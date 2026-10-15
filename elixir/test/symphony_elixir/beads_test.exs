@@ -95,6 +95,15 @@ defmodule SymphonyElixir.BeadsTest do
     for line in sys.stdin:
       request=json.loads(line)
       if 'id' not in request: continue
+      if 'method' not in request:
+        assert request['result']['success'] is False
+        assert 'root_task_tools_only' in request['result']['contentItems'][0]['text']
+        if request['id']==70:
+          send({'id':71,'method':'item/tool/call','params':{'threadId':'observed-thread','turnId':'stale-turn','tool':'beads_checkpoint','arguments':{}}})
+        else:
+          send({'method':'turn/completed','params':{'threadId':'child-thread','turn':{'id':'child-turn','status':'completed'}}})
+          send({'method':'turn/completed','params':{'threadId':'observed-thread','turn':{'id':'observed-turn','status':'completed'}}})
+        continue
       method=request['method']
       if method=='initialize': send({'id':request['id'],'result':{}})
       else:
@@ -104,8 +113,7 @@ defmodule SymphonyElixir.BeadsTest do
         if method=='turn/start':
           assert record['thread_id']=='observed-thread'
           send({'id':request['id'],'result':{'turn':{'id':'observed-turn'}}})
-          send({'method':'turn/completed','params':{'threadId':'child-thread','turn':{'id':'child-turn','status':'completed'}}})
-          send({'method':'turn/completed','params':{'threadId':'observed-thread','turn':{'id':'observed-turn','status':'completed'}}})
+          send({'id':70,'method':'item/tool/call','params':{'threadId':'child-thread','turnId':'child-turn','tool':'beads_task_context','arguments':{}}})
     """)
 
     File.chmod!(codex, 0o755)
@@ -414,7 +422,7 @@ defmodule SymphonyElixir.BeadsTest do
 
     records =
       Enum.map(records, fn row ->
-        if row["id"] == "bd-ready", do: row |> Map.put("external_ref", url) |> Map.put("labels", ["symphony", "symphony:publish"]), else: row
+        if row["id"] == "bd-ready", do: row |> Map.put("external_ref", url) |> Map.put("labels", ["symphony", "symphony:checkpoint"]), else: row
       end)
 
     File.write!(context.data, Jason.encode!(records))
@@ -427,7 +435,7 @@ defmodule SymphonyElixir.BeadsTest do
     {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
     {:ok, issue, opts} = Adapter.prepare_run(issue, [])
     settings = opts[:tracker_settings]
-    settings = put_in(settings.provider["publish_paths"], ["allowed.txt"])
+    settings = put_in(settings.provider["checkpoint_paths"], ["allowed.txt"])
     workspace = Path.join(context.root, "checkpoint-worktree")
     File.mkdir_p!(workspace)
 
@@ -449,7 +457,14 @@ defmodule SymphonyElixir.BeadsTest do
     assert {:ok, %{published: false, head_sha: sha}} = Publication.checkpoint(settings, issue)
     assert {"allowed.txt\n", 0} = System.cmd("git", ["ls-tree", "--name-only", "HEAD"], cd: workspace)
     assert File.read!(Path.join(workspace, "unrelated.txt")) == "preserved"
-    assert {:error, :current_validation_required} = Publication.publish(settings, issue)
+    assert {:error, :publication_not_currently_authorized} = Publication.publish(settings, issue)
+    File.write!(Path.join(workspace, "allowed.txt"), "second change")
+    {_, 0} = System.cmd("git", ["add", "unrelated.txt"], cd: workspace)
+    assert {:error, :unrelated_staged_changes} = Publication.checkpoint(settings, issue)
+    {_, 0} = System.cmd("git", ["reset", "--", "unrelated.txt"], cd: workspace)
+    revoked = Enum.map(Jason.decode!(File.read!(context.data)), &Map.put(&1, "labels", ["symphony"]))
+    File.write!(context.data, Jason.encode!(revoked))
+    assert {:error, :publication_not_currently_authorized} = Publication.checkpoint(settings, issue)
     {head, 0} = System.cmd("git", ["rev-parse", "--verify", "HEAD"], cd: workspace)
     assert String.trim(head) == sha
     refute Adapter.execute_agent_tool("beads_checkpoint", %{}, issue: %{issue | assignee_id: "wrong"}, tracker_settings: settings)["success"]

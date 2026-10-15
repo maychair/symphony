@@ -506,6 +506,31 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp handle_unscoped_event(port, on_message, %{"id" => id, "method" => "item/tool/call"} = payload, timeout, context, auto) do
+    result = %{
+      "success" => false,
+      "contentItems" => [
+        %{
+          "type" => "inputText",
+          "text" =>
+            Jason.encode!(%{
+              error: %{
+                code: "root_task_tools_only",
+                detail:
+                  "Task tools are bound to the root thread and turn. " <>
+                    "Ask the root agent for a task snapshot or host action."
+              }
+            })
+        }
+      ]
+    }
+
+    send_message(port, %{"id" => id, "result" => result})
+    metadata = metadata_from_message(port, payload)
+    emit_message(on_message, :tool_call_failed, %{payload: payload, scope_rejected: true}, metadata)
+    receive_loop(port, on_message, timeout, "", context, auto)
+  end
+
   defp handle_unscoped_event(port, on_message, %{"id" => id} = payload, _timeout, _context, _auto) do
     send_message(port, %{"id" => id, "error" => %{"code" => -32_001, "message" => "Request is outside the root execution; human review required."}})
     emit_message(on_message, :turn_input_required, %{payload: payload}, metadata_from_message(port, payload))

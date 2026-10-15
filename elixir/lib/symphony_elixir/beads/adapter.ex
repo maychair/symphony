@@ -191,7 +191,8 @@ defmodule SymphonyElixir.Beads.Adapter do
       },
       %{
         "name" => "beads_checkpoint",
-        "description" => "Commit only configured authorized task paths on the host before validation. Requires symphony:publish. Never pushes, opens reviews or merges.",
+        "description" =>
+          "Commit only configured authorized task paths on the host before validation. Requires symphony:checkpoint plus checkpoint_paths, or existing publication authority. Never pushes, opens reviews or merges.",
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
       },
       %{

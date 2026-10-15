@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Beads.Publication do
 
   @spec publish(map(), map()) :: {:ok, map()} | {:error, term()}
   def publish(settings, issue) do
-    with {:ok, context} <- prepare_commit(settings, issue),
+    with {:ok, context} <- prepare_commit(settings, issue, :publish),
          :ok <- Validation.gate(context.record),
          {:ok, _} <- push(context.workspace, context.remote, context.branch, context.repo),
          {:ok, url} <- review(context.repo, context.branch, issue, context.record, settings) do
@@ -14,17 +14,17 @@ defmodule SymphonyElixir.Beads.Publication do
 
   @spec checkpoint(map(), map()) :: {:ok, map()} | {:error, term()}
   def checkpoint(settings, issue) do
-    with {:ok, context} <- prepare_commit(settings, issue) do
+    with {:ok, context} <- prepare_commit(settings, issue, :checkpoint) do
       {:ok, %{head_sha: context.sha, published: false}}
     end
   end
 
-  defp prepare_commit(settings, issue) do
-    paths = settings.provider["publish_paths"] || []
+  defp prepare_commit(settings, issue, operation) do
+    {label, paths} = authority(settings, issue, operation)
     remote_name = settings.provider["git_remote"] || "origin"
 
-    with :ok <- authorized_task(settings, issue),
-         :ok <- authorized_paths(issue, paths),
+    with :ok <- authorized_task(settings, issue, label),
+         :ok <- authorized_paths(issue, paths, label),
          true <- Enum.all?(paths, &safe_path?/1) || {:error, :invalid_publication_paths},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
          true <- record["owner"] == issue.assignee_id || {:error, :publication_owner_mismatch},
@@ -47,15 +47,25 @@ defmodule SymphonyElixir.Beads.Publication do
     end
   end
 
-  defp authorized_paths(issue, paths) do
-    if "symphony:publish" in issue.labels and paths != [], do: :ok, else: {:error, :publication_not_authorized}
+  defp authority(settings, issue, :checkpoint) do
+    if "symphony:checkpoint" in issue.labels do
+      {"symphony:checkpoint", settings.provider["checkpoint_paths"] || []}
+    else
+      authority(settings, issue, :publish)
+    end
   end
 
-  defp authorized_task(settings, issue) do
+  defp authority(settings, _issue, :publish), do: {"symphony:publish", settings.provider["publish_paths"] || []}
+
+  defp authorized_paths(issue, paths, label) do
+    if label in issue.labels and is_list(paths) and paths != [], do: :ok, else: {:error, :publication_not_authorized}
+  end
+
+  defp authorized_task(settings, issue, label) do
     with {:ok, [current]} <- Adapter.command(settings, ["show", issue.id, "--json"]),
          true <-
            (current["status"] == "in_progress" and current["assignee"] == issue.assignee_id and
-              "symphony:publish" in (current["labels"] || [])) || {:error, :publication_not_currently_authorized},
+              label in (current["labels"] || [])) || {:error, :publication_not_currently_authorized},
          {:ok, %{closed: false}} <- SourceIssue.read(settings, current["external_ref"] || "") do
       :ok
     else
