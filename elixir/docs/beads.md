@@ -419,3 +419,13 @@ a remote gate `manual_delivery: true`. Its acceptance verifies the configured
 repository, exact published head and remote merged proof before closing the
 manual task. Native Run deliveries continue through normal native acceptance;
 no thread/turn identity or validation receipt is fabricated.
+
+Verified merge events use the existing authenticated webhook refresh and scheduler
+reconciliation loop; periodic reconciliation also recovers missed events. The
+current remote API remains authoritative. Workbench gates, including manually
+tracked historical deliveries, use the existing merger allowlist, CI/review
+conditions and exact delivered head before recording acceptance and closing.
+No second operator confirmation is needed after a qualifying developer merge.
+Unmet merge conditions remain workflow verification work, outside the review
+inbox. Resolved dependencies use existing admission or native recovery; uncertain
+old executors become diagnostic incidents rather than duplicate execution.

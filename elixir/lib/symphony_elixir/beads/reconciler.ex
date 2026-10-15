@@ -8,9 +8,9 @@ defmodule SymphonyElixir.Beads.Reconciler do
     if settings.kind == "beads" do
       case Adapter.command(settings, ["list", "--all", "--limit", "0", "--json"]) do
         {:ok, issues} when is_list(issues) ->
-          issues |> Enum.filter(&routed?(&1, settings)) |> Enum.each(fn issue ->
+          issues |> Enum.filter(&(routed?(&1, settings) or SymphonyElixir.Beads.Workbench.managed?(&1))) |> Enum.each(fn issue ->
             if issue["status"] == "blocked", do: SymphonyElixir.Beads.Workbench.reconcile(settings, issue)
-            if settings.provider["remote_reconcile"] == true, do: reconcile(settings, issue)
+            if settings.provider["remote_reconcile"] == true and routed?(issue, settings), do: reconcile(settings, issue)
           end)
 
         error ->
@@ -44,6 +44,14 @@ defmodule SymphonyElixir.Beads.Reconciler do
   end
 
   defp reconcile_record(settings, issue, nil) do
+    if issue["external_ref"] in [nil, ""] and SymphonyElixir.Beads.Workbench.managed?(issue) do
+      :ok
+    else
+      reconcile_unstarted_source(settings, issue)
+    end
+  end
+
+  defp reconcile_unstarted_source(settings, issue) do
     case SourceIssue.read(settings, issue["external_ref"] || "") do
       {:ok, %{closed: false}} -> reopen_unstarted(settings, issue)
       {:ok, %{closed: true}} -> park_unstarted(settings, issue, "source_issue_closed")
@@ -109,7 +117,8 @@ defmodule SymphonyElixir.Beads.Reconciler do
     with true <- is_binary(url) || {:error, :missing_review_binding},
          false <- File.exists?(Path.join(record["directory"], "executor.lock")),
          {:ok, review} <- RemoteReview.fetch(settings, url) do
-      case SourceIssue.read(settings, issue["external_ref"] || "") do
+      source = if issue["external_ref"] in [nil, ""], do: {:ok, %{closed: false}}, else: SourceIssue.read(settings, issue["external_ref"])
+      case source do
         {:ok, %{closed: true}} when review.state != "merged" -> checkpoint(record, "source_issue_closed")
         {:ok, _} -> act(decide(review, settings.provider), settings, issue, record, review)
         error -> error

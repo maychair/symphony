@@ -151,8 +151,9 @@ defmodule SymphonyElixir.Beads.Adapter do
   end
 
   defp source_ready(settings, issue) do
-    if settings.provider["remote_reconcile"] == true do
-      case SourceIssue.read(settings, issue.native_ref["external_ref"] || "") do
+    reference = issue.native_ref["external_ref"]
+    if settings.provider["remote_reconcile"] == true and reference not in [nil, ""] do
+      case SourceIssue.read(settings, reference) do
         {:ok, %{closed: false}} -> :ok
         {:ok, %{closed: true}} -> {:error, :source_issue_closed}
         error -> error
@@ -367,7 +368,7 @@ defmodule SymphonyElixir.Beads.Adapter do
   defp finish_handoff(settings, issue, arguments) do
     with :ok <- await_human(settings, issue.id, issue.assignee_id, arguments["reason"]),
          {:ok, _} <- SymphonyElixir.Beads.Workbench.request(settings, issue.id, [%{
-           "kind" => "review", "title" => "审查已发布的交付", "reason" => "交付已发布，请审查具体变更及验证结果；合入后才能登记验收完成。",
+           "kind" => "review", "title" => "审查已发布的交付", "reason" => "交付已发布，请到远程仓库审查；合入后由 scheduler 核验并自动推进任务。",
            "review_url" => arguments["review_url"], "head_sha" => arguments["head_sha"]
          }], issue.assignee_id) do
       :ok

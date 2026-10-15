@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Beads.Workbench do
   @moduledoc "Structured gates and operator receipts stored in Beads; execution remains scheduler owned."
-  alias SymphonyElixir.Beads.{Adapter, RunJournal, Recovery, Acceptance}
+  alias SymphonyElixir.Beads.{Adapter, RunJournal, Recovery, Acceptance, RemoteReview, Reconciler}
   @kinds ~w(authorization decision review incident dependency)
 
   @spec list(map()) :: {:ok, [map()]} | {:error, term()}
@@ -9,6 +9,9 @@ defmodule SymphonyElixir.Beads.Workbench do
       {:ok, Enum.map(issues, &present(settings, &1))}
     end
   end
+
+  @spec managed?(map()) :: boolean()
+  def managed?(issue), do: issue["status"] != "closed" and (envelope(issue)["gates"] || []) != []
 
   @spec envelope(map()) :: map()
   def envelope(issue) do
@@ -288,11 +291,10 @@ defmodule SymphonyElixir.Beads.Workbench do
          true <- Enum.all?(gates, &satisfied?(settings, &1)),
          record <- record(settings, id),
          true <- Enum.all?(gates, &(&1["binding"] == binding(issue, record))),
-         :ok <- release_resolved_external_edges(settings, id, gates),
-         true <- if(record == %{}, do: resume_unstarted(settings, issue), else: true),
-         true <- record["native_stop_confirmed"] != false,
-         false <- File.exists?(Path.join(record["directory"], "executor.lock")) do
-      case Recovery.resume_online(settings, id) do
+         :ok <- release_resolved_external_edges(settings, id, gates) do
+      result = if record == %{}, do: resume_unstarted(settings, issue), else: Recovery.resume_online(settings, id)
+
+      case result do
         :ok ->
           :ok
 
@@ -301,7 +303,7 @@ defmodule SymphonyElixir.Beads.Workbench do
             "id" => random_id(),
             "kind" => "incident",
             "title" => "原任务未能安全恢复",
-            "reason" => "决策已记录，但原生执行对账未通过；需要修复后继续，系统不会重复启动旧执行。",
+            "reason" => "前置条件已满足，但原生执行对账未通过；需要修复后继续，系统不会重复启动旧执行。",
             "repair_project" => "symphony",
             "repair_scope" => "诊断任务 " <> id <> " 的恢复失败 " <> inspect(reason) <> "。保留原执行身份与已记录决策，禁止盲目重试。",
             "binding" => binding(issue, record),
@@ -319,12 +321,48 @@ defmodule SymphonyElixir.Beads.Workbench do
   end
 
   defp resume_unstarted(settings, issue) do
-    if get_in(issue, ["metadata", "workbench_preflight_failed"]) in [true, "true"] and
-         RunJournal.read(RunJournal.directory(Adapter.journal_root(settings), issue["id"])) == {:ok, nil} do
-      Adapter.command(settings, ["update", issue["id"], "--if-status", "blocked", "--if-assignee", "", "--status", "open", "--remove-label", "human", "--set-metadata", "symphony_gate=ready", "--json"])
-    end
+    directory = RunJournal.directory(Adapter.journal_root(settings), issue["id"])
+    metadata = issue["metadata"] || %{}
+    gates = envelope(issue)["gates"] || []
+    dependency_release = gates != [] and Enum.all?(gates, &(&1["kind"] == "dependency" and satisfied?(settings, &1)))
+    preflight = metadata["workbench_preflight_failed"] in [true, "true"]
 
-    false
+    cond do
+      dependency_release and not is_nil(metadata["nativeSession"]) ->
+        {:error, :missing_historical_run_identity}
+
+      (preflight or dependency_release) and is_nil(metadata["nativeSession"]) and
+        RunJournal.read(directory) == {:ok, nil} and not File.exists?(Path.join(directory, "executor.lock")) ->
+        labels = Enum.flat_map(settings.required_labels, &["--add-label", &1])
+
+        case Adapter.command(
+               settings,
+               [
+                 "update",
+                 issue["id"],
+                 "--if-status",
+                 "blocked",
+                 "--if-assignee",
+                 issue["assignee"] || "",
+                 "--status",
+                 "open",
+                 "--assignee",
+                 "",
+                 "--remove-label",
+                 "human",
+                 "--set-metadata",
+                 "symphony_gate=ready",
+                 "--append-notes",
+                 "Scheduler released verified workbench prerequisites for admission."
+               ] ++ labels ++ ["--json"]
+             ) do
+          {:ok, _} -> :ok
+          error -> error
+        end
+
+      true ->
+        :ok
+    end
   end
 
   defp release_resolved_external_edges(settings, id, gates) do
@@ -340,7 +378,74 @@ defmodule SymphonyElixir.Beads.Workbench do
 
   @spec reconcile(map(), map()) :: :ok | {:error, term()}
   def reconcile(settings, issue) do
+    if settings.provider["remote_reconcile"] == true, do: reconcile_reviews(settings, issue)
     serial(settings, issue["id"], fn -> maybe_resume(settings, issue["id"]) end)
+  end
+
+  defp reconcile_reviews(settings, issue) do
+    gates = envelope(issue)["gates"] || []
+
+    for gate <- gates, gate["kind"] == "review", gate["state"] == "pending", is_binary(gate["review_url"]) do
+      with true <- gate["binding"] == binding(issue, record(settings, issue["id"])),
+           {:ok, review} <- RemoteReview.fetch(settings, gate["review_url"]) do
+        decision = Reconciler.decide(review, settings.provider)
+
+        cond do
+          review.head != gate["head_sha"] ->
+            record_remote_wait(settings, issue["id"], gate, "delivery_commit_mismatch", "远程提交 " <> to_string(review.head) <> " 与交付提交 " <> gate["head_sha"] <> " 不一致。")
+
+          decision == :accepted and Enum.all?(gates, &(&1["id"] == gate["id"] or satisfied?(settings, &1))) ->
+            result =
+              decide(settings, issue["id"], gate["id"], %{
+                "binding" => gate["binding"],
+                "choice" => "accept",
+                "actor" => review.actor,
+                "comment" => "Scheduler verified merged delivery; merger identity, exact head and configured acceptance conditions passed."
+              })
+
+            case result do
+              {:error, reason} -> record_remote_wait(settings, issue["id"], gate, "merge_transition_failed", "安全交付对账未通过：" <> inspect(reason))
+              _ -> :ok
+            end
+
+          decision == :merged_conditions_unmet ->
+            record_remote_wait(settings, issue["id"], gate, "merged_conditions_unmet", merge_wait_reason(review, settings.provider))
+
+          decision == :accepted ->
+            record_remote_wait(settings, issue["id"], gate, "other_gates_pending", "同一任务仍有其他未解除的授权或依赖条件。")
+
+          true ->
+            :ok
+        end
+      else
+        _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  defp merge_wait_reason(review, provider) do
+    actor = if review.actor in (provider["accepted_merge_actors"] || []), do: [], else: ["合入账号 " <> to_string(review.actor) <> " 不在已配置的允许范围"]
+    failed = for check <- review.feedback.checks, String.downcase(check.status || "") not in ["success", "neutral", "skipped"], do: "检查 " <> check.name <> "：" <> to_string(check.status)
+    missing = for name <- provider["required_checks"] || [], not Enum.any?(review.feedback.checks, &(&1.name == name)), do: "缺少必需检查 " <> name
+    threads = if review.feedback.threads == [], do: [], else: ["仍有 " <> to_string(length(review.feedback.threads)) <> " 条未解决讨论"]
+    changes = if review.feedback.changes_requested, do: ["仍有要求修改的审查"], else: []
+    Enum.join(actor ++ failed ++ missing ++ threads ++ changes, "；")
+  end
+
+  defp record_remote_wait(settings, id, gate, state, reason) do
+    serial(settings, id, fn ->
+      with {:ok, current} <- issue(settings, id),
+           env <- envelope(current),
+           found when is_map(found) <- Enum.find(env["gates"] || [], &(&1["id"] == gate["id"])),
+           true <- found["binding"] == gate["binding"] and found["state"] == "pending" and found["remote_state"] != state do
+        gates = Enum.map(env["gates"], &if(&1["id"] == gate["id"], do: &1 |> Map.put("remote_state", state) |> Map.put("remote_reason", reason), else: &1))
+        persist(settings, current, Map.put(env, "gates", gates))
+      else
+        _ -> :ok
+      end
+    end)
   end
 
   defp satisfied?(_settings, %{"state" => "resolved"}), do: true
@@ -427,7 +532,7 @@ defmodule SymphonyElixir.Beads.Workbench do
         accept_manual(settings, issue, gate, actor)
 
       is_binary(gate["review_url"]) ->
-        case Acceptance.accept(settings, issue["id"], gate["review_url"], actor) do
+        case Acceptance.accept(settings, issue["id"], gate["review_url"], actor, close_source: true) do
           :ok -> {:ok, %{}}
           error -> error
         end
@@ -474,10 +579,14 @@ defmodule SymphonyElixir.Beads.Workbench do
   end
 
   defp publication_state(gate, settings, record) do
-    if gate["kind"] == "review" and gate["delivery_kind"] == "local" and remote_backed?(settings, record, gate) do
-      gate |> Map.put("kind", "publication") |> Map.put("reason", "交付尚未发布到远程仓库，工作流需先准备具体 PR / MR；当前不需要本地验收。")
+    if gate["kind"] == "review" and gate["remote_state"] in ["delivery_commit_mismatch", "merged_conditions_unmet", "merge_transition_failed", "other_gates_pending"] do
+      gate |> Map.put("kind", "verification") |> Map.put("reason", "远程交付由工作流继续核对：" <> (gate["remote_reason"] || "交付条件尚未满足") <> "。无需重复人工验收。")
     else
-      gate
+      if gate["kind"] == "review" and gate["delivery_kind"] == "local" and remote_backed?(settings, record, gate) do
+        gate |> Map.put("kind", "publication") |> Map.put("reason", "交付尚未发布到远程仓库，工作流需先准备具体 PR / MR；当前不需要本地验收。")
+      else
+        gate
+      end
     end
   end
 
