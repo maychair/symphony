@@ -8,8 +8,8 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Beads.{Adapter, Reconciler, RunJournal}
   alias SymphonyElixir.Tracker.Issue
-  alias SymphonyElixir.Beads.{Adapter, RunJournal}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -119,7 +119,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    :ok = SymphonyElixir.Beads.Reconciler.poll(Config.settings!().tracker)
+    :ok = Reconciler.poll(Config.settings!().tracker)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}

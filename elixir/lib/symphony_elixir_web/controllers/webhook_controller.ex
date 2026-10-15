@@ -2,8 +2,8 @@ defmodule SymphonyElixirWeb.WebhookController do
   @moduledoc "Authenticated event hints; remote API reconciliation remains authoritative."
   use Phoenix.Controller, formats: [:json]
   alias Plug.Conn
-  alias SymphonyElixir.{Config, Orchestrator}
   alias SymphonyElixir.Beads.{Adapter, Repository}
+  alias SymphonyElixir.{Config, Orchestrator}
 
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
   def read_body(conn, opts) do

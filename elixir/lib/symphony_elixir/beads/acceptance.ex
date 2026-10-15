@@ -24,7 +24,11 @@ defmodule SymphonyElixir.Beads.Acceptance do
 
     case Repository.review_repository(url) do
       {:ok, ^repository} when is_binary(repository) ->
-        if String.starts_with?(url, "https://github.com/") or Repository.gitlab_url?(settings, url), do: :ok, else: {:error, :review_outside_configured_repository}
+        if String.starts_with?(url, "https://github.com/") or Repository.gitlab_url?(settings, url) do
+          :ok
+        else
+          {:error, :review_outside_configured_repository}
+        end
 
       _ ->
         {:error, :review_outside_configured_repository}
@@ -129,9 +133,21 @@ defmodule SymphonyElixir.Beads.Acceptance do
   @spec merged_review(String.t()) :: {:ok, map()} | {:error, term()}
   def merged_review(url) do
     case URI.parse(url) do
-      %URI{scheme: "https", host: "github.com", path: path} -> github_review(path, url)
-      %URI{scheme: scheme, host: host, path: path, userinfo: nil, query: nil, fragment: nil} when scheme in ["http", "https"] and is_binary(host) -> gitlab_review(path, url, host)
-      _ -> {:error, :unsupported_review_host}
+      %URI{scheme: "https", host: "github.com", path: path} ->
+        github_review(path, url)
+
+      uri ->
+        verify_gitlab_review(uri, url)
+    end
+  end
+
+  defp verify_gitlab_review(uri, url) do
+    case {uri.scheme, uri.host, uri.userinfo, uri.query, uri.fragment} do
+      {scheme, host, nil, nil, nil} when scheme in ["http", "https"] and is_binary(host) ->
+        gitlab_review(uri.path, url, host)
+
+      _ ->
+        {:error, :unsupported_review_host}
     end
   end
 

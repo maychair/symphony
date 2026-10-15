@@ -29,7 +29,9 @@ defmodule SymphonyElixir.Beads.Recovery do
          {:ok, session} <- inspect_native_session(settings, record) do
       AppServer.stop_session(session)
 
-      with {:ok, record} <- RunJournal.checkpoint(record, %{"feedback" => feedback, "repair_fingerprint" => feedback[:fingerprint], "repair_count" => (record["repair_count"] || 0) + 1}) do
+      changes = %{"feedback" => feedback, "repair_fingerprint" => feedback[:fingerprint], "repair_count" => (record["repair_count"] || 0) + 1}
+
+      with {:ok, record} <- RunJournal.checkpoint(record, changes) do
         release_for_resume(settings, record)
       end
     else
@@ -47,18 +49,28 @@ defmodule SymphonyElixir.Beads.Recovery do
         :ok
 
       {:error, {:response_error, %{"code" => -32_600, "message" => message}}} = error ->
-        if record["phase"] == "thread_ready" and record["turn_count"] == 0 and is_nil(record["turn_id"]) and
-             message == "no rollout found for thread id " <> record["thread_id"] do
-          case RunJournal.checkpoint(record, %{"abandoned_pre_turn_thread_id" => record["thread_id"]}) do
-            {:ok, _} -> :ok
-            failure -> failure
-          end
-        else
-          error
-        end
+        recover_absent_rollout(record, message, error)
 
       error ->
         error
+    end
+  end
+
+  defp recover_absent_rollout(record, message, error) do
+    if unstarted_thread?(record) and message == "no rollout found for thread id " <> record["thread_id"] do
+      checkpoint_recovery(record)
+    else
+      error
+    end
+  end
+
+  defp unstarted_thread?(record),
+    do: record["phase"] == "thread_ready" and record["turn_count"] == 0 and is_nil(record["turn_id"])
+
+  defp checkpoint_recovery(record) do
+    case RunJournal.checkpoint(record, %{"abandoned_pre_turn_thread_id" => record["thread_id"]}) do
+      {:ok, _} -> :ok
+      failure -> failure
     end
   end
 
@@ -83,20 +95,18 @@ defmodule SymphonyElixir.Beads.Recovery do
       not (native_identity?(record) or recovered_before_thread?(record)) ->
         {:error, :missing_native_identity}
 
-      record["host"] != hostname() ->
-        {:error, :unknown_executor_host}
-
-      not is_binary(record["executor_os_pid"]) ->
-        {:error, :unknown_executor_process}
-
-      File.exists?(Path.join("/proc", record["executor_os_pid"])) ->
-        {:error, :executor_may_still_be_alive}
-
-      not File.dir?("/proc") ->
-        {:error, :executor_liveness_unavailable}
-
       true ->
-        :ok
+        stopped_executor?(record)
+    end
+  end
+
+  defp stopped_executor?(record) do
+    cond do
+      record["host"] != hostname() -> {:error, :unknown_executor_host}
+      not is_binary(record["executor_os_pid"]) -> {:error, :unknown_executor_process}
+      File.exists?(Path.join("/proc", record["executor_os_pid"])) -> {:error, :executor_may_still_be_alive}
+      not File.dir?("/proc") -> {:error, :executor_liveness_unavailable}
+      true -> :ok
     end
   end
 

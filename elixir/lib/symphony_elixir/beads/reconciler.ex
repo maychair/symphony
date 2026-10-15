@@ -102,11 +102,19 @@ defmodule SymphonyElixir.Beads.Reconciler do
       review.state == "closed" -> :closed_unmerged
       review.state == "merged" and acceptable?(review, provider) -> :accepted
       review.state == "merged" -> :merged_conditions_unmet
-      feedback.threads != [] or feedback.changes_requested or failed -> :repair
+      repair_needed?(feedback, failed) -> :repair
       Enum.any?(feedback.checks, &(not passed_check?(&1))) -> :waiting_ci
-      Enum.any?(provider["required_checks"] || [], fn name -> not Enum.any?(feedback.checks, &(&1.name == name and passed_check?(&1))) end) -> :waiting_ci
+      not required_checks_passed?(feedback.checks, provider) -> :waiting_ci
       true -> :awaiting_merge
     end
+  end
+
+  defp repair_needed?(feedback, failed), do: feedback.threads != [] or feedback.changes_requested or failed
+
+  defp required_checks_passed?(checks, provider) do
+    Enum.all?(provider["required_checks"] || [], fn name ->
+      Enum.any?(checks, &(&1.name == name and passed_check?(&1)))
+    end)
   end
 
   defp acceptable?(review, provider) do

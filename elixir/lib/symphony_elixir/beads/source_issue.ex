@@ -29,7 +29,11 @@ defmodule SymphonyElixir.Beads.SourceIssue do
         github_source(path, configured)
 
       %URI{host: host, path: path} ->
-        if Repository.gitlab_url?(settings, url), do: gitlab_source(path, configured, host), else: {:error, :invalid_source_issue_reference}
+        if Repository.gitlab_url?(settings, url) do
+          gitlab_source(path, configured, host)
+        else
+          {:error, :invalid_source_issue_reference}
+        end
 
       _ ->
         {:error, :invalid_source_issue_reference}
@@ -57,7 +61,9 @@ defmodule SymphonyElixir.Beads.SourceIssue do
       [_, project, number] ->
         if configured == host <> "/" <> project do
           endpoint = "projects/" <> URI.encode_www_form(project) <> "/issues/" <> number
-          {:ok, %{provider: "gitlab", bin: "glab", get: ["api", "--hostname", host, endpoint], close: ["api", "--hostname", host, "--method", "PUT", endpoint, "-f", "state_event=close"]}}
+          get = ["api", "--hostname", host, endpoint]
+          close = ["api", "--hostname", host, "--method", "PUT", endpoint, "-f", "state_event=close"]
+          {:ok, %{provider: "gitlab", bin: "glab", get: get, close: close}}
         else
           {:error, :source_issue_outside_configured_repository}
         end
