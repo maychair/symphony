@@ -226,7 +226,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp restore_beads_gate(issue, state) do
     required = Config.settings!().tracker.required_labels
 
-    if "human" in issue.labels and Enum.all?(required, &(&1 in issue.labels)) do
+    if beads_terminal_gate?(issue) and Enum.all?(required, &(&1 in issue.labels)) do
       block_issue_from_entry(state, issue.id, %{identifier: issue.identifier, issue: issue}, beads_gate_error(issue.id, issue))
     else
       state
@@ -260,6 +260,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
     if Config.settings!().tracker.kind == "beads" do
+      park_beads_worker_exit(issue_id, :normal)
       block_issue_from_entry(state, issue_id, running_entry, beads_gate_error(issue_id, Map.get(running_entry, :issue)))
     else
       handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id)
@@ -268,9 +269,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     if Config.settings!().tracker.kind == "beads" do
-      block_issue_from_entry(state, issue_id, running_entry, "run requires human reconciliation: #{inspect(reason)}")
+      park_beads_worker_exit(issue_id, reason)
+      block_issue_from_entry(state, issue_id, running_entry, beads_gate_error(issue_id, Map.get(running_entry, :issue)))
     else
       handle_provider_agent_down(reason, state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp park_beads_worker_exit(issue_id, reason) do
+    case Reconciler.park_worker_exit(Config.settings!().tracker, issue_id, reason) do
+      :ok -> :ok
+      error -> Logger.warning("Coordinator exit reconciliation failed issue_id=#{issue_id} issue_identifier=#{issue_id} reason=#{inspect(error)}")
     end
   end
 
@@ -494,7 +503,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
-      beads_human_gate?(issue) ->
+      beads_terminal_gate?(issue) ->
         refresh_running_issue_state(state, issue)
 
       !issue_routable?(issue) ->
@@ -532,7 +541,7 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
         release_issue_claim(state, issue.id)
 
-      beads_human_gate?(issue) ->
+      beads_terminal_gate?(issue) ->
         refresh_blocked_issue_state(state, issue)
 
       !issue_routable?(issue) ->
@@ -561,10 +570,10 @@ defmodule SymphonyElixir.Orchestrator do
     gate == "resumed" or (gate == "ready" and RunJournal.read(directory) == {:ok, nil})
   end
 
-  defp beads_human_gate?(issue) do
+  defp beads_terminal_gate?(issue) do
     settings = Config.settings!().tracker
 
-    settings.kind == "beads" and issue.state == "blocked" and "human" in issue.labels and
+    settings.kind == "beads" and issue.state == "blocked" and
       get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) in ["awaiting_human", "blocked"] and
       Enum.all?(settings.required_labels, &(&1 in issue.labels))
   end
@@ -639,7 +648,7 @@ defmodule SymphonyElixir.Orchestrator do
     case Map.get(state.blocked, issue.id) do
       %{issue: _} = blocked_entry ->
         updated = Map.put(blocked_entry, :issue, issue)
-        updated = if beads_human_gate?(issue), do: Map.put(updated, :error, beads_gate_error(issue.id, issue)), else: updated
+        updated = if beads_terminal_gate?(issue), do: Map.put(updated, :error, beads_gate_error(issue.id, issue)), else: updated
         %{state | blocked: Map.put(state.blocked, issue.id, updated)}
 
       _ ->

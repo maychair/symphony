@@ -83,7 +83,7 @@ defmodule SymphonyElixir.BeadsTest do
   defp replace_owner(%{"id" => id} = record, id), do: Map.put(record, "assignee", "another-owner")
   defp replace_owner(record, _id), do: record
 
-  test "native run checkpoints intent before side effects and delivers exactly one root turn", context do
+  test "bounded legacy run checkpoints intent before side effects and blocks on its turn budget", context do
     codex = Path.join(context.root, "codex")
     native_trace = Path.join(context.root, "native-trace")
     journal = RunJournal.directory(Adapter.journal_root(Config.settings!().tracker), "bd-ready")
@@ -117,13 +117,13 @@ defmodule SymphonyElixir.BeadsTest do
     """)
 
     File.chmod!(codex, 0o755)
-    File.write!(Workflow.workflow_file_path(), File.read!(Workflow.workflow_file_path()) |> String.replace("polling:", "codex:\n  command: #{Jason.encode!(codex)}\npolling:"))
+    File.write!(Workflow.workflow_file_path(), File.read!(Workflow.workflow_file_path()) |> String.replace("polling:", "agent:\n  max_turns: 1\ncodex:\n  command: #{Jason.encode!(codex)}\npolling:"))
     :ok = WorkflowStore.force_reload()
     old = System.get_env("BEADS_DIR")
     on_exit(fn -> restore_env("BEADS_DIR", old) end)
     System.put_env("BEADS_DIR", "/wrong/inherited/database")
     {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
-    assert :ok = AgentRunner.run(issue)
+    assert_raise RuntimeError, ~r/agent_turn_budget_exhausted/, fn -> AgentRunner.run(issue) end
     events = native_trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
     assert Enum.map(events, &{&1["method"], &1["phase"]}) == [{"thread/start", "thread_start_intent"}, {"turn/start", "turn_start_intent"}]
     assert Enum.all?(events, &(&1["beads_dir"] == context.database))
@@ -138,6 +138,217 @@ defmodule SymphonyElixir.BeadsTest do
     state = %Orchestrator.State{blocked: %{issue.id => %{issue: issue}}, claimed: MapSet.new([issue.id])}
     reconciled = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
     assert Map.has_key?(reconciled.blocked, issue.id)
+  end
+
+  test "native Goal owns two automatic root turns until an explicit blocker without a Butler", context do
+    codex = Path.join(context.root, "goal-server")
+    native_trace = Path.join(context.root, "goal-trace")
+
+    File.write!(codex, """
+    #!/usr/bin/env python3
+    import json,sys
+    def send(x): print(json.dumps(x),flush=True)
+    def goal(status): return {'threadId':'goal-thread','status':status,'objective':'retained objective'}
+    def started(turn): send({'method':'turn/started','params':{'threadId':'goal-thread','turn':{'id':turn,'status':'inProgress'}}})
+    def completed(turn): send({'method':'turn/completed','params':{'threadId':'goal-thread','turn':{'id':turn,'status':'completed'}}})
+    for line in sys.stdin:
+      request=json.loads(line)
+      if 'id' not in request: continue
+      with open(#{inspect(native_trace)},'a') as f: f.write(json.dumps(request)+'\\n')
+      method=request.get('method')
+      if method=='initialize': send({'id':request['id'],'result':{}})
+      elif method=='thread/start': send({'id':request['id'],'result':{'thread':{'id':'goal-thread'}}})
+      elif method=='thread/goal/get': send({'id':request['id'],'result':{'goal':None}})
+      elif method=='thread/goal/set':
+        status=request['params']['status']
+        send({'id':request['id'],'result':{'goal':goal(status)}})
+        send({'method':'thread/goal/updated','params':{'threadId':'goal-thread','goal':goal(status)}})
+        if status=='active':
+          started('goal-turn-1')
+          completed('goal-turn-1')
+          send({'method':'turn/completed','params':{'threadId':'child-thread','turn':{'id':'child-turn','status':'completed'}}})
+          started('goal-turn-2')
+          send({'id':71,'method':'item/tool/call','params':{'threadId':'goal-thread','turnId':'goal-turn-2','tool':'beads_await_human','arguments':{'intent':'blocked','reason':'Required target artifact is absent; resume after producer delivers it'}}})
+      elif method=='turn/start': raise AssertionError('Goal continuation must not start a competing explicit turn')
+      elif method is None:
+        assert request['id']==71 and request['result']['success'] is True, request
+        completed('goal-turn-2')
+    """)
+
+    File.chmod!(codex, 0o755)
+
+    workflow =
+      File.read!(Workflow.workflow_file_path())
+      |> String.replace("review_repository:", "goal_mode: true\n    review_repository:")
+      |> String.replace(
+        "polling:",
+        "agent:\n  max_turns: 1\ncodex:\n  command: #{Jason.encode!(codex)}\n  turn_sandbox_policy:\n    type: workspaceWrite\n    networkAccess: true\n    writableRoots: [#{Jason.encode!(context.root)}]\npolling:"
+      )
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    :ok = WorkflowStore.force_reload()
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    assert_raise RuntimeError, ~r/native_goal_stopped.*blocked/, fn -> AgentRunner.run(issue) end
+
+    events =
+      native_trace
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&Jason.decode!/1)
+
+    assert Enum.count(events, &(&1["method"] == "thread/start")) == 1
+    thread_start = Enum.find(events, &(&1["method"] == "thread/start"))
+    assert thread_start["params"]["config"]["sandbox_workspace_write.network_access"] == true
+    assert context.root in thread_start["params"]["config"]["sandbox_workspace_write.writable_roots"]
+    assert Enum.count(events, &(&1["method"] == "thread/goal/set")) == 2
+    active_goal = Enum.find(events, &(&1["method"] == "thread/goal/set" and &1["params"]["status"] == "active"))
+    assert String.length(active_goal["params"]["objective"]) <= 4000
+    refute Enum.any?(events, &(&1["method"] == "turn/start"))
+    assert {:ok, record} = RunJournal.read(RunJournal.directory(Adapter.journal_root(Config.settings!().tracker), issue.id))
+    assert record["turn_id"] == "goal-turn-2"
+    assert File.read!(Path.join(record["directory"], "goal-instructions.txt")) =~ "Frozen validation policy"
+    assert record["turn_count"] == 2
+    assert record["goal_status"] == "blocked"
+    assert record["native_stop_confirmed"] == true
+    assert record["blocker_reason"] =~ "Required target artifact"
+    refute File.exists?(Path.join(record["directory"], "executor.lock"))
+    assert {:ok, [issue]} = Adapter.fetch_issues_by_ids([issue.id])
+    assert issue.state == "blocked"
+  end
+
+  test "Goal wall-clock budget survives notification traffic and fences an unconfirmed stop", context do
+    codex = Path.join(context.root, "goal-budget-server")
+
+    File.write!(codex, """
+    #!/usr/bin/env python3
+    import json,sys,threading,time
+    running=threading.Event()
+    goal_state=None
+    def send(x): print(json.dumps(x),flush=True)
+    def goal(status): return {'threadId':'budget-thread','status':status,'objective':'budget smoke'}
+    def traffic():
+      while running.is_set():
+        send({'method':'item/updated','params':{'threadId':'budget-thread','turnId':'budget-turn'}})
+        time.sleep(.005)
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      if 'id' not in q: continue
+      if m=='initialize': send({'id':q['id'],'result':{}})
+      elif m=='thread/start': send({'id':q['id'],'result':{'thread':{'id':'budget-thread'}}})
+      elif m=='thread/goal/get': send({'id':q['id'],'result':{'goal':goal_state}})
+      elif m=='thread/goal/set':
+        status=q['params']['status']
+        goal_state=goal(status)
+        send({'id':q['id'],'result':{'goal':goal_state}})
+        if status=='active':
+          send({'method':'turn/started','params':{'threadId':'budget-thread','turn':{'id':'budget-turn','status':'inProgress'}}})
+          running.set()
+          threading.Thread(target=traffic,daemon=True).start()
+        else: running.clear()
+      elif m=='turn/interrupt': send({'id':q['id'],'result':{}})
+      elif m=='thread/read':
+        send({'id':q['id'],'result':{'thread':{'id':'budget-thread','turns':[{'id':'budget-turn','status':'inProgress'}]}}})
+    """)
+
+    File.chmod!(codex, 0o755)
+
+    workflow =
+      File.read!(Workflow.workflow_file_path())
+      |> String.replace("review_repository:", "goal_mode: true\n    run_budget_ms: 1000\n    review_repository:")
+      |> String.replace("polling:", "codex:\n  command: #{Jason.encode!(codex)}\npolling:")
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+    :ok = WorkflowStore.force_reload()
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    started = System.monotonic_time(:millisecond)
+    assert_raise RuntimeError, ~r/execution_budget_exhausted/, fn -> AgentRunner.run(issue) end
+    assert System.monotonic_time(:millisecond) - started < 5000
+    assert {:ok, record} = RunJournal.read(RunJournal.directory(Adapter.journal_root(Config.settings!().tracker), issue.id))
+    assert record["phase"] == "blocked"
+    assert record["goal_status"] == "blocked"
+    assert record["native_stop_confirmed"] == false
+    assert File.exists?(Path.join(record["directory"], "executor.lock"))
+    assert {:ok, [issue]} = Adapter.fetch_issues_by_ids([issue.id])
+    assert issue.state == "blocked"
+  end
+
+  test "scheduler polling parks a lost executor without remote reconciliation or a Butler", context do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, _issue, opts} = Adapter.prepare_run(issue, [])
+    settings = opts[:tracker_settings]
+    record = opts[:run_record]
+    {:ok, [raw]} = Adapter.command(settings, ["show", issue.id, "--json"])
+    refute settings.provider["remote_reconcile"]
+    assert RunJournal.executor_state(record) == :alive
+    assert :ok = Reconciler.poll(settings)
+    assert {:ok, [unchanged]} = Adapter.command(settings, ["show", issue.id, "--json"])
+    assert unchanged["status"] == "in_progress"
+
+    {:ok, dead} = RunJournal.checkpoint(record, %{"executor_os_pid" => "999999999", "phase" => "turn_running", "thread_id" => "lost-thread", "turn_id" => "lost-turn"})
+    assert RunJournal.executor_state(dead) == :stopped
+    assert :ok = Reconciler.reconcile_runtime(settings, %{raw | "assignee" => "foreign-owner"})
+    assert {:ok, [unchanged]} = Adapter.command(settings, ["show", issue.id, "--json"])
+    assert unchanged["status"] == "in_progress"
+
+    assert :ok = Reconciler.poll(settings)
+    assert {:ok, [parked]} = Adapter.command(settings, ["show", issue.id, "--json"])
+    assert parked["status"] == "blocked"
+    assert {:ok, parked_run} = RunJournal.read(record["directory"])
+    assert parked_run["blocker_reason"] =~ "Scheduler executor exited"
+    assert parked_run["native_stop_confirmed"] == false
+    assert File.exists?(Path.join(record["directory"], "executor.lock"))
+    assert :ok = Reconciler.poll(settings)
+    assert File.exists?(Path.join(record["directory"], "executor.lock"))
+    assert File.exists?(context.data)
+  end
+
+  test "polling preserves operator-authorized resume until a new admission consumes it" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, _issue, opts} = Adapter.prepare_run(issue, [])
+    record = opts[:run_record]
+    settings = opts[:tracker_settings]
+    {:ok, recovered} = RunJournal.checkpoint(record, %{"executor_os_pid" => "999999999", "phase" => "completed", "resume_authorized" => true, "thread_id" => "idle-thread", "turn_id" => "idle-turn"})
+    File.rmdir!(Path.join(record["directory"], "executor.lock"))
+    assert :ok = Reconciler.poll(settings)
+    assert {:ok, [current]} = Adapter.command(settings, ["show", issue.id, "--json"])
+    assert current["status"] == "in_progress"
+    assert {:ok, admitted} = RunJournal.admit(Adapter.journal_root(settings), issue.id)
+    refute admitted["resume_authorized"]
+    assert admitted["thread_id"] == recovered["thread_id"]
+  end
+
+  test "observed Coordinator worker death parks Beads while the scheduler process remains alive" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, _issue, opts} = Adapter.prepare_run(issue, [])
+    record = opts[:run_record]
+    assert RunJournal.executor_state(record) == :alive
+
+    {pid, ref} = spawn_monitor(fn -> exit(:coordinator_crashed) end)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :coordinator_crashed}
+    assert :ok = Reconciler.park_worker_exit(opts[:tracker_settings], issue.id, :coordinator_crashed)
+    assert {:ok, [parked]} = Adapter.command(opts[:tracker_settings], ["show", issue.id, "--json"])
+    assert parked["status"] == "blocked"
+    assert {:ok, current} = RunJournal.read(record["directory"])
+    assert current["blocker_reason"] =~ "coordinator_crashed"
+    assert current["native_stop_confirmed"] == false
+    assert File.exists?(Path.join(record["directory"], "executor.lock"))
+
+    assert {:ok, _} =
+             Adapter.command(opts[:tracker_settings], [
+               "update",
+               issue.id,
+               "--if-assignee",
+               record["owner"],
+               "--if-status",
+               "blocked",
+               "--status",
+               "in_progress",
+               "--json"
+             ])
+
+    assert :ok = Reconciler.poll(opts[:tracker_settings])
+    assert {:ok, [repaired]} = Adapter.command(opts[:tracker_settings], ["show", issue.id, "--json"])
+    assert repaired["status"] == "blocked"
   end
 
   test "child server requests refuse safely and root approvals never auto-approve", context do
@@ -203,7 +414,7 @@ defmodule SymphonyElixir.BeadsTest do
     assert :ok = Adapter.finish_run(prepared, opts, :ok)
     assert {:ok, [gated]} = Adapter.fetch_issues_by_ids([issue.id])
     assert gated.state == "blocked"
-    assert "human" in gated.labels
+    refute "human" in gated.labels
     refute gated.dispatchable
     assert {:error, {:run_admission_blocked, _, :uncertain_or_awaiting_run}} = Adapter.prepare_run(gated, [])
   end
@@ -552,11 +763,19 @@ defmodule SymphonyElixir.BeadsTest do
     {_, 0} = System.cmd("git", ["add", "unrelated.txt"], cd: workspace)
     assert {:error, :unrelated_staged_changes} = Publication.checkpoint(settings, issue)
     {_, 0} = System.cmd("git", ["reset", "--", "unrelated.txt"], cd: workspace)
+    local = Enum.map(Jason.decode!(File.read!(context.data)), &Map.delete(&1, "external_ref"))
+    File.write!(context.data, Jason.encode!(local))
+    assert {:error, _} = Publication.checkpoint(settings, issue)
+    settings = put_in(settings.provider["allow_local_checkpoint"], true)
+    settings = put_in(settings.provider["checkpoint_paths_by_issue"], %{issue.id => ["allowed.txt"]})
+    assert {:ok, %{published: false, head_sha: local_sha}} = Publication.checkpoint(settings, issue)
+    assert local_sha != sha
+    assert {:error, :publication_not_currently_authorized} = Publication.publish(settings, issue)
     revoked = Enum.map(Jason.decode!(File.read!(context.data)), &Map.put(&1, "labels", ["symphony"]))
     File.write!(context.data, Jason.encode!(revoked))
     assert {:error, :publication_not_currently_authorized} = Publication.checkpoint(settings, issue)
     {head, 0} = System.cmd("git", ["rev-parse", "--verify", "HEAD"], cd: workspace)
-    assert String.trim(head) == sha
+    assert String.trim(head) == local_sha
     refute Adapter.execute_agent_tool("beads_checkpoint", %{}, issue: %{issue | assignee_id: "wrong"}, tracker_settings: settings)["success"]
   end
 

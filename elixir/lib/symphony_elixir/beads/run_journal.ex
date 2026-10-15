@@ -21,6 +21,8 @@ defmodule SymphonyElixir.Beads.RunJournal do
         |> Map.delete("delivery")
         |> Map.delete("pre_session_blocked")
         |> Map.delete("blocker_reason")
+        |> Map.delete("native_stop_confirmed")
+        |> Map.delete("resume_authorized")
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
@@ -64,6 +66,20 @@ defmodule SymphonyElixir.Beads.RunJournal do
       {:ok, data} -> Jason.decode(data)
       {:error, :enoent} -> {:ok, nil}
       error -> error
+    end
+  end
+
+  @spec executor_state(map()) :: :alive | :stopped | :unknown
+  def executor_state(record) do
+    {:ok, host} = :inet.gethostname()
+    pid = record["executor_os_pid"]
+
+    cond do
+      record["host"] != to_string(host) -> :unknown
+      not is_binary(pid) or not String.match?(pid, ~r/^[1-9][0-9]*$/) -> :unknown
+      not File.dir?("/proc") -> :unknown
+      File.exists?(Path.join("/proc", pid)) -> :alive
+      true -> :stopped
     end
   end
 
