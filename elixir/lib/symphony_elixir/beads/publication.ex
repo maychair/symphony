@@ -4,6 +4,22 @@ defmodule SymphonyElixir.Beads.Publication do
 
   @spec publish(map(), map()) :: {:ok, map()} | {:error, term()}
   def publish(settings, issue) do
+    with {:ok, context} <- prepare_commit(settings, issue),
+         :ok <- Validation.gate(context.record),
+         {:ok, _} <- push(context.workspace, context.remote, context.branch, context.repo),
+         {:ok, url} <- review(context.repo, context.branch, issue, context.record, settings) do
+      {:ok, %{review_url: url, head_sha: context.sha}}
+    end
+  end
+
+  @spec checkpoint(map(), map()) :: {:ok, map()} | {:error, term()}
+  def checkpoint(settings, issue) do
+    with {:ok, context} <- prepare_commit(settings, issue) do
+      {:ok, %{head_sha: context.sha, published: false}}
+    end
+  end
+
+  defp prepare_commit(settings, issue) do
     paths = settings.provider["publish_paths"] || []
     remote_name = settings.provider["git_remote"] || "origin"
 
@@ -12,7 +28,6 @@ defmodule SymphonyElixir.Beads.Publication do
          true <- Enum.all?(paths, &safe_path?/1) || {:error, :invalid_publication_paths},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
          true <- record["owner"] == issue.assignee_id || {:error, :publication_owner_mismatch},
-         :ok <- Validation.gate(record),
          workspace when is_binary(workspace) <- record["workspace"],
          true <- Enum.all?(paths, &(File.lstat(Path.join(workspace, &1)) |> regular?())) || {:error, :invalid_publication_file},
          {:ok, branch} <- git(workspace, ["branch", "--show-current"]),
@@ -21,13 +36,11 @@ defmodule SymphonyElixir.Beads.Publication do
          {:ok, repo} <- publication_repo(settings, remote),
          {:ok, staged} <- git(workspace, ["diff", "--cached", "--name-only"]),
          true <- Enum.all?(String.split(staged, "\n", trim: true), &(&1 in paths)) || {:error, :unrelated_staged_changes},
-         {:ok, _} <- RunJournal.checkpoint(record, %{"publication_intent" => %{branch: branch, paths: paths}}),
+         {:ok, record} <- RunJournal.checkpoint(record, %{"checkpoint_intent" => %{branch: branch, paths: paths}}),
          {:ok, _} <- git(workspace, ["add", "--" | paths]),
          :ok <- commit_if_changed(workspace, issue.id),
-         {:ok, sha} <- git(workspace, ["rev-parse", "HEAD"]),
-         {:ok, _} <- push(workspace, remote_name, branch, repo),
-         {:ok, url} <- review(repo, branch, issue, record, settings) do
-      {:ok, %{review_url: url, head_sha: sha}}
+         {:ok, sha} <- git(workspace, ["rev-parse", "HEAD"]) do
+      {:ok, %{record: record, workspace: workspace, remote: remote_name, repo: repo, branch: branch, sha: sha}}
     else
       {:error, _} = error -> error
       _ -> {:error, :invalid_publication_binding}

@@ -124,7 +124,7 @@ defmodule SymphonyElixir.Beads.Adapter do
   defp policy_prompt(policy) do
     "\nFrozen validation policy: " <>
       Jason.encode!(policy) <>
-      "\nUse beads_task_context for current task reads. Explicit commands require a clean commit and beads_validate before delivery." <>
+      "\nUse beads_task_context for current task reads. Call beads_checkpoint to commit authorized paths, then beads_validate on the clean commit before beads_publish." <>
       " A review value of none selects direct development without subagents or internal review. This never grants merge authority."
   end
 
@@ -180,6 +180,11 @@ defmodule SymphonyElixir.Beads.Adapter do
       %{
         "name" => "beads_validate",
         "description" => "Execute the frozen, explicitly enabled host validation commands on the clean committed task worktree. Returns process exit codes; never accepts or merges.",
+        "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
+      },
+      %{
+        "name" => "beads_checkpoint",
+        "description" => "Commit only configured authorized task paths on the host before validation. Requires symphony:publish. Never pushes, opens reviews or merges.",
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
       },
       %{
@@ -239,6 +244,13 @@ defmodule SymphonyElixir.Beads.Adapter do
       end
 
     tool_result(result)
+  end
+
+  def execute_agent_tool("beads_checkpoint", arguments, opts) when arguments == %{} do
+    case Publication.checkpoint(opts[:tracker_settings], opts[:issue]) do
+      {:ok, result} -> tool_result_payload(result)
+      error -> tool_result(error)
+    end
   end
 
   def execute_agent_tool("beads_publish", %{} = arguments, opts) when map_size(arguments) == 0 do

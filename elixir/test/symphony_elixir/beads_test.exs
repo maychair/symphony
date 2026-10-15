@@ -406,4 +406,52 @@ defmodule SymphonyElixir.BeadsTest do
     result = Adapter.preflight(opts[:tracker_settings], changed, [], policy)
     assert {:error, :validation_policy_changed_for_existing_thread} = result
   end
+
+  test "host checkpoint commits only authorized paths without publishing before validation", context do
+    alias SymphonyElixir.Beads.Publication
+    url = "https://github.com/example/repo/issues/1"
+    records = Jason.decode!(File.read!(context.data))
+
+    records =
+      Enum.map(records, fn row ->
+        if row["id"] == "bd-ready", do: row |> Map.put("external_ref", url) |> Map.put("labels", ["symphony", "symphony:publish"]), else: row
+      end)
+
+    File.write!(context.data, Jason.encode!(records))
+    fake_gh = Path.join(context.root, "gh")
+    File.write!(fake_gh, "#!/bin/sh\nprintf '%s' '{\"state\":\"OPEN\",\"url\":\"#{url}\"}'\n")
+    File.chmod!(fake_gh, 0o755)
+    old_path = System.fetch_env!("PATH")
+    System.put_env("PATH", context.root <> ":" <> old_path)
+    on_exit(fn -> System.put_env("PATH", old_path) end)
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    settings = opts[:tracker_settings]
+    settings = put_in(settings.provider["publish_paths"], ["allowed.txt"])
+    workspace = Path.join(context.root, "checkpoint-worktree")
+    File.mkdir_p!(workspace)
+
+    for args <- [
+          ["init", "-q"],
+          ["config", "user.name", "Smoke"],
+          ["config", "user.email", "smoke@example.com"],
+          ["checkout", "-qb", "codex/checkpoint"],
+          ["remote", "add", "origin", "https://github.com/example/repo"],
+          ["remote", "set-url", "--push", "origin", "file:///nonexistent-checkpoint-test"]
+        ] do
+      {_, 0} = System.cmd("git", args, cd: workspace)
+    end
+
+    File.write!(Path.join(workspace, "allowed.txt"), "approved")
+    File.write!(Path.join(workspace, "unrelated.txt"), "preserved")
+    policy = %{"mode" => "targeted", "commands" => [["true"]]}
+    {:ok, _} = RunJournal.checkpoint(opts[:run_record], %{"workspace" => workspace, "validation_policy" => policy})
+    assert {:ok, %{published: false, head_sha: sha}} = Publication.checkpoint(settings, issue)
+    assert {"allowed.txt\n", 0} = System.cmd("git", ["ls-tree", "--name-only", "HEAD"], cd: workspace)
+    assert File.read!(Path.join(workspace, "unrelated.txt")) == "preserved"
+    assert {:error, :current_validation_required} = Publication.publish(settings, issue)
+    {head, 0} = System.cmd("git", ["rev-parse", "--verify", "HEAD"], cd: workspace)
+    assert String.trim(head) == sha
+    refute Adapter.execute_agent_tool("beads_checkpoint", %{}, issue: %{issue | assignee_id: "wrong"}, tracker_settings: settings)["success"]
+  end
 end
