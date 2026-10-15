@@ -24,7 +24,24 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       case RunJournal.read(directory) do
         {:ok, %{} = record} ->
-          json(conn, Map.take(record, ["issue_id", "phase", "attempt_id", "attempt_count", "repair_count", "thread_id", "turn_id", "delivery", "remote_state", "updated_at", "events"]))
+          json(
+            conn,
+            Map.take(record, [
+              "issue_id",
+              "phase",
+              "attempt_id",
+              "attempt_count",
+              "repair_count",
+              "thread_id",
+              "turn_id",
+              "delivery",
+              "remote_state",
+              "validation_policy",
+              "validation_receipt",
+              "updated_at",
+              "events"
+            ])
+          )
 
         _ ->
           error_response(conn, 404, "run_not_found", "Run not found")

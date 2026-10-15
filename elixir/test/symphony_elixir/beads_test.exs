@@ -332,4 +332,78 @@ defmodule SymphonyElixir.BeadsTest do
     assert File.read!(Path.join(workspace, "valuable")) == "data"
     assert File.dir?(Path.join(context.root, "workspaces"))
   end
+
+  test "invalid task prompt fails before admission or claim", context do
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), "{{ issue.description }}", "{{ issue.native_ref.missing_field }}"))
+    :ok = WorkflowStore.force_reload()
+    assert {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    assert {:error, :prompt_preflight_failed} = Adapter.prepare_run(issue, [])
+    refute File.exists?(RunJournal.directory(Adapter.journal_root(Config.settings!().tracker), issue.id))
+    assert Enum.find(Jason.decode!(File.read!(context.data)), &(&1["id"] == issue.id))["status"] == "open"
+  end
+
+  test "baseline policy requires explicit authority and host context is scoped" do
+    alias SymphonyElixir.Beads.Validation
+    assert {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    metadata = %{"symphony_validation" => %{"mode" => "baseline_diff", "commands" => [["true"]]}}
+    unsafe = %{issue | native_ref: Map.put(issue.native_ref, "metadata", metadata)}
+    assert {:error, :baseline_requires_explicit_authorization} = Validation.policy(Config.settings!().tracker, unsafe)
+    assert {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    binding = [issue: issue, tracker_settings: opts[:tracker_settings]]
+    assert Adapter.execute_agent_tool("beads_task_context", %{}, binding)["success"]
+    wrong = %{issue | assignee_id: "another-owner"}
+    refute Adapter.execute_agent_tool("beads_task_context", %{}, Keyword.put(binding, :issue, wrong))["success"]
+    refute Adapter.execute_agent_tool("beads_task_context", %{"id" => "bd-human"}, binding)["success"]
+  end
+
+  test "host validation binds results to attempt policy and clean HEAD", context do
+    alias SymphonyElixir.Beads.Validation
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), "provider:", "provider:\n    allow_host_validation: true"))
+    :ok = WorkflowStore.force_reload()
+    assert {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    policy = %{"mode" => "targeted", "commands" => [["sh", "-c", "exit 0"]], "review" => "none"}
+    metadata = Map.put(issue.native_ref["metadata"], "symphony_validation", policy)
+    issue = %{issue | native_ref: Map.put(issue.native_ref, "metadata", metadata)}
+    assert {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    workspace = Path.join(context.root, "verification-worktree")
+    File.mkdir_p!(workspace)
+    {_, 0} = System.cmd("git", ["init", "-q", workspace])
+    {_, 0} = System.cmd("git", ["-c", "user.name=Smoke", "-c", "user.email=smoke@example.com", "commit", "--allow-empty", "-qm", "initial"], cd: workspace)
+    assert {:ok, record} = RunJournal.checkpoint(opts[:run_record], %{"workspace" => workspace})
+    assert {:error, :current_validation_required} = Validation.gate(record)
+    assert {:ok, %{"passed" => true}} = Validation.run(opts[:tracker_settings], issue)
+    assert {:ok, record} = RunJournal.read(record["directory"])
+    assert :ok = Validation.gate(record)
+    assert {:error, :validation_delivery_head_mismatch} = Validation.delivery_head(record, String.duplicate("a", 40))
+    File.write!(Path.join(workspace, "untracked-change"), "dirty")
+    assert {:error, :current_validation_required} = Validation.gate(record)
+    assert {:error, :validation_requires_clean_commit} = Validation.run(opts[:tracker_settings], issue)
+  end
+
+  test "failed and timed out host checks do not open delivery", context do
+    alias SymphonyElixir.Beads.Validation
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), "provider:", "provider:\n    allow_host_validation: true"))
+    :ok = WorkflowStore.force_reload()
+    assert {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    policy = %{"mode" => "targeted", "commands" => [["sh", "-c", "exit 7"], ["sh", "-c", "sleep 5"]], "timeout_ms" => 100}
+    issue = %{issue | native_ref: Map.put(issue.native_ref, "metadata", %{"symphony_validation" => policy})}
+    assert {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    workspace = Path.join(context.root, "failed-verification")
+    File.mkdir_p!(workspace)
+    {_, 0} = System.cmd("git", ["init", "-q", workspace])
+    {_, 0} = System.cmd("git", ["-c", "user.name=Smoke", "-c", "user.email=smoke@example.com", "commit", "--allow-empty", "-qm", "initial"], cd: workspace)
+    {:ok, record} = RunJournal.checkpoint(opts[:run_record], %{"workspace" => workspace})
+    assert {:ok, %{"passed" => false, "results" => results}} = Validation.run(opts[:tracker_settings], issue)
+    assert Enum.map(results, & &1["exit_code"]) == [7, 124]
+    {:ok, record} = RunJournal.read(record["directory"])
+    assert {:error, :current_validation_required} = Validation.gate(record)
+    {:ok, _} = RunJournal.checkpoint(record, %{"thread_id" => "existing-thread"})
+    changed = put_in(issue.native_ref["metadata"]["symphony_validation"]["timeout_ms"], 200)
+    {:ok, policy} = Validation.policy(opts[:tracker_settings], changed)
+    result = Adapter.preflight(opts[:tracker_settings], changed, [], policy)
+    assert {:error, :validation_policy_changed_for_existing_thread} = result
+  end
 end

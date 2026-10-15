@@ -411,3 +411,8 @@ For a scoped local Beads development loop with durable native Codex identities, 
 For event-driven Beads tasks, configure `remote_reconcile`, `accepted_merge_actors`, `required_checks` and repair/run budgets. The host never merges; it reconciles a developer merge before closing the linked Issue and Bead. Native CLI credentials and webhook secrets stay outside source. See [operation](docs/beads.md).
 
 Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](docs/beads.md).
+
+Use `mix beads.preflight --workflow WORKFLOW.md [--issue ID]` before dispatch to
+check configuration and a concrete Beads prompt without admission. Task validation
+and the private `scripts/session_evidence.py` exporter are described in the
+[Beads guide](docs/beads.md). No extra scheduler or agent harness is required.
