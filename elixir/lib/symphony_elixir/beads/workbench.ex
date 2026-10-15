@@ -25,7 +25,7 @@ defmodule SymphonyElixir.Beads.Workbench do
 
     gates =
       Enum.map(env["gates"] || [], fn gate ->
-        gate |> Map.drop(["artifact_path"]) |> Map.put("stale", gate["binding"] != binding(issue, record))
+        gate |> Map.drop(["artifact_path"]) |> Map.put("stale", gate["binding"] != binding(issue, record)) |> publication_state(settings, record)
       end)
 
     %{
@@ -104,7 +104,8 @@ defmodule SymphonyElixir.Beads.Workbench do
     serial(settings, id, fn ->
       with {:ok, issue} <- issue(settings, id),
            true <- issue["status"] != "closed" || {:error, :task_closed},
-           :ok <- validate_gates(gates) do
+           :ok <- validate_gates(gates),
+           :ok <- validate_delivery_routes(settings, record(settings, id), gates) do
         env = envelope(issue)
         binding = binding(issue, record(settings, id))
 
@@ -422,6 +423,9 @@ defmodule SymphonyElixir.Beads.Workbench do
 
   defp accept(settings, issue, gate, actor) do
     cond do
+      is_binary(gate["review_url"]) and gate["manual_delivery"] == true and record(settings, issue["id"]) == %{} ->
+        accept_manual(settings, issue, gate, actor)
+
       is_binary(gate["review_url"]) ->
         case Acceptance.accept(settings, issue["id"], gate["review_url"], actor) do
           :ok -> {:ok, %{}}
@@ -436,11 +440,86 @@ defmodule SymphonyElixir.Beads.Workbench do
     end
   end
 
+  # A manually tracked delivery has no native Run; never fabricate execution identities.
+  defp accept_manual(settings, issue, gate, actor) do
+    with true <- issue["external_ref"] in [nil, ""] || {:error, :manual_delivery_has_source_issue},
+         :ok <- Acceptance.validate_review_scope(settings, gate["review_url"]),
+         {:ok, proof} <- Acceptance.merged_review(gate["review_url"]),
+         true <- (proof["headRefOid"] || proof["sha"]) == gate["head_sha"] || {:error, :delivery_commit_mismatch},
+         {:ok, _} <-
+           Adapter.command(settings, [
+             "update",
+             issue["id"],
+             "--if-status",
+             issue["status"],
+             "--if-assignee",
+             issue["assignee"] || "",
+             "--status",
+             "closed",
+             "--remove-label",
+             "human",
+             "--set-metadata",
+             "symphony_gate=accepted",
+             "--set-metadata",
+             "symphony_accepted_by=" <> actor,
+             "--append-notes",
+             "Operator accepted verified merged manual delivery " <> gate["review_url"] <> " at " <> gate["head_sha"],
+             "--json"
+           ]) do
+      {:ok, %{}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :manual_delivery_verification_failed}
+    end
+  end
+
+  defp publication_state(gate, settings, record) do
+    if gate["kind"] == "review" and gate["delivery_kind"] == "local" and remote_backed?(settings, record, gate) do
+      gate |> Map.put("kind", "publication") |> Map.put("reason", "交付尚未发布到远程仓库，工作流需先准备具体 PR / MR；当前不需要本地验收。")
+    else
+      gate
+    end
+  end
+
+  defp validate_delivery_routes(settings, record, gates) do
+    Enum.reduce_while(gates, :ok, fn gate, :ok ->
+      result =
+        cond do
+          gate["kind"] != "review" -> :ok
+          gate["delivery_kind"] == "local" and remote_backed?(settings, record, gate) -> {:error, :remote_review_required}
+          is_binary(gate["review_url"]) -> Acceptance.validate_review_scope(settings, gate["review_url"])
+          true -> :ok
+        end
+
+      if result == :ok, do: {:cont, :ok}, else: {:halt, result}
+    end)
+  end
+
+  defp remote_backed?(settings, record, gate) do
+    configured = settings.provider["review_repository"]
+    workspace = record["workspace"] || gate["workspace"]
+
+    cond do
+      is_binary(configured) and String.trim(configured) != "" ->
+        true
+
+      is_binary(workspace) ->
+        case System.cmd("git", ["-C", workspace, "remote"], stderr_to_stdout: true) do
+          {remotes, 0} -> String.trim(remotes) != ""
+          _ -> true
+        end
+
+      true ->
+        true
+    end
+  end
+
   defp accept_local(settings, issue, gate, actor) do
     record = record(settings, issue["id"])
     workspace = record["workspace"] || gate["workspace"]
 
-    with true <- not File.exists?(Path.join(record["directory"] || RunJournal.directory(Adapter.journal_root(settings), issue["id"]), "executor.lock")) || {:error, :executor_active},
+    with :ok <- validate_delivery_routes(settings, record, [gate]),
+         true <- not File.exists?(Path.join(record["directory"] || RunJournal.directory(Adapter.journal_root(settings), issue["id"]), "executor.lock")) || {:error, :executor_active},
          true <- (is_binary(workspace) and is_binary(gate["head_sha"])) || {:error, :missing_delivery_identity},
          {head, 0} <- System.cmd("git", ["-C", workspace, "rev-parse", "--verify", "--end-of-options", (gate["delivery_ref"] || "HEAD") <> "^{commit}"], stderr_to_stdout: false),
          true <- String.trim(head) == gate["head_sha"] || {:error, :delivery_changed},

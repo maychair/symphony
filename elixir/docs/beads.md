@@ -407,3 +407,15 @@ Trusted single-worker maintenance instances can set `workbench_primary_checkout`
 to execute in the verified `SYMPHONY_TARGET_REPO` primary checkout. It does not
 change normal isolated task workspaces. Publication and merge authority remain
 separate; the workbench is not a general command-execution endpoint.
+
+Remote-backed repositories must publish a scoped PR/MR before requesting review.
+A local artifact does not substitute for remote delivery. Legacy local-review
+gates are presented as publication work, outside the operator review inbox.
+The request API rejects local-review gates for configured or detected remotes
+and rejects review URLs outside the configured repository.
+
+A manually tracked historical task without any native Run may explicitly mark
+a remote gate `manual_delivery: true`. Its acceptance verifies the configured
+repository, exact published head and remote merged proof before closing the
+manual task. Native Run deliveries continue through normal native acceptance;
+no thread/turn identity or validation receipt is fabricated.

@@ -446,13 +446,15 @@ defmodule SymphonyElixir.Beads.Adapter do
 
   @spec await_human(map(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def await_human(settings, id, owner, reason) do
-    case command(settings, [
+    with {:ok, [current]} <- command(settings, ["show", id, "--json"]),
+         true <- current["assignee"] == owner and current["status"] in ["in_progress", "blocked"] || {:error, :not_owned_by_symphony} do
+      case command(settings, [
            "update",
            id,
            "--if-assignee",
            owner,
            "--if-status",
-           "in_progress",
+           current["status"],
            "--status",
            "blocked",
            "--add-label",
@@ -465,6 +467,7 @@ defmodule SymphonyElixir.Beads.Adapter do
          ]) do
       {:ok, _} -> :ok
       error -> error
+      end
     end
   end
 
