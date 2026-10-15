@@ -339,3 +339,6 @@ For Beads workflows only, trusted local `metadata.symphony_validation` overrides
 `allow_host_validation` enables frozen argv checks through `beads_validate` on a
 clean commit. Read tasks through `beads_task_context`; never infer acceptance or
 merge authority from successful validation. See `docs/beads.md` for the contract.
+
+Beads host delivery uses `beads_checkpoint` (scoped commit only), then
+`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.

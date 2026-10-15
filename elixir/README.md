@@ -416,3 +416,6 @@ Use `mix beads.preflight --workflow WORKFLOW.md [--issue ID]` before dispatch to
 check configuration and a concrete Beads prompt without admission. Task validation
 and the private `scripts/session_evidence.py` exporter are described in the
 [Beads guide](docs/beads.md). No extra scheduler or agent harness is required.
+
+Beads host delivery uses `beads_checkpoint` (scoped commit only), then
+`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.

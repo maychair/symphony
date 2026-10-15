@@ -50,3 +50,6 @@ Beads runs can freeze task-specific validation policies, expose scoped host task
 reads, and preflight strict prompts before claiming work. Opt-in host checks bind
 receipts to a clean commit and attempt. Corrected session evidence keeps process
 results separate from tool transport status; see [operation](elixir/docs/beads.md).
+
+Beads host delivery uses `beads_checkpoint` (scoped commit only), then
+`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.

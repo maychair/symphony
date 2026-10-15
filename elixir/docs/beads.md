@@ -273,3 +273,9 @@ No arbitrary JavaScript is executed or guessed, no native logs or third-party
 Traces packages are modified, and no internal review relationship is fabricated.
 The output contains private repository identity and must stay outside Git.
 `/api/v1/runs/:id` additionally exposes the frozen validation policy and receipt.
+
+The no-argument `beads_checkpoint` tool performs only the authorized configured-path
+commit using publication task/owner/branch/remote checks. It does not push or
+create a review and does not require a validation receipt. Use checkpoint, validate,
+then publish when Git metadata is protected in the agent sandbox. Publication
+rechecks the receipt after its idempotent commit step and before any push.
