@@ -160,8 +160,9 @@ defmodule SymphonyElixir.Beads.Adapter do
   end
 
   defp source_ready(settings, issue) do
-    if settings.provider["remote_reconcile"] == true do
-      case SourceIssue.read(settings, issue.native_ref["external_ref"] || "") do
+    reference = issue.native_ref["external_ref"]
+    if settings.provider["remote_reconcile"] == true and reference not in [nil, ""] do
+      case SourceIssue.read(settings, reference) do
         {:ok, %{closed: false}} -> :ok
         {:ok, %{closed: true}} -> {:error, :source_issue_closed}
         error -> error
@@ -210,6 +211,14 @@ defmodule SymphonyElixir.Beads.Adapter do
         "name" => "beads_publish",
         "description" => "Publish only pre-authorized configured paths to a task-branch PR. Requires symphony:publish label. Never merges. Returns review_url/head_sha.",
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
+      },
+      %{
+        "name" => "beads_request_action",
+        "description" => "Park this task with structured workbench gates. Kinds: authorization/decision (exact options and limits), review (exact delivery identity and review URL or local artifact), incident (repair project and bounded scope), dependency (task references). Never infer authorization from old notes. Do not label resource queue waiting as a gate.",
+        "inputSchema" => %{"type" => "object", "properties" => %{
+          "reason" => %{"type" => "string"},
+          "gates" => %{"type" => "array", "minItems" => 1, "maxItems" => 12, "items" => %{"type" => "object"}}
+        }, "required" => ["reason", "gates"], "additionalProperties" => false}
       },
       %{
         "name" => "beads_block",
@@ -297,6 +306,23 @@ defmodule SymphonyElixir.Beads.Adapter do
     tool_result(result)
   end
 
+  def execute_agent_tool("beads_request_action", %{"reason" => reason, "gates" => gates}, opts) when is_binary(reason) do
+    issue = opts[:issue]
+    settings = opts[:tracker_settings]
+    result = with {:ok, [current]} <- command(settings, ["show", issue.id, "--json"]),
+         true <- current["assignee"] == issue.assignee_id || {:error, :not_owned_by_symphony},
+         {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
+         :ok <- SymphonyElixir.Beads.Workbench.validate_request(gates),
+         :ok <- block_undelivered(settings, issue.id, record, reason),
+         {:ok, result} <- SymphonyElixir.Beads.Workbench.request(settings, issue.id, gates, issue.assignee_id) do
+      {:ok, result}
+    end
+    case result do
+      {:ok, result} -> tool_result_payload(result)
+      error -> tool_result(error)
+    end
+  end
+
   def execute_agent_tool("beads_deliver", arguments, opts) when arguments == %{} do
     case Delivery.run(opts) do
       {:ok, result} -> tool_result_payload(result)
@@ -348,8 +374,15 @@ defmodule SymphonyElixir.Beads.Adapter do
     end
   end
 
-  defp finish_handoff(settings, issue, arguments),
-    do: await_human(settings, issue.id, issue.assignee_id, arguments["reason"])
+  defp finish_handoff(settings, issue, arguments) do
+    with :ok <- await_human(settings, issue.id, issue.assignee_id, arguments["reason"]),
+         {:ok, _} <- SymphonyElixir.Beads.Workbench.request(settings, issue.id, [%{
+           "kind" => "review", "title" => "审查已发布的交付", "reason" => "交付已发布，请到远程仓库审查；合入后由 scheduler 核验并自动推进任务。",
+           "review_url" => arguments["review_url"], "head_sha" => arguments["head_sha"]
+         }], issue.assignee_id) do
+      :ok
+    end
+  end
 
   defp checkpoint_handoff(issue, arguments) do
     intent = arguments["intent"] || if(arguments["review_url"], do: "ready_for_review", else: "blocked")
@@ -423,13 +456,15 @@ defmodule SymphonyElixir.Beads.Adapter do
 
   @spec await_human(map(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def await_human(settings, id, owner, reason) do
-    case command(settings, [
+    with {:ok, [current]} <- command(settings, ["show", id, "--json"]),
+         true <- current["assignee"] == owner and current["status"] in ["in_progress", "blocked"] || {:error, :not_owned_by_symphony} do
+      case command(settings, [
            "update",
            id,
            "--if-assignee",
            owner,
            "--if-status",
-           "in_progress",
+           current["status"],
            "--status",
            "blocked",
            "--add-label",
@@ -442,6 +477,7 @@ defmodule SymphonyElixir.Beads.Adapter do
          ]) do
       {:ok, _} -> :ok
       error -> error
+      end
     end
   end
 
@@ -520,7 +556,7 @@ defmodule SymphonyElixir.Beads.Adapter do
              "--json"
            ]),
          {:ok, _} <- RunJournal.checkpoint(record, %{"blocker_reason" => reason}) do
-      :ok
+      SymphonyElixir.Beads.Workbench.capture(settings, id, reason)
     end
   end
 

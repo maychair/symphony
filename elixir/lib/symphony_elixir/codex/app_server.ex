@@ -331,7 +331,11 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
       canonical_root_prefix = canonical_root <> "/"
 
+      operator_primary = Config.settings!().tracker.provider["workbench_primary_checkout"] == true and
+        expanded_workspace == canonical_workspace and System.get_env("SYMPHONY_TARGET_REPO") == canonical_workspace
+
       cond do
+        operator_primary -> {:ok, canonical_workspace}
         canonical_workspace == canonical_root ->
           {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
 
@@ -501,9 +505,26 @@ defmodule SymphonyElixir.Codex.AppServer do
       on_intent.()
 
       case opts[:resume_thread_id] do
-        id when is_binary(id) -> resume_thread(port, id, workspace, session_policies, opts)
+        id when is_binary(id) ->
+          if opts[:inspect_only], do: inspect_thread(port, id, opts), else: resume_thread(port, id, workspace, session_policies, opts)
         _ -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
       end
+    end
+  end
+
+  defp inspect_thread(port, thread_id, opts) do
+    send_message(port, %{"id" => @thread_start_id, "method" => "thread/read", "params" => %{"threadId" => thread_id, "includeTurns" => true}})
+
+    case await_response(port, @thread_start_id) do
+      {:ok, %{"thread" => %{"id" => ^thread_id, "status" => %{"type" => status}} = thread}} when status in ["idle", "notLoaded"] ->
+        if reconciled_turn?(thread, opts[:expected_turn_id]),
+          do: {:ok, thread_id}, else: {:error, :native_turn_not_reconciled}
+
+      {:ok, result} ->
+        {:error, {:resume_thread_not_proven_idle, result}}
+
+      error ->
+        error
     end
   end
 

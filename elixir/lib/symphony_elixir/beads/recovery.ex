@@ -18,6 +18,39 @@ defmodule SymphonyElixir.Beads.Recovery do
     end
   end
 
+  @doc "Resume a parked native run while its scheduler stays alive; never steal an executor."
+  @spec resume_online(map(), String.t()) :: :ok | {:error, term()}
+  def resume_online(settings, issue_id) do
+    directory = RunJournal.directory(Adapter.journal_root(settings), issue_id)
+    with {:ok, %{} = record} <- RunJournal.read(directory),
+         true <- record["issue_id"] == issue_id and record["beads_dir"] == Adapter.beads_dir(settings) || {:error, :run_scope_mismatch},
+         true <- record["phase"] == "blocked" || {:error, :run_not_parked},
+         false <- File.exists?(Path.join(directory, "executor.lock")),
+         {:ok, record} <- prove_parked(record),
+         true <- record["native_stop_confirmed"] == true || {:error, :native_stop_unconfirmed},
+         :ok <- recover_native(settings, record) do
+      release_for_resume(settings, record)
+    else
+      true -> {:error, :executor_active}
+      {:error, _} = error -> error
+      _ -> {:error, :run_not_safely_resumable}
+    end
+  end
+
+  defp prove_parked(%{"native_stop_confirmed" => true, "pre_session_blocked" => true} = record),
+    do: {:ok, record |> Map.put_new("thread_id", nil) |> Map.put_new("turn_id", nil)}
+  defp prove_parked(%{"native_stop_confirmed" => true} = record), do: {:ok, record}
+  defp prove_parked(record) do
+    phases = Enum.map(record["events"] || [], & &1["phase"])
+    if is_nil(record["thread_id"]) and is_nil(record["turn_id"]) and record["turn_count"] == 0 and
+         record["thread_allocation_intent"] != true and "admitted" in phases and
+         Enum.all?(phases, &(&1 in [nil, "admitted", "claimed", "blocked"])) do
+      RunJournal.checkpoint(record, %{"pre_session_blocked" => true, "native_stop_confirmed" => true, "thread_id" => nil, "turn_id" => nil})
+    else
+      {:error, :native_stop_unconfirmed}
+    end
+  end
+
   @spec resume_completed(map(), String.t(), map()) :: :ok | {:error, term()}
   def resume_completed(settings, issue_id, feedback) do
     directory = RunJournal.directory(Adapter.journal_root(settings), issue_id)
@@ -103,6 +136,7 @@ defmodule SymphonyElixir.Beads.Recovery do
 
   defp inspect_native_session(settings, record) do
     opts = [
+      inspect_only: true,
       tracker_settings: settings,
       resume_thread_id: record["thread_id"],
       expected_turn_id: record["turn_id"] || :no_turns

@@ -30,6 +30,9 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     post("/api/v1/webhooks/:provider", WebhookController, :receive_event)
+    get("/api/v1/workbench", WorkbenchController, :index)
+    post("/api/v1/workbench/:issue/:gate/decide", WorkbenchController, :decide)
+    get("/api/v1/workbench/:issue/:gate/artifact", WorkbenchController, :artifact)
     get("/api/v1/runs/:issue_identifier", ObservabilityApiController, :run)
     get("/api/v1/state", ObservabilityApiController, :state)
 
