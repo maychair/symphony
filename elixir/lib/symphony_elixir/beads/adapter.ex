@@ -6,8 +6,8 @@ defmodule SymphonyElixir.Beads.Adapter do
   """
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Beads.{Acceptance, Publication, RunJournal, SourceIssue}
-  alias SymphonyElixir.{Config, Tracker.Issue}
+  alias SymphonyElixir.Beads.{Acceptance, Publication, RunJournal, SourceIssue, Validation}
+  alias SymphonyElixir.{Config, PromptBuilder, Tracker.Issue}
 
   @impl true
   def validate_config(settings) do
@@ -61,21 +61,26 @@ defmodule SymphonyElixir.Beads.Adapter do
   @impl true
   def prepare_run(%Issue{} = issue, opts) do
     settings = freeze_settings(Config.settings!().tracker)
+    scope = %{"beads_dir" => beads_dir(settings), "provider_dir" => settings.provider["dir"]}
 
     with true <- is_nil(opts[:worker_host]) || {:error, :beads_requires_local_executor},
          :ok <- source_ready(settings, issue),
+         {:ok, policy} <- Validation.policy(settings, issue),
+         {:ok, prompt} <- preflight(settings, issue, opts, policy),
          {:ok, record} <- RunJournal.admit(journal_root(settings), issue.id),
          true <- record["beads_dir"] in [nil, beads_dir(settings)] || {:error, :run_scope_mismatch},
-         {:ok, record} <- RunJournal.checkpoint(record, %{"beads_dir" => beads_dir(settings), "provider_dir" => settings.provider["dir"]}),
+         {:ok, record} <- RunJournal.checkpoint(record, Map.put(scope, "validation_policy", policy)),
          :ok <- claim(settings, issue, record),
          {:ok, record} <- RunJournal.checkpoint(record, %{"phase" => "claimed"}) do
-      {:ok,
-       %{
-         issue
-         | assignee_id: record["owner"],
-           state: "in_progress",
-           native_ref: (issue.native_ref || %{}) |> Map.put("beads_dir", beads_dir(settings)) |> Map.put("run_directory", record["directory"])
-       }, opts |> Keyword.put(:run_record, record) |> Keyword.put(:tracker_settings, %{settings | provider: Map.put(settings.provider, "beads_dir", beads_dir(settings))})}
+      native_ref =
+        (issue.native_ref || %{})
+        |> Map.put("beads_dir", beads_dir(settings))
+        |> Map.put("run_directory", record["directory"])
+        |> Map.put("validation_policy", policy)
+
+      prepared = %{issue | assignee_id: record["owner"], state: "in_progress", native_ref: native_ref}
+      tracker = %{settings | provider: Map.put(settings.provider, "beads_dir", beads_dir(settings))}
+      {:ok, prepared, opts |> Keyword.put(:prepared_prompt, prompt) |> Keyword.put(:run_record, record) |> Keyword.put(:tracker_settings, tracker)}
     end
   end
 
@@ -93,6 +98,52 @@ defmodule SymphonyElixir.Beads.Adapter do
 
       _ ->
         :ok
+    end
+  end
+
+  @spec preflight(map(), Issue.t(), keyword(), map()) :: {:ok, String.t()} | {:error, term()}
+  def preflight(settings, issue, opts, policy) do
+    executable = settings.provider["bin"] || "bd"
+    prepared = %{issue | native_ref: Map.put(issue.native_ref || %{}, "validation_policy", policy)}
+    host_enabled = settings.provider["allow_host_validation"] == true
+    timeout_available = not is_nil(System.find_executable("timeout"))
+    codex = Config.settings!().codex.command |> String.split() |> List.first()
+
+    with true <- not is_nil(System.find_executable(executable)) || {:error, :beads_executable_missing},
+         true <- (policy["commands"] == [] or host_enabled) || {:error, :host_validation_not_enabled},
+         true <- (policy["commands"] == [] or timeout_available) || {:error, :validation_timeout_missing},
+         true <- not is_nil(System.find_executable(codex)) || {:error, :codex_executable_missing} do
+      with :ok <- unchanged_policy(settings, issue, policy) do
+        {:ok, PromptBuilder.build_prompt(prepared, opts) <> policy_prompt(policy)}
+      end
+    end
+  rescue
+    _ -> {:error, :prompt_preflight_failed}
+  end
+
+  defp policy_prompt(policy) do
+    "\nFrozen validation policy: " <>
+      Jason.encode!(policy) <>
+      "\nUse beads_task_context for current task reads. Explicit commands require a clean commit and beads_validate before delivery." <>
+      " A review value of none selects direct development without subagents or internal review. This never grants merge authority."
+  end
+
+  defp unchanged_policy(settings, issue, policy) do
+    directory = RunJournal.directory(journal_root(settings), issue.id)
+
+    case RunJournal.read(directory) do
+      {:ok, %{"thread_id" => thread} = previous} when is_binary(thread) ->
+        old = previous["validation_policy"]
+
+        if old == policy or (is_nil(old) and policy["commands"] == []),
+          do: :ok,
+          else: {:error, :validation_policy_changed_for_existing_thread}
+
+      {:ok, _} ->
+        :ok
+
+      error ->
+        error
     end
   end
 
@@ -122,6 +173,16 @@ defmodule SymphonyElixir.Beads.Adapter do
   def agent_tool_specs do
     [
       %{
+        "name" => "beads_task_context",
+        "description" => "Read only this owned task from the host, including current notes and frozen validation policy. No database sandbox write access needed.",
+        "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
+      },
+      %{
+        "name" => "beads_validate",
+        "description" => "Execute the frozen, explicitly enabled host validation commands on the clean committed task worktree. Returns process exit codes; never accepts or merges.",
+        "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
+      },
+      %{
         "name" => "beads_publish",
         "description" => "Publish only pre-authorized configured paths to a task-branch PR. Requires symphony:publish label. Never merges. Returns review_url/head_sha.",
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
@@ -140,6 +201,28 @@ defmodule SymphonyElixir.Beads.Adapter do
   end
 
   @impl true
+  def execute_agent_tool("beads_task_context", arguments, opts) when arguments == %{} do
+    issue = opts[:issue]
+    settings = opts[:tracker_settings]
+
+    with {:ok, record} <- Validation.owned_record(settings, issue),
+         {:ok, [current]} <- command(settings, ["show", issue.id, "--json"]),
+         true <- (current["assignee"] == issue.assignee_id and current["status"] == "in_progress") || {:error, :not_owned_by_symphony} do
+      fields = Map.take(current, ["id", "title", "description", "design", "acceptance_criteria", "notes", "status", "updated_at", "external_ref", "metadata"])
+      payload = Map.merge(fields, %{"validation_policy" => record["validation_policy"], "attempt_id" => record["attempt_id"]})
+      if byte_size(Jason.encode!(payload)) <= 65_536, do: tool_result_payload(payload), else: tool_result({:error, :task_context_too_large})
+    else
+      error -> tool_result(error)
+    end
+  end
+
+  def execute_agent_tool("beads_validate", arguments, opts) when arguments == %{} do
+    case Validation.run(opts[:tracker_settings], opts[:issue]) do
+      {:ok, receipt} -> tool_result_payload(receipt)
+      error -> tool_result(error)
+    end
+  end
+
   def execute_agent_tool("beads_await_human", %{"reason" => reason} = arguments, opts) when is_binary(reason) do
     issue = opts[:issue]
     settings = opts[:tracker_settings]
@@ -259,6 +342,8 @@ defmodule SymphonyElixir.Beads.Adapter do
          true <- String.match?(sha, ~r/^[a-fA-F0-9]{40,64}$/) || {:error, :invalid_delivery_commit},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
          true <- record["owner"] == issue.assignee_id || {:error, :delivery_owner_mismatch},
+         :ok <- Validation.gate(record),
+         :ok <- Validation.delivery_head(record, sha),
          {:ok, _} <- bind_delivery(record, url, sha) do
       :ok
     end
@@ -332,7 +417,7 @@ defmodule SymphonyElixir.Beads.Adapter do
       priority: if(is_integer(raw["priority"]), do: raw["priority"] + 1),
       assignee_id: raw["assignee"],
       labels: labels,
-      native_ref: Map.take(raw, ["issue_type", "acceptance_criteria", "external_ref", "metadata"]),
+      native_ref: Map.take(raw, ["issue_type", "acceptance_criteria", "external_ref", "metadata", "notes"]),
       url: raw["external_ref"],
       dispatchable: (MapSet.member?(readiness.ready, raw["id"]) or running) and not MapSet.member?(readiness.blocked, raw["id"]) and "human" not in labels,
       created_at: timestamp(raw["created_at"]),

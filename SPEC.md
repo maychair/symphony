@@ -2314,3 +2314,13 @@ Extension config:
 ## Local Beads provider extension
 
 The Elixir implementation may use `tracker.kind: beads` with a mandatory routing label, explicit external database directory, guarded CLI claims and a separate execution checkpoint journal. Beads task goals remain authoritative. One native root turn delivers to a persisted blocked/human gate; terminal child events cannot complete the parent. Operator acceptance requires task-bound merged review evidence and explicit human identity; linked remote source Issues require explicit scoped closure before the bead closes. Unknown native execution is blocked on restart rather than duplicated. Git worktrees are retained. See `elixir/docs/beads.md` for configuration, recovery limits and the operator contract.
+
+### Native Beads task validation extension
+
+Beads adapters may freeze an explicitly configured task validation policy before
+admitting a run, preflight its strict prompt, and expose ownership-scoped host task
+reads. Opt-in host verification receipts identify the attempt, policy and clean
+commit; stale receipts cannot authorize publication. Repository gates remain the
+default for unconfigured tasks. Validation is separate from human acceptance and
+verified remote merge. Private session evidence must distinguish transport
+responses from observed process exit codes and preserve unknown values.

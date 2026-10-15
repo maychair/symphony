@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Beads.Publication do
   @moduledoc "Opt-in host publication of an explicitly scoped delivery; never merges."
-  alias SymphonyElixir.Beads.{Adapter, RemoteReview, Repository, RunJournal, SourceIssue}
+  alias SymphonyElixir.Beads.{Adapter, RemoteReview, Repository, RunJournal, SourceIssue, Validation}
 
   @spec publish(map(), map()) :: {:ok, map()} | {:error, term()}
   def publish(settings, issue) do
@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Beads.Publication do
          true <- Enum.all?(paths, &safe_path?/1) || {:error, :invalid_publication_paths},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
          true <- record["owner"] == issue.assignee_id || {:error, :publication_owner_mismatch},
+         :ok <- Validation.gate(record),
          workspace when is_binary(workspace) <- record["workspace"],
          true <- Enum.all?(paths, &(File.lstat(Path.join(workspace, &1)) |> regular?())) || {:error, :invalid_publication_file},
          {:ok, branch} <- git(workspace, ["branch", "--show-current"]),

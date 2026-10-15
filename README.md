@@ -45,3 +45,8 @@ The Elixir implementation also supports a scoped [native Beads development loop]
 The Beads extension supports remote review/CI reconciliation in Symphony's existing poll loop, authenticated Webhook hints, bounded same-session repair and verified manual-merge closure. See [Beads operation](elixir/docs/beads.md).
 
 Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](elixir/docs/beads.md).
+
+Beads runs can freeze task-specific validation policies, expose scoped host task
+reads, and preflight strict prompts before claiming work. Opt-in host checks bind
+receipts to a clean commit and attempt. Corrected session evidence keeps process
+results separate from tool transport status; see [operation](elixir/docs/beads.md).

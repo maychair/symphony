@@ -333,3 +333,9 @@ For the Beads provider contract and bounded native development loop, use the sep
 For the optional Beads provider, `remote_reconcile: true` enables event hints plus polling, same-session repair and manual-merge acceptance. Publication additionally requires explicit task/paths authorization. See [Beads contract](docs/beads.md).
 
 Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](docs/beads.md).
+
+For Beads workflows only, trusted local `metadata.symphony_validation` overrides
+`tracker.provider.validation_policy` before admission. Opt-in
+`allow_host_validation` enables frozen argv checks through `beads_validate` on a
+clean commit. Read tasks through `beads_task_context`; never infer acceptance or
+merge authority from successful validation. See `docs/beads.md` for the contract.

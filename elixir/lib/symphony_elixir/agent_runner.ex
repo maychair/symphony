@@ -212,7 +212,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns) do
-    prompt = PromptBuilder.build_prompt(issue, opts)
+    prompt = opts[:prepared_prompt] || PromptBuilder.build_prompt(issue, opts)
 
     case get_in(opts[:run_record] || %{}, ["feedback"]) do
       nil -> prompt

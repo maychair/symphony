@@ -198,3 +198,78 @@ No unknown turn-start intent is replayed. Guarded ownership remains unchanged.
 An unstarted source Issue that becomes available again releases an in-memory
 block only when its journal proves no Run exists. Rebuild the escript after
 source changes; compiling modules alone does not refresh bin/symphony.
+
+## Task validation, host context and preflight
+
+A trusted local Beads `metadata.symphony_validation` object overrides
+`tracker.provider.validation_policy` before admission. Without either, existing
+repository gates remain unchanged. Example rapid policy:
+
+```json
+{"mode":"targeted","review":"none","commands":[["python3","-m","compileall","-q","src"]],"timeout_ms":60000}
+```
+
+Modes are `targeted`, `full`, and `baseline_diff`; the configured argv arrays
+must actually implement the selected scope. Review is `required` (default) or
+`none`; this directs the Coordinator and never grants merge authority.
+`baseline_diff` requires a nonempty `baseline_authorization` citing explicit
+operator/repository authority. Its commands must compare fixed baseline and
+candidate failures and return nonzero for any new failure. The host does not
+infer a waiver from existing red tests or attempt to interpret arbitrary test
+framework output. Keep baseline artifacts outside the active source worktree.
+
+Set `tracker.provider.allow_host_validation: true` only for trusted local task
+configuration. This permits host execution of the **frozen** argv arrays, not
+commands supplied in tool arguments or remote comments. Commands have a
+100–300000 ms per-command budget (default 60000), maximum eight commands, and
+GNU `timeout` bounds process groups. Logs stay in the private Run directory.
+The existing Run budget remains an outer limit. Host commands are privileged
+relative to the agent sandbox, so never copy untrusted Issue text into this
+policy without developer authorization.
+
+The no-argument `beads_task_context` tool reads only its currently owned task,
+including notes, acceptance criteria, current `updated_at`, metadata, attempt ID
+and frozen policy. Output is bounded to 64 KiB; no raw external database access
+from the agent sandbox is required. A foreign task ID or owner is rejected.
+`beads_validate` executes configured checks on the clean committed task worktree
+and journals individual process exit codes and log paths. Commit source changes
+before calling it. A receipt opens publication/delivery only for the same
+attempt, policy and clean HEAD, and the delivery SHA must match. Changed source
+or a new attempt requires new verification. A successful tool transport carrying
+`passed: false` is a failed verification. Parking without delivery remains
+possible when blocked. Acceptance and remote merge gates are unchanged.
+
+Before admitting a Run or allocating a native session, the adapter checks local
+executables, validates the policy and renders the actual strict task prompt.
+That exact rendered prompt is reused for the first turn. Invalid templates leave
+no claim or journal lock. A changed policy on an existing native thread is
+blocked for operator handoff rather than silently changing its authority.
+Existing threads cannot acquire new dynamic tool registrations through resume;
+use a new authorized task/thread when new tools or policy are required.
+
+```sh
+mix beads.preflight --workflow /path/to/WORKFLOW.md --issue task-id
+```
+
+This checks configuration and optionally the concrete task without starting a
+scheduler, claiming it or creating a session. A live source Issue is still checked
+at actual admission. Workflow shell hooks and arbitrary shell command internals
+are not executed by preflight.
+
+## Corrected session evidence
+
+```sh
+python3 scripts/session_evidence.py --rollout /private/rollout.jsonl \
+  --run-record /private/run.json --output /private/session-evidence.json
+```
+
+The exporter reads immutable native logs and optionally a matching thread's Run
+snapshot. It records historical cwd/commit from `session_meta`, resolves the
+actual worktree's Git common directory and remote, and separates transport
+response delivery from explicit nested exec-envelope exit codes. Missing or
+unrecognized process outcomes, cost and verification remain unknown. A wait
+response is not attributed to its initiating command without observed linkage.
+No arbitrary JavaScript is executed or guessed, no native logs or third-party
+Traces packages are modified, and no internal review relationship is fabricated.
+The output contains private repository identity and must stay outside Git.
+`/api/v1/runs/:id` additionally exposes the frozen validation policy and receipt.
