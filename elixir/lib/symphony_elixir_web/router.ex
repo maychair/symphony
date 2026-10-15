@@ -29,6 +29,8 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
+    post("/api/v1/webhooks/:provider", WebhookController, :receive_event)
+    get("/api/v1/runs/:issue_identifier", ObservabilityApiController, :run)
     get("/api/v1/state", ObservabilityApiController, :state)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)

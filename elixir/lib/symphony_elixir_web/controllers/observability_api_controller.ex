@@ -13,6 +13,25 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
   end
 
+  @spec run(Conn.t(), map()) :: Conn.t()
+  def run(conn, %{"issue_identifier" => id}) do
+    settings = SymphonyElixir.Config.settings!().tracker
+
+    if settings.kind == "beads" do
+      directory = SymphonyElixir.Beads.RunJournal.directory(SymphonyElixir.Beads.Adapter.journal_root(settings), id)
+
+      case SymphonyElixir.Beads.RunJournal.read(directory) do
+        {:ok, %{} = record} ->
+          json(conn, Map.take(record, ["issue_id", "phase", "attempt_id", "attempt_count", "repair_count", "thread_id", "turn_id", "delivery", "remote_state", "updated_at", "events"]))
+
+        _ ->
+          error_response(conn, 404, "run_not_found", "Run not found")
+      end
+    else
+      error_response(conn, 404, "run_not_found", "Run not found")
+    end
+  end
+
   @spec issue(Conn.t(), map()) :: Conn.t()
   def issue(conn, %{"issue_identifier" => issue_identifier}) do
     case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do

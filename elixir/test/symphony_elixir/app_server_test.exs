@@ -1,6 +1,46 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "root turn waits past child completion and rejects failed parent envelopes" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace_root = Path.join(root, "protocol-workspaces")
+    workspace = Path.join(workspace_root, "issue")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "protocol-server")
+    issue = %Issue{id: "root-issue", identifier: "ROOT", title: "Root turn", state: "Todo"}
+
+    for status <- ["completed", "failed", "interrupted"] do
+      File.write!(binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count+1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"root-thread"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"root-turn"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed"}}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"old-turn","status":"completed"}}}'
+            sleep 0.05
+            printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"#{status}"}}}'
+            exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: binary)
+
+      if status == "completed" do
+        assert {:ok, %{thread_id: "root-thread", turn_id: "root-turn"}} = AppServer.run(workspace, "root", issue)
+      else
+        assert {:error, {:turn_failed, %{"status" => ^status}}} = AppServer.run(workspace, "root", issue)
+      end
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(

@@ -14,6 +14,11 @@ defmodule SymphonyElixir.MixProject do
         ],
         ignore_modules: [
           SymphonyElixir.Asana.Client,
+          SymphonyElixir.Beads.Adapter,
+          SymphonyElixir.Beads.Acceptance,
+          SymphonyElixir.Beads.RunJournal,
+          SymphonyElixir.Beads.Recovery,
+          SymphonyElixir.Beads.SourceIssue,
           SymphonyElixir.Config,
           SymphonyElixir.GitHub.Client,
           SymphonyElixir.GitLab.Client,

@@ -39,3 +39,7 @@ help with the setup:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+The Elixir implementation also supports a scoped [native Beads development loop](elixir/docs/beads.md): Beads owns tasks and human acceptance, while Symphony journals native execution identities and preserves worktrees.
+
+The Beads extension supports remote review/CI reconciliation in Symphony's existing poll loop, authenticated Webhook hints, bounded same-session repair and verified manual-merge closure. See [Beads operation](elixir/docs/beads.md).

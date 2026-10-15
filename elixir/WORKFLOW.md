@@ -327,3 +327,7 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
+
+For the Beads provider contract and bounded native development loop, use the separate [Beads example](WORKFLOW.beads.md) and [provider guide](docs/beads.md).
+
+For the optional Beads provider, `remote_reconcile: true` enables event hints plus polling, same-session repair and manual-merge acceptance. Publication additionally requires explicit task/paths authorization. See [Beads contract](docs/beads.md).
