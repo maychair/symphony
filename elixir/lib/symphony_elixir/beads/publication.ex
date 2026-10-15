@@ -50,7 +50,8 @@ defmodule SymphonyElixir.Beads.Publication do
 
   defp authority(settings, issue, :checkpoint) do
     if "symphony:checkpoint" in issue.labels do
-      {"symphony:checkpoint", settings.provider["checkpoint_paths"] || []}
+      paths = get_in(settings.provider, ["checkpoint_paths_by_issue", issue.id]) || settings.provider["checkpoint_paths"] || []
+      {"symphony:checkpoint", paths}
     else
       authority(settings, issue, :publish)
     end
@@ -95,7 +96,13 @@ defmodule SymphonyElixir.Beads.Publication do
     end
   end
 
-  defp source_authority(settings, current, :checkpoint), do: open_source(settings, current)
+  defp source_authority(settings, current, :checkpoint) do
+    if settings.provider["allow_local_checkpoint"] == true and current["external_ref"] in [nil, ""] do
+      :ok
+    else
+      open_source(settings, current)
+    end
+  end
 
   defp source_authority(settings, current, :publish) do
     if current["external_ref"] in [nil, ""] and SymphonyElixir.Beads.Workbench.publication_authority(settings, current["id"]),

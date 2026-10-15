@@ -125,7 +125,7 @@ defmodule SymphonyElixir.Beads.Recovery do
   end
 
   defp unstarted_thread?(record),
-    do: record["phase"] == "thread_ready" and record["turn_count"] == 0 and is_nil(record["turn_id"])
+    do: is_binary(record["thread_id"]) and record["turn_count"] == 0 and is_nil(record["turn_id"])
 
   defp checkpoint_recovery(record) do
     case RunJournal.checkpoint(record, %{"abandoned_pre_turn_thread_id" => record["thread_id"]}) do
@@ -182,11 +182,11 @@ defmodule SymphonyElixir.Beads.Recovery do
   defp native_identity?(record),
     do:
       is_binary(record["thread_id"]) and
-        (is_binary(record["turn_id"]) or (record["phase"] == "thread_ready" and record["turn_count"] == 0 and is_nil(record["turn_id"])))
+        (is_binary(record["turn_id"]) or (record["turn_count"] == 0 and is_nil(record["turn_id"])))
 
   defp pre_turn?(record) do
     pre_session_blocked?(record) or
-      (record["phase"] in ["admitted", "claimed", "thread_ready"] and record["turn_count"] == 0 and is_nil(record["turn_id"]))
+      (record["turn_count"] == 0 and is_nil(record["turn_id"]))
   end
 
   defp release_for_resume(settings, record) do
