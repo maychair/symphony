@@ -4,7 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Beads.RunJournal
+  alias SymphonyElixir.Beads.{RunJournal, Validation}
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
@@ -61,7 +61,8 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+               :ok <- Validation.preflight_workspace(workspace, opts[:run_record]) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after

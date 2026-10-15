@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Beads.RunJournal do
       record =
         record
         |> Map.delete("delivery")
+        |> Map.delete("pre_session_blocked")
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
@@ -88,6 +89,12 @@ defmodule SymphonyElixir.Beads.RunJournal do
   defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_turn_recovered" => true, "abandoned_pre_turn_thread_id" => abandoned} = record, issue_id)
        when is_binary(abandoned) do
     if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
+  end
+
+  defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_session_blocked" => true} = record, issue_id) do
+    if record["issue_id"] == issue_id and is_binary(record["owner"]),
+      do: {:ok, Map.put(record, "pre_turn_recovered", true)},
+      else: {:error, :issue_identity_mismatch}
   end
 
   defp admission(_record, _issue_id), do: {:error, :uncertain_or_awaiting_run}

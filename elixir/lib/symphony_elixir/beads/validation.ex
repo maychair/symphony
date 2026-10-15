@@ -83,13 +83,25 @@ defmodule SymphonyElixir.Beads.Validation do
   end
 
   defp execute(argv, record, policy) do
+    started = System.monotonic_time(:millisecond)
+    at = DateTime.to_iso8601(DateTime.utc_now())
     log = Path.join(record["directory"], "validation-#{System.unique_integer([:positive])}.log")
     timeout = "#{policy["timeout_ms"] / 1000}s"
     # GNU timeout bounds the entire command group; the log avoids unbounded output in memory.
     {_, status} = System.cmd("timeout", ["--kill-after=5s", timeout | argv], cd: record["workspace"], into: File.stream!(log), stderr_to_stdout: true)
-    %{"argv" => argv, "exit_code" => status, "log" => log}
+    duration = System.monotonic_time(:millisecond) - started
+    result = %{"argv" => argv, "exit_code" => status, "log" => log, "log_sha256" => log_hash(log)}
+    Map.merge(result, %{"started_at" => at, "duration_ms" => duration})
   rescue
     _ -> %{"argv" => argv, "exit_code" => nil, "error" => "validation_command_unavailable"}
+  end
+
+  defp log_hash(log) do
+    log
+    |> File.stream!([], 65_536)
+    |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
   end
 
   @spec gate(map()) :: :ok | {:error, term()}
@@ -123,13 +135,65 @@ defmodule SymphonyElixir.Beads.Validation do
     end
   end
 
+  @spec preflight_workspace(Path.t(), map() | nil) :: :ok | {:error, term()}
+  def preflight_workspace(workspace, %{"validation_policy" => %{"commands" => [_ | _]}} = record) do
+    case identity(workspace) do
+      {:ok, _} ->
+        :ok
+
+      {:error, _} = error ->
+        checkpoint_workspace_block(record, workspace, error)
+    end
+  end
+
+  def preflight_workspace(_workspace, _record), do: :ok
+
+  defp checkpoint_workspace_block(%{"directory" => directory}, workspace, error) do
+    with {:ok, current} <- RunJournal.read(directory),
+         changes <- workspace_block_changes(current, workspace),
+         {:ok, _} <- RunJournal.checkpoint(current, changes) do
+      error
+    end
+  end
+
+  defp checkpoint_workspace_block(_record, _workspace, error), do: error
+
+  defp workspace_block_changes(current, workspace) do
+    if is_nil(current["thread_id"]) and is_nil(current["turn_id"]),
+      do: %{"pre_session_blocked" => true, "thread_id" => nil, "turn_id" => nil, "workspace" => workspace},
+      else: %{"workspace" => workspace}
+  end
+
+  defp status_arguments(workspace) do
+    args = ["status", "--porcelain", "--untracked-files=normal"]
+    marker = Path.join(workspace, ".symphony-retain")
+
+    case File.lstat(marker) do
+      {:error, :enoent} -> {:ok, args}
+      {:ok, %{type: :regular}} -> marker_arguments(workspace, marker, args)
+      _ -> {:error, :unowned_retention_marker}
+    end
+  end
+
+  defp marker_arguments(workspace, marker, args) do
+    {_, tracked} = System.cmd("git", ["ls-files", "--error-unmatch", ".symphony-retain"], cd: workspace, stderr_to_stdout: true)
+
+    if File.read!(marker) == "retained by Symphony\n" and tracked == 1,
+      do: {:ok, args ++ ["--", ".", ":(exclude).symphony-retain"]},
+      else: {:error, :unowned_retention_marker}
+  end
+
   @spec identity(Path.t() | nil) :: {:ok, map()} | {:error, term()}
   def identity(workspace) when is_binary(workspace) do
-    with {head, 0} <- System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true),
-         {status, 0} <- System.cmd("git", ["status", "--porcelain", "--untracked-files=normal"], cd: workspace, stderr_to_stdout: true),
+    with {:ok, args} <- status_arguments(workspace),
+         {top, 0} <- System.cmd("git", ["rev-parse", "--show-toplevel"], cd: workspace, stderr_to_stdout: true),
+         true <- String.trim(top) == Path.expand(workspace),
+         {head, 0} <- System.cmd("git", ["rev-parse", "HEAD"], cd: workspace, stderr_to_stdout: true),
+         {status, 0} <- System.cmd("git", args, cd: workspace, stderr_to_stdout: true),
          true <- status == "" do
       {:ok, %{"head_sha" => String.trim(head), "worktree" => workspace}}
     else
+      {:error, _} = error -> error
       _ -> {:error, :validation_requires_clean_commit}
     end
   rescue

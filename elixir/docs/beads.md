@@ -279,3 +279,61 @@ commit using publication task/owner/branch/remote checks. It does not push or
 create a review and does not require a validation receipt. Use checkpoint, validate,
 then publish when Git metadata is protected in the agent sandbox. Publication
 rechecks the receipt after its idempotent commit step and before any push.
+
+## Ready worktrees, typed handoff and recovery budgets
+
+Explicit host-validation tasks now preflight the actual Git worktree before native
+thread allocation. The exact untracked regular `.symphony-retain` marker is excluded
+only from the engine's status invocation; other files still require a clean commit.
+Foreign/tracked markers, symlinks and unrelated dirtiness are rejected. Bootstrap
+preserves foreign markers instead of overwriting them. No shared Git ignore changes
+or broader sandbox permissions are needed.
+
+`beads_await_human` accepts optional `intent`:
+
+- `blocked`: reason plus optional checkpoint head SHA, without a review URL.
+- `ready_for_review`: reason plus both review URL and verified head SHA.
+
+Legacy reason-only and complete URL/SHA forms remain compatible. Partial delivery
+is rejected with a corrective error before publication or Run mutation. A blocked
+checkpoint is never a delivery or acceptance. Operator merge gates are unchanged.
+
+`Recovery.resume_completed/3` accepts `cause: runtime` or `cause: review` (legacy
+default). Runtime recovery increments `runtime_recovery_count`, bounded by provider
+`max_runtime_recoveries` (default 2), without consuming review `repair_count` or its
+`max_repair_runs` budget. Limits are checked before native inspection/side effects.
+Optional observed `actor` and `caused_by_event` persist trigger provenance. Recovery
+still requires completed native identity, correct scope, no lock and proven idle;
+unknown outcomes do not become retryable merely by selecting a cause.
+
+## Compact briefs and composed delivery
+
+Set `tracker.provider.compact_task_context: true` to read task body/acceptance/notes
+once through `beads_task_context`, with `task_version` and frozen policy. The actual
+custom Workflow still renders and preflights; only repeated task fields become
+host-read references. On the same native thread and unchanged template hash, a
+shorter recovery delta may replace resending the full rendered brief. A changed
+Workflow resends instructions; a changed policy remains blocked. Mandatory repo
+rules and current ownership checks are retained. Default rendering stays compatible.
+
+The no-argument `beads_deliver` uses the existing guarded checkpoint, validate,
+publish and ready-for-review handoff steps. Explicit commands and enabled host
+validation are required. Every boundary is journaled as `delivery_step`; failures
+record `delivery_error`. Receipts capture argv, timestamps, exit code, duration and
+SHA-256 of actual log bytes. A failed or stale receipt cannot authorize a push.
+Repeated delivery reuses a matching confirmed result; interrupted calls replay
+idempotent guarded stages and reconcile a completed handoff by readback. This is
+not an atomic Git/API transaction. Granular tools remain available; no new merge
+or acceptance authority is introduced.
+
+`session_evidence.py --otlp-out FILE` also exports private native-event spans. JSON
+schema version 2 separates wrapper calls from typed native operations, native
+command exits from host tool success, and observed verification receipts from
+transport completion. Repeated native IDs are deduplicated; incomplete native
+coverage retains wrapper evidence rather than inventing a join. Token/cache usage
+and explicit recovery provenance are preserved. Missing costs, actor identities
+or causal links remain uncaptured; no native transcripts are rewritten.
+
+A proven workspace preflight abort before any thread allocation can be recovered
+through the stopped-executor operator path without inventing native IDs. Thread
+start/turn intent uncertainty remains fenced; a new admission clears that proof.
