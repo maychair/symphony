@@ -13,6 +13,21 @@ defmodule SymphonyElixir.Workspace do
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    if Config.settings!().tracker.provider["workbench_primary_checkout"] == true and is_nil(worker_host) do
+      primary = System.get_env("SYMPHONY_TARGET_REPO")
+      with true <- is_binary(primary) and File.dir?(primary),
+           {top, 0} <- System.cmd("git", ["-C", primary, "rev-parse", "--show-toplevel"], stderr_to_stdout: false),
+           true <- String.trim(top) == Path.expand(primary) do
+        {:ok, primary}
+      else
+        _ -> {:error, :invalid_operator_primary_checkout}
+      end
+    else
+      create_isolated_for_issue(issue_or_identifier, worker_host)
+    end
+  end
+
+  defp create_isolated_for_issue(issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
 
     try do

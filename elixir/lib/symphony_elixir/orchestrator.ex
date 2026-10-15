@@ -268,6 +268,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     if Config.settings!().tracker.kind == "beads" do
+      SymphonyElixir.Beads.Workbench.preflight_failure(Config.settings!().tracker, issue_id, reason)
       block_issue_from_entry(state, issue_id, running_entry, "run requires human reconciliation: #{inspect(reason)}")
     else
       handle_provider_agent_down(reason, state, issue_id, running_entry, session_id)

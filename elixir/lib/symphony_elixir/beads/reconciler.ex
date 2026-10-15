@@ -5,10 +5,13 @@ defmodule SymphonyElixir.Beads.Reconciler do
 
   @spec poll(map()) :: :ok
   def poll(settings) do
-    if settings.kind == "beads" and settings.provider["remote_reconcile"] == true do
+    if settings.kind == "beads" do
       case Adapter.command(settings, ["list", "--all", "--limit", "0", "--json"]) do
         {:ok, issues} when is_list(issues) ->
-          issues |> Enum.filter(&routed?(&1, settings)) |> Enum.each(&reconcile(settings, &1))
+          issues |> Enum.filter(&routed?(&1, settings)) |> Enum.each(fn issue ->
+            if issue["status"] == "blocked", do: SymphonyElixir.Beads.Workbench.reconcile(settings, issue)
+            if settings.provider["remote_reconcile"] == true, do: reconcile(settings, issue)
+          end)
 
         error ->
           Logger.warning("Remote reconciliation queue unavailable: #{inspect(error)}")

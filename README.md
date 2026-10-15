@@ -60,3 +60,5 @@ separate runtime recovery budgets, opt-in compact task briefs and resumable
 keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
 
 Undelivered Beads runs retain preparation blockers for operator recovery; bound PR/MR deliveries retain explicit acceptance and merge gates.
+
+The operator workbench exposes structured decisions, delivery review and repair incidents through authenticated Beads interfaces. See [the workbench contract](elixir/docs/beads.md#operator-workbench).

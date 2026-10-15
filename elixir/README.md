@@ -426,3 +426,5 @@ separate runtime recovery budgets, opt-in compact task briefs and resumable
 keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
 
 Undelivered Beads runs retain a preparation blocker and resume through operator recovery; only bound PR/MR deliveries await acceptance.
+
+The authenticated `/api/v1/workbench` API supports bound decisions, verified artifacts and safe repair dispatch. Set `SYMPHONY_WORKBENCH_TOKEN` outside Git; see [the contract](docs/beads.md#operator-workbench).

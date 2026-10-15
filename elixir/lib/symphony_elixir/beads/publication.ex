@@ -23,13 +23,14 @@ defmodule SymphonyElixir.Beads.Publication do
     {label, paths} = authority(settings, issue, operation)
     remote_name = settings.provider["git_remote"] || "origin"
 
-    with :ok <- authorized_task(settings, issue, label),
-         :ok <- authorized_paths(issue, paths, label),
+    with :ok <- authorized_task(settings, issue, label, operation),
+         :ok <- authorized_paths(settings, issue, paths, label),
          true <- Enum.all?(paths, &safe_path?/1) || {:error, :invalid_publication_paths},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
          true <- record["owner"] == issue.assignee_id || {:error, :publication_owner_mismatch},
          workspace when is_binary(workspace) <- record["workspace"],
          true <- Enum.all?(paths, &(File.lstat(Path.join(workspace, &1)) |> regular?())) || {:error, :invalid_publication_file},
+         :ok <- approved_head(settings, issue, workspace, operation),
          {:ok, branch} <- git(workspace, ["branch", "--show-current"]),
          true <- String.starts_with?(branch, "codex/") || {:error, :publication_requires_task_branch},
          {:ok, remote} <- git(workspace, ["remote", "get-url", remote_name]),
@@ -55,20 +56,55 @@ defmodule SymphonyElixir.Beads.Publication do
     end
   end
 
-  defp authority(settings, _issue, :publish), do: {"symphony:publish", settings.provider["publish_paths"] || []}
-
-  defp authorized_paths(issue, paths, label) do
-    if label in issue.labels and is_list(paths) and paths != [], do: :ok, else: {:error, :publication_not_authorized}
+  defp authority(settings, issue, :publish) do
+    grant = SymphonyElixir.Beads.Workbench.publication_authority(settings, issue.id)
+    {"symphony:publish", if(grant, do: grant["paths"], else: settings.provider["publish_paths"] || [])}
   end
 
-  defp authorized_task(settings, issue, label) do
+  defp approved_head(settings, issue, workspace, :publish) do
+    case SymphonyElixir.Beads.Workbench.publication_authority(settings, issue.id) do
+      nil -> :ok
+      grant ->
+        with {:ok, head} <- git(workspace, ["rev-parse", "HEAD"]),
+             true <- head == grant["head_sha"] || {:error, :approved_publication_head_changed},
+             {:ok, ""} <- git(workspace, ["diff", "--name-only"]),
+             {:ok, ""} <- git(workspace, ["diff", "--cached", "--name-only"]) do
+          :ok
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :approved_publication_requires_clean_head}
+        end
+    end
+  end
+  defp approved_head(_, _, _, _), do: :ok
+
+  defp authorized_paths(settings, issue, paths, label) do
+    if (label in issue.labels or not is_nil(SymphonyElixir.Beads.Workbench.publication_authority(settings, issue.id))) and is_list(paths) and paths != [], do: :ok, else: {:error, :publication_not_authorized}
+  end
+
+  defp authorized_task(settings, issue, label, operation) do
     with {:ok, [current]} <- Adapter.command(settings, ["show", issue.id, "--json"]),
          true <-
            (current["status"] == "in_progress" and current["assignee"] == issue.assignee_id and
-              label in (current["labels"] || [])) || {:error, :publication_not_currently_authorized},
-         {:ok, %{closed: false}} <- SourceIssue.read(settings, current["external_ref"] || "") do
+              (label in (current["labels"] || []) or not is_nil(SymphonyElixir.Beads.Workbench.publication_authority(settings, issue.id)))) || {:error, :publication_not_currently_authorized},
+         :ok <- source_authority(settings, current, operation) do
       :ok
     else
+      {:error, _} = error -> error
+      _ -> {:error, :publication_source_not_open}
+    end
+  end
+
+  defp source_authority(settings, current, :checkpoint), do: open_source(settings, current)
+
+  defp source_authority(settings, current, :publish) do
+    if current["external_ref"] in [nil, ""] and SymphonyElixir.Beads.Workbench.publication_authority(settings, current["id"]),
+      do: :ok, else: open_source(settings, current)
+  end
+
+  defp open_source(settings, current) do
+    case SourceIssue.read(settings, current["external_ref"] || "") do
+      {:ok, %{closed: false}} -> :ok
       {:error, _} = error -> error
       _ -> {:error, :publication_source_not_open}
     end

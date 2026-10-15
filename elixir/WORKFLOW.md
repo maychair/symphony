@@ -349,3 +349,12 @@ separate runtime recovery budgets, opt-in compact task briefs and resumable
 keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
 
 Beads preparation blockers use `beads_block` (or reason-only `beads_await_human`); delivered review handoffs require both review URL and head SHA.
+
+## Optional Beads operator workbench
+
+For `tracker.kind: beads`, the local workbench proxy uses an external
+`SYMPHONY_WORKBENCH_TOKEN`. Trusted `tracker.provider.workbench_projects` maps
+project names to Beads directories, routing labels and ID prefixes.
+`workbench_artifact_roots` limits readable delivery materials. Keep credentials
+and host-specific paths outside this example. See `docs/beads.md` for the
+structured action and receipt contract.

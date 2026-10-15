@@ -115,7 +115,7 @@ defmodule SymphonyElixir.AgentRunner do
       tracker_settings: opts[:tracker_settings],
       resume_thread_id: record && record["thread_id"],
       expected_turn_id: record && (record["turn_id"] || :no_turns),
-      on_thread_intent: fn -> journal!(record, %{"phase" => "thread_start_intent", "workspace" => workspace}) end,
+      on_thread_intent: fn -> journal!(record, %{"phase" => "thread_start_intent", "workspace" => workspace, "thread_allocation_intent" => true}) end,
       on_thread_started: fn thread_id -> journal!(record, %{"phase" => "thread_ready", "thread_id" => thread_id, "workspace" => workspace}) end
     ]
 

@@ -198,6 +198,6 @@ defmodule SymphonyElixir.Beads.Acceptance do
   end
 
   defp merged?("gitlab", proof) do
-    proof["state"] == "merged" and is_binary(proof["merged_at"]) and is_binary(proof["merge_commit_sha"])
+    proof["state"] == "merged" and is_binary(proof["merged_at"]) and (is_binary(proof["merge_commit_sha"]) or is_binary(proof["squash_commit_sha"]))
   end
 end

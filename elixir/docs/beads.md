@@ -369,3 +369,41 @@ Deploy only when the owning executor is idle and stopped. Preserve its Run recor
 and native identities; supply the explicit local task label and exact trusted
 checkpoint paths before recovery. Never grant publication merely to unblock a
 local checkpoint, or restart an active Run to apply this package.
+
+
+## Operator workbench
+
+`GET /api/v1/workbench` returns structured gates, native execution identity and
+operator receipts. `POST /api/v1/workbench/:issue/:gate/decide` takes the exact
+`binding`, `choice`, `actor` and optional comment. The proxy authenticates using
+`X-Symphony-Workbench-Token`, whose value comes from the native
+`SYMPHONY_WORKBENCH_TOKEN` environment (at least 32 bytes). It is never sent to
+browser JavaScript. Missing credentials deny access.
+
+Gates and decisions live in Beads `metadata.symphony_workbench`. Kinds are
+`authorization`, `decision`, `review`, `incident`, `dependency`; a task may have
+several concurrent gates. `beads_request_action` parks an owned task with these
+gates. Already-registered reason-only tools can send `workbench:v1` followed by
+a newline and a JSON object with `gates`. Legacy untyped blockers become
+explicit diagnostic incidents rather than guessed authorization requests.
+
+An operation records its decision before effects and returns its original
+receipt on identical replay; different choices and stale task/attempt bindings
+are refused. Dependency gates use local IDs or configured `project:id` stores.
+After all gates resolve, online resume requires confirmed native shutdown, no
+executor lock, and a read-only native idle reconciliation. Failure produces a
+repair incident rather than blind retry. A repair click creates a deterministic
+linked Bead in a trusted `workbench_projects` route; the receiving scheduler
+starts the native Goal. Original tasks wait for verified repair closure.
+
+Review must bind a commit and either a scoped MR/PR or immutable local artifact.
+Local technical review records acceptance without closing the task or replacing
+the final merged-delivery gate. `GET .../:issue/:gate/artifact` only reads the
+bound file under configured `workbench_artifact_roots`, rejects symlink paths,
+checks its digest, and limits responses to 512 KiB. GitLab acceptance supports
+both merge commits and squash commits.
+
+Trusted single-worker maintenance instances can set `workbench_primary_checkout`
+to execute in the verified `SYMPHONY_TARGET_REPO` primary checkout. It does not
+change normal isolated task workspaces. Publication and merge authority remain
+separate; the workbench is not a general command-execution endpoint.
