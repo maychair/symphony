@@ -22,16 +22,9 @@ defmodule SymphonyElixir.AgentRunner do
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     settings = Config.settings!().tracker
-    timer = if settings.kind == "beads", do: :timer.exit_after(settings.provider["run_budget_ms"] || 600_000, self(), :execution_budget_exhausted)
-
-    try do
-      do_run(issue, codex_update_recipient, opts)
-    after
-      case timer do
-        {:ok, ref} -> :timer.cancel(ref)
-        _ -> :ok
-      end
-    end
+    budget = settings.provider["run_budget_ms"] || 600_000
+    opts = if settings.kind == "beads", do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
+    do_run(issue, codex_update_recipient, opts)
   end
 
   defp do_run(issue, codex_update_recipient, opts) do
@@ -121,7 +114,11 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        if opts[:tracker_settings] && opts[:tracker_settings].provider["goal_mode"] == true do
+          run_goal(session, issue, codex_update_recipient, opts)
+        else
+          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        end
       after
         AppServer.stop_session(session)
       end
@@ -136,6 +133,7 @@ defmodule SymphonyElixir.AgentRunner do
              app_session,
              prompt,
              issue,
+             deadline: opts[:deadline],
              before_turn: fn -> journal!(opts[:run_record], %{"phase" => "turn_start_intent"}) end,
              on_message: journal_message_handler(opts[:run_record], codex_update_recipient, issue)
            ) do
@@ -160,7 +158,7 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          :ok
+          if opts[:run_record], do: {:error, :agent_turn_budget_exhausted}, else: :ok
 
         {:done, _refreshed_issue} ->
           :ok
@@ -172,7 +170,69 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp next_action(issue, opts, fetcher) do
-    if opts[:run_record], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
+    if opts[:run_record] do
+      with {:ok, current} <- RunJournal.read(opts[:run_record]["directory"]) do
+        if current["delivery"] || current["blocker_reason"], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
+      end
+    else
+      continue_with_issue?(issue, fetcher)
+    end
+  end
+
+  defp run_goal(session, issue, recipient, opts) do
+    record = opts[:run_record]
+    prompt = build_turn_prompt(issue, opts, 1, 1)
+    brief = Path.join(record["directory"], "goal-instructions.txt")
+    File.write!(brief, prompt)
+
+    objective = """
+    Execute Beads task #{issue.identifier} as its receiving Coordinator under Symphony.
+    Before taking any action, read the complete execution instructions at:
+    #{brief}
+    That file contains the workflow, task scope, acceptance criteria and authority.
+    Call beads_task_context for current task notes and frozen validation policy.
+    Continue authorized work until validated delivery or a specific real blocker.
+    Follow all verification, resource admission, publication and acceptance gates.
+    A normal turn ending or idle parent chat is not a blocker.
+    """
+
+    journal!(record, %{"native_stop_confirmed" => false})
+
+    result =
+      AppServer.run_goal(session, objective, issue,
+        deadline: opts[:deadline],
+        resume_goal: is_binary(record["recovery"]),
+        on_message: journal_message_handler(record, recipient, issue),
+        before_goal: fn -> journal!(record, %{"phase" => "goal_start_intent", "execution_mode" => "goal"}) end,
+        handoff_status: fn ->
+          {:ok, current} = RunJournal.read(record["directory"])
+
+          cond do
+            current["delivery"] -> "complete"
+            current["blocker_reason"] -> "blocked"
+            true -> nil
+          end
+        end,
+        latest_turn: fn ->
+          {:ok, current} = RunJournal.read(record["directory"])
+          current["turn_id"]
+        end,
+        on_goal_stopped: fn confirmed -> journal!(record, %{"native_stop_confirmed" => confirmed}) end
+      )
+
+    case result do
+      {:ok, final} ->
+        journal!(record, %{"phase" => "completed", "goal_status" => final.goal_status, "turn_id" => final.turn_id})
+
+        if final.goal_status == "complete" do
+          :ok
+        else
+          {:error, {:native_goal_stopped, final.goal_status}}
+        end
+
+      error ->
+        error
+    end
   end
 
   defp checkpoint_completed(record, session, turn_number) do
@@ -187,6 +247,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp journal_message_handler(record, recipient, issue) do
     fn message ->
       checkpoint_session_started(record, message)
+      checkpoint_goal_event(record, message)
       codex_message_handler(recipient, issue).(message)
     end
   end
@@ -200,6 +261,24 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp checkpoint_session_started(_record, _message), do: :ok
+
+  defp checkpoint_goal_event(record, %{event: :goal_updated, goal: goal}) do
+    journal!(record, %{"goal_status" => goal["status"], "goal_thread_id" => goal["threadId"]})
+  end
+
+  defp checkpoint_goal_event(record, %{event: :turn_completed, payload: payload}) when is_map(record) do
+    {:ok, current} = RunJournal.read(record["directory"])
+
+    if current["execution_mode"] == "goal" do
+      journal!(record, %{
+        "phase" => "goal_waiting",
+        "turn_id" => get_in(payload, ["params", "turn", "id"]),
+        "turn_count" => (current["turn_count"] || 0) + 1
+      })
+    end
+  end
+
+  defp checkpoint_goal_event(_record, _message), do: :ok
 
   defp journal!(nil, _changes), do: :ok
 

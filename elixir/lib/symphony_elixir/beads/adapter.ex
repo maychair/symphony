@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Beads.Adapter do
   @impl true
   def validate_config(settings) do
     cond do
+      settings.provider["goal_mode"] not in [nil, true, false] -> {:error, :invalid_goal_mode}
+      not (is_integer(settings.provider["run_budget_ms"] || 600_000) and (settings.provider["run_budget_ms"] || 600_000) > 0) -> {:error, :invalid_run_budget}
       settings.required_labels == [] or "" in settings.required_labels -> {:error, :beads_requires_routing_labels}
       not absolute_directory?(beads_dir(settings)) -> {:error, :beads_requires_absolute_beads_dir}
       not absolute_directory?(journal_root(settings)) -> {:error, :beads_requires_absolute_journal_dir}
@@ -95,7 +97,14 @@ defmodule SymphonyElixir.Beads.Adapter do
         reason = current["blocker_reason"] || "Run ended without a delivery: #{inspect(result)}. Inspect native session evidence before resuming."
 
         with :ok <- finish_delivery(settings, issue.id, current, phase, reason) do
-          RunJournal.complete(latest_record(current), phase)
+          if current["native_stop_confirmed"] == false do
+            case RunJournal.checkpoint(latest_record(current), %{"phase" => phase}) do
+              {:ok, _} -> :ok
+              error -> error
+            end
+          else
+            RunJournal.complete(latest_record(current), phase)
+          end
         end
 
       _ ->
@@ -502,7 +511,7 @@ defmodule SymphonyElixir.Beads.Adapter do
              issue["status"],
              "--status",
              "blocked",
-             "--add-label",
+             "--remove-label",
              "human",
              "--set-metadata",
              "symphony_gate=blocked",

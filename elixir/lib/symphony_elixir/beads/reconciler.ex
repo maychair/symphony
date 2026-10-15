@@ -5,10 +5,15 @@ defmodule SymphonyElixir.Beads.Reconciler do
 
   @spec poll(map()) :: :ok
   def poll(settings) do
-    if settings.kind == "beads" and settings.provider["remote_reconcile"] == true do
+    if settings.kind == "beads" do
       case Adapter.command(settings, ["list", "--all", "--limit", "0", "--json"]) do
         {:ok, issues} when is_list(issues) ->
-          issues |> Enum.filter(&routed?(&1, settings)) |> Enum.each(&reconcile(settings, &1))
+          issues
+          |> Enum.filter(&routed?(&1, settings))
+          |> Enum.each(fn issue ->
+            reconcile_runtime(settings, issue)
+            if settings.provider["remote_reconcile"] == true, do: reconcile(settings, issue)
+          end)
 
         error ->
           Logger.warning("Remote reconciliation queue unavailable: #{inspect(error)}")
@@ -16,6 +21,50 @@ defmodule SymphonyElixir.Beads.Reconciler do
     end
 
     :ok
+  end
+
+  @doc "Park a lost local scheduler executor without replaying an uncertain native Goal."
+  @spec reconcile_runtime(map(), map()) :: :ok | {:error, term()}
+  def reconcile_runtime(settings, issue) do
+    directory = RunJournal.directory(Adapter.journal_root(settings), issue["id"])
+
+    with {:ok, %{} = record} <- RunJournal.read(directory),
+         true <- record["beads_dir"] == Adapter.beads_dir(settings),
+         true <- issue["status"] == "in_progress" and issue["assignee"] == record["owner"],
+         true <- is_nil(record["delivery"]),
+         false <- record["phase"] == "completed" and record["resume_authorized"] == true,
+         true <- record["phase"] == "blocked" or RunJournal.executor_state(record) == :stopped do
+      reason = record["blocker_reason"] || "Scheduler executor exited before a terminal handoff; reconcile the recorded native Goal/thread/turn before resuming. Butler session is not required."
+
+      with :ok <- Adapter.block_undelivered(settings, issue["id"], record, reason),
+           {:ok, current} <- RunJournal.read(directory),
+           {:ok, _} <- RunJournal.checkpoint(current, %{"phase" => "blocked", "native_stop_confirmed" => false}) do
+        :ok
+      end
+    else
+      {:error, _} = error -> error
+      _ -> :ok
+    end
+  end
+
+  @doc "Called only after the scheduler observes its Coordinator worker terminate."
+  @spec park_worker_exit(map(), String.t(), term()) :: :ok | {:error, term()}
+  def park_worker_exit(settings, issue_id, reason) do
+    directory = RunJournal.directory(Adapter.journal_root(settings), issue_id)
+
+    with {:ok, %{} = record} <- RunJournal.read(directory),
+         true <- record["beads_dir"] == Adapter.beads_dir(settings),
+         true <- record["executor_os_pid"] == System.pid(),
+         true <- record["phase"] not in ["blocked", "awaiting_human"],
+         true <- is_nil(record["delivery"]),
+         :ok <- Adapter.block_undelivered(settings, issue_id, record, "Coordinator executor exited before terminal handoff: #{inspect(reason)}"),
+         {:ok, current} <- RunJournal.read(directory),
+         {:ok, _} <- RunJournal.checkpoint(current, %{"phase" => "blocked", "native_stop_confirmed" => false}) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> :ok
+    end
   end
 
   defp routed?(issue, settings) do

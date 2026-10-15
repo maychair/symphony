@@ -10,6 +10,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
+  @goal_read_id 4
+  @goal_start_id 5
+  @goal_stop_id 6
+  @goal_interrupt_id 7
+  @goal_inspect_id 8
   @max_stream_log_bytes 1_000
   @type session :: %{
           port: port(),
@@ -38,7 +43,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
-    dynamic_tool_binding = DynamicTool.bind(opts[:tracker_settings])
+    dynamic_tool_binding = Keyword.get_lazy(opts, :dynamic_tool_binding, fn -> DynamicTool.bind(opts[:tracker_settings]) end)
 
     on_thread_intent = Keyword.get(opts, :on_thread_intent, fn -> :ok end)
     on_thread_started = Keyword.get(opts, :on_thread_started, fn _id -> :ok end)
@@ -47,7 +52,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
            {:ok, thread_id} <-
              do_start_session(
                port,
@@ -133,7 +138,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         case await_turn_completion(
                port,
                on_message,
-               execution_context(tool_executor, thread_id, turn_id, dynamic_tool_binding),
+               Map.put(execution_context(tool_executor, thread_id, turn_id, dynamic_tool_binding), :deadline, opts[:deadline]),
                auto_approve_requests
              ) do
           {:ok, result} ->
@@ -167,6 +172,148 @@ defmodule SymphonyElixir.Codex.AppServer do
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
+    end
+  end
+
+  @doc "Run the task's native Goal; automatic Goal turns belong to this executor, not a UI parent."
+  @spec run_goal(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def run_goal(session, objective, issue, opts \\ []) do
+    handler = Keyword.get(opts, :on_message, &default_on_message/1)
+
+    executor = fn tool, arguments ->
+      DynamicTool.execute(tool, arguments, session.dynamic_tool_binding, issue: issue)
+    end
+
+    with {:ok, existing} <- read_goal(session),
+         :ok <- resumable_goal(existing, opts) do
+      Keyword.get(opts, :before_goal, fn -> :ok end).()
+
+      context =
+        execution_context(executor, session.thread_id, nil, session.dynamic_tool_binding)
+        |> Map.merge(%{
+          goal_mode: true,
+          goal_status: "active",
+          goal_ack: false,
+          goal_running: false,
+          goal_stop_requested: nil,
+          deadline: opts[:deadline],
+          handoff_status: Keyword.get(opts, :handoff_status, fn -> nil end)
+        })
+
+      send_message(session.port, %{
+        "id" => @goal_start_id,
+        "method" => "thread/goal/set",
+        "params" => %{
+          "threadId" => session.thread_id,
+          "objective" => if(existing, do: existing["objective"], else: objective),
+          "status" => "active",
+          "origin" => "user"
+        }
+      })
+
+      result =
+        try do
+          receive_loop(session.port, handler, Config.settings!().codex.turn_timeout_ms, "", context, session.auto_approve_requests)
+        rescue
+          error -> {:error, {:goal_stream_failed, Exception.message(error)}}
+        end
+
+      case result do
+        {:ok, _} ->
+          Keyword.get(opts, :on_goal_stopped, fn _ -> :ok end).(true)
+          result
+
+        {:error, _} ->
+          confirmed = stop_goal_after_error(session, opts)
+          Keyword.get(opts, :on_goal_stopped, fn _ -> :ok end).(confirmed)
+          result
+      end
+    end
+  end
+
+  defp read_goal(session) do
+    send_message(session.port, %{"id" => @goal_read_id, "method" => "thread/goal/get", "params" => %{"threadId" => session.thread_id}})
+
+    case await_response(session.port, @goal_read_id) do
+      {:ok, %{"goal" => nil}} ->
+        {:ok, nil}
+
+      {:ok, %{"goal" => goal}} ->
+        if valid_goal?(goal, session.thread_id), do: {:ok, goal}, else: {:error, :invalid_goal_response}
+
+      {:ok, result} ->
+        {:error, {:invalid_goal_response, result}}
+
+      error ->
+        error
+    end
+  end
+
+  defp valid_goal?(goal, thread_id) do
+    is_map(goal) and goal["threadId"] == thread_id and
+      goal["status"] in ["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"] and
+      is_binary(goal["objective"])
+  end
+
+  defp resumable_goal(nil, _opts), do: :ok
+  defp resumable_goal(%{"status" => "active"}, _opts), do: :ok
+
+  defp resumable_goal(%{"status" => status}, opts) do
+    if opts[:resume_goal] == true and status in ["blocked", "complete"],
+      do: :ok,
+      else: {:error, {:native_goal_requires_explicit_resume, status}}
+  end
+
+  defp stop_goal_after_error(session, opts) do
+    turn_id = Keyword.get(opts, :latest_turn, fn -> nil end).()
+
+    with {:ok, goal} <- halt_goal(session),
+         true <- goal["threadId"] == session.thread_id do
+      emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
+
+      if is_binary(turn_id) do
+        send_message(session.port, %{
+          "id" => @goal_interrupt_id,
+          "method" => "turn/interrupt",
+          "params" => %{"threadId" => session.thread_id, "turnId" => turn_id}
+        })
+
+        await_response(session.port, @goal_interrupt_id)
+      end
+
+      send_message(session.port, %{
+        "id" => @goal_inspect_id,
+        "method" => "thread/read",
+        "params" => %{"threadId" => session.thread_id, "includeTurns" => true}
+      })
+
+      case await_response(session.port, @goal_inspect_id) do
+        {:ok, %{"thread" => thread}} -> thread["id"] == session.thread_id and reconciled_turn?(thread, turn_id || :no_turns)
+        _ -> false
+      end
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp halt_goal(session) do
+    with {:ok, goal} when is_map(goal) <- read_goal(session) do
+      if goal["status"] in ["paused", "blocked", "usageLimited", "budgetLimited", "complete"] do
+        {:ok, goal}
+      else
+        send_message(session.port, %{
+          "id" => @goal_stop_id,
+          "method" => "thread/goal/set",
+          "params" => %{"threadId" => session.thread_id, "status" => "blocked", "origin" => "automatic"}
+        })
+
+        case await_response(session.port, @goal_stop_id) do
+          {:ok, %{"goal" => goal}} -> {:ok, goal}
+          error -> error
+        end
+      end
     end
   end
 
@@ -337,11 +484,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
+  defp session_policies(workspace, nil, opts) do
+    if Keyword.get(opts, :review_only, false) do
+      {:ok, %{approval_policy: "never", thread_sandbox: "read-only", turn_sandbox_policy: %{"type" => "readOnly"}}}
+    else
+      Config.codex_runtime_settings(workspace)
+    end
   end
 
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
+  defp session_policies(workspace, worker_host, _opts) when is_binary(worker_host) do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
@@ -364,7 +515,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         "threadId" => thread_id,
         "cwd" => workspace,
         "approvalPolicy" => policies.approval_policy,
-        "sandbox" => policies.thread_sandbox
+        "sandbox" => policies.thread_sandbox,
+        "config" => thread_sandbox_config(policies)
       }
     })
 
@@ -396,7 +548,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp start_thread(
          port,
          workspace,
-         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox} = policies,
          dynamic_tool_binding
        ) do
     send_message(port, %{
@@ -405,6 +557,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
+        "config" => thread_sandbox_config(policies),
         "cwd" => workspace,
         "dynamicTools" => dynamic_tool_binding.tool_specs
       }
@@ -421,6 +574,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         other
     end
   end
+
+  # Native Goal turns use thread defaults rather than explicit turn/start policy.
+  defp thread_sandbox_config(%{thread_sandbox: "workspace-write", turn_sandbox_policy: policy}) do
+    %{
+      "sandbox_workspace_write.network_access" => policy["networkAccess"] == true,
+      "sandbox_workspace_write.writable_roots" => policy["writableRoots"] || [],
+      "sandbox_workspace_write.exclude_slash_tmp" => policy["excludeSlashTmp"] == true,
+      "sandbox_workspace_write.exclude_tmpdir_env_var" => policy["excludeTmpdirEnvVar"] == true
+    }
+  end
+
+  defp thread_sandbox_config(_policies), do: %{}
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{
@@ -459,6 +624,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    remaining = if tool_executor[:deadline], do: max(0, tool_executor.deadline - System.monotonic_time(:millisecond)), else: timeout_ms
+    wait_ms = min(timeout_ms, remaining)
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
@@ -477,8 +645,9 @@ defmodule SymphonyElixir.Codex.AppServer do
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
-        {:error, :turn_timeout}
+      wait_ms ->
+        reason = if tool_executor[:deadline] && System.monotonic_time(:millisecond) >= tool_executor.deadline, do: :execution_budget_exhausted, else: :turn_timeout
+        {:error, reason}
     end
   end
 
@@ -487,10 +656,21 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(raw) do
       {:ok, %{"method" => _method} = payload} ->
-        if root_event?(payload, context) do
-          handle_decoded_result(port, on_message, {:ok, payload}, raw, timeout_ms, context, auto_approve_requests)
+        if goal_event?(payload, context) do
+          handle_goal_event(port, on_message, payload, timeout_ms, context, auto_approve_requests)
         else
-          handle_unscoped_event(port, on_message, payload, timeout_ms, context, auto_approve_requests)
+          if root_event?(payload, context) do
+            handle_decoded_result(port, on_message, {:ok, payload}, raw, timeout_ms, context, auto_approve_requests)
+          else
+            handle_unscoped_event(port, on_message, payload, timeout_ms, context, auto_approve_requests)
+          end
+        end
+
+      {:ok, %{"id" => id} = payload} when id in [@goal_start_id, @goal_stop_id] ->
+        if context[:goal_mode] do
+          handle_goal_reply(port, on_message, payload, timeout_ms, context, auto_approve_requests)
+        else
+          handle_decoded_result(port, on_message, {:ok, payload}, raw, timeout_ms, context, auto_approve_requests)
         end
 
       decoded ->
@@ -505,6 +685,87 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
     end
   end
+
+  defp goal_event?(payload, %{goal_mode: true} = context) do
+    params = payload["params"] || %{}
+    params["threadId"] == context.thread_id and payload["method"] in ["thread/goal/updated", "thread/goal/cleared", "turn/started"]
+  end
+
+  defp goal_event?(_payload, _context), do: false
+
+  defp handle_goal_event(_port, _handler, %{"method" => "thread/goal/cleared"}, _timeout, _context, _auto),
+    do: {:error, :native_goal_cleared}
+
+  defp handle_goal_event(port, handler, %{"method" => "thread/goal/updated", "params" => %{"goal" => goal}}, timeout, context, auto) do
+    if goal["threadId"] == context.thread_id and goal["status"] in ["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"] do
+      emit_message(handler, :goal_updated, %{goal: goal}, port_metadata(port, nil))
+      finish_or_wait_goal(port, handler, timeout, %{context | goal_status: goal["status"]}, auto)
+    else
+      {:error, :invalid_native_goal_identity}
+    end
+  end
+
+  defp handle_goal_event(port, handler, %{"method" => "turn/started", "params" => %{"turn" => %{"id" => turn_id}}}, timeout, context, auto)
+       when is_binary(turn_id) do
+    cond do
+      context.goal_running and context.turn_id == turn_id ->
+        receive_loop(port, handler, timeout, "", context, auto)
+
+      context.goal_running ->
+        {:error, :overlapping_native_goal_turns}
+
+      true ->
+        emit_message(handler, :session_started, %{thread_id: context.thread_id, turn_id: turn_id, session_id: context.thread_id <> "-" <> turn_id}, port_metadata(port, nil))
+        context = %{context | turn_id: turn_id, goal_running: true}
+
+        if context.goal_stop_requested do
+          send_message(port, %{"id" => @goal_interrupt_id, "method" => "turn/interrupt", "params" => %{"threadId" => context.thread_id, "turnId" => turn_id}})
+        end
+
+        receive_loop(port, handler, timeout, "", context, auto)
+    end
+  end
+
+  defp handle_goal_event(_port, _handler, _payload, _timeout, _context, _auto), do: {:error, :invalid_native_goal_event}
+
+  defp handle_goal_reply(_port, _handler, %{"error" => error}, _timeout, _context, _auto), do: {:error, {:goal_request_failed, error}}
+
+  defp handle_goal_reply(port, handler, %{"result" => %{"goal" => goal}}, timeout, context, auto) do
+    if valid_goal?(goal, context.thread_id) do
+      emit_message(handler, :goal_updated, %{goal: goal}, port_metadata(port, nil))
+      finish_or_wait_goal(port, handler, timeout, %{context | goal_ack: true, goal_status: goal["status"]}, auto)
+    else
+      {:error, :invalid_native_goal_identity}
+    end
+  end
+
+  defp handle_goal_reply(_port, _handler, _payload, _timeout, _context, _auto), do: {:error, :invalid_goal_response}
+
+  defp finish_or_wait_goal(port, handler, timeout, context, auto) do
+    if context.goal_ack and not context.goal_running and context.goal_status != "active" do
+      {:ok, %{goal_status: context.goal_status, thread_id: context.thread_id, turn_id: context.turn_id}}
+    else
+      receive_loop(port, handler, timeout, "", context, auto)
+    end
+  end
+
+  defp maybe_request_goal_handoff(port, %{goal_mode: true, goal_stop_requested: nil} = context) do
+    case context.handoff_status.() do
+      status when status in ["complete", "blocked"] ->
+        send_message(port, %{
+          "id" => @goal_stop_id,
+          "method" => "thread/goal/set",
+          "params" => %{"threadId" => context.thread_id, "status" => status, "origin" => "automatic"}
+        })
+
+        %{context | goal_stop_requested: status}
+
+      _ ->
+        context
+    end
+  end
+
+  defp maybe_request_goal_handoff(_port, context), do: context
 
   defp handle_unscoped_event(port, on_message, %{"id" => id, "method" => "item/tool/call"} = payload, timeout, context, auto) do
     result = %{
@@ -551,6 +812,10 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp thread_matches?(nil, context), do: not context.strict
   defp thread_matches?(thread, context), do: thread == context.thread_id
+
+  defp turn_matches?(_turn, %{"method" => method}, %{goal_mode: true, goal_running: false})
+       when method in ["turn/completed", "turn/failed", "turn/cancelled"], do: false
+
   defp turn_matches?(nil, payload, context), do: not context.strict or (not terminal_event?(payload) and not Map.has_key?(payload, "id"))
   defp turn_matches?(turn, _payload, context), do: turn == context.turn_id
 
@@ -561,7 +826,18 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(handler, :turn_completed, payload, raw, port, payload)
 
-        terminal_turn_result(payload, context.strict)
+        if context[:goal_mode] do
+          result = terminal_turn_result(payload, context.strict)
+
+          if match?({:ok, _}, result) or (context.goal_stop_requested && get_in(payload, ["params", "turn", "status"]) == "interrupted") do
+            context = maybe_request_goal_handoff(port, %{context | goal_running: false})
+            finish_or_wait_goal(port, handler, timeout, context, auto)
+          else
+            result
+          end
+        else
+          terminal_turn_result(payload, context.strict)
+        end
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -686,7 +962,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        context = maybe_request_goal_handoff(port, tool_executor)
+        receive_loop(port, on_message, timeout_ms, "", context, auto_approve_requests)
 
       :approval_required ->
         emit_message(

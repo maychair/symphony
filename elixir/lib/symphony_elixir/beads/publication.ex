@@ -23,7 +23,7 @@ defmodule SymphonyElixir.Beads.Publication do
     {label, paths} = authority(settings, issue, operation)
     remote_name = settings.provider["git_remote"] || "origin"
 
-    with :ok <- authorized_task(settings, issue, label),
+    with :ok <- authorized_task(settings, issue, label, operation),
          :ok <- authorized_paths(issue, paths, label),
          true <- Enum.all?(paths, &safe_path?/1) || {:error, :invalid_publication_paths},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
@@ -49,7 +49,8 @@ defmodule SymphonyElixir.Beads.Publication do
 
   defp authority(settings, issue, :checkpoint) do
     if "symphony:checkpoint" in issue.labels do
-      {"symphony:checkpoint", settings.provider["checkpoint_paths"] || []}
+      paths = get_in(settings.provider, ["checkpoint_paths_by_issue", issue.id]) || settings.provider["checkpoint_paths"] || []
+      {"symphony:checkpoint", paths}
     else
       authority(settings, issue, :publish)
     end
@@ -61,14 +62,32 @@ defmodule SymphonyElixir.Beads.Publication do
     if label in issue.labels and is_list(paths) and paths != [], do: :ok, else: {:error, :publication_not_authorized}
   end
 
-  defp authorized_task(settings, issue, label) do
+  defp authorized_task(settings, issue, label, operation) do
     with {:ok, [current]} <- Adapter.command(settings, ["show", issue.id, "--json"]),
          true <-
            (current["status"] == "in_progress" and current["assignee"] == issue.assignee_id and
               label in (current["labels"] || [])) || {:error, :publication_not_currently_authorized},
-         {:ok, %{closed: false}} <- SourceIssue.read(settings, current["external_ref"] || "") do
+         :ok <- source_authority(settings, current, operation) do
       :ok
     else
+      {:error, _} = error -> error
+      _ -> {:error, :publication_source_not_open}
+    end
+  end
+
+  defp source_authority(settings, current, :checkpoint) do
+    if settings.provider["allow_local_checkpoint"] == true and current["external_ref"] in [nil, ""] do
+      :ok
+    else
+      open_source(settings, current)
+    end
+  end
+
+  defp source_authority(settings, current, :publish), do: open_source(settings, current)
+
+  defp open_source(settings, current) do
+    case SourceIssue.read(settings, current["external_ref"] || "") do
+      {:ok, %{closed: false}} -> :ok
       {:error, _} = error -> error
       _ -> {:error, :publication_source_not_open}
     end
