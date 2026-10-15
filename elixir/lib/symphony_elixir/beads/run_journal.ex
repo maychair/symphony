@@ -80,6 +80,16 @@ defmodule SymphonyElixir.Beads.RunJournal do
     if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
   end
 
+  defp admission(%{"phase" => "completed", "thread_id" => thread, "turn_id" => nil, "turn_count" => 0, "recovery" => "operator confirmed stopped; native resume proved idle"} = record, issue_id)
+       when is_binary(thread) do
+    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
+  end
+
+  defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_turn_recovered" => true, "abandoned_pre_turn_thread_id" => abandoned} = record, issue_id)
+       when is_binary(abandoned) do
+    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
+  end
+
   defp admission(_record, _issue_id), do: {:error, :uncertain_or_awaiting_run}
 
   defp key(issue_id), do: Base.encode16(:crypto.hash(:sha256, issue_id), case: :lower)

@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Beads.RemoteReview do
   @moduledoc "Read current PR/MR facts through the operator's native authenticated CLIs."
-  alias SymphonyElixir.Beads.Acceptance
+  alias SymphonyElixir.Beads.{Acceptance, Repository}
 
   @github_query """
   query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){
@@ -16,25 +16,33 @@ defmodule SymphonyElixir.Beads.RemoteReview do
   @spec fetch(map(), String.t()) :: {:ok, map()} | {:error, term()}
   def fetch(settings, url) do
     with :ok <- Acceptance.validate_review_scope(settings, url) do
-      case URI.parse(url) do
-        %URI{host: "github.com", path: path} -> github(path)
-        %URI{host: "gitlab.com", path: path} -> gitlab(path)
-        _ -> {:error, :unsupported_review_host}
-      end
+      fetch_repository(settings, URI.parse(url), url)
     end
+  end
+
+  defp fetch_repository(_settings, %URI{host: "github.com", path: path}, _url), do: github(path)
+
+  defp fetch_repository(settings, %URI{host: host, path: path}, url) do
+    if Repository.gitlab_url?(settings, url), do: gitlab(path, host), else: {:error, :unsupported_review_host}
   end
 
   defp github(path) do
     [_, owner, name, number] = Regex.run(~r{^/([^/]+)/([^/]+)/pull/(\d+)$}, path)
 
-    with {:ok, result} <- json_command("gh", ["api", "graphql", "-f", "query=" <> @github_query, "-f", "owner=" <> owner, "-f", "name=" <> name, "-F", "number=" <> number]),
+    variables = ["-f", "owner=" <> owner, "-f", "name=" <> name, "-F", "number=" <> number]
+    args = ["api", "graphql", "-f", "query=" <> @github_query] ++ variables
+
+    with {:ok, result} <- json_command("gh", args),
          nil <- result["errors"],
          %{} = pr <- get_in(result, ["data", "repository", "pullRequest"]),
          :ok <- complete_threads(pr["reviewThreads"]),
          {:ok, checks} <- github_checks(pr) do
       threads = Enum.reject(pr["reviewThreads"]["nodes"], & &1["isResolved"])
       feedback = %{threads: threads, changes_requested: pr["reviewDecision"] == "CHANGES_REQUESTED", checks: checks}
-      {:ok, %{url: pr["url"], state: String.downcase(pr["state"]), head: pr["headRefOid"], actor: get_in(pr, ["mergedBy", "login"]), proof: pr, feedback: feedback}}
+      state = String.downcase(pr["state"])
+      actor = get_in(pr, ["mergedBy", "login"])
+      review = %{url: pr["url"], state: state, head: pr["headRefOid"], actor: actor, proof: pr, feedback: feedback}
+      {:ok, review}
     else
       {:error, _} = error -> error
       _ -> {:error, :incomplete_remote_review}
@@ -60,12 +68,12 @@ defmodule SymphonyElixir.Beads.RemoteReview do
     end
   end
 
-  defp gitlab(path) do
+  defp gitlab(path, host) do
     [_, project, number] = Regex.run(~r{^/(.+)/-/merge_requests/(\d+)$}, path)
     endpoint = "projects/" <> URI.encode_www_form(project) <> "/merge_requests/" <> number
 
-    with {:ok, mr} <- json_command("glab", ["api", endpoint]),
-         {:ok, pages} <- json_command("glab", ["api", "--paginate", "--output", "json", endpoint <> "/discussions?per_page=100"]),
+    with {:ok, mr} <- json_command("glab", ["api", "--hostname", host, endpoint]),
+         {:ok, pages} <- json_command("glab", ["api", "--hostname", host, "--paginate", "--output", "json", endpoint <> "/discussions?per_page=100"]),
          true <- is_list(pages) || {:error, :invalid_gitlab_discussions} do
       threads = Enum.filter(pages, fn thread -> Enum.any?(thread["notes"] || [], &(&1["resolvable"] == true and &1["resolved"] != true)) end)
 
@@ -76,7 +84,8 @@ defmodule SymphonyElixir.Beads.RemoteReview do
         end
 
       feedback = %{threads: threads, changes_requested: mr["detailed_merge_status"] == "requested_changes", checks: checks}
-      {:ok, %{url: mr["web_url"], state: mr["state"], head: mr["sha"], actor: get_in(mr, ["merge_user", "username"]), proof: mr, feedback: feedback}}
+      actor = get_in(mr, ["merge_user", "username"]) || get_in(mr, ["merged_by", "username"])
+      {:ok, %{url: mr["web_url"], state: mr["state"], head: mr["sha"], actor: actor, proof: mr, feedback: feedback}}
     end
   end
 
@@ -100,13 +109,15 @@ defmodule SymphonyElixir.Beads.RemoteReview do
       {:error, _} ->
         output
         |> String.split("\n", trim: true)
-        |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
-          case Jason.decode(line) do
-            {:ok, values} when is_list(values) -> {:cont, {:ok, acc ++ values}}
-            {:ok, value} when is_map(value) -> {:cont, {:ok, acc ++ [value]}}
-            _ -> {:halt, {:error, :invalid_remote_json}}
-          end
-        end)
+        |> Enum.reduce_while({:ok, []}, &decode_page/2)
+    end
+  end
+
+  defp decode_page(line, {:ok, acc}) do
+    case Jason.decode(line) do
+      {:ok, values} when is_list(values) -> {:cont, {:ok, acc ++ values}}
+      {:ok, value} when is_map(value) -> {:cont, {:ok, acc ++ [value]}}
+      _ -> {:halt, {:error, :invalid_remote_json}}
     end
   end
 

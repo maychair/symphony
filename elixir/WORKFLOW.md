@@ -331,3 +331,5 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 For the Beads provider contract and bounded native development loop, use the separate [Beads example](WORKFLOW.beads.md) and [provider guide](docs/beads.md).
 
 For the optional Beads provider, `remote_reconcile: true` enables event hints plus polling, same-session repair and manual-merge acceptance. Publication additionally requires explicit task/paths authorization. See [Beads contract](docs/beads.md).
+
+Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](docs/beads.md).

@@ -172,3 +172,29 @@ commit/push/PR retry inspects actual Git and remote facts.
 GitLab read/reconciliation code is present; real GitLab validation requires a
 separately authorized account/project. The current real smoke targets the
 operator's GitHub fork only. No company GitLab repository is used.
+
+## Self-managed GitLab
+
+Set `tracker.provider.gitlab_web_url` to the exact GitLab web origin (HTTPS by
+default; HTTP requires explicit configuration), and `review_repository` to
+`host/group/project`. Issue, MR and webhook origins must match; API calls select
+the native credential profile explicitly with `glab api --hostname HOST`. Nested
+groups are supported. Authentication and API transport remain owned by glab.
+
+Host publication supports GitLab with `git_remote` (default `origin`),
+`publish_base` (default `main`) and the existing exact `publish_paths` allowlist.
+The configured remote URL must match the configured repository; GitLab uses
+native Git/SSH credentials, never GitHub's credential helper. MR creation uses a
+JSON request with explicit Content-Type. Only one matching open same-project MR
+is reused. Publication still never merges; task-specific operator authorization
+and verification remain separate from scheduler reconciliation.
+
+Before-first-turn recovery is an explicit exception to the complete-ID gate: a
+stopped executor with a durable thread-ready checkpoint, zero turns and no turn
+identity can be inspected. A persisted idle thread must prove an empty turn
+list; if the native server explicitly reports no rollout for that exact allocated
+thread ID, the journal retains the abandoned allocation and permits a new thread.
+No unknown turn-start intent is replayed. Guarded ownership remains unchanged.
+An unstarted source Issue that becomes available again releases an in-memory
+block only when its journal proves no Run exists. Rebuild the escript after
+source changes; compiling modules alone does not refresh bin/symphony.

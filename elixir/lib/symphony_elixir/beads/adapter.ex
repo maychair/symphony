@@ -200,10 +200,7 @@ defmodule SymphonyElixir.Beads.Adapter do
 
     case Task.yield(task, settings.provider["timeout_ms"] || 15_000) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, 0}} ->
-        case Jason.decode(output) do
-          {:ok, value} -> {:ok, value}
-          {:error, _} -> {:error, {:invalid_beads_json, List.first(args)}}
-        end
+        decode_command(output, args)
 
       {:ok, {:error, message}} ->
         {:error, {:beads_command_failed, message}}
@@ -216,6 +213,13 @@ defmodule SymphonyElixir.Beads.Adapter do
     end
   rescue
     error in [ErlangError, ArgumentError] -> {:error, {:beads_command_failed, Exception.message(error)}}
+  end
+
+  defp decode_command(output, args) do
+    case Jason.decode(output) do
+      {:ok, value} -> {:ok, value}
+      {:error, _} -> {:error, {:invalid_beads_json, List.first(args)}}
+    end
   end
 
   defp run_command(executable, args, directory, settings) do
@@ -255,13 +259,18 @@ defmodule SymphonyElixir.Beads.Adapter do
          true <- String.match?(sha, ~r/^[a-fA-F0-9]{40,64}$/) || {:error, :invalid_delivery_commit},
          {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
          true <- record["owner"] == issue.assignee_id || {:error, :delivery_owner_mismatch},
-         {:ok, _} <- RunJournal.checkpoint(record, %{"delivery" => %{"review_url" => url, "head_sha" => sha, "attempt_id" => record["attempt_id"], "turn_id" => record["turn_id"]}}) do
+         {:ok, _} <- bind_delivery(record, url, sha) do
       :ok
     end
   end
 
   defp record_delivery(_settings, _issue, arguments) do
     if Map.has_key?(arguments, "review_url") or Map.has_key?(arguments, "head_sha"), do: {:error, :incomplete_delivery}, else: :ok
+  end
+
+  defp bind_delivery(record, url, sha) do
+    delivery = %{"review_url" => url, "head_sha" => sha, "attempt_id" => record["attempt_id"], "turn_id" => record["turn_id"]}
+    RunJournal.checkpoint(record, %{"delivery" => delivery})
   end
 
   defp freeze_settings(settings) do
@@ -299,7 +308,7 @@ defmodule SymphonyElixir.Beads.Adapter do
   end
 
   defp claim(settings, issue, record) do
-    expected = if record["thread_id"], do: record["owner"], else: ""
+    expected = if record["thread_id"] || record["pre_turn_recovered"], do: record["owner"], else: ""
 
     case command(settings, ["update", issue.id, "--if-assignee", expected, "--if-status", issue.state, "--assignee", record["owner"], "--status", "in_progress", "--json"]) do
       {:ok, _} -> :ok
