@@ -111,13 +111,14 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:retain, :boolean, default: false)
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :retain], empty_values: [])
     end
   end
 
@@ -425,17 +426,7 @@ defmodule SymphonyElixir.Config.Schema do
           {settings.tracker.api_key, settings.tracker.assignee, provider, []}
       end
 
-    {active_states, terminal_states} =
-      case settings.tracker.kind do
-        kind when kind in ["linear", "memory"] ->
-          {
-            settings.tracker.active_states || @linear_active_states,
-            settings.tracker.terminal_states || @linear_terminal_states
-          }
-
-        _ ->
-          {settings.tracker.active_states, settings.tracker.terminal_states}
-      end
+    {active_states, terminal_states} = tracker_states(settings)
 
     tracker = %{
       settings.tracker
@@ -461,6 +452,22 @@ defmodule SymphonyElixir.Config.Schema do
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
+  end
+
+  defp tracker_states(settings) do
+    case settings.tracker.kind do
+      "beads" ->
+        {settings.tracker.active_states || ["open", "in_progress"], settings.tracker.terminal_states || ["closed"]}
+
+      kind when kind in ["linear", "memory"] ->
+        {
+          settings.tracker.active_states || @linear_active_states,
+          settings.tracker.terminal_states || @linear_terminal_states
+        }
+
+      _ ->
+        {settings.tracker.active_states, settings.tracker.terminal_states}
+    end
   end
 
   defp normalize_keys(value) when is_map(value) do

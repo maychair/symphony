@@ -70,6 +70,7 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
         run_terminal_workspace_cleanup()
+        state = restore_beads_gates(state)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -117,6 +118,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    :ok = SymphonyElixir.Beads.Reconciler.poll(Config.settings!().tracker)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -205,7 +207,48 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  defp restore_beads_gates(state) do
+    if Config.settings!().tracker.kind == "beads" do
+      case Tracker.fetch_issues_by_states(["blocked"]) do
+        {:ok, issues} ->
+          Enum.reduce(issues, state, &restore_beads_gate/2)
+
+        {:error, reason} ->
+          Logger.warning("Beads gate restoration failed reason=#{inspect(reason)}")
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp restore_beads_gate(issue, state) do
+    required = Config.settings!().tracker.required_labels
+
+    if "human" in issue.labels and Enum.all?(required, &(&1 in issue.labels)) do
+      block_issue_from_entry(state, issue.id, %{identifier: issue.identifier, issue: issue}, "awaiting human acceptance")
+    else
+      state
+    end
+  end
+
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
+    if Config.settings!().tracker.kind == "beads" do
+      block_issue_from_entry(state, issue_id, running_entry, "awaiting human acceptance or run reconciliation")
+    else
+      handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+    if Config.settings!().tracker.kind == "beads" do
+      block_issue_from_entry(state, issue_id, running_entry, "run requires human reconciliation: #{inspect(reason)}")
+    else
+      handle_provider_agent_down(reason, state, issue_id, running_entry, session_id)
+    end
+  end
+
+  defp handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
     else
@@ -223,7 +266,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
+  defp handle_provider_agent_down(reason, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
     else
@@ -425,6 +468,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
+      beads_human_gate?(issue) ->
+        refresh_running_issue_state(state, issue)
+
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
@@ -460,8 +506,15 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
         release_issue_claim(state, issue.id)
 
+      beads_human_gate?(issue) ->
+        refresh_blocked_issue_state(state, issue)
+
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
+        release_issue_claim(state, issue.id)
+
+      active_issue_state?(issue.state, active_states) and Config.settings!().tracker.kind == "beads" and
+          get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) == "resumed" ->
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -474,6 +527,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp beads_human_gate?(issue) do
+    settings = Config.settings!().tracker
+
+    settings.kind == "beads" and issue.state == "blocked" and "human" in issue.labels and
+      get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) == "awaiting_human" and
+      Enum.all?(settings.required_labels, &(&1 in issue.labels))
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do

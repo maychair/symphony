@@ -403,3 +403,9 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+## Beads tracker
+
+For a scoped local Beads development loop with durable native Codex identities, retained Git worktrees and explicit merged-review/human acceptance, see [the Beads guide](docs/beads.md) and [example workflow](WORKFLOW.beads.md).
+
+For event-driven Beads tasks, configure `remote_reconcile`, `accepted_merge_actors`, `required_checks` and repair/run budgets. The host never merges; it reconciles a developer merge before closing the linked Issue and Bead. Native CLI credentials and webhook secrets stay outside source. See [operation](docs/beads.md).

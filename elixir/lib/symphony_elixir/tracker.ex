@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Tracker do
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
+    "beads" => SymphonyElixir.Beads.Adapter,
     "asana" => SymphonyElixir.Asana.Adapter,
     "github" => SymphonyElixir.GitHub.Adapter,
     "gitlab" => SymphonyElixir.GitLab.Adapter,
@@ -26,9 +27,38 @@ defmodule SymphonyElixir.Tracker do
   @callback secret_environment_names(map()) :: [String.t()]
   @callback validate_config(map()) :: :ok | {:error, term()}
 
-  @optional_callbacks agent_tool_specs: 0,
-                      execute_agent_tool: 3,
-                      validate_config: 1
+  @callback prepare_run(Issue.t(), keyword()) :: {:ok, Issue.t(), keyword()} | {:error, term()}
+  @callback finish_run(Issue.t(), keyword(), term()) :: :ok | {:error, term()}
+  @callback agent_environment(map()) :: map()
+
+  @optional_callbacks [
+    prepare_run: 2,
+    finish_run: 3,
+    agent_environment: 1,
+    agent_tool_specs: 0,
+    execute_agent_tool: 3,
+    validate_config: 1
+  ]
+
+  @spec prepare_run(Issue.t(), keyword()) :: {:ok, Issue.t(), keyword()} | {:error, term()}
+  def prepare_run(issue, opts) do
+    selected = adapter()
+    optional(selected, :prepare_run, [issue, Keyword.put(opts, :tracker_adapter, selected)], {:ok, issue, opts})
+  end
+
+  @spec finish_run(Issue.t(), keyword(), term()) :: :ok | {:error, term()}
+  def finish_run(issue, opts, result) do
+    selected = opts[:tracker_adapter] || adapter()
+    optional(selected, :finish_run, [issue, opts, result], :ok)
+  end
+
+  defp optional(adapter, callback, args, fallback) do
+    if Code.ensure_loaded?(adapter) and function_exported?(adapter, callback, length(args)) do
+      apply(adapter, callback, args)
+    else
+      fallback
+    end
+  end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
@@ -45,12 +75,13 @@ defmodule SymphonyElixir.Tracker do
   app-server session so tool advertisement and execution cannot drift across a
   workflow reload.
   """
-  @spec bind_agent_tools() :: map()
-  def bind_agent_tools do
-    tracker_settings = Config.settings!().tracker
+  @spec bind_agent_tools(map() | nil) :: map()
+  def bind_agent_tools(tracker_settings \\ nil) do
+    tracker_settings = tracker_settings || Config.settings!().tracker
     adapter = adapter_for_settings!(tracker_settings)
 
     %{
+      agent_environment: optional(adapter, :agent_environment, [tracker_settings], %{}),
       adapter: adapter,
       tracker_settings: tracker_settings,
       tool_specs: adapter_agent_tool_specs(adapter),

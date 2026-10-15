@@ -923,7 +923,7 @@ Failure semantics:
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
-- `before_remove` failure or timeout is logged and ignored.
+- `before_remove` failure or timeout is logged and vetoes workspace removal.
 
 ### 9.5 Safety Invariants
 
@@ -2094,7 +2094,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
-- `before_remove` hook runs on cleanup and failures/timeouts are ignored
+- `before_remove` hook runs on cleanup and failures/timeouts veto removal
 - Workspace path sanitization, stable original-identifier-hash collision resistance, and root
   containment invariants are enforced before agent launch
 - Identifiers unchanged by sanitization keep their deterministic workspace key; conformance tests
@@ -2310,3 +2310,7 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## Local Beads provider extension
+
+The Elixir implementation may use `tracker.kind: beads` with a mandatory routing label, explicit external database directory, guarded CLI claims and a separate execution checkpoint journal. Beads task goals remain authoritative. One native root turn delivers to a persisted blocked/human gate; terminal child events cannot complete the parent. Operator acceptance requires task-bound merged review evidence and explicit human identity; linked remote source Issues require explicit scoped closure before the bead closes. Unknown native execution is blocked on restart rather than duplicated. Git worktrees are retained. See `elixir/docs/beads.md` for configuration, recovery limits and the operator contract.

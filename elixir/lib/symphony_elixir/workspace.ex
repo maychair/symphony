@@ -23,7 +23,7 @@ defmodule SymphonyElixir.Workspace do
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
         case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
           :ok ->
-            {:ok, workspace}
+            with :ok <- mark_retained(workspace, worker_host), do: {:ok, workspace}
 
           {:error, _reason} = error ->
             cleanup_failed_new_workspace(workspace, created?, worker_host)
@@ -37,14 +37,24 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp mark_retained(workspace, nil) do
+    if retain_workspace?(), do: File.write(Path.join(workspace, ".symphony-retain"), "retained by Symphony\n"), else: :ok
+  end
+
+  defp mark_retained(_workspace, _host), do: :ok
+
   defp ensure_workspace(workspace, nil) do
     cond do
       File.dir?(workspace) ->
         {:ok, workspace, false}
 
       File.exists?(workspace) ->
-        File.rm_rf!(workspace)
-        create_workspace(workspace)
+        if retain_workspace?() do
+          {:error, {:workspace_path_occupied, workspace}}
+        else
+          File.rm_rf!(workspace)
+          create_workspace(workspace)
+        end
 
       true ->
         create_workspace(workspace)
@@ -59,9 +69,7 @@ defmodule SymphonyElixir.Workspace do
         "if [ -d \"$workspace\" ]; then",
         "  created=0",
         "elif [ -e \"$workspace\" ]; then",
-        "  rm -rf \"$workspace\"",
-        "  mkdir -p \"$workspace\"",
-        "  created=1",
+        "  exit 1",
         "else",
         "  mkdir -p \"$workspace\"",
         "  created=1",
@@ -85,7 +93,6 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp create_workspace(workspace) do
-    File.rm_rf!(workspace)
     File.mkdir_p!(workspace)
     {:ok, workspace, true}
   end
@@ -95,6 +102,27 @@ defmodule SymphonyElixir.Workspace do
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace, nil) do
+    if retain_workspace?() do
+      {:ok, []}
+    else
+      do_remove_local(workspace)
+    end
+  end
+
+  def remove(workspace, worker_host) when is_binary(worker_host) do
+    if retain_workspace?() do
+      {:ok, []}
+    else
+      do_remove_remote(workspace, worker_host)
+    end
+  end
+
+  defp retain_workspace? do
+    settings = Config.settings!()
+    settings.workspace.retain or settings.tracker.kind == "beads"
+  end
+
+  defp do_remove_local(workspace) do
     case File.exists?(workspace) do
       true ->
         case validate_workspace_path(workspace, nil) do
@@ -110,12 +138,18 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+  defp do_remove_remote(workspace, worker_host) do
+    case maybe_run_before_remove_hook(workspace, worker_host) do
+      :ok -> remove_remote_directory(workspace, worker_host)
+      {:error, reason} -> {:error, reason, workspace}
+    end
+  end
 
+  defp remove_remote_directory(workspace, worker_host) do
     script =
       [
         remote_shell_assign("workspace", workspace),
+        "if [ -f \"$workspace/.git\" ]; then exit 1; fi",
         "rm -rf \"$workspace\""
       ]
       |> Enum.join("\n")
@@ -157,8 +191,19 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
+    cond do
+      retain_workspace?() or File.exists?(Path.join(workspace, ".symphony-retain")) ->
+        {:ok, []}
+
+      File.regular?(Path.join(workspace, ".git")) ->
+        {:error, :git_worktree_requires_explicit_removal, workspace}
+
+      true ->
+        case maybe_run_before_remove_hook(workspace, nil) do
+          :ok -> File.rm_rf(workspace)
+          {:error, reason} -> {:error, reason, workspace}
+        end
+    end
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
@@ -307,7 +352,7 @@ defmodule SymphonyElixir.Workspace do
   defp cleanup_failed_new_workspace(_workspace, false, _worker_host), do: :ok
 
   defp cleanup_failed_new_workspace(workspace, true, nil) do
-    case File.rm_rf(workspace) do
+    case remove_local_workspace(workspace) do
       {:ok, _removed} ->
         :ok
 
@@ -317,7 +362,15 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp cleanup_failed_new_workspace(workspace, true, worker_host) when is_binary(worker_host) do
-    script = [remote_shell_assign("workspace", workspace), "rm -rf \"$workspace\""] |> Enum.join("\n")
+    if retain_workspace?() do
+      :ok
+    else
+      cleanup_remote_workspace(workspace, worker_host)
+    end
+  end
+
+  defp cleanup_remote_workspace(workspace, worker_host) do
+    script = [remote_shell_assign("workspace", workspace), "if [ -f \"$workspace/.git\" ]; then exit 1; fi", "rm -rf \"$workspace\""] |> Enum.join("\n")
 
     case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
       {:ok, {_output, 0}} ->
@@ -345,7 +398,6 @@ defmodule SymphonyElixir.Workspace do
               "before_remove",
               nil
             )
-            |> ignore_hook_failure()
         end
 
       false ->
@@ -387,7 +439,6 @@ defmodule SymphonyElixir.Workspace do
           {:error, reason} ->
             {:error, reason}
         end
-        |> ignore_hook_failure()
     end
   end
 
@@ -401,7 +452,7 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command], cd: workspace, env: issue_context[:agent_environment] || [], stderr_to_stdout: true)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -568,8 +619,12 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
+    native_ref = Map.get(issue, :native_ref) || %{}
+    environment = if is_binary(native_ref["beads_dir"]), do: [{"BEADS_DIR", native_ref["beads_dir"]}], else: []
+
     %{
+      agent_environment: environment,
       issue_id: issue_id,
       issue_identifier: identifier || "issue"
     }

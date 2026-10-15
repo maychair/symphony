@@ -900,7 +900,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "workspace remove continues when before_remove hook fails" do
+  test "workspace remove preserves when before_remove hook fails" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -919,13 +919,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-FAIL")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-FAIL")
-      refute File.exists?(workspace)
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook fails with large output" do
+  test "workspace remove preserves when before_remove hook fails with large output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -944,13 +944,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-LARGE-FAIL")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-LARGE-FAIL")
-      refute File.exists?(workspace)
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "workspace remove continues when before_remove hook times out" do
+  test "workspace remove preserves when before_remove hook times out" do
     previous_timeout = Application.get_env(:symphony_elixir, :workspace_hook_timeout_ms)
 
     on_exit(fn ->
@@ -976,12 +976,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_before_remove: "sleep 1"
+        hook_before_remove: "sleep 1",
+        hook_timeout_ms: 10
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS-TIMEOUT")
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS-TIMEOUT")
-      refute File.exists?(workspace)
+      assert File.exists?(workspace)
     after
       File.rm_rf(test_root)
     end
