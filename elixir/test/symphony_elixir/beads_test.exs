@@ -261,7 +261,7 @@ defmodule SymphonyElixir.BeadsTest do
         "beads_dir" => Adapter.beads_dir(settings),
         "thread_id" => "thread",
         "turn_id" => "turn",
-        "delivery" => %{"review_url" => url, "head_sha" => sha}
+        "delivery" => %{"review_url" => url, "head_sha" => sha, "attempt_id" => record["attempt_id"], "turn_id" => "turn"}
       })
 
     assert :ok = RunJournal.complete(record, "awaiting_human")
@@ -297,7 +297,7 @@ defmodule SymphonyElixir.BeadsTest do
         "beads_dir" => Adapter.beads_dir(settings),
         "thread_id" => "thread",
         "turn_id" => "turn",
-        "delivery" => %{"review_url" => url, "head_sha" => sha}
+        "delivery" => %{"review_url" => url, "head_sha" => sha, "attempt_id" => record["attempt_id"], "turn_id" => "turn"}
       })
 
     :ok = RunJournal.complete(record, "awaiting_human")

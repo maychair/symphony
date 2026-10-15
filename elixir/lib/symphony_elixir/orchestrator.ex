@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
+  alias SymphonyElixir.Beads.{Adapter, RunJournal}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -514,7 +515,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) and Config.settings!().tracker.kind == "beads" and
-          get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) == "resumed" ->
+          beads_dispatch_released?(issue) ->
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -527,6 +528,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp beads_dispatch_released?(issue) do
+    gate = get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"])
+    settings = Config.settings!().tracker
+    directory = RunJournal.directory(Adapter.journal_root(settings), issue.id)
+    gate == "resumed" or (gate == "ready" and RunJournal.read(directory) == {:ok, nil})
+  end
 
   defp beads_human_gate?(issue) do
     settings = Config.settings!().tracker

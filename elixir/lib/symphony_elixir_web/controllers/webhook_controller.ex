@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.WebhookController do
   use Phoenix.Controller, formats: [:json]
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
-  alias SymphonyElixir.Beads.Adapter
+  alias SymphonyElixir.Beads.{Adapter, Repository}
 
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
   def read_body(conn, opts) do
@@ -52,9 +52,15 @@ defmodule SymphonyElixirWeb.WebhookController do
   defp scope(settings, provider, payload) do
     repo =
       case provider do
-        "github" -> "github.com/" <> (get_in(payload, ["repository", "full_name"]) || "")
-        "gitlab" -> "gitlab.com/" <> (get_in(payload, ["project", "path_with_namespace"]) || "")
-        _ -> ""
+        "github" ->
+          "github.com/" <> (get_in(payload, ["repository", "full_name"]) || "")
+
+        "gitlab" ->
+          web_url = get_in(payload, ["project", "web_url"]) || ""
+          if Repository.gitlab_url?(settings, web_url), do: URI.parse(web_url).host <> "/" <> (get_in(payload, ["project", "path_with_namespace"]) || ""), else: ""
+
+        _ ->
+          ""
       end
 
     if repo == resolve(settings.provider["review_repository"]), do: :ok, else: {:error, :repository_mismatch}

@@ -299,7 +299,7 @@ defmodule SymphonyElixir.Beads.Adapter do
   end
 
   defp claim(settings, issue, record) do
-    expected = if record["thread_id"], do: record["owner"], else: ""
+    expected = if record["thread_id"] || record["pre_turn_recovered"], do: record["owner"], else: ""
 
     case command(settings, ["update", issue.id, "--if-assignee", expected, "--if-status", issue.state, "--assignee", record["owner"], "--status", "in_progress", "--json"]) do
       {:ok, _} -> :ok

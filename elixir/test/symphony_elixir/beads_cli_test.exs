@@ -59,7 +59,7 @@ defmodule SymphonyElixir.BeadsCLITest do
         "turn_id" => "cli-turn",
         "workspace" => workspace,
         "beads_dir" => database,
-        "delivery" => %{"review_url" => "https://github.com/example/repo/pull/1", "head_sha" => String.duplicate("a", 40)}
+        "delivery" => %{"review_url" => "https://github.com/example/repo/pull/1", "head_sha" => String.duplicate("a", 40), "attempt_id" => record["attempt_id"], "turn_id" => "cli-turn"}
       })
 
     :ok = RunJournal.complete(record, "awaiting_human")
@@ -112,5 +112,43 @@ defmodule SymphonyElixir.BeadsCLITest do
     {:ok, _} = RunJournal.checkpoint(record, %{"executor_os_pid" => "99999999"})
     assert :ok = Resume.run(args)
     assert Jason.decode!(File.read!(context.data))["status"] == "in_progress"
+  end
+
+  test "pre-turn recovery retains the exact absent allocation and permits fresh admission", context do
+    codex = Path.join(context.root, "codex-no-rollout")
+
+    File.write!(codex, """
+    #!/usr/bin/env python3
+    import json,sys
+    for line in sys.stdin:
+      request=json.loads(line)
+      if request.get('method')=='initialize':
+        print(json.dumps({'id':request['id'],'result':{}}),flush=True)
+      elif request.get('method')=='thread/resume':
+        print(json.dumps({'id':request['id'],'error':{'code':-32600,'message':'no rollout found for thread id cli-thread'}}),flush=True)
+    """)
+
+    File.chmod!(codex, 0o755)
+    text = String.replace(File.read!(Workflow.workflow_file_path()), "workspace:", "codex:\n  command: #{Jason.encode!(codex)}\nworkspace:")
+    File.write!(Workflow.workflow_file_path(), text)
+    :ok = WorkflowStore.force_reload()
+    {:ok, record} = RunJournal.read(context.record["directory"])
+    {:ok, _} = RunJournal.checkpoint(record, %{"executor_os_pid" => "99999999", "phase" => "thread_ready", "turn_id" => nil})
+    assert :ok = Resume.run(["--workflow", Workflow.workflow_file_path(), "--issue", "bd-cli", "--executor-stopped"])
+    {:ok, recovered} = RunJournal.read(context.record["directory"])
+    assert recovered["thread_id"] == nil
+    assert recovered["abandoned_pre_turn_thread_id"] == "cli-thread"
+    assert recovered["pre_turn_recovered"] == true
+    assert {:ok, next} = RunJournal.admit(Adapter.journal_root(Config.settings!().tracker), "bd-cli")
+    assert next["owner"] == record["owner"]
+  end
+
+  test "missing turn after turn-start intent never permits pre-turn recovery", context do
+    {:ok, record} = RunJournal.read(context.record["directory"])
+    {:ok, _} = RunJournal.checkpoint(record, %{"executor_os_pid" => "99999999", "phase" => "turn_start_intent", "turn_id" => nil})
+
+    assert_raise Mix.Error, ~r/missing_native_identity/, fn ->
+      Resume.run(["--workflow", Workflow.workflow_file_path(), "--issue", "bd-cli", "--executor-stopped"])
+    end
   end
 end

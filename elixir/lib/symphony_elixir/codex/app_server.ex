@@ -383,6 +383,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp reconciled_turn?(%{"turns" => []}, :no_turns), do: true
   defp reconciled_turn?(_thread, nil), do: true
 
   defp reconciled_turn?(thread, expected_turn) do

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.Beads.SourceIssue do
   @moduledoc "Bounded, explicit source Issue closure after verified delivery acceptance."
 
+  alias SymphonyElixir.Beads.Repository
+
   @spec read(map(), String.t()) :: {:ok, map()} | {:error, term()}
   def read(settings, url) do
     with {:ok, source} <- source(settings, url),
@@ -26,8 +28,8 @@ defmodule SymphonyElixir.Beads.SourceIssue do
       %URI{scheme: "https", host: "github.com", path: path, query: nil, fragment: nil} ->
         github_source(path, configured)
 
-      %URI{scheme: "https", host: "gitlab.com", path: path, query: nil, fragment: nil} ->
-        gitlab_source(path, configured)
+      %URI{host: host, path: path} ->
+        if Repository.gitlab_url?(settings, url), do: gitlab_source(path, configured, host), else: {:error, :invalid_source_issue_reference}
 
       _ ->
         {:error, :invalid_source_issue_reference}
@@ -50,12 +52,12 @@ defmodule SymphonyElixir.Beads.SourceIssue do
     end
   end
 
-  defp gitlab_source(path, configured) do
+  defp gitlab_source(path, configured, host) do
     case Regex.run(~r{^/(.+)/-/issues/(\d+)$}, path) do
       [_, project, number] ->
-        if configured == "gitlab.com/" <> project do
+        if configured == host <> "/" <> project do
           endpoint = "projects/" <> URI.encode_www_form(project) <> "/issues/" <> number
-          {:ok, %{provider: "gitlab", bin: "glab", get: ["api", endpoint], close: ["api", "--method", "PUT", endpoint, "-f", "state_event=close"]}}
+          {:ok, %{provider: "gitlab", bin: "glab", get: ["api", "--hostname", host, endpoint], close: ["api", "--hostname", host, "--method", "PUT", endpoint, "-f", "state_event=close"]}}
         else
           {:error, :source_issue_outside_configured_repository}
         end
