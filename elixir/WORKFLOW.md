@@ -342,3 +342,8 @@ merge authority from successful validation. See `docs/beads.md` for the contract
 
 Beads host delivery uses `beads_checkpoint` (scoped commit only), then
 `beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
+
+Beads workflows support retained-worktree preflight, typed blocked/review handoffs,
+separate runtime recovery budgets, opt-in compact task briefs and resumable
+`beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
+keeps operation outcomes separate from exec wrappers; see the Beads operation guide.

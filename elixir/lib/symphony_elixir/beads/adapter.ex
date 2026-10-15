@@ -6,8 +6,8 @@ defmodule SymphonyElixir.Beads.Adapter do
   """
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Beads.{Acceptance, Publication, RunJournal, SourceIssue, Validation}
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker.Issue}
+  alias SymphonyElixir.Beads.{Acceptance, Brief, Delivery, Publication, RunJournal, SourceIssue, Validation}
+  alias SymphonyElixir.{Config, Tracker.Issue, Workflow}
 
   @impl true
   def validate_config(settings) do
@@ -61,6 +61,7 @@ defmodule SymphonyElixir.Beads.Adapter do
   @impl true
   def prepare_run(%Issue{} = issue, opts) do
     settings = freeze_settings(Config.settings!().tracker)
+    opts = Keyword.put(opts, :workflow_snapshot, Workflow.current())
     scope = %{"beads_dir" => beads_dir(settings), "provider_dir" => settings.provider["dir"]}
 
     with true <- is_nil(opts[:worker_host]) || {:error, :beads_requires_local_executor},
@@ -69,7 +70,7 @@ defmodule SymphonyElixir.Beads.Adapter do
          {:ok, prompt} <- preflight(settings, issue, opts, policy),
          {:ok, record} <- RunJournal.admit(journal_root(settings), issue.id),
          true <- record["beads_dir"] in [nil, beads_dir(settings)] || {:error, :run_scope_mismatch},
-         {:ok, record} <- RunJournal.checkpoint(record, Map.put(scope, "validation_policy", policy)),
+         {:ok, record} <- RunJournal.checkpoint(record, scope |> Map.put("validation_policy", policy) |> Map.put("brief_template_hash", Brief.template_hash(opts[:workflow_snapshot]))),
          :ok <- claim(settings, issue, record),
          {:ok, record} <- RunJournal.checkpoint(record, %{"phase" => "claimed"}) do
       native_ref =
@@ -114,7 +115,7 @@ defmodule SymphonyElixir.Beads.Adapter do
          true <- (policy["commands"] == [] or timeout_available) || {:error, :validation_timeout_missing},
          true <- not is_nil(System.find_executable(codex)) || {:error, :codex_executable_missing} do
       with :ok <- unchanged_policy(settings, issue, policy) do
-        {:ok, PromptBuilder.build_prompt(prepared, opts) <> policy_prompt(policy)}
+        {:ok, Brief.render(settings, prepared, opts) <> policy_prompt(policy)}
       end
     end
   rescue
@@ -124,7 +125,7 @@ defmodule SymphonyElixir.Beads.Adapter do
   defp policy_prompt(policy) do
     "\nFrozen validation policy: " <>
       Jason.encode!(policy) <>
-      "\nUse beads_task_context for current task reads. Call beads_checkpoint to commit authorized paths, then beads_validate on the clean commit before beads_publish." <>
+      "\nUse beads_task_context for current task reads. Call beads_deliver for guarded checkpoint/validation/publication/review handoff; granular tools remain available." <>
       " A review value of none selects direct development without subagents or internal review. This never grants merge authority."
   end
 
@@ -183,6 +184,12 @@ defmodule SymphonyElixir.Beads.Adapter do
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
       },
       %{
+        "name" => "beads_deliver",
+        "description" =>
+          "Checkpoint configured paths, execute/reuse current verification, publish and park for configured review/acceptance. Journals each stage; repeated completed delivery is idempotent. Never merges.",
+        "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
+      },
+      %{
         "name" => "beads_checkpoint",
         "description" => "Commit only configured authorized task paths on the host before validation. Requires symphony:publish. Never pushes, opens reviews or merges.",
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
@@ -197,7 +204,12 @@ defmodule SymphonyElixir.Beads.Adapter do
         "description" => "Park this issue for explicit human review. Does not merge or close it.",
         "inputSchema" => %{
           "type" => "object",
-          "properties" => %{"reason" => %{"type" => "string"}, "review_url" => %{"type" => "string"}, "head_sha" => %{"type" => "string"}},
+          "properties" => %{
+            "intent" => %{"type" => "string", "enum" => ["blocked", "ready_for_review"]},
+            "reason" => %{"type" => "string"},
+            "review_url" => %{"type" => "string"},
+            "head_sha" => %{"type" => "string"}
+          },
           "required" => ["reason"],
           "additionalProperties" => false
         }
@@ -214,7 +226,9 @@ defmodule SymphonyElixir.Beads.Adapter do
          {:ok, [current]} <- command(settings, ["show", issue.id, "--json"]),
          true <- (current["assignee"] == issue.assignee_id and current["status"] == "in_progress") || {:error, :not_owned_by_symphony} do
       fields = Map.take(current, ["id", "title", "description", "design", "acceptance_criteria", "notes", "status", "updated_at", "external_ref", "metadata"])
-      payload = Map.merge(fields, %{"validation_policy" => record["validation_policy"], "attempt_id" => record["attempt_id"]})
+      metadata = Map.delete(fields["metadata"] || %{}, "symphony_validation")
+      payload = fields |> Map.put("metadata", metadata) |> Map.put("task_version", Brief.version(fields))
+      payload = Map.merge(payload, %{"validation_policy" => record["validation_policy"], "attempt_id" => record["attempt_id"]})
       if byte_size(Jason.encode!(payload)) <= 65_536, do: tool_result_payload(payload), else: tool_result({:error, :task_context_too_large})
     else
       error -> tool_result(error)
@@ -233,10 +247,12 @@ defmodule SymphonyElixir.Beads.Adapter do
     settings = opts[:tracker_settings]
 
     result =
-      with {:ok, [record]} <- command(settings, ["show", issue.id, "--json"]),
+      with :ok <- validate_handoff(arguments),
+           {:ok, [record]} <- command(settings, ["show", issue.id, "--json"]),
            true <- record["assignee"] == issue.assignee_id and is_binary(issue.assignee_id),
            {:ok, arguments} <- publish_on_handoff(settings, issue, arguments),
-           :ok <- record_delivery(settings, issue, arguments) do
+           :ok <- record_delivery(settings, issue, arguments),
+           :ok <- checkpoint_handoff(issue, arguments) do
         await_human(settings, issue.id, record["assignee"], reason)
       else
         {:error, _} = error -> error
@@ -244,6 +260,13 @@ defmodule SymphonyElixir.Beads.Adapter do
       end
 
     tool_result(result)
+  end
+
+  def execute_agent_tool("beads_deliver", arguments, opts) when arguments == %{} do
+    case Delivery.run(opts) do
+      {:ok, result} -> tool_result_payload(result)
+      error -> tool_result(error)
+    end
   end
 
   def execute_agent_tool("beads_checkpoint", arguments, opts) when arguments == %{} do
@@ -262,8 +285,39 @@ defmodule SymphonyElixir.Beads.Adapter do
 
   def execute_agent_tool(_tool, _arguments, _opts), do: tool_result({:error, :unsupported_tool})
 
+  @spec validate_handoff(map()) :: :ok | {:error, term()}
+  def validate_handoff(arguments) do
+    intent = arguments["intent"]
+    url = arguments["review_url"]
+    sha = arguments["head_sha"]
+
+    case {intent, url, sha} do
+      {"blocked", nil, sha} -> checkpoint_reference(sha)
+      {nil, nil, nil} -> :ok
+      {mode, url, sha} when mode in [nil, "ready_for_review"] and is_binary(url) and is_binary(sha) -> :ok
+      _ -> {:error, {:invalid_handoff, "blocked: reason and optional checkpoint head_sha; ready_for_review: reason, review_url and head_sha"}}
+    end
+  end
+
+  defp checkpoint_reference(nil), do: :ok
+
+  defp checkpoint_reference(sha) when is_binary(sha) do
+    if String.match?(sha, ~r/^[a-fA-F0-9]{40,64}$/), do: :ok, else: {:error, :invalid_checkpoint_reference}
+  end
+
+  defp checkpoint_reference(_sha), do: {:error, :invalid_checkpoint_reference}
+
+  defp checkpoint_handoff(issue, arguments) do
+    intent = arguments["intent"] || if(arguments["review_url"], do: "ready_for_review", else: "blocked")
+
+    with {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
+         {:ok, _} <- RunJournal.checkpoint(record, %{"handoff_intent" => intent, "handoff_reason" => arguments["reason"], "checkpoint_head_sha" => arguments["head_sha"]}) do
+      :ok
+    end
+  end
+
   defp publish_on_handoff(settings, issue, arguments) do
-    if settings.provider["publish_on_handoff"] == true and not Map.has_key?(arguments, "review_url") do
+    if settings.provider["publish_on_handoff"] == true and arguments["intent"] != "blocked" and not Map.has_key?(arguments, "review_url") do
       with {:ok, delivery} <- Publication.publish(settings, issue) do
         {:ok, Map.merge(arguments, %{"review_url" => delivery.review_url, "head_sha" => delivery.head_sha})}
       end
@@ -346,6 +400,8 @@ defmodule SymphonyElixir.Beads.Adapter do
       error -> error
     end
   end
+
+  defp record_delivery(_settings, _issue, %{"intent" => "blocked"}), do: :ok
 
   defp record_delivery(_settings, _issue, %{"review_url" => nil}), do: :ok
 
@@ -451,8 +507,18 @@ defmodule SymphonyElixir.Beads.Adapter do
   defp resolve(value), do: value
   defp absolute_directory?(value), do: is_binary(value) and value != "" and Path.type(value) == :absolute
 
+  defp tool_result({:error, reason}) do
+    error = %{"code" => tool_error_code(reason), "detail" => inspect(reason)}
+    output = Jason.encode!(%{"error" => error})
+    %{"success" => false, "error" => error, "output" => output, "contentItems" => [%{"type" => "inputText", "text" => output}]}
+  end
+
   defp tool_result(result) do
     output = inspect(result)
     %{"success" => result == :ok, "output" => output, "contentItems" => [%{"type" => "inputText", "text" => output}]}
   end
+
+  defp tool_error_code(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp tool_error_code(reason) when is_tuple(reason) and tuple_size(reason) > 0, do: tool_error_code(elem(reason, 0))
+  defp tool_error_code(_reason), do: "operation_failed"
 end

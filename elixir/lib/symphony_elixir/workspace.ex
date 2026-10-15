@@ -38,10 +38,23 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp mark_retained(workspace, nil) do
-    if retain_workspace?(), do: File.write(Path.join(workspace, ".symphony-retain"), "retained by Symphony\n"), else: :ok
+    if retain_workspace?(), do: retain_marker(Path.join(workspace, ".symphony-retain")), else: :ok
   end
 
   defp mark_retained(_workspace, _host), do: :ok
+
+  defp retain_marker(path) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        File.write(path, "retained by Symphony\n", [:exclusive])
+
+      {:ok, %{type: :regular}} ->
+        if File.read!(path) == "retained by Symphony\n", do: :ok, else: {:error, :retention_marker_occupied}
+
+      _ ->
+        {:error, :retention_marker_occupied}
+    end
+  end
 
   defp ensure_workspace(workspace, nil) do
     cond do

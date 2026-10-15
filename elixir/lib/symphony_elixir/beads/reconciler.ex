@@ -152,7 +152,16 @@ defmodule SymphonyElixir.Beads.Reconciler do
              {:ok, _} <-
                Adapter.command(settings, ["update", issue["id"], "--if-assignee", record["owner"], "--if-status", "blocked", "--set-metadata", "symphony_review_url=" <> review.url, "--json"]),
              {:ok, %{closed: false}} <- SourceIssue.read(settings, issue["external_ref"] || ""),
-             :ok <- Recovery.resume_completed(settings, issue["id"], %{review_url: review.url, head: review.head, facts: review.feedback, fingerprint: fingerprint}) do
+             :ok <-
+               Recovery.resume_completed(settings, issue["id"], %{
+                 review_url: review.url,
+                 head: review.head,
+                 facts: review.feedback,
+                 fingerprint: fingerprint,
+                 cause: "review",
+                 actor: "remote_review",
+                 caused_by_event: fingerprint
+               }) do
           :ok
         else
           {:ok, %{closed: true}} -> checkpoint(record, "source_issue_closed")

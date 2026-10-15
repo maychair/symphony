@@ -46,4 +46,21 @@ defmodule SymphonyElixir.BeadsRepositoryTest do
 
     assert {:ok, %{"attempt_count" => 2, "thread_id" => nil}} = RunJournal.admit(root, "task")
   end
+
+  test "runtime recovery retains review repair budget and enforces its own limit" do
+    alias SymphonyElixir.Beads.Recovery
+    settings = %{provider: %{"max_repair_runs" => 3, "max_runtime_recoveries" => 1}}
+    record = %{"repair_count" => 2}
+    feedback = %{cause: "runtime", actor: "operator_agent", caused_by_event: "validation-item", fingerprint: "runtime-v1"}
+    assert {:ok, changes} = Recovery.recovery_changes(settings, record, feedback)
+    assert changes["runtime_recovery_count"] == 1
+    refute changes["repair_count"]
+    refute changes["repair_fingerprint"]
+    assert changes["runtime_recovery_fingerprint"] == "runtime-v1"
+    assert changes["trigger_actor"] == "operator_agent"
+    assert {:error, :recovery_budget_exhausted} = Recovery.recovery_changes(settings, Map.merge(record, changes), feedback)
+    assert {:ok, %{"repair_count" => 3}} = Recovery.recovery_changes(settings, record, %{cause: "review"})
+    assert {:error, :recovery_budget_exhausted} = Recovery.recovery_changes(settings, %{"repair_count" => 3}, %{})
+    assert {:error, :unknown_recovery_cause} = Recovery.recovery_changes(settings, record, %{cause: "unknown"})
+  end
 end

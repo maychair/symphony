@@ -151,4 +151,18 @@ defmodule SymphonyElixir.BeadsCLITest do
       Resume.run(["--workflow", Workflow.workflow_file_path(), "--issue", "bd-cli", "--executor-stopped"])
     end
   end
+
+  test "known workspace preflight abort can recover without allocating native identity", context do
+    alias SymphonyElixir.Beads.Validation
+    {:ok, record} = RunJournal.read(context.record["directory"])
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "executor_os_pid" => "99999999", "validation_policy" => %{"commands" => [["true"]]}})
+    assert {:error, _} = Validation.preflight_workspace(record["workspace"], record)
+    {:ok, record} = RunJournal.read(record["directory"])
+    assert record["pre_session_blocked"]
+    assert :ok = Resume.run(["--workflow", Workflow.workflow_file_path(), "--issue", "bd-cli", "--executor-stopped"])
+    assert {:ok, next} = RunJournal.admit(Adapter.journal_root(Config.settings!().tracker), "bd-cli")
+    assert next["pre_turn_recovered"]
+    refute next["pre_session_blocked"]
+    assert is_nil(next["thread_id"])
+  end
 end

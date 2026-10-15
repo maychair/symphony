@@ -2324,3 +2324,8 @@ commit; stale receipts cannot authorize publication. Repository gates remain the
 default for unconfigured tasks. Validation is separate from human acceptance and
 verified remote merge. Private session evidence must distinguish transport
 responses from observed process exit codes and preserve unknown values.
+
+Beads runtime recovery and review repair may have separate bounded budgets, while
+retaining native idle and ownership fencing. Host delivery composes durable guarded
+steps without atomicity or merge authority. Typed native event evidence must preserve
+unknown outcomes and explicit identities rather than infer success from wrappers.

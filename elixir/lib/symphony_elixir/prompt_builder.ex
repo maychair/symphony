@@ -10,7 +10,7 @@ defmodule SymphonyElixir.PromptBuilder do
   @spec build_prompt(SymphonyElixir.Tracker.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
     template =
-      Workflow.current()
+      Keyword.get_lazy(opts, :workflow_snapshot, &Workflow.current/0)
       |> prompt_template!()
       |> parse_template!()
 

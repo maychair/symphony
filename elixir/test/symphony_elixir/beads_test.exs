@@ -454,4 +454,135 @@ defmodule SymphonyElixir.BeadsTest do
     assert String.trim(head) == sha
     refute Adapter.execute_agent_tool("beads_checkpoint", %{}, issue: %{issue | assignee_id: "wrong"}, tracker_settings: settings)["success"]
   end
+
+  test "retained workspace passes preflight without hiding unrelated or foreign files", context do
+    alias SymphonyElixir.Beads.Validation
+    workspace = initialized_git(context.root, "retained-preflight")
+    marker = Path.join(workspace, ".symphony-retain")
+    File.write!(marker, "retained by Symphony\n")
+    record = %{"validation_policy" => %{"commands" => [["true"]]}}
+    assert :ok = Validation.preflight_workspace(workspace, record)
+    assert File.exists?(marker)
+    File.write!(Path.join(workspace, "unrelated"), "keep")
+    assert {:error, :validation_requires_clean_commit} = Validation.preflight_workspace(workspace, record)
+    File.rm!(Path.join(workspace, "unrelated"))
+    File.write!(marker, "not owned by Symphony")
+    assert {:error, :unowned_retention_marker} = Validation.identity(workspace)
+  end
+
+  test "typed handoff rejects partial review before effects and permits blocked checkpoint", context do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    binding = [issue: issue, tracker_settings: opts[:tracker_settings]]
+    before = File.read!(context.data)
+    result = Adapter.execute_agent_tool("beads_await_human", %{"reason" => "blocked", "head_sha" => String.duplicate("a", 40)}, binding)
+    refute result["success"]
+    assert File.read!(context.data) == before
+    arguments = %{"intent" => "blocked", "reason" => "runtime prerequisite", "head_sha" => String.duplicate("a", 40)}
+    assert Adapter.execute_agent_tool("beads_await_human", arguments, binding)["success"]
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    assert record["handoff_intent"] == "blocked"
+    refute record["delivery"]
+  end
+
+  test "compact same-thread prompt keeps custom rules and rejects stale template reuse" do
+    alias SymphonyElixir.Beads.{Brief, Validation}
+    path = Workflow.workflow_file_path()
+    text = File.read!(path) |> String.replace("provider:", "provider:\n    compact_task_context: true")
+    File.write!(path, text <> "\nMANDATORY CUSTOM RULE\n" <> String.duplicate("Preserve the custom Workflow instruction.\n", 20))
+    :ok = WorkflowStore.force_reload()
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    settings = Config.settings!().tracker
+    {:ok, policy} = Validation.policy(settings, issue)
+    {:ok, prompt} = Adapter.preflight(settings, issue, [], policy)
+    assert prompt =~ "MANDATORY CUSTOM RULE"
+    refute prompt =~ "Implement safely in the assigned checkout"
+    {:ok, _prepared, opts} = Adapter.prepare_run(issue, [])
+    {:ok, _} = RunJournal.checkpoint(opts[:run_record], %{"thread_id" => "same-thread"})
+    {:ok, resumed} = Adapter.preflight(settings, issue, [], policy)
+    assert resumed =~ "same native thread"
+    assert byte_size(resumed) < byte_size(prompt)
+    File.write!(path, File.read!(path) <> "\nNEW CUSTOM RULE\n")
+    :ok = WorkflowStore.force_reload()
+    {:ok, changed} = Adapter.preflight(settings, issue, [], policy)
+    assert changed =~ "NEW CUSTOM RULE"
+    assert Brief.template_hash() != opts[:run_record]["brief_template_hash"]
+  end
+
+  test "composed delivery validates retained worktree and reuses confirmed publication", context do
+    alias SymphonyElixir.Beads.Delivery
+    source = "https://github.com/example/repo/issues/1"
+    records = Jason.decode!(File.read!(context.data))
+
+    records =
+      Enum.map(records, fn row ->
+        if row["id"] == "bd-ready", do: row |> Map.put("external_ref", source) |> Map.put("labels", ["symphony", "symphony:publish"]), else: row
+      end)
+
+    File.write!(context.data, Jason.encode!(records))
+    fake_gh = Path.join(context.root, "gh")
+    calls = Path.join(context.root, "gh-calls")
+
+    File.write!(fake_gh, """
+    #!/usr/bin/env python3
+    import json,sys
+    args=sys.argv[1:]
+    with open(#{inspect(calls)},'a') as f: f.write(json.dumps(args)+'\\n')
+    if args[:2]==['issue','view']: print(json.dumps({'state':'OPEN','url':#{inspect(source)}}))
+    elif args[:2]==['pr','list']: print('[]')
+    elif args[:2]==['pr','create']: print('https://github.com/example/repo/pull/1')
+    else: sys.exit(9)
+    """)
+
+    File.chmod!(fake_gh, 0o755)
+    old = System.fetch_env!("PATH")
+    System.put_env("PATH", context.root <> ":" <> old)
+    on_exit(fn -> System.put_env("PATH", old) end)
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    workspace = initialized_git(context.root, "composed-delivery")
+    {_, 0} = System.cmd("git", ["checkout", "-qb", "codex/composed"], cd: workspace)
+    {_, 0} = System.cmd("git", ["remote", "add", "origin", "https://github.com/example/repo"], cd: workspace)
+    bare = Path.join(context.root, "local-remote.git")
+    {_, 0} = System.cmd("git", ["init", "--bare", "-q", bare])
+    {_, 0} = System.cmd("git", ["remote", "set-url", "--push", "origin", bare], cd: workspace)
+    File.write!(Path.join(workspace, ".symphony-retain"), "retained by Symphony\n")
+    File.write!(Path.join(workspace, "allowed.txt"), "approved")
+    settings = opts[:tracker_settings]
+    settings = %{settings | provider: Map.merge(settings.provider, %{"publish_paths" => ["allowed.txt"], "allow_host_validation" => true})}
+    policy = %{"mode" => "targeted", "commands" => [["sh", "-c", "printf verified"]], "timeout_ms" => 1000}
+    {:ok, _} = RunJournal.checkpoint(opts[:run_record], %{"workspace" => workspace, "validation_policy" => policy})
+    binding = [issue: issue, tracker_settings: settings]
+    assert {:ok, delivery} = Delivery.run(binding)
+    receipt = delivery["validation_receipt"]
+    [result] = receipt["results"]
+    assert result["log_sha256"] == Base.encode16(:crypto.hash(:sha256, File.read!(result["log"])), case: :lower)
+    assert result["exit_code"] == 0
+    {:ok, checkpoint} = RunJournal.read(opts[:run_record]["directory"])
+    {:ok, _} = RunJournal.checkpoint(checkpoint, %{"delivery_step" => "handoff"})
+    assert {:ok, %{"reused" => true}} = Delivery.run(binding)
+    assert Enum.count(String.split(File.read!(calls), "\n", trim: true), &String.contains?(&1, ~s("create"))) == 1
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    assert record["delivery_step"] == "completed"
+    assert record["handoff_intent"] == "ready_for_review"
+  end
+
+  test "workspace bootstrap preserves a foreign retention marker" do
+    {:ok, workspace} = Workspace.create_for_issue("foreign-marker")
+    marker = Path.join(workspace, ".symphony-retain")
+    File.write!(marker, "user-owned data")
+    assert {:error, :retention_marker_occupied} = Workspace.create_for_issue("foreign-marker")
+    assert File.read!(marker) == "user-owned data"
+  end
+
+  defp initialized_git(root, name) do
+    workspace = Path.join(root, name)
+    File.mkdir_p!(workspace)
+
+    for args <- [["init", "-q"], ["config", "user.name", "Smoke"], ["config", "user.email", "smoke@example.com"], ["commit", "--allow-empty", "-qm", "initial"]] do
+      {_, 0} = System.cmd("git", args, cd: workspace)
+    end
+
+    workspace
+  end
 end

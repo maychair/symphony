@@ -26,10 +26,9 @@ defmodule SymphonyElixir.Beads.Recovery do
          {:ok, %{"phase" => "awaiting_human"} = record} <- RunJournal.read(directory),
          true <- record["issue_id"] == issue_id and record["beads_dir"] == Adapter.beads_dir(settings),
          true <- native_identity?(record),
+         {:ok, changes} <- recovery_changes(settings, record, feedback),
          {:ok, session} <- inspect_native_session(settings, record) do
       AppServer.stop_session(session)
-
-      changes = %{"feedback" => feedback, "repair_fingerprint" => feedback[:fingerprint], "repair_count" => (record["repair_count"] || 0) + 1}
 
       with {:ok, record} <- RunJournal.checkpoint(record, changes) do
         release_for_resume(settings, record)
@@ -39,6 +38,34 @@ defmodule SymphonyElixir.Beads.Recovery do
       _ -> {:error, :run_not_safely_resumable}
     end
   end
+
+  @spec recovery_changes(map(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def recovery_changes(settings, record, feedback) do
+    cause = field(feedback, :cause) || "review"
+    fingerprint_key = if cause == "runtime", do: "runtime_recovery_fingerprint", else: "repair_fingerprint"
+
+    with {:ok, counter, limit} <- recovery_budget(settings.provider, cause),
+         true <- (record[counter] || 0) < limit || {:error, :recovery_budget_exhausted} do
+      {:ok,
+       %{
+         "feedback" => feedback,
+         fingerprint_key => field(feedback, :fingerprint),
+         counter => (record[counter] || 0) + 1,
+         "recovery_cause" => cause,
+         "trigger_actor" => field(feedback, :actor),
+         "caused_by_event" => field(feedback, :caused_by_event)
+       }}
+    end
+  end
+
+  defp recovery_budget(provider, "runtime"), do: budget("runtime_recovery_count", provider["max_runtime_recoveries"] || 2)
+  defp recovery_budget(provider, "review"), do: budget("repair_count", provider["max_repair_runs"] || 3)
+  defp recovery_budget(_provider, _cause), do: {:error, :unknown_recovery_cause}
+  defp budget(counter, limit) when is_integer(limit) and limit >= 0, do: {:ok, counter, limit}
+  defp budget(_counter, _limit), do: {:error, :invalid_recovery_budget}
+  defp field(map, key), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
+
+  defp recover_native(_settings, %{"pre_session_blocked" => true, "thread_id" => nil, "turn_id" => nil, "turn_count" => 0}), do: :ok
 
   defp recover_native(_settings, %{"thread_id" => nil, "turn_count" => 0, "pre_turn_recovered" => true, "phase" => phase}) when phase in ["admitted", "claimed"], do: :ok
 
@@ -92,7 +119,7 @@ defmodule SymphonyElixir.Beads.Recovery do
       record["beads_dir"] != Adapter.beads_dir(settings) ->
         {:error, :run_scope_mismatch}
 
-      not (native_identity?(record) or recovered_before_thread?(record)) ->
+      not (native_identity?(record) or recovered_before_thread?(record) or pre_session_blocked?(record)) ->
         {:error, :missing_native_identity}
 
       true ->
@@ -110,6 +137,9 @@ defmodule SymphonyElixir.Beads.Recovery do
     end
   end
 
+  defp pre_session_blocked?(record),
+    do: record["pre_session_blocked"] == true and is_nil(record["thread_id"]) and is_nil(record["turn_id"]) and record["turn_count"] == 0
+
   defp recovered_before_thread?(record) do
     record["phase"] in ["admitted", "claimed"] and record["pre_turn_recovered"] == true and
       is_nil(record["thread_id"]) and is_nil(record["turn_id"]) and record["turn_count"] == 0
@@ -120,9 +150,14 @@ defmodule SymphonyElixir.Beads.Recovery do
       is_binary(record["thread_id"]) and
         (is_binary(record["turn_id"]) or (record["phase"] == "thread_ready" and record["turn_count"] == 0 and is_nil(record["turn_id"])))
 
+  defp pre_turn?(record) do
+    pre_session_blocked?(record) or
+      (record["phase"] in ["admitted", "claimed", "thread_ready"] and record["turn_count"] == 0 and is_nil(record["turn_id"]))
+  end
+
   defp release_for_resume(settings, record) do
     {:ok, record} = RunJournal.read(record["directory"])
-    pre_turn = record["phase"] in ["admitted", "claimed", "thread_ready"] and record["turn_count"] == 0 and is_nil(record["turn_id"])
+    pre_turn = pre_turn?(record)
     reset_thread = pre_turn and record["abandoned_pre_turn_thread_id"] == record["thread_id"]
 
     with {:ok, [issue]} <- Adapter.command(settings, ["show", record["issue_id"], "--json"]),
