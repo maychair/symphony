@@ -227,15 +227,40 @@ defmodule SymphonyElixir.Orchestrator do
     required = Config.settings!().tracker.required_labels
 
     if "human" in issue.labels and Enum.all?(required, &(&1 in issue.labels)) do
-      block_issue_from_entry(state, issue.id, %{identifier: issue.identifier, issue: issue}, "awaiting human acceptance")
+      block_issue_from_entry(state, issue.id, %{identifier: issue.identifier, issue: issue}, beads_gate_error(issue.id, issue))
     else
       state
     end
   end
 
+  defp beads_gate_error(issue_id, issue) do
+    settings = Config.settings!().tracker
+    directory = RunJournal.directory(Adapter.journal_root(settings), issue_id)
+
+    record =
+      case RunJournal.read(directory) do
+        {:ok, %{} = record} -> record
+        _ -> %{}
+      end
+
+    cond do
+      record["phase"] == "awaiting_human" and is_binary(get_in(record, ["delivery", "review_url"])) ->
+        "awaiting human acceptance"
+
+      match?(%Issue{native_ref: %{"dependency_blocked" => true}}, issue) ->
+        "blocked by task dependencies"
+
+      is_binary(record["blocker_reason"]) and record["blocker_reason"] != "" ->
+        "blocked: " <> record["blocker_reason"]
+
+      true ->
+        "run requires human reconciliation"
+    end
+  end
+
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
     if Config.settings!().tracker.kind == "beads" do
-      block_issue_from_entry(state, issue_id, running_entry, "awaiting human acceptance or run reconciliation")
+      block_issue_from_entry(state, issue_id, running_entry, beads_gate_error(issue_id, Map.get(running_entry, :issue)))
     else
       handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id)
     end
@@ -540,7 +565,7 @@ defmodule SymphonyElixir.Orchestrator do
     settings = Config.settings!().tracker
 
     settings.kind == "beads" and issue.state == "blocked" and "human" in issue.labels and
-      get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) == "awaiting_human" and
+      get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) in ["awaiting_human", "blocked"] and
       Enum.all?(settings.required_labels, &(&1 in issue.labels))
   end
 
@@ -613,7 +638,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_blocked_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.blocked, issue.id) do
       %{issue: _} = blocked_entry ->
-        %{state | blocked: Map.put(state.blocked, issue.id, %{blocked_entry | issue: issue})}
+        updated = Map.put(blocked_entry, :issue, issue)
+        updated = if beads_human_gate?(issue), do: Map.put(updated, :error, beads_gate_error(issue.id, issue)), else: updated
+        %{state | blocked: Map.put(state.blocked, issue.id, updated)}
 
       _ ->
         state

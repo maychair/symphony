@@ -48,12 +48,22 @@ refusal and park the run for human input rather than waiting indefinitely or
 auto-approving. Other providers retain their continuation policy and legacy
 ID-less fixture compatibility; Beads requires identified terminal events.
 
-Completion and errors move the owned task to `blocked` with label `human` and
-metadata `symphony_gate=awaiting_human`. This state survives restart and is visible
-in the existing local status API (`GET /api/v1/state`) and dashboard. No worker
-exit merges or closes a task. The optional `beads_await_human` tool can also bind
-an exact `review_url` and full `head_sha` to this run's delivery checkpoint. It
-cannot accept or close tasks.
+Completion without a bound delivery and execution errors move the owned task to
+`blocked` with label `human`, metadata `symphony_gate=blocked` and journal phase
+`blocked`. Use `beads_await_human` with `intent: blocked` to record a concrete blocker and
+release condition; `beads_block` and reason-only calls remain compatible aliases.
+A turn ending without either tool records an explicit instruction to inspect native
+session evidence before resuming. Local implementation without a review binding
+also remains blocked for operator inspection and continuation.
+
+Actual deliveries use `beads_await_human` with both exact `review_url` and full
+`head_sha`, then enter journal phase and metadata gate `awaiting_human`. Partial
+bindings are refused. These states survive restart and remain visible in the
+existing status API (`GET /api/v1/state`) and dashboard, which display the durable
+blocker reason or a dependency wait separately from delivery acceptance. No worker exit merges or
+closes a task. Remote polling skips preparation blockers; it migrates legacy
+awaiting-human records with no delivery or review metadata to `blocked` once the
+executor lock is absent, preserving existing notes as the blocker reason.
 
 Uncertain intent, corrupt records, missing IDs, a live lock or lost ownership
 blocks admission. There is no dead-PID automatic release. To continue a known
@@ -163,10 +173,10 @@ publication. Opt in to the `beads_publish` host tool with the task label
 `symphony:publish` and an explicit `publish_paths` list. The tool stages only
 those regular relative files, refuses unrelated staged changes, checks the
 configured GitHub remote and a `codex/` task branch, uses gh's credential helper,
-and reuses an existing open PR. It never merges. `publish_on_handoff: true`
-allows an existing `beads_await_human` call without URL/head to publish and bind
-the result before parking, useful for persisted threads whose native tool schema
-predates `beads_publish`. Publication intent is journaled before side effects;
+and reuses an existing open PR. It never merges. Call `beads_publish` (or the
+composed `beads_deliver`) to publish, then hand off both the URL and SHA.
+Partial URL/SHA handoffs are rejected even when `publish_on_handoff` is configured.
+A reason alone always parks an undelivered blocker without publication. Publication intent is journaled before side effects;
 commit/push/PR retry inspects actual Git and remote facts.
 
 GitLab read/reconciliation code is present; real GitLab validation requires a

@@ -347,3 +347,5 @@ Beads workflows support retained-worktree preflight, typed blocked/review handof
 separate runtime recovery budgets, opt-in compact task briefs and resumable
 `beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
 keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
+
+Beads preparation blockers use `beads_block` (or reason-only `beads_await_human`); delivered review handoffs require both review URL and head SHA.
