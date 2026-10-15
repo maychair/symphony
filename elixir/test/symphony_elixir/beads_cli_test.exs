@@ -85,7 +85,7 @@ defmodule SymphonyElixir.BeadsCLITest do
     assert Jason.decode!(File.read!(context.data))["status"] == "closed"
   end
 
-  test "resume CLI requires stopped executor and reconciles observed idle terminal turn", context do
+  test "resume CLI requires stopped executor and resumes a preparation blocker on the observed idle terminal turn", context do
     assert_raise Mix.Error, fn -> Resume.run([]) end
     args = ["--workflow", Workflow.workflow_file_path(), "--issue", "bd-cli", "--executor-stopped"]
     assert_raise Mix.Error, fn -> Resume.run(args) end
@@ -109,7 +109,7 @@ defmodule SymphonyElixir.BeadsCLITest do
     File.write!(Workflow.workflow_file_path(), text)
     :ok = WorkflowStore.force_reload()
     {:ok, record} = RunJournal.read(context.record["directory"])
-    {:ok, _} = RunJournal.checkpoint(record, %{"executor_os_pid" => "99999999"})
+    {:ok, _} = RunJournal.checkpoint(record, %{"executor_os_pid" => "99999999", "phase" => "blocked", "delivery" => nil, "blocker_reason" => "Build missing; prepared by operator"})
     assert :ok = Resume.run(args)
     assert Jason.decode!(File.read!(context.data))["status"] == "in_progress"
   end

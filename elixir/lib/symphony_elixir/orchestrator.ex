@@ -540,7 +540,7 @@ defmodule SymphonyElixir.Orchestrator do
     settings = Config.settings!().tracker
 
     settings.kind == "beads" and issue.state == "blocked" and "human" in issue.labels and
-      get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) == "awaiting_human" and
+      get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) in ["awaiting_human", "blocked"] and
       Enum.all?(settings.required_labels, &(&1 in issue.labels))
   end
 

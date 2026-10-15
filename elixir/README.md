@@ -419,3 +419,5 @@ and the private `scripts/session_evidence.py` exporter are described in the
 
 Beads host delivery uses `beads_checkpoint` (scoped commit only), then
 `beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
+
+Undelivered Beads runs retain a preparation blocker and resume through operator recovery; only bound PR/MR deliveries await acceptance.

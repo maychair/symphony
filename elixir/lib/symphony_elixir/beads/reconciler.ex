@@ -48,21 +48,15 @@ defmodule SymphonyElixir.Beads.Reconciler do
     end
   end
 
-  defp reconcile_record(settings, issue, %{"phase" => "awaiting_human"} = record) do
-    url = get_in(record, ["delivery", "review_url"]) || get_in(issue, ["metadata", "symphony_review_url"])
+  defp reconcile_record(_settings, _issue, %{"phase" => "blocked"}), do: :ok
 
-    with true <- is_binary(url) || {:error, :missing_review_binding},
-         false <- File.exists?(Path.join(record["directory"], "executor.lock")),
-         {:ok, review} <- RemoteReview.fetch(settings, url) do
-      case SourceIssue.read(settings, issue["external_ref"] || "") do
-        {:ok, %{closed: true}} when review.state != "merged" -> checkpoint(record, "source_issue_closed")
-        {:ok, _} -> act(decide(review, settings.provider), settings, issue, record, review)
-        error -> error
-      end
+  # Older runs parked every completed turn as a delivery, including preparation.
+  # Migrate only absent deliveries; partial bindings remain strict review errors.
+  defp reconcile_record(settings, issue, %{"phase" => "awaiting_human"} = record) do
+    if is_nil(record["delivery"]) and is_nil(get_in(issue, ["metadata", "symphony_review_url"])) do
+      park_undelivered(settings, issue, record)
     else
-      true -> {:error, :run_may_have_live_executor}
-      {:error, _} = error -> error
-      _ -> {:error, :incomplete_review_binding}
+      reconcile_delivery(settings, issue, record)
     end
   end
 
@@ -90,6 +84,37 @@ defmodule SymphonyElixir.Beads.Reconciler do
 
       _ ->
         :ok
+    end
+  end
+
+  defp park_undelivered(settings, issue, record) do
+    reason = record["blocker_reason"] || issue["notes"] || "Legacy run ended without delivery; inspect native session evidence and resolve preparation before resuming."
+
+    with false <- File.exists?(Path.join(record["directory"], "executor.lock")),
+         :ok <- Adapter.block_undelivered(settings, issue["id"], record, reason),
+         {:ok, _} <- RunJournal.checkpoint(Map.put(record, "blocker_reason", reason), %{"phase" => "blocked"}) do
+      :ok
+    else
+      true -> {:error, :run_may_have_live_executor}
+      error -> error
+    end
+  end
+
+  defp reconcile_delivery(settings, issue, record) do
+    url = get_in(record, ["delivery", "review_url"]) || get_in(issue, ["metadata", "symphony_review_url"])
+
+    with true <- is_binary(url) || {:error, :missing_review_binding},
+         false <- File.exists?(Path.join(record["directory"], "executor.lock")),
+         {:ok, review} <- RemoteReview.fetch(settings, url) do
+      case SourceIssue.read(settings, issue["external_ref"] || "") do
+        {:ok, %{closed: true}} when review.state != "merged" -> checkpoint(record, "source_issue_closed")
+        {:ok, _} -> act(decide(review, settings.provider), settings, issue, record, review)
+        error -> error
+      end
+    else
+      true -> {:error, :run_may_have_live_executor}
+      {:error, _} = error -> error
+      _ -> {:error, :incomplete_review_binding}
     end
   end
 

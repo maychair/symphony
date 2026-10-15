@@ -19,6 +19,7 @@ defmodule SymphonyElixir.Beads.RunJournal do
       record =
         record
         |> Map.delete("delivery")
+        |> Map.delete("blocker_reason")
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)

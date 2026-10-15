@@ -53,3 +53,5 @@ results separate from tool transport status; see [operation](elixir/docs/beads.m
 
 Beads host delivery uses `beads_checkpoint` (scoped commit only), then
 `beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
+
+Undelivered Beads runs retain preparation blockers for operator recovery; bound PR/MR deliveries retain explicit acceptance and merge gates.

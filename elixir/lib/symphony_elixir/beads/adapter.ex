@@ -89,11 +89,12 @@ defmodule SymphonyElixir.Beads.Adapter do
     case opts[:run_record] do
       %{} = record ->
         settings = opts[:tracker_settings]
-        # A bounded run or approval/error is delivery evidence, never acceptance.
-        with :ok <- finish_delivery(settings, issue.id, record["owner"], result) do
-          current = latest_record(record)
+        current = latest_record(record)
+        phase = if is_nil(current["delivery"]), do: "blocked", else: "awaiting_human"
+        reason = current["blocker_reason"] || "Run ended without a delivery: #{inspect(result)}. Inspect native session evidence before resuming."
 
-          RunJournal.complete(current, "awaiting_human")
+        with :ok <- finish_delivery(settings, issue.id, current, phase, reason) do
+          RunJournal.complete(latest_record(current), phase)
         end
 
       _ ->
@@ -125,7 +126,8 @@ defmodule SymphonyElixir.Beads.Adapter do
     "\nFrozen validation policy: " <>
       Jason.encode!(policy) <>
       "\nUse beads_task_context for current task reads. Call beads_checkpoint to commit authorized paths, then beads_validate on the clean commit before beads_publish." <>
-      " A review value of none selects direct development without subagents or internal review. This never grants merge authority."
+      " A review value of none selects direct development without subagents or internal review. This never grants merge authority." <>
+      " If preparation blocks execution, use beads_block with the concrete blocker and release condition; no review URL is required."
   end
 
   defp unchanged_policy(settings, issue, policy) do
@@ -193,8 +195,19 @@ defmodule SymphonyElixir.Beads.Adapter do
         "inputSchema" => %{"type" => "object", "properties" => %{}, "additionalProperties" => false}
       },
       %{
+        "name" => "beads_block",
+        "description" => "Park an undelivered task with a concrete preparation blocker and release condition. Resumable by the operator; never requests delivery acceptance.",
+        "inputSchema" => %{
+          "type" => "object",
+          "properties" => %{"reason" => %{"type" => "string"}},
+          "required" => ["reason"],
+          "additionalProperties" => false
+        }
+      },
+      %{
         "name" => "beads_await_human",
-        "description" => "Park this issue for explicit human review. Does not merge or close it.",
+        "description" =>
+          "Request acceptance of a delivered review. Requires review_url and head_sha (or configured host publication). A reason alone parks a preparation blocker; prefer beads_block. Never merges or closes.",
         "inputSchema" => %{
           "type" => "object",
           "properties" => %{"reason" => %{"type" => "string"}, "review_url" => %{"type" => "string"}, "head_sha" => %{"type" => "string"}},
@@ -226,6 +239,27 @@ defmodule SymphonyElixir.Beads.Adapter do
       {:ok, receipt} -> tool_result_payload(receipt)
       error -> tool_result(error)
     end
+  end
+
+  def execute_agent_tool("beads_block", %{"reason" => reason} = arguments, opts)
+      when is_binary(reason) and map_size(arguments) == 1 do
+    issue = opts[:issue]
+
+    result =
+      with true <- String.trim(reason) != "" || {:error, :blocker_reason_required},
+           {:ok, record} <- RunJournal.read(issue.native_ref["run_directory"]),
+           :ok <- blocker_owner(record, issue),
+           true <- is_nil(record["delivery"]) || {:error, :delivery_already_bound} do
+        block_undelivered(opts[:tracker_settings], issue.id, record, reason)
+      end
+
+    tool_result(result)
+  end
+
+  # Compatibility for existing agents: a reason alone describes an undelivered blocker.
+  def execute_agent_tool("beads_await_human", %{"reason" => reason} = arguments, opts)
+      when is_binary(reason) and map_size(arguments) == 1 do
+    execute_agent_tool("beads_block", arguments, opts)
   end
 
   def execute_agent_tool("beads_await_human", %{"reason" => reason} = arguments, opts) when is_binary(reason) do
@@ -347,8 +381,6 @@ defmodule SymphonyElixir.Beads.Adapter do
     end
   end
 
-  defp record_delivery(_settings, _issue, %{"review_url" => nil}), do: :ok
-
   defp record_delivery(settings, issue, %{"review_url" => url, "head_sha" => sha}) when is_binary(url) and is_binary(sha) do
     with :ok <- Acceptance.validate_review_scope(settings, url),
          true <- String.match?(sha, ~r/^[a-fA-F0-9]{40,64}$/) || {:error, :invalid_delivery_commit},
@@ -361,8 +393,10 @@ defmodule SymphonyElixir.Beads.Adapter do
     end
   end
 
-  defp record_delivery(_settings, _issue, arguments) do
-    if Map.has_key?(arguments, "review_url") or Map.has_key?(arguments, "head_sha"), do: {:error, :incomplete_delivery}, else: :ok
+  defp record_delivery(_settings, _issue, _arguments), do: {:error, :incomplete_delivery}
+
+  defp blocker_owner(record, issue) do
+    if record["owner"] == issue.assignee_id and is_binary(issue.assignee_id), do: :ok, else: {:error, :not_owned_by_symphony}
   end
 
   defp bind_delivery(record, url, sha) do
@@ -394,12 +428,43 @@ defmodule SymphonyElixir.Beads.Adapter do
     end
   end
 
-  defp finish_delivery(settings, id, owner, result) do
+  @spec block_undelivered(map(), String.t(), map(), String.t()) :: :ok | {:error, term()}
+  def block_undelivered(settings, id, record, reason) do
+    with true <- is_nil(record["delivery"]) || {:error, :delivery_already_bound},
+         {:ok, [issue]} <- read_records(settings, ["show", id, "--json"]),
+         true <- (issue["status"] in ["in_progress", "blocked"] and issue["assignee"] == record["owner"]) || {:error, :not_owned_by_symphony},
+         {:ok, _} <-
+           command(settings, [
+             "update",
+             id,
+             "--if-assignee",
+             record["owner"],
+             "--if-status",
+             issue["status"],
+             "--status",
+             "blocked",
+             "--add-label",
+             "human",
+             "--set-metadata",
+             "symphony_gate=blocked",
+             "--append-notes",
+             "Symphony blocker: " <> reason,
+             "--json"
+           ]),
+         {:ok, _} <- RunJournal.checkpoint(record, %{"blocker_reason" => reason}) do
+      :ok
+    end
+  end
+
+  defp finish_delivery(settings, id, record, "blocked", reason), do: block_undelivered(settings, id, record, reason)
+
+  defp finish_delivery(settings, id, record, "awaiting_human", _reason) do
     with {:ok, [issue]} <- read_records(settings, ["show", id, "--json"]) do
-      if issue["status"] == "blocked" and issue["assignee"] == owner and "human" in (issue["labels"] || []) do
+      if issue["status"] == "blocked" and issue["assignee"] == record["owner"] and "human" in (issue["labels"] || []) and
+           get_in(issue, ["metadata", "symphony_gate"]) == "awaiting_human" do
         :ok
       else
-        await_human(settings, id, owner, inspect(result))
+        await_human(settings, id, record["owner"], "Delivery recorded; awaiting explicit acceptance")
       end
     end
   end

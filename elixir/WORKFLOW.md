@@ -342,3 +342,5 @@ merge authority from successful validation. See `docs/beads.md` for the contract
 
 Beads host delivery uses `beads_checkpoint` (scoped commit only), then
 `beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
+
+Beads preparation blockers use `beads_block` (or reason-only `beads_await_human`); delivered review handoffs require both review URL and head SHA.
