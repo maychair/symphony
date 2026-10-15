@@ -59,7 +59,8 @@ also remains blocked for operator inspection and continuation.
 Actual deliveries use `beads_await_human` with both exact `review_url` and full
 `head_sha`, then enter journal phase and metadata gate `awaiting_human`. Partial
 bindings are refused. These states survive restart and remain visible in the
-existing status API (`GET /api/v1/state`) and dashboard. No worker exit merges or
+existing status API (`GET /api/v1/state`) and dashboard, which display the durable
+blocker reason or a dependency wait separately from delivery acceptance. No worker exit merges or
 closes a task. Remote polling skips preparation blockers; it migrates legacy
 awaiting-human records with no delivery or review metadata to `blocked` once the
 executor lock is absent, preserving existing notes as the blocker reason.

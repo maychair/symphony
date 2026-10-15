@@ -177,7 +177,10 @@ defmodule SymphonyElixir.BeadsTest do
     assert ready.description =~ "Acceptance criteria:\nTests pass"
     assert ready.native_ref["metadata"] == %{"source" => "original"}
     assert ready.priority == 1
-    refute Enum.find(issues, &(&1.id == "bd-blocked")).dispatchable
+    blocked = Enum.find(issues, &(&1.id == "bd-blocked"))
+    refute blocked.dispatchable
+    assert blocked.native_ref["dependency_blocked"]
+    refute ready.native_ref["dependency_blocked"]
     assert {:ok, [^ready]} = Adapter.fetch_issues_by_ids(["bd-ready"])
     assert Enum.all?(File.stream!(context.trace), &(Jason.decode!(&1)["beads_dir"] == context.database))
   end
@@ -267,6 +270,38 @@ defmodule SymphonyElixir.BeadsTest do
     assert :ok = Reconciler.reconcile(opts[:tracker_settings], raw)
     assert :ok = Reconciler.reconcile(opts[:tracker_settings], raw)
     assert {:error, {:run_admission_blocked, _, :uncertain_or_awaiting_run}} = RunJournal.admit(Adapter.journal_root(opts[:tracker_settings]), issue.id)
+  end
+
+  test "dashboard reasons distinguish preparation, dependency blocking and actual review on completion and restart" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    reason = "Prepare linked repository before resuming"
+    assert Adapter.execute_agent_tool("beads_block", %{"reason" => reason}, issue: issue, tracker_settings: opts[:tracker_settings])["success"]
+    assert :ok = Adapter.finish_run(issue, opts, :ok)
+    server = Module.concat(__MODULE__, :BlockerDashboard)
+    pid = start_supervised!({Orchestrator, name: server})
+    row = Enum.find(Orchestrator.snapshot(server, 5_000).blocked, &(&1.issue_id == issue.id))
+    assert row.error == "blocked: " <> reason
+
+    ref = make_ref()
+    entry = %{pid: self(), ref: ref, identifier: issue.id, issue: issue, started_at: DateTime.utc_now()}
+    :sys.replace_state(pid, &%{&1 | running: %{issue.id => entry}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    row = Enum.find(Orchestrator.snapshot(server, 5_000).blocked, &(&1.issue_id == issue.id))
+    assert row.error == "blocked: " <> reason
+
+    {:ok, [current]} = Adapter.fetch_issues_by_ids([issue.id])
+    dependent = %{current | native_ref: Map.put(current.native_ref, "dependency_blocked", true)}
+    state = Orchestrator.reconcile_blocked_issue_states_for_test([dependent], :sys.get_state(pid))
+    assert state.blocked[issue.id].error == "blocked by task dependencies"
+
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    delivery = %{"review_url" => "https://github.com/example/repo/pull/1", "head_sha" => String.duplicate("a", 40)}
+    {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "awaiting_human", "delivery" => delivery})
+    stop_supervised!(Orchestrator)
+    start_supervised!({Orchestrator, name: server})
+    row = Enum.find(Orchestrator.snapshot(server, 5_000).blocked, &(&1.issue_id == issue.id))
+    assert row.error == "awaiting human acceptance"
   end
 
   test "legacy undelivered runs migrate only after executor lock release; partial deliveries stay strict" do

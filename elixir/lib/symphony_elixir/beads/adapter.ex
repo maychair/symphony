@@ -494,7 +494,10 @@ defmodule SymphonyElixir.Beads.Adapter do
       priority: if(is_integer(raw["priority"]), do: raw["priority"] + 1),
       assignee_id: raw["assignee"],
       labels: labels,
-      native_ref: Map.take(raw, ["issue_type", "acceptance_criteria", "external_ref", "metadata", "notes"]),
+      native_ref:
+        raw
+        |> Map.take(["issue_type", "acceptance_criteria", "external_ref", "metadata", "notes"])
+        |> Map.put("dependency_blocked", MapSet.member?(readiness.blocked, raw["id"])),
       url: raw["external_ref"],
       dispatchable: (MapSet.member?(readiness.ready, raw["id"]) or running) and not MapSet.member?(readiness.blocked, raw["id"]) and "human" not in labels,
       created_at: timestamp(raw["created_at"]),
