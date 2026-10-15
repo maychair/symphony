@@ -275,7 +275,7 @@ The output contains private repository identity and must stay outside Git.
 `/api/v1/runs/:id` additionally exposes the frozen validation policy and receipt.
 
 The no-argument `beads_checkpoint` tool performs only the authorized configured-path
-commit using publication task/owner/branch/remote checks. It does not push or
+commit using explicit task authority and owner/branch/remote checks. It does not push or
 create a review and does not require a validation receipt. Use checkpoint, validate,
 then publish when Git metadata is protected in the agent sandbox. Publication
 rechecks the receipt after its idempotent commit step and before any push.
@@ -337,3 +337,25 @@ or causal links remain uncaptured; no native transcripts are rewritten.
 A proven workspace preflight abort before any thread allocation can be recovered
 through the stopped-executor operator path without inventing native IDs. Thread
 start/turn intent uncertainty remains fenced; a new admission clears that proof.
+
+## Local checkpoint authority and child tools
+
+Local-only commits can opt in with the current task label `symphony:checkpoint`
+and a trusted provider `checkpoint_paths` list. This does not grant publication.
+Owner, open source Issue, task branch, repository remote and exact staged paths
+are still checked on the host. Existing `symphony:publish` / `publish_paths`
+checkpoint callers remain compatible. If both labels exist, checkpoint uses the
+local checkpoint list; publication independently requires its original authority.
+No sandbox write expansion is needed for shared Git worktree metadata.
+
+Task tools remain bound to the root thread and current turn. An inherited child
+or stale-turn tool call gets a structured `root_task_tools_only` failure without
+executing the host action or ending the parent Run. The root must provide the
+child's task snapshot and perform host actions itself. Unscoped approval requests
+continue to stop execution for operator handling; foreign completion events
+cannot complete the root turn. No arbitrary child identity is admitted.
+
+Deploy only when the owning executor is idle and stopped. Preserve its Run record
+and native identities; supply the explicit local task label and exact trusted
+checkpoint paths before recovery. Never grant publication merely to unblock a
+local checkpoint, or restart an active Run to apply this package.
