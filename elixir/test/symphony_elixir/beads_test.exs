@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.BeadsTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.Beads.{Acceptance, Adapter, RunJournal}
+  alias SymphonyElixir.Beads.{Acceptance, Adapter, Reconciler, RunJournal}
 
   setup do
     root = Path.dirname(Workflow.workflow_file_path())
@@ -128,7 +128,8 @@ defmodule SymphonyElixir.BeadsTest do
     assert Enum.map(events, &{&1["method"], &1["phase"]}) == [{"thread/start", "thread_start_intent"}, {"turn/start", "turn_start_intent"}]
     assert Enum.all?(events, &(&1["beads_dir"] == context.database))
     assert {:ok, record} = RunJournal.read(journal)
-    assert record["phase"] == "awaiting_human"
+    assert record["phase"] == "blocked"
+    assert record["blocker_reason"] =~ "Run ended without a delivery"
     assert record["thread_id"] == "observed-thread"
     assert record["turn_id"] == "observed-turn"
     assert record["turn_count"] == 1
@@ -184,7 +185,10 @@ defmodule SymphonyElixir.BeadsTest do
     assert ready.description =~ "Acceptance criteria:\nTests pass"
     assert ready.native_ref["metadata"] == %{"source" => "original"}
     assert ready.priority == 1
-    refute Enum.find(issues, &(&1.id == "bd-blocked")).dispatchable
+    blocked = Enum.find(issues, &(&1.id == "bd-blocked"))
+    refute blocked.dispatchable
+    assert blocked.native_ref["dependency_blocked"]
+    refute ready.native_ref["dependency_blocked"]
     assert {:ok, [^ready]} = Adapter.fetch_issues_by_ids(["bd-ready"])
     assert Enum.all?(File.stream!(context.trace), &(Jason.decode!(&1)["beads_dir"] == context.database))
   end
@@ -234,11 +238,12 @@ defmodule SymphonyElixir.BeadsTest do
 
   test "known completed checkpoint retains native identity on next admission", context do
     {:ok, record} = RunJournal.admit(context.root, "completed")
-    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "thread", "turn_id" => "turn"})
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "thread", "turn_id" => "turn", "blocker_reason" => "Old preparation blocker"})
     assert :ok = RunJournal.complete(record, "completed")
     assert {:ok, resumed} = RunJournal.admit(context.root, "completed")
     assert resumed["owner"] == record["owner"]
     assert resumed["thread_id"] == "thread"
+    refute Map.has_key?(resumed, "blocker_reason")
   end
 
   test "agent tool can only park its own claimed issue and cannot accept" do
@@ -248,9 +253,94 @@ defmodule SymphonyElixir.BeadsTest do
     wrong_owner = %{issue | assignee_id: "other"}
     result = Adapter.execute_agent_tool("beads_await_human", %{"reason" => "Review"}, issue: wrong_owner, tracker_settings: settings)
     refute result["success"]
-    assert Adapter.execute_agent_tool("beads_await_human", %{"reason" => "Review"}, issue: issue, tracker_settings: settings)["success"]
+    refute Adapter.execute_agent_tool("beads_await_human", %{"reason" => "Review", "review_url" => nil}, issue: issue, tracker_settings: settings)["success"]
+    assert Adapter.execute_agent_tool("beads_await_human", %{"reason" => "Build directory missing; operator must prepare it before resuming"}, issue: issue, tracker_settings: settings)["success"]
     refute Adapter.execute_agent_tool("beads_accept", %{}, issue: issue, tracker_settings: settings)["success"]
     assert :ok = Adapter.finish_run(issue, opts, :ok)
+  end
+
+  test "preparation blockers retain reasons, skip review polling and fence admission" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    reason = "Linked repository missing; prepare it before resuming"
+    wrong_owner = %{issue | assignee_id: "other"}
+    tool_opts = [issue: wrong_owner, tracker_settings: opts[:tracker_settings]]
+    wrong_result = Adapter.execute_agent_tool("beads_block", %{"reason" => reason}, tool_opts)
+    refute wrong_result["success"]
+    assert Adapter.execute_agent_tool("beads_block", %{"reason" => reason}, issue: issue, tracker_settings: opts[:tracker_settings])["success"]
+    assert :ok = Adapter.finish_run(issue, opts, :ok)
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    assert record["phase"] == "blocked"
+    assert record["blocker_reason"] == reason
+    assert is_nil(record["delivery"])
+    {:ok, [raw]} = Adapter.command(opts[:tracker_settings], ["show", issue.id, "--json"])
+    assert raw["metadata"]["symphony_gate"] == "blocked"
+    assert :ok = Reconciler.reconcile(opts[:tracker_settings], raw)
+    assert :ok = Reconciler.reconcile(opts[:tracker_settings], raw)
+    assert {:error, {:run_admission_blocked, _, :uncertain_or_awaiting_run}} = RunJournal.admit(Adapter.journal_root(opts[:tracker_settings]), issue.id)
+  end
+
+  test "dashboard reasons distinguish preparation, dependency blocking and actual review on completion and restart" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    reason = "Prepare linked repository before resuming"
+    assert Adapter.execute_agent_tool("beads_block", %{"reason" => reason}, issue: issue, tracker_settings: opts[:tracker_settings])["success"]
+    assert :ok = Adapter.finish_run(issue, opts, :ok)
+    server = Module.concat(__MODULE__, :BlockerDashboard)
+    pid = start_supervised!({Orchestrator, name: server})
+    row = Enum.find(Orchestrator.snapshot(server, 5_000).blocked, &(&1.issue_id == issue.id))
+    assert row.error == "blocked: " <> reason
+
+    ref = make_ref()
+    entry = %{pid: self(), ref: ref, identifier: issue.id, issue: issue, started_at: DateTime.utc_now()}
+    :sys.replace_state(pid, &%{&1 | running: %{issue.id => entry}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    row = Enum.find(Orchestrator.snapshot(server, 5_000).blocked, &(&1.issue_id == issue.id))
+    assert row.error == "blocked: " <> reason
+
+    {:ok, [current]} = Adapter.fetch_issues_by_ids([issue.id])
+    dependent = %{current | native_ref: Map.put(current.native_ref, "dependency_blocked", true)}
+    state = Orchestrator.reconcile_blocked_issue_states_for_test([dependent], :sys.get_state(pid))
+    assert state.blocked[issue.id].error == "blocked by task dependencies"
+
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    delivery = %{"review_url" => "https://github.com/example/repo/pull/1", "head_sha" => String.duplicate("a", 40)}
+    {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "awaiting_human", "delivery" => delivery})
+    stop_supervised!(Orchestrator)
+    start_supervised!({Orchestrator, name: server})
+    row = Enum.find(Orchestrator.snapshot(server, 5_000).blocked, &(&1.issue_id == issue.id))
+    assert row.error == "awaiting human acceptance"
+  end
+
+  test "legacy undelivered runs migrate only after executor lock release; partial deliveries stay strict" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    settings = opts[:tracker_settings]
+    assert :ok = Adapter.await_human(settings, issue.id, issue.assignee_id, "Build missing; prepare before resume")
+    {:ok, record} = RunJournal.checkpoint(opts[:run_record], %{"phase" => "awaiting_human"})
+    {:ok, [raw]} = Adapter.command(settings, ["show", issue.id, "--json"])
+    assert {:error, :run_may_have_live_executor} = Reconciler.reconcile(settings, raw)
+    assert :ok = RunJournal.complete(record, "awaiting_human")
+    raw = Map.put(raw, "notes", "Build missing; prepare before resume")
+    assert :ok = Reconciler.reconcile(settings, raw)
+    {:ok, blocked} = RunJournal.read(record["directory"])
+    assert blocked["phase"] == "blocked"
+    assert blocked["blocker_reason"] == "Build missing; prepare before resume"
+    {:ok, _} = RunJournal.checkpoint(blocked, %{"phase" => "awaiting_human", "delivery" => %{"head_sha" => String.duplicate("a", 40)}})
+    assert {:error, :missing_review_binding} = Reconciler.reconcile(settings, raw)
+  end
+
+  test "actual delivery requires complete binding and remains awaiting acceptance" do
+    {:ok, [issue]} = Adapter.fetch_issues_by_ids(["bd-ready"])
+    {:ok, issue, opts} = Adapter.prepare_run(issue, [])
+    arguments = %{"reason" => "Delivered", "review_url" => "https://github.com/example/repo/pull/1", "head_sha" => String.duplicate("a", 40)}
+    assert Adapter.execute_agent_tool("beads_await_human", arguments, issue: issue, tracker_settings: opts[:tracker_settings])["success"]
+    refute Adapter.execute_agent_tool("beads_block", %{"reason" => "Ignore delivery"}, issue: issue, tracker_settings: opts[:tracker_settings])["success"]
+    assert :ok = Adapter.finish_run(issue, opts, :ok)
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    assert record["phase"] == "awaiting_human"
+    assert record["delivery"]["review_url"] == arguments["review_url"]
+    assert record["delivery"]["head_sha"] == arguments["head_sha"]
   end
 
   test "acceptance binds a merged review to durable delivery, scope, owner and human identity" do
@@ -497,7 +587,17 @@ defmodule SymphonyElixir.BeadsTest do
     assert Adapter.execute_agent_tool("beads_await_human", arguments, binding)["success"]
     {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
     assert record["handoff_intent"] == "blocked"
+    assert record["blocker_reason"] == arguments["reason"]
     refute record["delivery"]
+    {:ok, [task]} = Adapter.command(opts[:tracker_settings], ["show", issue.id, "--json"])
+    assert task["metadata"]["symphony_gate"] == "blocked"
+    assert :ok = Adapter.finish_run(issue, opts, :ok)
+    {:ok, record} = RunJournal.read(record["directory"])
+    assert record["phase"] == "blocked"
+    {:ok, _} = RunJournal.checkpoint(record, %{"delivery" => %{"head_sha" => String.duplicate("b", 40)}})
+    before_run = File.read!(Path.join(record["directory"], "run.json"))
+    refute Adapter.execute_agent_tool("beads_await_human", arguments, binding)["success"]
+    assert File.read!(Path.join(record["directory"], "run.json")) == before_run
   end
 
   test "compact same-thread prompt keeps custom rules and rejects stale template reuse" do

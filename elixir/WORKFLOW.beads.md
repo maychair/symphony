@@ -50,8 +50,9 @@ merge a PR/MR, close this bead or its source Issue, impersonate human acceptance
 or change task ownership. A successful turn is delivery evidence. Native approval
 or input requests require a human. Never approve them automatically.
 
-When delivery is ready, call beads_await_human with a reason and, when a review
-exists, its exact review_url and head_sha. These identify the delivered PR/MR
-and commit; source Issue external_ref remains unchanged. If blocked or unfinished,
-request human review with a reason. Symphony also parks a normally completed
-turn without a tool call. Subsequent work requires explicit operator recovery.
+When delivery is ready, call beads_await_human with a reason and its exact
+review_url and head_sha. These identify the delivered PR/MR and commit; source
+Issue external_ref remains unchanged. If blocked or unfinished, call beads_block
+with the concrete blocker and release condition. A reason-only beads_await_human
+call also parks an undelivered blocker. Symphony parks a normally completed turn
+without a delivery as blocked. Subsequent work requires explicit operator recovery.
