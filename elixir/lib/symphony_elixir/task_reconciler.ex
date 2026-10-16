@@ -359,12 +359,15 @@ defmodule SymphonyElixir.TaskReconciler do
 
   defp bind_natural(event, _, _, _), do: event
 
-  # The restrictions a natural note releases: an answer resumes the task, so it
-  # releases the decision that asked for it and the pauses that precede it. Only
-  # a note that follows the question is an answer, so an older resume cannot
-  # release a decision raised after it.
-  defp natural_restrictions(%{"answer" => true} = event, parsed, flow),
+  # The restrictions a natural note releases. An answer releases the decision
+  # that asked for it; only a resume the owner wrote releases the pauses that
+  # precede it, so plain text answering a question leaves an earlier pause in
+  # place. Only a note that follows the question is an answer, so an older resume
+  # cannot release a decision raised after it.
+  defp natural_restrictions(%{"answer" => true, "resume" => true} = event, parsed, flow),
     do: pause_releases(event, parsed, flow) ++ decision_handoff(flow)
+
+  defp natural_restrictions(%{"answer" => true}, _parsed, flow), do: decision_handoff(flow)
 
   defp natural_restrictions(event, parsed, flow), do: pause_releases(event, parsed, flow)
 
@@ -380,7 +383,8 @@ defmodule SymphonyElixir.TaskReconciler do
   defp parse_note(note, flow, owner, question) do
     body = note["body"] || ""
     answers? = answer?(note, flow, owner, question)
-    payload = note_payload(body) || (answers? and %{"action" => "resume", "natural" => true})
+    declared = note_payload(body)
+    payload = declared || (answers? and %{"action" => "resume", "natural" => true})
 
     if is_map(payload) and is_map(payload["data"] || %{}) do
       version = note_version(note)
@@ -395,10 +399,17 @@ defmodule SymphonyElixir.TaskReconciler do
         "contract" => payload["contract"],
         "data" => payload["data"] || %{},
         "natural" => payload["natural"] == true,
+        "resume" => declared_resume?(declared),
         "answer" => answer_event?(answers?, payload)
       }
     end
   end
+
+  # Answering releases the question without releasing a pause the owner asked
+  # for, so the natural restrictions distinguish a resume the note declares from
+  # the resume payload the answer itself synthesizes.
+  defp declared_resume?(%{"action" => "resume", "natural" => true}), do: true
+  defp declared_resume?(_), do: false
 
   # A note answers the question only when it both follows the question and
   # resumes, so a clarification or pause request is not an answer.

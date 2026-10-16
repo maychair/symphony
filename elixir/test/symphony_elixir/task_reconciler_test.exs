@@ -972,6 +972,33 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute Enum.any?(record["workflow"]["restrictions"], fn {_, restriction} -> restriction["kind"] == "pause" end)
   end
 
+  test "a plain text answer leaves the pause it follows in place", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    append(server, reply(50, "Please pause this task.", 1, "2026-10-16T00:00:02Z"))
+
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "decision", "reason" => "Pick a fixture."}, handoff_opts)["success"]
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "waiting"
+
+    # Answering is not resuming: the reply releases the question, while the
+    # pause the owner asked for keeps the task waiting until it is released.
+    append(server, reply(96, "Use the replay fixture."))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+
+    assert record["workflow"]["state"] == "waiting"
+    assert record["workflow"]["restrictions"]["handoff"] == nil
+    assert Enum.any?(record["workflow"]["restrictions"], fn {_, restriction} -> restriction["kind"] == "pause" end)
+
+    append(server, reply(97, "Please resume this task."))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+
+    assert record["workflow"]["state"] == "ready"
+    refute Enum.any?(record["workflow"]["restrictions"], fn {_, restriction} -> restriction["kind"] == "pause" end)
+  end
+
   test "a comment in the question's own second answers only after the notice note", %{issue: issue, server: server, client: client} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]

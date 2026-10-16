@@ -120,13 +120,14 @@ requests to pause or resume enter a clarification wait.
 
 A blocking question is answered in the Issue itself. While the agent's handoff
 holds a task-scope decision restriction, the sole assignee's first note after the
-engine posted its question releases that restriction and resumes execution, so
-answering needs no label. Notes carry second precision, so a note in the
-question's own second counts only when its note id follows the notice. Engine
-notices end with a `<!-- symphony-engine-notice -->` line of their own; the engine
-never answers its own question, and a reply that quotes the notice counts. A
-review handoff is unchanged and still waits for `symphony:accept` or
-`symphony:rework`.
+engine posted its question releases that restriction, so answering needs no
+label. Answering is not resuming: it leaves a pause the owner asked for in
+place, and only an explicit resume releases that pause. Notes carry second
+precision, so a note in the question's own second counts only when its note id
+follows the notice. Engine notices end with a `<!-- symphony-engine-notice -->`
+line of their own; the engine never answers its own question, and a reply that
+quotes the notice counts. A review handoff is unchanged and still waits for
+`symphony:accept` or `symphony:rework`.
 
 Other prose remains discussion and requires a concrete decision where its meaning
 is unclear.
