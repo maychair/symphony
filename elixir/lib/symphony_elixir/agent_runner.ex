@@ -183,6 +183,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp next_action(issue, opts, fetcher) do
     if opts[:run_record] do
+      Execution.reconcile_delivery(issue, opts)
+
       with {:ok, current} <- RunJournal.read(opts[:run_record]["directory"]) do
         if current["handoff"] || current["blocker_reason"], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
       end
@@ -203,7 +205,9 @@ defmodule SymphonyElixir.AgentRunner do
     #{brief}
     That file contains the workflow, task scope, acceptance criteria and authority.
     Read the current repository Issue and its comments through the native provider tool.
-    Use task_handoff after recording a concrete review, decision or blocker on the Issue.
+    For GitLab MR delivery, use the configured publication entry with --handoff.
+    Symphony completes the review handoff automatically; do not post a duplicate notice.
+    Use task_handoff directly for a concrete decision, blocker or other delivery provider.
     Continue authorized work until validated delivery or a specific real blocker.
     Follow all verification, resource admission, publication and acceptance gates.
     A normal turn ending or idle parent chat is not a blocker.
@@ -218,6 +222,7 @@ defmodule SymphonyElixir.AgentRunner do
         on_message: journal_message_handler(record, recipient, issue),
         before_goal: fn -> journal!(record, %{"phase" => "goal_start_intent", "execution_mode" => "goal"}) end,
         handoff_status: fn ->
+          Execution.reconcile_delivery(issue, opts)
           {:ok, current} = RunJournal.read(record["directory"])
 
           cond do
@@ -354,7 +359,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp active_issue_state?(_state_name), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    Issue.routable?(issue, Config.settings!().tracker)
   end
 
   defp selected_worker_host(nil, []), do: nil

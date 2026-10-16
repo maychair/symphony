@@ -32,6 +32,24 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 In native Goal mode, it retains the running entry until the worker confirms native
 shutdown and finalizes the durable journal; an unconfirmed stop remains an incident.
 
+### Merged-delivery cleanup
+
+`workspace.merge_cleanup_command` is an optional trusted operator command,
+disabled by default. The existing poll cycle starts one asynchronous pass at a
+time; slow or failed cleanup does not block task reconciliation. Startup and
+subsequent polls use the same path, and changing configuration affects later
+passes. The command must independently confirm the native review is merged,
+the recorded task is stopped, and the exact local worktree/branch are safe to
+remove. Closing an Issue alone is not merge evidence. Ordinary `workspace.retain`
+semantics remain unchanged.
+
+The command owns provider-specific merge checks, exclusive execution fencing,
+data protection, durable cleanup receipts and operator notices. It must preserve
+execution records, stop on dirty or unpublished work, avoid forced removal, and
+support restart/partial-failure recovery. A successful command exit means a pass
+finished, not that every candidate was removed. This is lifecycle reconciliation,
+not another task source or Agent retry loop.
+
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
@@ -409,3 +427,7 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 ## Repository Issue execution
 
 See [repository execution](docs/repository-issues.md) for native Goal sessions, durable execution records and handoffs.
+
+Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
+
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.

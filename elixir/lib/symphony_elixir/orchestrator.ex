@@ -35,6 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :merge_cleanup_ref,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -120,11 +121,23 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
+    state = maybe_start_merge_cleanup(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info({ref, {_output, status}}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    if status != 0, do: Logger.warning("Merged-workspace cleanup command failed status=#{status}; retained execution records")
+    {:noreply, %{state | merge_cleanup_ref: nil}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
+    Logger.warning("Merged-workspace cleanup command stopped reason=#{inspect(reason)}")
+    {:noreply, %{state | merge_cleanup_ref: nil}}
   end
 
   def handle_info(
@@ -936,7 +949,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    Issue.routable?(issue, Config.settings!().tracker)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
@@ -1239,6 +1252,12 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
     end
   end
+
+  defp maybe_start_merge_cleanup(%{merge_cleanup_ref: nil} = state) do
+    %{state | merge_cleanup_ref: SymphonyElixir.MergedWorkspaceCleanup.start(state.task_supervisor)}
+  end
+
+  defp maybe_start_merge_cleanup(state), do: state
 
   defp notify_dashboard do
     StatusDashboard.notify_update()

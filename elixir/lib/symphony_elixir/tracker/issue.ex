@@ -50,7 +50,14 @@ defmodule SymphonyElixir.Tracker.Issue do
     labels
   end
 
-  @spec routable?(t(), [String.t()]) :: boolean()
+  @spec routable?(t(), [String.t()] | map()) :: boolean()
+  def routable?(%__MODULE__{} = issue, %{required_labels: labels} = tracker) do
+    owner = if tracker.kind in ["github", "gitlab"], do: Map.get(tracker, :assignee)
+
+    routable?(issue, labels) and
+      (is_nil(owner) or (is_binary(owner) and owner != "" and issue.assignee_id == owner))
+  end
+
   def routable?(%__MODULE__{dispatchable: true, labels: labels}, required_labels)
       when is_list(labels) and is_list(required_labels) do
     issue_labels = MapSet.new(labels, &normalize_label/1)

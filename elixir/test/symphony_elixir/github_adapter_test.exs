@@ -102,6 +102,13 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
            ]
   end
 
+  test "empty and multiple assignees cannot inherit a stale singular assignee" do
+    for assignees <- [[], [%{"id" => 20, "login" => "owner"}, %{"id" => 21, "login" => "other"}]] do
+      raw = raw_issue(42) |> Map.put("assignees", assignees)
+      assert GitHubClient.normalize_issue_for_test(raw, "octo/repo").assignee_id == nil
+    end
+  end
+
   test "client normalizes GitHub issues without dropping provider details" do
     issue = GitHubClient.normalize_issue_for_test(raw_issue(42), "octo/repo")
 

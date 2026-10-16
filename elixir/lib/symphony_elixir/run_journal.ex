@@ -27,16 +27,40 @@ defmodule SymphonyElixir.RunJournal do
 
       record =
         record
-        |> Map.drop(["handoff", "handoff_pending", "blocker_reason", "native_stop_confirmed"])
+        |> Map.drop(["handoff", "handoff_pending", "handoff_notice", "delivery", "stage_results", "blocker_reason", "native_stop_confirmed"])
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
         |> Map.put("host", to_string(host))
         |> Map.put("executor_os_pid", System.pid())
 
-      checkpoint(record, %{"phase" => "admitted"})
+      with {:ok, record} <- carry_pending_review(previous, record) do
+        checkpoint(record, %{"phase" => "admitted"})
+      end
     end
   end
+
+  defp carry_pending_review(%{"thread_id" => thread} = previous, record) when is_binary(thread) do
+    old = Path.join(record["directory"], "review-request-#{previous["attempt_id"]}.json")
+
+    if previous["handoff"] || not File.exists?(old) do
+      {:ok, record}
+    else
+      path = Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json")
+
+      with {:ok, data} <- File.read(old),
+           {:ok, %{} = request} <- Jason.decode(data),
+           true <- request["attempt_id"] == previous["attempt_id"] and request["issue_url"] == previous["issue_url"],
+           :ok <- write_synced(path <> ".pending", Jason.encode!(Map.put(request, "attempt_id", record["attempt_id"]))),
+           :ok <- File.rename(path <> ".pending", path) do
+        {:ok, Map.put(record, "handoff_notice", previous["handoff_notice"])}
+      else
+        error -> {:error, {:pending_review_recovery_failed, error}}
+      end
+    end
+  end
+
+  defp carry_pending_review(_, record), do: {:ok, record}
 
   @spec checkpoint(map(), map()) :: {:ok, map()} | {:error, term()}
   def checkpoint(%{"directory" => directory} = record, changes) do
@@ -44,6 +68,7 @@ defmodule SymphonyElixir.RunJournal do
     event = Map.take(changes, ["phase", "thread_id", "turn_id"]) |> Map.put("at", now) |> Map.put("attempt_id", record["attempt_id"])
     events = Enum.take((record["events"] || []) ++ [event], -200)
     updated = record |> Map.merge(changes) |> Map.put("updated_at", now) |> Map.put("events", events)
+    updated = Map.put(updated, "stage_results", stage_results(updated))
     path = Path.join(directory, "run.json")
     temporary = path <> ".pending"
 
@@ -51,6 +76,18 @@ defmodule SymphonyElixir.RunJournal do
          :ok <- File.rename(temporary, path) do
       {:ok, updated}
     end
+  end
+
+  @spec stage_results(map()) :: map()
+  def stage_results(record) do
+    %{
+      "execution_admitted" => if(record["attempt_id"], do: "passed", else: "not_verified"),
+      "mr_publication" => if(get_in(record, ["delivery", "mr_verified"]) == true, do: "passed", else: "not_verified"),
+      "review_handoff" => if(get_in(record, ["handoff", "kind"]) == "review", do: "passed", else: "not_verified"),
+      "native_execution_stopped" => if(record["native_stop_confirmed"] == true, do: "passed", else: "not_verified"),
+      "business_validation" => "see_mr_evidence",
+      "error" => record["blocker_reason"]
+    }
   end
 
   @spec complete(map(), String.t()) :: :ok | {:error, term()}

@@ -216,7 +216,9 @@ defmodule SymphonyElixir.GitLab.Client do
     |> Map.new()
   end
 
-  defp assignee_id(%{"assignees" => [assignee | _]}) when is_map(assignee), do: assignee_id(assignee)
+  defp assignee_id(%{"assignees" => [assignee]}) when is_map(assignee), do: assignee_id(assignee)
+
+  defp assignee_id(%{"assignees" => _}), do: nil
 
   defp assignee_id(%{"assignee" => assignee}) when is_map(assignee), do: assignee_id(assignee)
 

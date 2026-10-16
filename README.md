@@ -3,6 +3,11 @@
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+The Elixir implementation supports an opt-in merged-delivery cleanup command on
+its existing polling cycle. Operators can verify merged reviews and retire only
+the corresponding safe local worktrees while retaining execution evidence; see
+[the lifecycle contract](elixir/README.md#merged-delivery-cleanup).
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
@@ -41,3 +46,7 @@ help with the setup:
 This project is licensed under the [Apache License 2.0](LICENSE).
 
 The Elixir implementation supports repository Issues directly through the GitHub and GitLab adapters. Native Goal execution and durable run identities are tracker-independent. See [repository execution](elixir/docs/repository-issues.md).
+
+Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
+
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.

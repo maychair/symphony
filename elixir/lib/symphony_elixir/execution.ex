@@ -61,10 +61,12 @@ defmodule SymphonyElixir.Execution do
       cond do
         is_nil(record) -> :ok
         record["issue_url"] != issue.url -> {:error, :execution_issue_identity_changed}
+        # Completed runs have already released their executor lock. A lock present
+        # now may belong to merge cleanup; admission must never reclaim it.
+        record["phase"] == "completed" -> :ok
         resumable?(issue) -> release_for_resume(record)
         record["phase"] == "incident" -> {:error, {:execution_requires_recovery, record["blocker_reason"]}}
         RunJournal.executor_state(record) == :stopped and (is_binary(record["thread_id"]) or record["thread_allocation_intent"] != true) -> release_for_resume(record)
-        record["phase"] == "completed" -> :ok
         true -> {:error, {:execution_requires_recovery, record["blocker_reason"] || record["phase"]}}
       end
     end
@@ -91,12 +93,16 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp release_for_resume(record) do
-    with {:ok, _} <- RunJournal.checkpoint(record, %{"phase" => "completed", "handoff" => nil, "blocker_reason" => nil}) do
+    with false <- File.exists?(Path.join([record["directory"], "executor.lock", "cleanup-owner.json"])),
+         {:ok, _} <- RunJournal.checkpoint(record, %{"phase" => "completed", "handoff" => nil, "blocker_reason" => nil}) do
       case File.rmdir(Path.join(record["directory"], "executor.lock")) do
         :ok -> :ok
         {:error, :enoent} -> :ok
         error -> error
       end
+    else
+      true -> {:error, :merge_cleanup_in_progress}
+      error -> error
     end
   end
 
@@ -133,7 +139,7 @@ defmodule SymphonyElixir.Execution do
       case Tracker.fetch_issues_by_ids([issue.id]) do
         {:ok, [current]} ->
           if current.state in Config.settings!().tracker.terminal_states or
-               not Tracker.Issue.routable?(current, Config.settings!().tracker.required_labels),
+               not Tracker.Issue.routable?(current, Config.settings!().tracker),
              do: {"completed", nil},
              else: {"incident", "Goal ended while the Issue still requests execution; inspect the result or add symphony:retry."}
 
@@ -218,6 +224,75 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
+  @spec reconcile_delivery(Tracker.Issue.t(), keyword()) :: :ok | {:error, term()}
+  def reconcile_delivery(issue, opts) do
+    directory = RunJournal.directory(journal_root(), issue.id)
+
+    with {:ok, record} <- RunJournal.read(directory),
+         {:ok, path} <- pending_review_path(record) do
+      case accept_delivery(issue, record, path, opts) do
+        :ok -> :ok
+        error -> record_delivery_error(directory, error)
+      end
+    else
+      :none -> :ok
+      error -> error
+    end
+  end
+
+  defp pending_review_path(nil), do: :none
+
+  defp pending_review_path(record) do
+    path = Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json")
+    if record["handoff"] || not File.exists?(path), do: :none, else: {:ok, path}
+  end
+
+  defp record_delivery_error(directory, error) do
+    {:ok, current} = RunJournal.read(directory)
+    RunJournal.checkpoint(current, %{"blocker_reason" => "Automatic review handoff failed: #{inspect(error)}"})
+    error
+  end
+
+  defp accept_delivery(issue, record, path, opts) do
+    settings = opts[:tracker_settings] || Config.settings!().tracker
+    opts = Keyword.merge(opts, issue: issue, tracker_settings: settings)
+    {client, _} = client_path(settings, issue, opts)
+    prefix = String.replace_suffix(issue.url, "/issues/#{issue.id}", "/merge_requests/")
+
+    with {:ok, data} <- File.read(path),
+         {:ok, %{} = request} <- Jason.decode(data),
+         true <- valid_delivery_request?(settings, issue, record, request),
+         %{"iid" => iid, "sha" => sha} = publication <- request["publication"],
+         true <- is_integer(iid) and iid > 0 and is_binary(sha) and request["url"] == prefix <> to_string(iid),
+         {:ok, %{status: 200, body: %{} = mr}} <- client.("GET", "/projects/#{URI.encode_www_form(settings.provider["project_path"])}/merge_requests/#{iid}", %{}, nil, tracker_settings: settings),
+         true <- valid_review_options?(mr, request["url"]),
+         true <- same_publication?(publication, mr),
+         {:ok, _} <- RunJournal.checkpoint(record, %{"delivery" => %{"url" => request["url"], "mr_verified" => true, "attempt_id" => record["attempt_id"]}}),
+         %{"success" => true} <- handoff(Map.take(request, ["kind", "reason", "url"]), opts) do
+      :ok
+    else
+      error -> {:error, {:review_delivery_not_verified, error}}
+    end
+  end
+
+  defp valid_delivery_request?(settings, issue, record, request) do
+    expected = %{"schema_version" => 1, "attempt_id" => record["attempt_id"], "issue_url" => issue.url}
+    settings.kind == "gitlab" and Enum.all?(expected, fn {key, value} -> request[key] == value end)
+  end
+
+  defp valid_review_options?(mr, url) do
+    expected = %{"state" => "opened", "web_url" => url, "squash" => true}
+
+    Enum.all?(expected, fn {key, value} -> mr[key] == value end) and mr["draft"] != true and
+      mr["source_project_id"] == mr["target_project_id"] and
+      (mr["force_remove_source_branch"] == true or mr["should_remove_source_branch"] == true)
+  end
+
+  defp same_publication?(publication, mr) do
+    fields = ["sha", "source_branch", "target_branch", "source_project_id", "target_project_id"]
+    Enum.all?(fields, &(not is_nil(publication[&1]) and publication[&1] == mr[&1]))
+  end
+
   @spec handoff(term(), keyword()) :: map()
   def handoff(arguments, opts) do
     result = do_handoff(arguments, opts)
@@ -233,14 +308,15 @@ defmodule SymphonyElixir.Execution do
     with {:ok, %{} = record} <- RunJournal.read(RunJournal.directory(journal_root(), issue.id)),
          true <- record["issue_url"] == issue.url,
          {:ok, pending} <- RunJournal.checkpoint(record, %{"handoff_pending" => true}) do
-      case post_handoff(settings, issue, arguments, opts) do
-        :ok ->
-          with {:ok, updated} <- RunJournal.checkpoint(pending, %{"handoff_pending" => false, "handoff" => arguments}) do
+      case post_handoff(settings, issue, arguments, pending, opts) do
+        {:ok, posted} ->
+          with {:ok, updated} <- RunJournal.checkpoint(posted, %{"handoff_pending" => false, "handoff" => arguments}) do
             {:ok, Map.take(updated, ["issue_url", "handoff"])}
           end
 
         error ->
-          RunJournal.checkpoint(pending, %{"handoff_pending" => false})
+          {:ok, current} = RunJournal.read(record["directory"])
+          RunJournal.checkpoint(current, %{"handoff_pending" => false})
           {:error, error}
       end
     else
@@ -250,17 +326,48 @@ defmodule SymphonyElixir.Execution do
 
   defp do_handoff(_, _), do: {:error, :invalid_handoff}
 
-  defp post_handoff(%{kind: kind} = settings, issue, args, opts) when kind in ["github", "gitlab"] do
+  defp post_handoff(%{kind: kind} = settings, issue, args, record, opts) when kind in ["github", "gitlab"] do
     {client, path} = client_path(settings, issue, opts)
     suffix = if kind == "github", do: "/comments", else: "/notes"
 
-    with :ok <- response(client.("POST", path <> suffix, %{}, %{"body" => handoff_body(args)}, tracker_settings: settings)),
-         :ok <- remove_labels(settings, issue, settings.required_labels ++ ["symphony:retry"], opts) do
-      :ok
+    body = handoff_body(args)
+
+    with {:ok, posted} <- ensure_handoff_notice(client, path <> suffix, settings, body, record),
+         :ok <- remove_labels(settings, issue, settings.required_labels ++ ["symphony:retry"], opts),
+         {:ok, %{status: 200, body: %{} = current}} <- client.("GET", path, %{}, nil, tracker_settings: settings),
+         labels when is_list(labels) <- current["labels"],
+         true <- routing_released?(labels, settings) do
+      {:ok, posted}
     end
   end
 
-  defp post_handoff(_, _, _, _), do: {:error, :repository_tracker_required}
+  defp post_handoff(_, _, _, _, _), do: {:error, :repository_tracker_required}
+
+  defp routing_released?(labels, settings) do
+    Enum.all?(labels, fn label ->
+      name = if is_map(label), do: label["name"], else: label
+      is_binary(name) and String.downcase(String.trim(name)) not in (settings.required_labels ++ ["symphony:retry"])
+    end)
+  end
+
+  defp ensure_handoff_notice(_client, _path, _settings, body, %{"handoff_notice" => previous} = record)
+       when previous == body, do: {:ok, record}
+
+  defp ensure_handoff_notice(client, path, settings, body, record) do
+    with {:ok, %{status: 200, body: notes}} when is_list(notes) <-
+           client.("GET", path, %{"per_page" => 100}, nil, tracker_settings: settings),
+         :ok <- post_notice_unless_present(client, path, settings, body, notes) do
+      RunJournal.checkpoint(record, %{"handoff_notice" => body})
+    end
+  end
+
+  defp post_notice_unless_present(client, path, settings, body, notes) do
+    if Enum.any?(notes, &(&1["body"] == body)) do
+      :ok
+    else
+      response(client.("POST", path, %{}, %{"body" => body}, tracker_settings: settings))
+    end
+  end
 
   defp remove_labels(%{kind: "github"} = settings, issue, labels, opts) do
     {client, path} = client_path(settings, issue, opts)

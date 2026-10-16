@@ -36,6 +36,28 @@ defmodule SymphonyElixir.ExecutionTest do
     refute File.exists?(Path.join(record["directory"], "executor.lock"))
   end
 
+  test "completed-run recovery cannot steal a cleanup lock from a new scheduler", %{issue: issue} do
+    assert {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    assert :ok = RunJournal.complete(record, "completed")
+
+    assert {:ok, record} =
+             RunJournal.checkpoint(record, %{
+               "phase" => "completed",
+               "executor_os_pid" => "999999999",
+               "native_stop_confirmed" => true,
+               "handoff" => %{"kind" => "review", "url" => "https://example.invalid/mr/6"}
+             })
+
+    lock = Path.join(record["directory"], "executor.lock")
+    File.mkdir!(lock)
+    File.write!(Path.join(lock, "cleanup-owner.json"), "cleanup owns this lock")
+    before = File.read!(Path.join(record["directory"], "run.json"))
+    assert {:error, {:run_admission_blocked, _, :eexist}} = Execution.prepare(issue, [])
+    assert File.read!(Path.join(record["directory"], "run.json")) == before
+    assert File.read!(Path.join(lock, "cleanup-owner.json")) == "cleanup owns this lock"
+  end
+
   test "a recorded native thread cannot silently change execution backend", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     {:ok, record} = RunJournal.checkpoint(opts[:run_record], %{"backend" => "omp"})
@@ -73,7 +95,7 @@ defmodule SymphonyElixir.ExecutionTest do
 
     client = fn method, path, _, _, _ ->
       send(self(), {:native, method, path})
-      {:ok, %{status: 200}}
+      native_ok(method, path)
     end
 
     assert {:ok, _, resumed} = Execution.prepare(%{issue | labels: issue.labels ++ ["symphony:retry"]}, github_client: client)
@@ -231,7 +253,7 @@ defmodule SymphonyElixir.ExecutionTest do
     client = fn method, path, _, body, _ ->
       assert Execution.handing_off?(issue.id)
       send(self(), {:native, method, path, body})
-      {:ok, %{status: 200}}
+      native_ok(method, path)
     end
 
     args = %{"kind" => "review", "reason" => "Review the verified change", "url" => "https://github.com/example/repository/pull/9"}
@@ -274,7 +296,7 @@ defmodule SymphonyElixir.ExecutionTest do
 
     client = fn method, path, _, body, _ ->
       send(self(), {:native, method, path, body})
-      {:ok, %{status: 200}}
+      native_ok(method, path)
     end
 
     assert Execution.handoff(%{"kind" => "decision", "reason" => "Choose the required interface"}, issue: issue, tracker_settings: settings, gitlab_client: client)["success"]
@@ -435,5 +457,151 @@ defmodule SymphonyElixir.ExecutionTest do
     after
       AppServer.stop_session(session)
     end
+  end
+
+  test "verified publication automatically completes one review handoff", %{issue: original} do
+    issue = %{original | url: "https://gitlab.test/group/repository/-/issues/42"}
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    settings = %{kind: "gitlab", provider: %{"project_path" => "group/repository"}, required_labels: ["symphony:ready"]}
+
+    mr = %{
+      "iid" => 9,
+      "sha" => "source",
+      "source_branch" => "task",
+      "target_branch" => "main",
+      "source_project_id" => 1,
+      "target_project_id" => 1,
+      "state" => "opened",
+      "web_url" => "https://gitlab.test/group/repository/-/merge_requests/9",
+      "squash" => true,
+      "force_remove_source_branch" => true
+    }
+
+    request = %{
+      "schema_version" => 1,
+      "attempt_id" => record["attempt_id"],
+      "issue_url" => issue.url,
+      "kind" => "review",
+      "reason" => "Please review the published change.",
+      "url" => mr["web_url"],
+      "publication" => mr
+    }
+
+    File.write!(Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json"), Jason.encode!(request))
+
+    client = fn method, path, _, body, _ ->
+      send(self(), {:publication_native, method, path, body})
+      if String.ends_with?(path, "/merge_requests/9"), do: {:ok, %{status: 200, body: mr}}, else: native_ok(method, path)
+    end
+
+    delivery_opts = [tracker_settings: settings, gitlab_client: client]
+    assert :ok = Execution.reconcile_delivery(issue, delivery_opts)
+    assert_receive {:publication_native, "POST", "/projects/group%2Frepository/issues/42/notes", _}
+    assert_receive {:publication_native, "PUT", "/projects/group%2Frepository/issues/42", _}
+    assert :ok = Execution.reconcile_delivery(issue, delivery_opts)
+    refute_receive {:publication_native, "POST", _, _}
+    {:ok, current} = RunJournal.read(record["directory"])
+    assert current["stage_results"]["mr_publication"] == "passed"
+    assert current["stage_results"]["review_handoff"] == "passed"
+    assert current["stage_results"]["native_execution_stopped"] == "not_verified"
+    assert current["stage_results"]["business_validation"] == "see_mr_evidence"
+  end
+
+  test "a partial handoff retries label removal without repeating the notice", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    args = %{"kind" => "review", "reason" => "Please review.", "url" => "https://github.com/example/repository/pull/9"}
+
+    client = fn method, path, _, _, _ ->
+      send(self(), {:handoff_call, method})
+      if method == "DELETE", do: {:ok, %{status: 503}}, else: native_ok(method, path)
+    end
+
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, github_client: client]
+    refute Execution.handoff(args, handoff_opts)["success"]
+    assert_receive {:handoff_call, "POST"}
+    assert_receive {:handoff_call, "DELETE"}
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    assert record["handoff_notice"]
+    refute record["handoff"]
+
+    client = fn method, path, _, _, _ ->
+      send(self(), {:retry_call, method})
+      native_ok(method, path)
+    end
+
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, github_client: client]
+    assert Execution.handoff(args, handoff_opts)["success"]
+    refute_receive {:retry_call, "POST"}
+    assert_receive {:retry_call, "DELETE"}
+  end
+
+  test "a stale publication request never creates a handoff or a passed publication stage", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    request = %{"schema_version" => 1, "attempt_id" => "previous", "issue_url" => issue.url}
+    File.write!(Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json"), Jason.encode!(request))
+    settings = %{kind: "gitlab", provider: %{"project_path" => "group/repository"}, required_labels: ["symphony:ready"]}
+    client = fn _, _, _, _, _ -> flunk("stale request reached provider") end
+    assert {:error, _} = Execution.reconcile_delivery(issue, tracker_settings: settings, gitlab_client: client)
+    {:ok, current} = RunJournal.read(record["directory"])
+    refute current["handoff"]
+    assert current["stage_results"]["mr_publication"] == "not_verified"
+    assert current["blocker_reason"] =~ "Automatic review handoff failed"
+  end
+
+  test "restart carries only an unfinished review request to the resumed native thread", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    notice = "Already posted review request"
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "same-native-thread", "handoff_notice" => notice})
+    request = %{"attempt_id" => record["attempt_id"], "issue_url" => issue.url}
+    File.write!(Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json"), Jason.encode!(request))
+    assert :ok = RunJournal.complete(record, "completed")
+    {:ok, resumed} = RunJournal.admit(Execution.journal_root(), issue.id)
+    assert resumed["thread_id"] == "same-native-thread"
+    assert resumed["handoff_notice"] == notice
+    assert resumed["attempt_id"] != record["attempt_id"]
+    {:ok, copied} = Path.join(record["directory"], "review-request-#{resumed["attempt_id"]}.json") |> File.read()
+    assert Jason.decode!(copied)["attempt_id"] == resumed["attempt_id"]
+    refute resumed["stage_results"]["mr_publication"] == "passed"
+    assert :ok = RunJournal.complete(resumed, "completed")
+    {:ok, completed} = RunJournal.read(resumed["directory"])
+    {:ok, ended} = RunJournal.checkpoint(completed, %{"handoff" => %{"kind" => "review"}})
+    {:ok, next} = RunJournal.admit(Execution.journal_root(), issue.id)
+    refute File.exists?(Path.join(ended["directory"], "review-request-#{next["attempt_id"]}.json"))
+    refute next["handoff_notice"]
+  end
+
+  test "malformed pending review recovery releases its failed admission lock", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    {:ok, record} = RunJournal.checkpoint(opts[:run_record], %{"thread_id" => "same-thread"})
+    File.write!(Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json"), "[]")
+    assert :ok = RunJournal.complete(record, "completed")
+    assert {:error, {:pending_review_recovery_failed, _}} = RunJournal.admit(Execution.journal_root(), issue.id)
+    refute File.exists?(Path.join(record["directory"], "executor.lock"))
+  end
+
+  test "handoff cannot pass while a required label remains with different casing", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+
+    client = fn method, path, _, _, _ ->
+      if method == "GET" and String.ends_with?(path, "/42") do
+        {:ok, %{status: 200, body: %{"labels" => [%{"name" => "SYMPHONY:READY"}]}}}
+      else
+        native_ok(method, path)
+      end
+    end
+
+    args = %{"kind" => "review", "reason" => "Review the delivery."}
+    options = [issue: issue, tracker_settings: Config.settings!().tracker, github_client: client]
+    refute Execution.handoff(args, options)["success"]
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    refute record["handoff"]
+  end
+
+  defp native_ok(method, path) do
+    body = if method == "GET" and (String.ends_with?(path, "/comments") or String.ends_with?(path, "/notes")), do: [], else: %{"labels" => []}
+    {:ok, %{status: 200, body: body}}
   end
 end

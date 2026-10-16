@@ -193,7 +193,7 @@ defmodule SymphonyElixir.GitHub.Client do
         description: issue["body"],
         state: state,
         url: issue["html_url"],
-        assignee_id: get_in(issue, ["assignee", "login"]),
+        assignee_id: assignee_id(issue),
         labels: extract_labels(issue),
         blocked_by: [],
         dispatchable: not Map.has_key?(issue, "pull_request"),
@@ -204,6 +204,10 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp normalize_issue(_issue, _repo), do: nil
+
+  defp assignee_id(%{"assignees" => [%{"login" => login}]}), do: login
+  defp assignee_id(%{"assignees" => _}), do: nil
+  defp assignee_id(issue), do: get_in(issue, ["assignee", "login"])
 
   defp native_ref(issue, repo) do
     %{

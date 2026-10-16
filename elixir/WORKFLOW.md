@@ -1,5 +1,7 @@
 ---
 tracker:
+  # Optional repository tracker owner: GitLab user ID or GitHub login.
+  # assignee: "20"
   kind: linear
   provider:
     project_slug: "symphony-0c79b11b75ea"
@@ -19,6 +21,8 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+  # Optional trusted operator command; one asynchronous pass per poll, single-flight.
+  merge_cleanup_command: null
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
@@ -331,3 +335,5 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 Repository Issue workflows can enable `agent.goal_mode` and set a durable
 `agent.run_journal_dir`. Task content stays on the provider; see
 [repository execution](docs/repository-issues.md).
+
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
