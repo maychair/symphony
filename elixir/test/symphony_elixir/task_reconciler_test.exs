@@ -904,9 +904,9 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
     {:ok, record} = TaskReconciler.refresh(record, false)
 
-    # Several comments can arrive before the next poll; the first one answers.
+    # A plain resume note says the same thing as an answer, so on its own it
+    # must drop the decision that is waiting for the human.
     append(server, reply(96, "Please resume this task."))
-    append(server, reply(97, "Use the replay fixture."))
 
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["state"] == "ready"
