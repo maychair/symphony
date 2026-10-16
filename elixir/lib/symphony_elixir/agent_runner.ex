@@ -118,16 +118,16 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- backend.start_session(workspace, session_opts) do
       try do
-        with :ok <- recheck_activation(record) do
+        with {:ok, active_opts} <- Execution.activation_options(opts) do
           if native_goal?(backend, opts) do
-            run_goal(session, issue, codex_update_recipient, opts)
+            run_goal(session, issue, codex_update_recipient, active_opts)
           else
             do_run_codex_turns(
               session,
               workspace,
               issue,
               codex_update_recipient,
-              opts,
+              active_opts,
               issue_state_fetcher,
               1,
               max_turns
@@ -138,15 +138,6 @@ defmodule SymphonyElixir.AgentRunner do
         stopped = backend.stop_session(session)
         if not native_goal?(backend, opts), do: journal!(record, %{"native_stop_confirmed" => stopped == :ok})
       end
-    end
-  end
-
-  defp recheck_activation(nil), do: :ok
-
-  defp recheck_activation(record) do
-    with {:ok, current} <- RunJournal.read(record["directory"]),
-         {:ok, current} <- Execution.refresh_workflow(current, false) do
-      if current["workflow"] && current["workflow"]["state"] not in ["ready", "running"], do: {:error, :scheduler_stop}, else: :ok
     end
   end
 

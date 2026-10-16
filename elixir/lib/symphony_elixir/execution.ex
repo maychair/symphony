@@ -114,14 +114,16 @@ defmodule SymphonyElixir.Execution do
   defp release_for_resume(record) do
     with false <- File.exists?(Path.join([record["directory"], "executor.lock", "cleanup-owner.json"])),
          false <- File.exists?(Path.join([record["directory"], "executor.lock", "reconcile-owner"])),
+         true <- RunJournal.recoverable_lock?(record),
          {:ok, _} <- RunJournal.checkpoint(record, %{"phase" => "completed", "handoff" => nil, "blocker_reason" => nil}) do
-      case File.rmdir(Path.join(record["directory"], "executor.lock")) do
+      case RunJournal.release_lock(record) do
         :ok -> :ok
         {:error, :enoent} -> :ok
         error -> error
       end
     else
       true -> {:error, :merge_cleanup_in_progress}
+      false -> {:error, :execution_lock_owner_unverified}
       error -> error
     end
   end
@@ -160,6 +162,39 @@ defmodule SymphonyElixir.Execution do
   def refresh_workflow(record, active) do
     if TaskReconciler.enabled?(), do: TaskReconciler.refresh(record, active), else: {:ok, record}
   end
+
+  @spec activation_options(keyword()) :: {:ok, keyword()} | {:error, term()}
+  def activation_options(opts) do
+    case opts[:run_record] do
+      nil -> {:ok, opts}
+      record -> refresh_activation(record, opts)
+    end
+  end
+
+  defp refresh_activation(record, opts) do
+    with {:ok, current} <- RunJournal.read(record["directory"]),
+         true <- current["attempt_id"] == record["attempt_id"],
+         {:ok, current} <- refresh_workflow(current, false) do
+      activation_budget(current, opts)
+    else
+      false -> {:error, :execution_attempt_changed}
+      error -> error
+    end
+  end
+
+  defp activation_budget(%{"workflow" => flow} = record, opts) do
+    now = System.monotonic_time(:millisecond)
+    remaining = max(0, flow["budget_ms"] - flow["used_ms"])
+    deadline = min(opts[:deadline] || now + remaining, now + remaining)
+
+    cond do
+      flow["state"] not in ["ready", "running"] -> {:error, :scheduler_stop}
+      deadline <= now -> {:error, :execution_budget_exhausted}
+      true -> {:ok, Keyword.merge(opts, run_record: record, deadline: deadline)}
+    end
+  end
+
+  defp activation_budget(record, opts), do: {:ok, Keyword.put(opts, :run_record, record)}
 
   defp final_phase(_issue, %{"native_stop_confirmed" => true, "workflow" => %{"state" => state}}, _result)
        when state in ["waiting", "review", "ended"], do: {"completed", nil}
@@ -207,8 +242,13 @@ defmodule SymphonyElixir.Execution do
 
   @spec worker_down(String.t(), term()) :: :ok | {:blocked, String.t()}
   def worker_down(id, reason) do
+    scheduler_pid = System.pid()
+
     if enabled?() do
       case RunJournal.read(RunJournal.directory(journal_root(), id)) do
+        {:ok, %{"executor_os_pid" => pid}} when pid != scheduler_pid ->
+          :ok
+
         {:ok, %{"phase" => "incident"} = record} ->
           {:blocked, record["blocker_reason"] || inspect(reason)}
 
@@ -312,7 +352,7 @@ defmodule SymphonyElixir.Execution do
          {:ok, %{status: 200, body: %{} = mr}} <- client.("GET", "/projects/#{URI.encode_www_form(settings.provider["project_path"])}/merge_requests/#{iid}", %{}, nil, tracker_settings: settings),
          true <- valid_review_options?(mr, request["url"]),
          true <- same_publication?(publication, mr),
-         delivery = %{"url" => request["url"], "version" => sha, "mr_verified" => true, "attempt_id" => record["attempt_id"]},
+         delivery = %{"url" => request["url"], "kind" => "mr", "version" => sha, "mr_verified" => true, "attempt_id" => record["attempt_id"]},
          {:ok, _} <- RunJournal.checkpoint(record, %{"delivery" => delivery}),
          %{"success" => true} <- handoff(Map.take(request, ["kind", "reason", "url", "stage", "continue_after"]), opts) do
       :ok

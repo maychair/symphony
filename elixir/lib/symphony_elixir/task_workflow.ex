@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskWorkflow do
   @moduledoc "Execution controls and evidence references derived from repository decisions."
 
-  @human ["pause", "decision", "review", "acceptance", "scope", "cancel"]
+  @human ["pause", "decision", "review", "acceptance", "scope", "cancel", "budget"]
 
   @spec digest(term()) :: String.t()
   def digest(value), do: :crypto.hash(:sha256, Jason.encode!(value)) |> Base.encode16(case: :lower)
@@ -18,6 +18,7 @@ defmodule SymphonyElixir.TaskWorkflow do
       "restrictions" => %{},
       "released" => %{},
       "events" => %{},
+      "source_versions" => %{},
       "contract" => nil,
       "manifest" => nil,
       "acceptance" => nil,
@@ -41,6 +42,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     |> check_conclusion_conflict()
     |> check_closure(facts)
     |> derive(facts)
+    |> Map.put("observed_refs", facts["observed_refs"] || [])
   end
 
   @spec tick(map(), integer()) :: map()
@@ -59,10 +61,23 @@ defmodule SymphonyElixir.TaskWorkflow do
       if Map.has_key?(acc["events"], key) do
         acc
       else
-        {updated, outcome} = apply_event(acc, event, facts)
+        {updated, outcome} = versioned_event(acc, event, facts)
         put_in(updated, ["events", key], outcome)
       end
     end)
+  end
+
+  defp versioned_event(flow, event, facts) do
+    id = to_string(event["id"])
+    previous = (flow["source_versions"] || %{})[id]
+
+    if is_map(previous) and event["at"] <= previous["at"] and event["version"] != previous["version"] do
+      {automatic(flow, "event_conflict:" <> id, "decision"), "source_version_conflict"}
+    else
+      {updated, outcome} = apply_event(flow, event, facts)
+      versions = Map.put(flow["source_versions"] || %{}, id, order(event))
+      {Map.put(updated, "source_versions", versions), outcome}
+    end
   end
 
   defp apply_event(flow, %{"action" => "authorize"} = event, facts) do
@@ -70,10 +85,13 @@ defmodule SymphonyElixir.TaskWorkflow do
     owner = get_in(flow, ["contract", "authorizer"]) || facts["owner"]
 
     if event["actor"] == owner and valid_contract?(data, facts) and newer?(event, flow["contract"]) do
-      contract = Map.take(data, ["issue_version", "type", "criteria", "deliverables", "acceptance_mode", "acceptor", "reviewers", "deadline"])
+      fields = ["issue_version", "type", "criteria", "deliverables", "acceptance_mode", "acceptor", "reviewers", "deadline", "close_on_conclusion"]
+      contract = Map.take(data, fields)
       contract = Map.merge(contract, Map.put(order(event), "authorizer", owner))
       updated = %{flow | "contract" => contract, "manifest" => nil, "acceptance" => nil, "budget_ms" => data["budget_ms"] || flow["budget_ms"]}
       updated = Map.put(updated, "cancellation", nil)
+      updated = Map.put(updated, "natural_resume", nil)
+      updated = Map.put(updated, "resume_requested", true)
       updated = updated |> Map.put("delivery_order", order(event)) |> Map.put("acceptance_order", order(event))
       {updated |> clear("baseline") |> install_dependencies(event), "authorized"}
     else
@@ -96,7 +114,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     actor = event["actor"]
 
     case event["action"] do
-      action when action in ["pause", "cancel", "restrict", "resume", "release", "budget"] -> actor == contract["authorizer"]
+      action when action in ["pause", "cancel", "restrict", "resume", "release", "budget", "clarify"] -> actor == contract["authorizer"]
       "rework" -> actor in [contract["acceptor"] | contract["reviewers"] || []]
       "manifest" -> actor in [contract["authorizer"], contract["acceptor"]]
       "accept" -> actor == contract["acceptor"]
@@ -109,13 +127,14 @@ defmodule SymphonyElixir.TaskWorkflow do
     kind = if action == "restrict", do: data["kind"] || "decision", else: action
     id = data["restriction"] || event["ref"]
     scope = if action in ["pause", "cancel"], do: "task", else: data["scope"] || "task"
-    updated = restrict(flow, id, kind, scope, event) |> add_condition(id, data["condition"])
-    updated = record_cancellation(updated, event)
+    updated = restrict(flow, id, kind, scope, event)
+    updated = apply_restriction_data(updated, id, event)
     {updated, "restricted"}
   end
 
   defp transition(flow, %{"action" => action} = event) when action in ["resume", "release"] do
     updated = Enum.reduce(event["data"]["restrictions"] || [], flow, &release(&2, &1, event))
+    updated = remember_natural_resume(updated, event)
     {Map.put(updated, "resume_requested", true), "released_selected_restrictions"}
   end
 
@@ -125,6 +144,9 @@ defmodule SymphonyElixir.TaskWorkflow do
   end
 
   defp transition(flow, %{"action" => "rework"} = event), do: rework(flow, event)
+
+  defp transition(flow, %{"action" => "clarify"} = event),
+    do: {restrict(flow, event["ref"], "decision", "task", event), "clarification_required"}
 
   defp transition(flow, %{"action" => "manifest"} = event) do
     case submit(flow, Map.put(event["data"], "ref", event["ref"])) do
@@ -143,6 +165,12 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp transition(flow, _), do: {flow, "no_authorized_transition"}
 
+  defp remember_natural_resume(flow, %{"natural" => true} = event) do
+    if newer?(event, flow["natural_resume"]), do: Map.put(flow, "natural_resume", order(event)), else: flow
+  end
+
+  defp remember_natural_resume(flow, _), do: flow
+
   defp order(event), do: Map.take(event, ["at", "id", "version", "ref"])
 
   defp obsolete_delivery?(flow, %{"action" => action} = event) when action in ["manifest", "rework", "accept"] do
@@ -151,6 +179,14 @@ defmodule SymphonyElixir.TaskWorkflow do
   end
 
   defp obsolete_delivery?(_, _), do: false
+
+  defp apply_restriction_data(flow, id, event) do
+    if get_in(flow, ["restrictions", id, "source"]) == event["ref"] do
+      flow |> add_condition(id, event["data"]["condition"]) |> record_cancellation(event)
+    else
+      flow
+    end
+  end
 
   defp add_condition(flow, _id, nil), do: flow
 
@@ -172,12 +208,15 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp valid_controls?(data) do
     owner = is_binary(data["acceptor"]) and data["acceptor"] != ""
-    budget = is_nil(data["budget_ms"]) or (is_integer(data["budget_ms"]) and data["budget_ms"] > 0)
     reviewers = data["reviewers"] || []
 
-    owner and budget and is_list(reviewers) and Enum.all?(reviewers, &is_binary/1) and
+    owner and valid_budget?(data["budget_ms"]) and valid_close?(data["close_on_conclusion"]) and is_list(reviewers) and Enum.all?(reviewers, &is_binary/1) and
       valid_dependencies?(data["dependencies"] || [])
   end
+
+  defp valid_budget?(nil), do: true
+  defp valid_budget?(budget), do: is_integer(budget) and budget > 0
+  defp valid_close?(value), do: value in [nil, true, false]
 
   defp valid_dependencies?(dependencies) when is_list(dependencies) do
     Enum.all?(dependencies, fn
@@ -252,17 +291,24 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp restrict(flow, id, kind, scope, event) do
     released = flow["released"][id]
+    current = flow["restrictions"][id]
+    resumed = kind == "pause" and is_map(flow["natural_resume"]) and not newer?(event, flow["natural_resume"])
+    obsolete = is_map(current) and not newer?(event, current)
 
-    if released && released >= event["at"],
+    if released_after?(released, event) or resumed or obsolete,
       do: flow,
-      else: put_in(flow, ["restrictions", id], %{"kind" => kind, "scope" => scope, "source" => event["ref"], "at" => event["at"]})
+      else: put_in(flow, ["restrictions", id], Map.merge(order(event), %{"kind" => kind, "scope" => scope, "source" => event["ref"]}))
   end
+
+  defp released_after?(nil, _), do: false
+  defp released_after?(at, event) when is_integer(at), do: at >= event["at"]
+  defp released_after?(released, event), do: not newer?(event, released)
 
   defp release(flow, id, event) do
     restriction = flow["restrictions"][id]
 
-    if is_nil(restriction) or restriction["at"] <= event["at"] do
-      flow |> clear(id) |> put_in(["released", id], event["at"])
+    if is_nil(restriction) or newer?(event, restriction) do
+      flow |> clear(id) |> put_in(["released", id], order(event))
     else
       flow
     end
@@ -299,7 +345,8 @@ defmodule SymphonyElixir.TaskWorkflow do
       expected = Enum.map(contract["deliverables"], & &1["id"]) |> Enum.sort()
       actual = Enum.map(items, & &1["id"]) |> Enum.sort()
       coverage = Enum.flat_map(items, & &1["criteria"]) |> Enum.uniq() |> Enum.sort()
-      actual == expected and coverage == Enum.sort(contract["criteria"])
+      kinds = Map.new(contract["deliverables"], &{&1["id"], &1["kind"]})
+      actual == expected and coverage == Enum.sort(contract["criteria"]) and Enum.all?(items, &(&1["kind"] == kinds[&1["id"]]))
     else
       false
     end
@@ -307,17 +354,26 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp manifest_items?(_, _), do: false
 
-  defp manifest_item?(%{"version" => version, "url" => url, "criteria" => criteria}, allowed)
+  defp manifest_item?(%{"version" => version, "url" => url, "criteria" => criteria, "kind" => kind}, allowed)
        when is_binary(version) and is_binary(url) do
-    nonempty_strings?(criteria) and Enum.all?(criteria, &(&1 in allowed))
+    nonempty_strings?(criteria) and Enum.all?(criteria, &(&1 in allowed)) and kind == artifact_kind(url)
   end
 
   defp manifest_item?(_, _), do: false
+
+  defp artifact_kind(url) do
+    cond do
+      Regex.match?(~r{/-/merge_requests/[1-9][0-9]*$}, url) -> "mr"
+      Regex.match?(~r{/-/issues/[1-9][0-9]*#note_[1-9][0-9]*$}, url) -> "report"
+      true -> nil
+    end
+  end
 
   defp check_manifest(%{"manifest" => nil} = flow, _facts), do: flow
 
   defp check_manifest(flow, facts) do
     manifest = flow["manifest"]
+    flow = Map.put(flow, "delivery_ready", facts["deliveries_ready"] == true)
 
     valid =
       manifest["ref"] in facts["source_refs"] and
@@ -381,7 +437,14 @@ defmodule SymphonyElixir.TaskWorkflow do
     not Map.has_key?(flow["restrictions"], "baseline") and
       not Map.has_key?(flow["restrictions"], "conclusion_conflict") and
       not Map.has_key?(flow["restrictions"], "cancellation_source") and
-      (is_binary(flow["cancellation"]) or (is_map(flow["acceptance"]) and not Map.has_key?(flow["restrictions"], "delivery_changed")))
+      (is_binary(flow["cancellation"]) or accepted_conclusion?(flow))
+  end
+
+  defp accepted_conclusion?(flow) do
+    is_map(flow["acceptance"]) and flow["delivery_ready"] == true and
+      not Enum.any?(flow["restrictions"], fn {id, restriction} ->
+        id != "closure" and restriction["kind"] not in ["pause", "budget", "review", "acceptance"]
+      end)
   end
 
   @spec allowed_criteria(map()) :: [String.t()]
@@ -398,11 +461,14 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp derive(flow, facts) do
     allowed = allowed_criteria(flow)
-    human = Enum.any?(Map.values(flow["restrictions"]), &(&1["scope"] == "task" and &1["kind"] in @human))
+    human = human_wait?(flow)
     state = logical_state(flow, facts, allowed)
     charging = flow["started"] and state != "ended" and billable?(flow, facts, human)
     flow |> Map.put("state", state) |> Map.put("charging", charging) |> Map.put("allowed_criteria", allowed)
   end
+
+  @spec human_wait?(map()) :: boolean()
+  def human_wait?(flow), do: Enum.any?(Map.values(flow["restrictions"]), &(&1["scope"] == "task" and &1["kind"] in @human))
 
   defp billable?(flow, facts, human), do: facts["stopped"] != true or (not human and not review?(flow))
   defp review?(flow), do: is_map(flow["manifest"]) and not Map.has_key?(flow["restrictions"], "delivery_changed")

@@ -68,7 +68,11 @@ defmodule SymphonyElixir.ExecutionTest do
   test "stopped scheduler resumes the recorded thread but never invents a missing allocation", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
-    {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "turn_started", "thread_allocation_intent" => true, "thread_id" => "same-thread", "turn_id" => "same-turn", "executor_os_pid" => "99999999"})
+
+    {:ok, stopped} =
+      RunJournal.checkpoint(record, %{"phase" => "turn_started", "thread_allocation_intent" => true, "thread_id" => "same-thread", "turn_id" => "same-turn", "executor_os_pid" => "99999999"})
+
+    write_lock_owner(stopped)
     assert {:ok, _, resumed} = Execution.prepare(issue, [])
     assert resumed[:run_record]["thread_id"] == "same-thread"
     assert resumed[:run_record]["turn_id"] == "same-turn"
@@ -90,6 +94,7 @@ defmodule SymphonyElixir.ExecutionTest do
         "blocker_reason" => "transport unavailable"
       })
 
+    write_lock_owner(record)
     assert :ok = RunJournal.complete(record, "incident")
     assert {:error, {:execution_requires_recovery, "transport unavailable"}} = Execution.prepare(issue, [])
 
@@ -655,7 +660,8 @@ defmodule SymphonyElixir.ExecutionTest do
   test "cleanup locks and failed writes stop recovery without releasing ownership", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
-    {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "turn_running", "executor_os_pid" => "99999999"})
+    {:ok, stopped} = RunJournal.checkpoint(record, %{"phase" => "turn_running", "executor_os_pid" => "99999999"})
+    write_lock_owner(stopped)
     lock = Path.join(record["directory"], "executor.lock")
     owner = Path.join(lock, "cleanup-owner.json")
     File.write!(owner, "owned")
@@ -663,7 +669,9 @@ defmodule SymphonyElixir.ExecutionTest do
     File.rm!(owner)
     File.write!(Path.join(lock, "unexpected"), "keep")
     assert {:error, reason} = Execution.prepare(issue, [])
-    assert reason in [:eexist, :enotempty]
+    assert match?({:execution_lock_owner_changed, _}, reason)
+    assert File.exists?(Path.join(lock, "executor-owner.json"))
+    assert File.read!(Path.join(lock, "unexpected")) == "keep"
     {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "turn_running", "executor_os_pid" => "99999999"})
     File.mkdir!(Path.join(record["directory"], "run.json.pending"))
     assert {:error, :eisdir} = Execution.prepare(issue, [])
@@ -692,6 +700,32 @@ defmodule SymphonyElixir.ExecutionTest do
 
   @spec finish_run(Issue.t(), keyword(), term()) :: :ok
   def finish_run(_issue, _opts, _result), do: :ok
+
+  test "activation and late scheduler callbacks cannot mutate another execution owner", %{issue: issue} do
+    assert {:ok, []} = Execution.activation_options([])
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    assert {:ok, _} = Execution.activation_options(opts)
+    {:ok, stopped} = RunJournal.checkpoint(record, %{"phase" => "turn_running", "thread_id" => "same", "executor_os_pid" => "99999999"})
+    # The source says another scheduler owns this record. A delayed DOWN is local only.
+    assert :ok = Execution.worker_down(issue.id, :late_down)
+    {:ok, unchanged} = RunJournal.read(record["directory"])
+    assert unchanged == stopped
+    File.rm!(Path.join([record["directory"], "executor.lock", "executor-owner.json"]))
+    assert {:error, :execution_lock_owner_unverified} = Execution.prepare(issue, [])
+    assert File.dir?(Path.join(record["directory"], "executor.lock"))
+    owner = Path.join([record["directory"], "executor.lock", "executor-owner.json"])
+    File.mkdir!(owner)
+    assert {:error, :eisdir} = RunJournal.release_lock(stopped)
+    File.rm!(Path.join(record["directory"], "run.json"))
+    File.mkdir!(Path.join(record["directory"], "run.json"))
+    assert {:error, :eisdir} = Execution.activation_options(opts)
+  end
+
+  defp write_lock_owner(record) do
+    path = Path.join([record["directory"], "executor.lock", "executor-owner.json"])
+    File.write!(path, Jason.encode!(Map.take(record, ["attempt_id", "host", "executor_os_pid"])))
+  end
 
   defp switch_tracker(kind) do
     text = File.read!(Workflow.workflow_file_path()) |> String.replace(~r/kind: (github|memory)/, "kind: " <> kind)

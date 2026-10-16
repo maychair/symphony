@@ -107,10 +107,106 @@ defmodule SymphonyElixir.TaskReconciler do
       facts = Map.merge(facts, %{"active" => active, "now" => now, "stopped" => record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true})
       flow = flow |> check_routing(facts, active) |> TaskWorkflow.reconcile(facts, events, now)
 
-      with {:ok, saved} <- RunJournal.checkpoint(record, %{"workflow" => flow}) do
+      with {:ok, saved} <- RunJournal.checkpoint(record, %{"workflow" => flow}),
+           {:ok, saved} <- notify_restrictions(saved, path, settings, client),
+           {:ok, saved} <- maybe_close(saved, raw, path, settings, client) do
         routing(saved, raw, path, settings, client, active)
       end
     end
+  end
+
+  defp notify_restrictions(record, path, settings, client) do
+    if stopped?(record) do
+      Enum.reduce_while(record["workflow"]["restrictions"], {:ok, record}, fn {id, restriction}, {:ok, current} ->
+        next_notice(current, id, restriction, path, settings, client)
+      end)
+    else
+      {:ok, record}
+    end
+  end
+
+  defp next_notice(record, id, restriction, path, settings, client) do
+    case notify_restriction(record, id, restriction, path, settings, client) do
+      {:ok, saved} -> {:cont, {:ok, saved}}
+      error -> {:halt, error}
+    end
+  end
+
+  defp notify_restriction(record, id, %{"kind" => kind} = restriction, path, settings, client)
+       when kind in ["decision", "scope", "budget"] do
+    key = TaskWorkflow.digest(restriction)
+    previous = record["waiting_notices"] || %{}
+
+    if previous[id] == key do
+      {:ok, record}
+    else
+      body = restriction_notice(record, id, kind, restriction)
+
+      with {:ok, notes} <- pages(client, path <> "/notes", settings, 1, []),
+           :ok <- post_wait_notice(notes, body, path, settings, client) do
+        RunJournal.checkpoint(record, %{"waiting_notices" => Map.put(previous, id, key)})
+      end
+    end
+  end
+
+  defp notify_restriction(record, _, _, _, _, _), do: {:ok, record}
+
+  defp restriction_notice(record, id, kind, restriction) do
+    message =
+      case {id, kind} do
+        {"budget", _} -> "累计执行预算已用完。请授权人追加预算、调整约定或决定如何处理现有成果。"
+        {"baseline", _} -> "当前任务约定版本无法核验。请授权人确认范围、权限和验收条件。"
+        {"external_routing", _} -> "调度标签被外部移除，原因尚未核验。请授权人明确是否恢复执行。"
+        {_, "scope"} -> "这条请求无法对应原有验收项，或改变了任务约定。请授权人确认受影响部分；独立且已授权的工作可继续。"
+        _ -> "存在未解除的执行限制或含义不清的指令。请授权人确认具体决定；调度标签不会代替授权。"
+      end
+
+    source =
+      case Regex.run(~r/^note:([1-9][0-9]*)@/, restriction["source"] || "") do
+        [_, number] -> "\n\n[需要确认的指令](#{record["issue_url"]}#note_#{number})"
+        _ -> ""
+      end
+
+    "**Symphony 需要确认**\n\n" <> message <> source
+  end
+
+  defp post_wait_notice(notes, body, path, settings, client) do
+    if Enum.any?(notes, &(&1["body"] == body)) do
+      :ok
+    else
+      with {:ok, note} <- request(client, "POST", path <> "/notes", %{"body" => body}, settings),
+           true <- is_map(note) and note["body"] == body do
+        :ok
+      else
+        error -> {:error, {:waiting_notice_unconfirmed, error}}
+      end
+    end
+  end
+
+  defp maybe_close(record, raw, path, settings, client) do
+    flow = record["workflow"]
+
+    if close_authorized?(record, raw) do
+      conclusion = flow["acceptance"] || %{"ref" => flow["cancellation"]}
+
+      with {:ok, intent} <- RunJournal.checkpoint(record, %{"closure_intent" => conclusion}),
+           {:ok, _} <- request(client, "PUT", path, %{"state_event" => "close"}, settings),
+           {:ok, current} <- get(client, path, settings),
+           true <- current["state"] == "closed" do
+        RunJournal.checkpoint(intent, %{"closure_confirmed" => conclusion})
+      else
+        error -> {:error, {:issue_closure_unconfirmed, error}}
+      end
+    else
+      {:ok, record}
+    end
+  end
+
+  defp close_authorized?(record, raw) do
+    flow = record["workflow"]
+
+    get_in(flow, ["contract", "close_on_conclusion"]) == true and raw["state"] != "closed" and
+      TaskWorkflow.valid_conclusion?(flow) and stopped?(record)
   end
 
   defp facts(raw, notes, record, prefix, client, settings) do
@@ -135,6 +231,7 @@ defmodule SymphonyElixir.TaskReconciler do
       "versions" => %{},
       "now" => now,
       "source_refs" => Enum.map(events, & &1["ref"]),
+      "observed_refs" => notes |> Enum.reject(&(&1["system"] == true)) |> Enum.map(&source_ref/1),
       "owner_valid" => owner == settings.assignee
     }
 
@@ -144,7 +241,8 @@ defmodule SymphonyElixir.TaskReconciler do
 
     with {:ok, versions, merged, merged_urls} <- versions(items, prefix, raw["web_url"], notes, client, settings),
          {:ok, satisfied} <- dependencies(candidate, prefix, client, settings) do
-      {:ok, Map.merge(basic, %{"versions" => versions, "merge_verified" => merged, "merged_urls" => merged_urls, "satisfied" => satisfied}), events}
+      evidence = %{"versions" => versions, "merge_verified" => merged, "deliveries_ready" => merged, "merged_urls" => merged_urls, "satisfied" => satisfied}
+      {:ok, Map.merge(basic, evidence), events}
     end
   end
 
@@ -171,7 +269,7 @@ defmodule SymphonyElixir.TaskReconciler do
     payload = note_payload(body)
 
     if is_map(payload) and is_map(payload["data"] || %{}) do
-      version = TaskWorkflow.digest(%{"body" => body, "updated_at" => note["updated_at"]})
+      version = note_version(note)
 
       %{
         "id" => note["id"],
@@ -190,7 +288,7 @@ defmodule SymphonyElixir.TaskReconciler do
   defp note_payload(body) do
     case Regex.run(~r/<!-- symphony-workflow\s+(\{.*?\})\s*-->/s, body) do
       [_, json] -> decode_payload(json)
-      _ -> natural(String.trim(body))
+      _ -> intent(String.trim(body))
     end
   end
 
@@ -201,9 +299,33 @@ defmodule SymphonyElixir.TaskReconciler do
     end
   end
 
-  defp natural(text) when text in ["暂停", "暂停任务", "停止执行", "Pause task", "Stop execution"], do: %{"action" => "pause", "natural" => true}
-  defp natural(text) when text in ["恢复执行", "继续执行", "Resume execution"], do: %{"action" => "resume", "natural" => true}
-  defp natural(_), do: nil
+  @spec source_ref(map()) :: String.t()
+  def source_ref(note), do: "note:#{note["id"]}@#{note_version(note)}"
+  defp note_version(note), do: TaskWorkflow.digest(%{"body" => note["body"] || "", "updated_at" => note["updated_at"]})
+
+  @spec intent(String.t()) :: map() | nil
+  def intent(text) do
+    cond do
+      pause_intent?(text) -> natural("pause")
+      resume_intent?(text) -> natural("resume")
+      Regex.match?(~r/^(?:(?:please|could you|can you|would you)\s+)?(?:pause|stop|resume|continue)\b|^(?:请|先|暂时|请先)?(?:暂停|停止|恢复|继续)/i, text) -> natural("clarify")
+      true -> nil
+    end
+  end
+
+  defp pause_intent?(text) do
+    english = ~r/^(?:please\s+)?(?:pause|stop)(?:\s+(?:this|the))?(?:\s+(?:task|execution))?(?:\s+(?:now|please))?[.!。！]?$/iu
+    chinese = ~r/^(?:请|先|暂时|请先)?(?:暂停|停止)(?:一下)?(?:这个|该|此)?(?:任务|执行)?[。！!]?$/u
+    Regex.match?(english, text) or Regex.match?(chinese, text)
+  end
+
+  defp resume_intent?(text) do
+    english = ~r/^(?:please\s+)?(?:resume|continue)(?:\s+(?:this|the))?(?:\s+(?:task|execution))?[.!。！]?$/iu
+    chinese = ~r/^(?:请|继续|请先)?(?:恢复|继续)(?:这个|该|此)?(?:任务|执行)?[。！!]?$/u
+    Regex.match?(english, text) or Regex.match?(chinese, text)
+  end
+
+  defp natural(action), do: %{"action" => action, "natural" => true}
 
   defp time(text) do
     case DateTime.from_iso8601(text || "") do
@@ -226,8 +348,8 @@ defmodule SymphonyElixir.TaskReconciler do
     url = item["url"] || ""
 
     cond do
-      String.starts_with?(url, mr_prefix) -> mr_artifact(item, prefix, mr_prefix, client, settings)
-      String.starts_with?(url, issue_url <> "#note_") -> report_artifact(url, notes)
+      item["kind"] == "mr" and String.starts_with?(url, mr_prefix) -> mr_artifact(item, prefix, mr_prefix, client, settings)
+      item["kind"] == "report" and String.starts_with?(url, issue_url <> "#note_") -> report_artifact(url, notes)
       true -> {:error, :unsupported_artifact_reference}
     end
   end
@@ -250,7 +372,9 @@ defmodule SymphonyElixir.TaskReconciler do
     case Regex.run(~r/#note_([1-9][0-9]*)$/, url) do
       [_, id] ->
         note = Enum.find(notes, &(&1["id"] == String.to_integer(id)))
-        {:ok, if(note, do: TaskWorkflow.digest(note["body"] || ""), else: nil), false, false}
+        version = if note, do: TaskWorkflow.digest(note["body"] || "")
+        ready = is_map(note) and is_binary(note["body"]) and String.trim(note["body"]) != ""
+        {:ok, version, ready, false}
 
       _ ->
         {:error, :unsupported_artifact_reference}
@@ -290,6 +414,7 @@ defmodule SymphonyElixir.TaskReconciler do
         put_in(flow, ["restrictions", "external_routing"], %{"kind" => "decision", "scope" => "task"})
 
       true ->
+        flow = if flow["restrictions"]["owner"], do: Map.put(flow, "resume_requested", true), else: flow
         Map.update!(flow, "restrictions", &Map.delete(&1, "owner"))
     end
   end

@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskWorkflowTest do
   use ExUnit.Case, async: true
   alias SymphonyElixir.TaskWorkflow, as: Flow
+  @mr "https://gitlab.test/group/project/-/merge_requests/9"
 
   defp facts(extra \\ %{}) do
     Map.merge(
@@ -9,7 +10,8 @@ defmodule SymphonyElixir.TaskWorkflowTest do
         "type" => "development",
         "issue_version" => "body",
         "source_refs" => ["auth", "manifest", "accept"],
-        "versions" => %{"mr" => "v1"},
+        "versions" => %{@mr => "v1"},
+        "deliveries_ready" => true,
         "closed" => false,
         "stopped" => true,
         "active" => false,
@@ -46,7 +48,7 @@ defmodule SymphonyElixir.TaskWorkflowTest do
   defp authorized(extra \\ %{}), do: Flow.reconcile(Flow.new(1_000, 0), facts(), [authorization(extra)], 0)
 
   defp manifest(extra \\ %{}) do
-    Map.merge(%{"ref" => "manifest", "contract" => "auth", "items" => [%{"id" => "code", "url" => "mr", "version" => "v1", "criteria" => ["a", "b"]}]}, extra)
+    Map.merge(%{"ref" => "manifest", "contract" => "auth", "items" => [%{"id" => "code", "kind" => "mr", "url" => @mr, "version" => "v1", "criteria" => ["a", "b"]}]}, extra)
   end
 
   test "authorization is versioned, typed and explicitly owned" do
@@ -153,6 +155,8 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert flow["used_ms"] == 1_000
     assert flow["restrictions"]["budget"]
     assert flow["state"] == "waiting"
+    refute flow["charging"]
+    assert Flow.reconcile(flow, facts(), [], 2_750)["used_ms"] == 1_000
     flow = Flow.reconcile(flow, facts(), [event("budget", "extra", 4, %{"add_ms" => 100})], 1_750)
     assert flow["state"] == "ready"
     assert Flow.tick(flow, 1_000)["used_ms"] == 1_000
@@ -164,7 +168,7 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     flow = authorized()
     assert {:error, :manifest_does_not_cover_contract} = Flow.submit(flow, manifest(%{"contract" => "old"}))
     assert {:error, _} = Flow.submit(flow, manifest(%{"items" => []}))
-    assert {:error, _} = Flow.submit(flow, manifest(%{"items" => [%{"id" => "code", "url" => "mr", "version" => "v1", "criteria" => ["a"]}]}))
+    assert {:error, _} = Flow.submit(flow, manifest(%{"items" => [%{"id" => "code", "kind" => "mr", "url" => @mr, "version" => "v1", "criteria" => ["a"]}]}))
     assert {:ok, _} = Flow.submit(flow, manifest())
     flow = Flow.reconcile(flow, facts(), [event("manifest", "manifest", 2, Map.delete(manifest(), "ref"))], 0)
     assert flow["state"] == "review"
@@ -179,7 +183,7 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert flow["state"] == "review"
     assert Flow.reconcile(flow, facts(%{"closed" => true, "stopped" => false}), [], 0)["state"] == "waiting"
     assert Flow.reconcile(flow, facts(%{"closed" => true}), [], 0)["state"] == "ended"
-    changed = Flow.reconcile(flow, facts(%{"versions" => %{"mr" => "v2"}}), [], 0)
+    changed = Flow.reconcile(flow, facts(%{"versions" => %{@mr => "v2"}}), [], 0)
     refute changed["acceptance"]
     assert changed["state"] == "waiting"
     assert Flow.reconcile(flow, facts(%{"source_refs" => ["auth", "manifest"]}), [], 0)["acceptance"] == nil
@@ -202,8 +206,8 @@ defmodule SymphonyElixir.TaskWorkflowTest do
   end
 
   test "intermediate merge clears only its review wait, and calendar deadlines survive pause" do
-    flow = Flow.handoff(authorized(), %{"kind" => "review"}) |> Map.put("intermediate", %{"url" => "mr", "version" => "v1"})
-    flow = Flow.reconcile(flow, facts(%{"merged_urls" => ["mr"]}), [], 0)
+    flow = Flow.handoff(authorized(), %{"kind" => "review"}) |> Map.put("intermediate", %{"url" => @mr, "version" => "v1"})
+    flow = Flow.reconcile(flow, facts(%{"merged_urls" => [@mr]}), [], 0)
     assert flow["state"] == "ready"
     assert flow["resume_requested"]
     refute flow["manifest"]
@@ -250,5 +254,37 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert flow["state"] == "waiting"
     refute Flow.valid_conclusion?(flow)
     assert flow["restrictions"]["conclusion_conflict"]
+  end
+
+  test "late restrictions cannot overwrite newer pauses and natural resume survives a late older pause" do
+    newer = event("pause", "new", 30, %{"restriction" => "pause"})
+    older = event("pause", "old", 10, %{"restriction" => "pause"})
+    flow = Flow.reconcile(authorized(), facts(), [newer], 0)
+    flow = Flow.reconcile(flow, facts(), [older], 0)
+    flow = Flow.reconcile(flow, facts(), [event("resume", "resume", 20, %{"restrictions" => ["pause"]})], 0)
+    assert flow["state"] == "waiting"
+    assert flow["restrictions"]["pause"]["at"] == 30
+    resume = Map.put(event("resume", "natural", 20), "natural", true)
+    flow = Flow.reconcile(authorized(), facts(), [resume], 0)
+    flow = Flow.reconcile(flow, facts(), [Map.put(event("pause", "late", 10), "natural", true), resume], 0)
+    assert flow["state"] == "ready"
+    assert Flow.reconcile(flow, facts(), [event("pause", "later", 30)], 0)["state"] == "waiting"
+    report = %{"id" => "code", "kind" => "report", "url" => "https://gitlab.test/group/project/-/issues/42#note_2", "version" => "v1", "criteria" => ["a", "b"]}
+    assert {:error, _} = Flow.submit(authorized(), manifest(%{"items" => [report]}))
+    assert {:error, _} = Flow.submit(authorized(), manifest(%{"items" => [%{report | "kind" => "mr"}]}))
+  end
+
+  test "unorderable edits and unclear control requests stop; legacy release times remain conservative" do
+    budget = event("budget", "budget", 5, %{"add_ms" => 10})
+    flow = Flow.reconcile(authorized(), facts(), [budget], 0)
+    edit = %{budget | "version" => "edited", "ref" => "edited"}
+    assert Flow.reconcile(flow, facts(), [edit], 0)["restrictions"]["event_conflict:budget"]
+    flow = put_in(authorized(), ["released", "legacy"], 20)
+    assert Flow.reconcile(flow, facts(), [event("pause", "legacy", 10)], 0)["state"] == "ready"
+    assert Flow.reconcile(authorized(), facts(), [event("clarify", "clarify", 2)], 0)["state"] == "waiting"
+    {:ok, flow} = Flow.submit(authorized(), manifest())
+    flow = Flow.reconcile(flow, facts(%{"deliveries_ready" => false, "closed" => true}), [event("accept", "accept", 5, %{"manifest" => "manifest"}, "2")], 0)
+    assert flow["state"] == "waiting"
+    refute Flow.valid_conclusion?(flow)
   end
 end

@@ -34,7 +34,10 @@ JSON, unescaped Unicode). The description contains the human-confirmed goal,
 scope, permissions and acceptance criteria. IDs in `criteria` and `deliverables`
 refer to that agreement. Research requires reports; development requires MRs;
 mixed tasks require both. `separate` is the default. `merge` is permitted only for
-one MR that completely delivers a development task. An optional `deadline` uses
+one MR that completely delivers a development task. Set `close_on_conclusion: true` only when the authorizer explicitly grants native
+Issue closure after valid acceptance or cancellation. Omitted or false leaves
+closure to the human. A stopped execution and successful close readback are
+required before the next poll can report ended. An optional `deadline` uses
 Unix milliseconds and remains in force while paused. Optional `dependencies` are
 objects with `id`, `kind` (`issue` or `mr`), positive `number` and optional criterion
 list `scope`; omitted scope blocks the whole task. Dependencies are in the same
@@ -66,12 +69,16 @@ continuing with fresh instructions. Task-wide pauses and cancellation override
 all execution. A release cannot remove a later pause. Dependency satisfaction,
 budget extension and pause release each affect only their own restrictions.
 
-People can also post a standalone `暂停任务`, `停止执行`, `Pause task`,
-`恢复执行` or `Resume execution`. These explicit intents use verified authorizer
-identity and source order; resume releases preceding pauses only. Other prose
+People can also write ordinary explicit requests such as `请暂停这个任务。`,
+`Please pause this task.` or `Please resume execution.`. These intents use verified authorizer
+identity and source order; resume releases preceding pauses only, including an older pause observed later.
+Unclear requests to pause or resume enter a clarification wait. Other prose
 remains discussion and requires a concrete decision where its meaning is unclear.
-An agent can translate an authorized human decision into the structured entry;
-it must not invent that authorization or impersonate a different native author.
+A coordinating human session can translate an authorized decision into the
+structured entry. The executing agent may submit manifests and evidence; native
+dynamic tools and the decision CLI reject its attempts to originate human control
+decisions. This is an auditable tool boundary, not an OS credential sandbox. The
+execution must not bypass it through another credentialed client.
 
 ## Delivery and acceptance
 
@@ -85,10 +92,12 @@ Use native `Related to` for separate acceptance, mixed tasks and multiple MRs.
 Publish an overall `manifest` decision with data like:
 
 ```json
-{"contract":"note:ID@VERSION","items":[{"id":"code","url":"https://gitlab.example/team/project/-/merge_requests/9","version":"FINAL_SOURCE_SHA","criteria":["result"],"checks":true,"review":true}]}
+{"contract":"note:ID@VERSION","items":[{"id":"code","kind":"mr","url":"https://gitlab.example/team/project/-/merge_requests/9","version":"FINAL_SOURCE_SHA","criteria":["result"],"checks":true,"review":true}]}
 ```
 
-The complete manifest covers all declared deliverables and criteria. `checks` and
+The complete manifest covers all declared deliverables and criteria, and each
+item's kind and native artifact type must match the agreement. All required MRs
+must be merged with the recorded validation/review evidence before conclusion. `checks` and
 `review` attest to the linked MR's business validation and technical review;
 Symphony does not infer them from an agent exit or GitLab mergeability. Reports
 use an Issue note URL ending in `#note_ID`, with the digest of its JSON-encoded
@@ -120,10 +129,18 @@ Intervals are settled once; retries and new attempts do not reset consumption.
 Each attempt is capped by both the configured run limit and remaining allowance.
 A backwards wall clock stops work for a decision rather than granting new time.
 
+Cleanup additionally compares current decision-note versions with the last
+observation saved by the engine; a newly arrived or edited decision prevents
+deletion until reconciliation. It never reconstructs a second decision reducer.
+Executor lock receipts bind recovery and release to the recorded attempt/owner;
+a late callback from another scheduler cannot finalize the new execution.
+
 A scheduler-owned label removal is recorded before mutation and verified by native
 readback. Automatic restoration requires the enabling decision, all restrictions
-cleared, unique ownership and confirmed stop. An unexplained external removal
-creates `external_routing`; it requires an explicit authorizer release and is not
+cleared, unique ownership and confirmed stop. After confirmed stop, scope disputes, exhausted budgets and unclear control
+requests produce a deduplicated Issue notice with the required next action.
+Repeated polls and a lost local notice receipt do not repost the request.
+An unexplained external removal creates `external_routing`; it requires an explicit authorizer release and is not
 automatically undone. Every admission and post-hook activation rereads facts.
 Queued stop messages take priority over native Goal handoff checks; active fact
 reads are asynchronous and fail closed on error or expiry.

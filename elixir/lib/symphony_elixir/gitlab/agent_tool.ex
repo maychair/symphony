@@ -60,6 +60,7 @@ defmodule SymphonyElixir.GitLab.AgentTool do
 
     with {:ok, method, path, query, body} <- normalize_arguments(arguments),
          :ok <- allow_request(method, path),
+         :ok <- allow_decision(method, query, body, opts),
          {:ok, %{status: status, body: response_body}} <-
            gitlab_client.(method, path, query, body, client_opts),
          true <- is_integer(status) do
@@ -77,6 +78,34 @@ defmodule SymphonyElixir.GitLab.AgentTool do
   end
 
   defp allow_request(_, _), do: :ok
+
+  defp allow_decision("GET", _, _, _), do: :ok
+
+  defp allow_decision(_method, query, body, opts) do
+    settings = opts[:tracker_settings] || SymphonyElixir.Config.settings!().tracker
+    text = if is_map(body), do: body["body"] || query["body"], else: query["body"]
+
+    if settings.provider["task_workflow"] == true and control_decision?(text) do
+      {:error, :human_control_decision_cannot_be_authored_by_executor}
+    else
+      :ok
+    end
+  end
+
+  defp control_decision?(text) when is_binary(text) do
+    case Regex.run(~r/<!-- symphony-workflow\s+(\{.*?\})\s*-->/s, text) do
+      [_, json] ->
+        case Jason.decode(json) do
+          {:ok, %{"action" => "manifest"}} -> false
+          _ -> true
+        end
+
+      _ ->
+        is_map(SymphonyElixir.TaskReconciler.intent(String.trim(text)))
+    end
+  end
+
+  defp control_decision?(_), do: false
 
   defp normalize_arguments(arguments) when is_map(arguments) do
     with {:ok, method} <- normalize_method(Map.get(arguments, "method")),

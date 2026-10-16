@@ -51,6 +51,10 @@ defmodule SymphonyElixir.TaskReconcilerTest do
           state.fault ->
             {state.fault, state}
 
+          String.ends_with?(path, "/notes") and method == "POST" ->
+            notice = %{"id" => 1_000_000 + length(state.notes), "body" => body["body"], "updated_at" => DateTime.to_iso8601(DateTime.utc_now()), "author" => %{"id" => 1}}
+            {{:ok, %{status: 201, body: notice}}, %{state | notes: state.notes ++ [notice]}}
+
           String.ends_with?(path, "/notes") ->
             notes = Enum.slice(state.notes, ((query["page"] || 1) - 1) * 100, 100)
             {{:ok, %{status: 200, body: notes}}, state}
@@ -60,6 +64,10 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
           String.ends_with?(path, "/issues/7") ->
             {{:ok, %{status: 200, body: state.dependency}}, state}
+
+          method == "PUT" and body["state_event"] == "close" ->
+            raw = Map.put(state.raw, "state", "closed")
+            {{:ok, %{status: 200, body: raw}}, %{state | raw: raw}}
 
           method == "PUT" ->
             labels = state.raw["labels"]
@@ -161,7 +169,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
     url = "https://gitlab.test/group/project/-/merge_requests/9"
-    flow = TaskWorkflow.handoff(record["workflow"], %{"kind" => "review"}) |> Map.put("intermediate", %{"url" => url, "version" => "v1"})
+    flow = TaskWorkflow.handoff(record["workflow"], %{"kind" => "review"}) |> Map.put("intermediate", %{"url" => url, "kind" => "mr", "version" => "v1"})
     {:ok, record} = RunJournal.checkpoint(record, %{"workflow" => flow, "native_stop_confirmed" => true, "thread_allocation_intent" => true, "thread_id" => "same"})
     :ok = RunJournal.complete(record, "completed")
     Agent.update(server, &%{&1 | raw: Map.put(&1.raw, "labels", ["type:development"]), mr: %{"web_url" => url, "sha" => "v1", "source_project_id" => 1, "target_project_id" => 1, "state" => "opened"}})
@@ -218,7 +226,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
     data = %{
       "contract" => contract,
-      "items" => [%{"id" => "report", "url" => issue.url <> "#note_2", "version" => TaskWorkflow.digest("The evidenced answer; uncertainty remains."), "criteria" => ["answer"]}]
+      "items" => [%{"id" => "report", "kind" => "report", "url" => issue.url <> "#note_2", "version" => TaskWorkflow.digest("The evidenced answer; uncertainty remains."), "criteria" => ["answer"]}]
     }
 
     submission = note(3, "manifest", data, contract)
@@ -271,10 +279,11 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     record = opts[:run_record]
 
     for url <- ["https://elsewhere.test/report", issue.url <> "#note_bad", "https://gitlab.test/group/project/-/merge_requests/not-a-number"] do
-      data = %{"contract" => contract, "items" => [%{"id" => "code", "url" => url, "version" => "v1", "criteria" => ["a", "b"]}]}
+      data = %{"contract" => contract, "items" => [%{"id" => "code", "kind" => "mr", "url" => url, "version" => "v1", "criteria" => ["a", "b"]}]}
       manifest = note(20, "manifest", data, contract)
       Agent.update(server, &%{&1 | notes: [hd(&1.notes), manifest]})
-      assert {:error, _} = TaskReconciler.refresh(record, false)
+      assert {:ok, updated} = TaskReconciler.refresh(record, false)
+      refute updated["workflow"]["manifest"]
     end
 
     Agent.update(server, &%{&1 | notes: [hd(&1.notes)]})
@@ -300,10 +309,11 @@ defmodule SymphonyElixir.TaskReconcilerTest do
   test "handoff intent preserves intermediate delivery and finalizes even when the provider later becomes unavailable", %{issue: issue, server: server, client: client} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
-    delivery = %{"url" => "https://gitlab.test/group/project/-/merge_requests/9", "version" => "v1"}
+    delivery = %{"url" => "https://gitlab.test/group/project/-/merge_requests/9", "kind" => "mr", "version" => "v1"}
     {:ok, _} = RunJournal.checkpoint(record, %{"delivery" => delivery})
-    arguments = %{"kind" => "review", "reason" => "Review this intermediate change.", "url" => delivery["url"], "continue_after" => "merged"}
-    assert Execution.handoff(arguments, issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client)["success"]
+    arguments = %{"kind" => "review", "reason" => "Review this change.", "url" => delivery["url"], "continue_after" => "merged"}
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(arguments, handoff_opts)["success"]
     assert current(record)["workflow"]["intermediate"] == delivery
     {:ok, _} = RunJournal.checkpoint(current(record), %{"native_stop_confirmed" => true})
     Agent.update(server, &%{&1 | fault: {:error, :offline}})
@@ -318,5 +328,108 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert :ok = Execution.finish(issue, opts, {:error, {:native_goal_stopped, "blocked"}})
     assert current(record)["phase"] == "completed"
     assert current(record)["blocker_reason"] == nil
+  end
+
+  test "activation uses refreshed scope and remaining budget after slow hooks", %{issue: issue, contract: contract, server: server} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    original = opts[:run_record]
+    append(server, note(2, "restrict", %{"kind" => "dependency", "scope" => ["a"]}, contract))
+    assert {:ok, current_opts} = Execution.activation_options(opts)
+    assert original["workflow"]["allowed_criteria"] == ["a", "b"]
+    assert current_opts[:run_record]["workflow"]["allowed_criteria"] == ["b"]
+    assert current_opts[:deadline] <= opts[:deadline]
+    assert {:error, :execution_budget_exhausted} = Execution.activation_options(Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) - 1))
+    stale = Keyword.put(opts, :run_record, Map.put(original, "attempt_id", "previous"))
+    assert {:error, :execution_attempt_changed} = Execution.activation_options(stale)
+    append(server, %{note(3, "pause", %{}, contract) | "body" => "Please pause this task."})
+    assert {:error, :scheduler_stop} = Execution.activation_options(opts)
+    assert TaskReconciler.intent(String.trim("请暂停这个任务。 ")) == %{"action" => "pause", "natural" => true}
+    assert TaskReconciler.intent("Please resume this task.")["action"] == "resume"
+    assert TaskReconciler.intent("Could you pause until we agree?")["action"] == "clarify"
+  end
+
+  test "authorized closure waits for native stop and verifies the close write", %{issue: issue, server: server, client: client} do
+    agreement = %{
+      "issue_version" => TaskWorkflow.digest("Deliver the result"),
+      "type" => "research",
+      "criteria" => ["answer"],
+      "acceptor" => "2",
+      "acceptance_mode" => "separate",
+      "close_on_conclusion" => true,
+      "deliverables" => [%{"id" => "report", "kind" => "report"}]
+    }
+
+    Agent.update(server, &%{&1 | raw: Map.put(&1.raw, "labels", ["symphony:ready", "type:research"]), notes: [note(1, "authorize", agreement)]})
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    contract = record["workflow"]["contract"]["ref"]
+    append(server, %{note(2, "report", %{}) | "body" => "Evidenced conclusion"})
+    item = %{"id" => "report", "kind" => "report", "url" => issue.url <> "#note_2", "version" => TaskWorkflow.digest("Evidenced conclusion"), "criteria" => ["answer"]}
+    submission = note(3, "manifest", %{"contract" => contract, "items" => [item]}, contract)
+    append(server, submission)
+    append(server, note(4, "accept", %{"manifest" => TaskReconciler.source_ref(submission)}, contract, 2))
+    {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => false, "thread_allocation_intent" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert Agent.get(server, & &1.raw["state"]) == "opened"
+    {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => true})
+
+    fail_close = fn method, path, query, body, options ->
+      if body == %{"state_event" => "close"}, do: {:error, :offline}, else: client.(method, path, query, body, options)
+    end
+
+    assert {:error, {:issue_closure_unconfirmed, _}} = TaskReconciler.refresh(record, false, client: fail_close)
+    {:ok, record} = TaskReconciler.refresh(current(record), false)
+    assert record["closure_confirmed"]
+    assert Agent.get(server, & &1.raw["state"]) == "closed"
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "ended"
+  end
+
+  test "legacy malformed artifacts fail closed and unknown native payloads do not grant completion", %{issue: issue, server: server} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+
+    for {kind, url} <- [{"mr", "https://elsewhere.invalid/report"}, {"report", issue.url <> "#note_bad"}] do
+      bad = %{"ref" => "legacy", "items" => [%{"kind" => kind, "url" => url, "version" => "v1"}]}
+      flow = Map.put(record["workflow"], "manifest", bad)
+      {:ok, saved} = RunJournal.checkpoint(record, %{"workflow" => flow})
+      assert {:error, _} = TaskReconciler.refresh(saved, false)
+    end
+
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"workflow" => record["workflow"]})
+    contract = record["workflow"]["contract"]["ref"]
+    item = %{"id" => "code", "kind" => "mr", "url" => "https://gitlab.test/group/project/-/merge_requests/9", "version" => "v1", "criteria" => ["a", "b"], "checks" => true, "review" => true}
+    append(server, note(5, "manifest", %{"contract" => contract, "items" => [item]}, contract))
+    assert {:error, _} = TaskReconciler.refresh(record, false)
+  end
+
+  test "decision requests are posted once and an interrupted notice write recovers by native readback", context do
+    %{issue: issue, contract: contract, server: server, client: client} = context
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    append(server, note(5, "rework", %{"criteria" => ["new"], "changes" => ["scope"]}, contract, 2))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    count = Agent.get(server, &Enum.count(&1.calls, fn {method, _, _, _} -> method == "POST" end))
+    assert count == 1
+    assert record["waiting_notices"]
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert Agent.get(server, &Enum.count(&1.calls, fn {method, _, _, _} -> method == "POST" end)) == count
+    # Simulate a lost local save after a successful remote post.
+    {:ok, record} = RunJournal.checkpoint(record, %{"waiting_notices" => %{}})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert Agent.get(server, &Enum.count(&1.calls, fn {method, _, _, _} -> method == "POST" end)) == count
+    append(server, %{note(6, "pause", %{}, contract) | "body" => "Could you pause until we agree?"})
+
+    fail_post = fn method, path, query, body, options ->
+      if method == "POST", do: {:error, :offline}, else: client.(method, path, query, body, options)
+    end
+
+    assert {:error, {:waiting_notice_unconfirmed, _}} = TaskReconciler.refresh(record, false, client: fail_post)
+    {:ok, record} = TaskReconciler.refresh(current(record), false)
+    flow = put_in(record["workflow"], ["used_ms"], record["workflow"]["budget_ms"])
+    {:ok, record} = RunJournal.checkpoint(record, %{"workflow" => flow})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["restrictions"]["budget"]
+    assert Enum.any?(Agent.get(server, & &1.notes), &String.contains?(&1["body"], "累计执行预算已用完"))
   end
 end
