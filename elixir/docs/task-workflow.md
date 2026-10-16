@@ -45,7 +45,17 @@ repository and resolve on native closure or merge.
 
 A decision reference is `note:ID@VERSION`, where VERSION hashes the compact JSON
 object containing `body` and `updated_at`, with sorted keys. Every later decision
-names `contract` with the confirmed authorization reference. Identity comes from
+names a top-level `contract` with the confirmed authorization reference, alongside
+`action` and `data`. For example, this is a complete pause decision:
+
+```json
+{"action":"pause","contract":"note:AUTH_ID@AUTH_VERSION","data":{"restriction":"manual-pause"}}
+```
+
+These complete decision objects are the contents of Workspace's `--decision-file`;
+the CLI appends the structured trailer to a separate human-readable explanation.
+Putting `contract` only inside `data` does not identify the decision's agreement
+and is rejected. Identity comes from
 the native note author, never the payload. Notes are paginated, ordered by source
 version time and deduplicated durably across restart. Edits form new versions;
 previous operations are not undone. Edited or missing authorization, manifest or
@@ -98,11 +108,24 @@ submission with intermediate continuation. Stopped-run polls recover unfinished
 review requests, including an already merged MR or a notice beyond the first
 comments page, without allocating a replacement executor.
 
-Publish an overall `manifest` decision with data like:
+Publish an overall `manifest` decision using this complete `--decision-file` object:
 
 ```json
-{"contract":"note:ID@VERSION","items":[{"id":"code","kind":"mr","url":"https://gitlab.example/team/project/-/merge_requests/9","version":"FINAL_SOURCE_SHA","criteria":["result"],"checks":true,"review":true}]}
+{
+  "action": "manifest",
+  "contract": "note:AUTH_ID@AUTH_VERSION",
+  "data": {
+    "contract": "note:AUTH_ID@AUTH_VERSION",
+    "items": [{"id":"code","kind":"mr","url":"https://gitlab.example/team/project/-/merge_requests/9","version":"FINAL_SOURCE_SHA","criteria":["result"],"checks":true,"review":true}]
+  }
+}
 ```
+
+For a manifest, both `contract` fields are required and must name the same
+authorization: the top-level field binds the decision, and `data.contract` binds
+the delivery manifest. The MR publisher's `--manifest-file` instead takes only
+the `data` object shown above, with paired `$publication` placeholders for the
+current MR. It constructs the complete decision when posting the handoff.
 
 The complete manifest covers all declared deliverables and criteria, and each
 item's kind and native artifact type must match the agreement. All required MRs
@@ -119,6 +142,15 @@ Submitting the complete manifest stops execution. Pending technical review or
 unmerged MRs keep the task waiting; only complete native delivery evidence enters
 overall acceptance. Separate
 acceptance requires the acceptor's `accept` decision naming that exact manifest.
+Its complete `--decision-file` object is:
+
+```json
+{"action":"accept","contract":"note:AUTH_ID@AUTH_VERSION","data":{"manifest":"note:MANIFEST_ID@MANIFEST_VERSION"}}
+```
+
+Use the authorization note's reference for `contract` and the submitted manifest
+note's reference for `data.manifest`; they identify different source decisions.
+
 Merge acceptance requires the declared single MR, verified source version,
 recorded checks/review evidence and native merge. A substantive report or source
 change invalidates the affected acceptance; submit and accept a new manifest.
