@@ -27,7 +27,7 @@ defmodule SymphonyElixir.RunJournal do
 
       record =
         record
-        |> Map.drop(["handoff", "handoff_pending", "handoff_notice", "delivery", "stage_results", "blocker_reason", "native_stop_confirmed"])
+        |> Map.drop(["handoff", "handoff_pending", "handoff_notice", "delivery", "stage_results", "blocker_reason", "control_restart"])
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
@@ -68,6 +68,7 @@ defmodule SymphonyElixir.RunJournal do
     event = Map.take(changes, ["phase", "thread_id", "turn_id"]) |> Map.put("at", now) |> Map.put("attempt_id", record["attempt_id"])
     events = Enum.take((record["events"] || []) ++ [event], -200)
     updated = record |> Map.merge(changes) |> Map.put("updated_at", now) |> Map.put("events", events)
+    updated = account_budget(updated, changes)
     updated = Map.put(updated, "stage_results", stage_results(updated))
     path = Path.join(directory, "run.json")
     temporary = path <> ".pending"
@@ -77,6 +78,15 @@ defmodule SymphonyElixir.RunJournal do
       {:ok, updated}
     end
   end
+
+  defp account_budget(%{"workflow" => %{} = flow} = record, changes) do
+    flow = SymphonyElixir.TaskWorkflow.tick(flow, System.system_time(:millisecond))
+    human = Enum.any?(Map.values(flow["restrictions"]), &(&1["scope"] == "task" and &1["kind"] in ["pause", "decision", "review", "acceptance", "scope", "cancel"]))
+    flow = if changes["native_stop_confirmed"] == true and (human or flow["manifest"]), do: Map.put(flow, "charging", false), else: flow
+    Map.put(record, "workflow", flow)
+  end
+
+  defp account_budget(record, _changes), do: record
 
   @spec stage_results(map()) :: map()
   def stage_results(record) do

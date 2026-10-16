@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Execution do
   @moduledoc "Durable native execution for repository Issues, independent of task storage."
-  alias SymphonyElixir.{Config, ExecutionBackend, RunJournal, Tracker}
+  alias SymphonyElixir.{Config, ExecutionBackend, RunJournal, TaskReconciler, Tracker}
 
   @spec enabled?() :: boolean()
   def enabled?, do: Config.settings!().agent.goal_mode
@@ -44,10 +44,24 @@ defmodule SymphonyElixir.Execution do
                "handoff" => nil,
                "blocker_reason" => nil
              }) do
-        {:ok, issue, Keyword.merge(opts, run_record: record, tracker_settings: Config.settings!().tracker)}
+        admit_workflow(issue, record, opts)
       end
     else
       {:ok, issue, opts}
+    end
+  end
+
+  defp admit_workflow(issue, record, opts) do
+    case TaskReconciler.admit(issue, record) do
+      {:ok, admitted} ->
+        budget = min(run_budget_ms(issue.id), admitted["remaining_budget_ms"] || run_budget_ms(issue.id))
+        options = Keyword.merge(opts, run_record: admitted, deadline: System.monotonic_time(:millisecond) + budget, tracker_settings: Config.settings!().tracker)
+        {:ok, issue, options}
+
+      error ->
+        {:ok, current} = RunJournal.read(record["directory"])
+        RunJournal.complete(current, "completed")
+        error
     end
   end
 
@@ -99,6 +113,7 @@ defmodule SymphonyElixir.Execution do
 
   defp release_for_resume(record) do
     with false <- File.exists?(Path.join([record["directory"], "executor.lock", "cleanup-owner.json"])),
+         false <- File.exists?(Path.join([record["directory"], "executor.lock", "reconcile-owner"])),
          {:ok, _} <- RunJournal.checkpoint(record, %{"phase" => "completed", "handoff" => nil, "blocker_reason" => nil}) do
       case File.rmdir(Path.join(record["directory"], "executor.lock")) do
         :ok -> :ok
@@ -125,7 +140,14 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp finish_record(issue, initial, result) do
-    with {:ok, record} <- RunJournal.read(initial["directory"]) do
+    with {:ok, record} <- RunJournal.read(initial["directory"]),
+         true <- record["attempt_id"] == initial["attempt_id"] do
+      record =
+        case refresh_workflow(record, false) do
+          {:ok, refreshed} -> refreshed
+          _ -> record
+        end
+
       {phase, error} = final_phase(issue, record, result)
 
       with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => error}) do
@@ -133,6 +155,16 @@ defmodule SymphonyElixir.Execution do
       end
     end
   end
+
+  @spec refresh_workflow(map(), boolean()) :: {:ok, map()} | {:error, term()}
+  def refresh_workflow(record, active) do
+    if TaskReconciler.enabled?(), do: TaskReconciler.refresh(record, active), else: {:ok, record}
+  end
+
+  defp final_phase(_issue, %{"native_stop_confirmed" => true, "workflow" => %{"state" => state}}, _result)
+       when state in ["waiting", "review", "ended"], do: {"completed", nil}
+
+  defp final_phase(_issue, %{"native_stop_confirmed" => true, "control_restart" => true}, _result), do: {"completed", nil}
 
   defp final_phase(_issue, record, {:error, :scheduler_stop}) do
     if record["native_stop_confirmed"] == true,
@@ -280,8 +312,9 @@ defmodule SymphonyElixir.Execution do
          {:ok, %{status: 200, body: %{} = mr}} <- client.("GET", "/projects/#{URI.encode_www_form(settings.provider["project_path"])}/merge_requests/#{iid}", %{}, nil, tracker_settings: settings),
          true <- valid_review_options?(mr, request["url"]),
          true <- same_publication?(publication, mr),
-         {:ok, _} <- RunJournal.checkpoint(record, %{"delivery" => %{"url" => request["url"], "mr_verified" => true, "attempt_id" => record["attempt_id"]}}),
-         %{"success" => true} <- handoff(Map.take(request, ["kind", "reason", "url"]), opts) do
+         delivery = %{"url" => request["url"], "version" => sha, "mr_verified" => true, "attempt_id" => record["attempt_id"]},
+         {:ok, _} <- RunJournal.checkpoint(record, %{"delivery" => delivery}),
+         %{"success" => true} <- handoff(Map.take(request, ["kind", "reason", "url", "stage", "continue_after"]), opts) do
       :ok
     else
       error -> {:error, {:review_delivery_not_verified, error}}
@@ -294,9 +327,9 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp valid_review_options?(mr, url) do
-    expected = %{"state" => "opened", "web_url" => url, "squash" => true}
+    expected = %{"web_url" => url, "squash" => true}
 
-    Enum.all?(expected, fn {key, value} -> mr[key] == value end) and mr["draft"] != true and
+    Enum.all?(expected, fn {key, value} -> mr[key] == value end) and mr["state"] in ["opened", "merged"] and mr["draft"] != true and
       mr["source_project_id"] == mr["target_project_id"] and
       (mr["force_remove_source_branch"] == true or mr["should_remove_source_branch"] == true)
   end
@@ -320,7 +353,7 @@ defmodule SymphonyElixir.Execution do
 
     with {:ok, %{} = record} <- RunJournal.read(RunJournal.directory(journal_root(), issue.id)),
          true <- record["issue_url"] == issue.url,
-         {:ok, pending} <- RunJournal.checkpoint(record, %{"handoff_pending" => true}) do
+         {:ok, pending} <- RunJournal.checkpoint(record, handoff_intent(record, arguments)) do
       case post_handoff(settings, issue, arguments, pending, opts) do
         {:ok, posted} ->
           complete_handoff(posted, arguments)
@@ -336,6 +369,17 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp do_handoff(_, _), do: {:error, :invalid_handoff}
+
+  defp handoff_intent(record, arguments) do
+    changes = %{"handoff_pending" => true}
+
+    if record["workflow"] do
+      flow = SymphonyElixir.TaskWorkflow.handoff(record["workflow"], arguments)
+      Map.put(changes, "workflow", Map.put(flow, "intermediate", if(arguments["continue_after"] == "merged", do: record["delivery"], else: nil)))
+    else
+      changes
+    end
+  end
 
   defp complete_handoff(posted, arguments) do
     with {:ok, updated} <- RunJournal.checkpoint(posted, %{"handoff_pending" => false, "handoff" => arguments}) do

@@ -710,6 +710,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    receive do
+      :symphony_stop when is_map_key(tool_executor, :goal_mode) -> {:error, :scheduler_stop}
+    after
+      0 -> receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     tool_executor = check_goal_handoff(port, tool_executor)
     remaining = remaining_time(tool_executor[:deadline], timeout_ms)
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
