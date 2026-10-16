@@ -35,4 +35,37 @@ defmodule SymphonyElixir.GitLabControlToolTest do
     result = AgentTool.execute("gitlab_api", %{"method" => "POST", "path" => path}, gitlab_client: client)
     refute result["success"]
   end
+
+  test "executors cannot write human-owned issue control fields" do
+    fields = [
+      {"add_labels", "symphony:ready"},
+      {"remove_labels", "symphony:ready"},
+      {"labels", "symphony:ready"},
+      {"description", "Edited agreement"},
+      {"title", "Edited title"}
+    ]
+
+    for {field, value} <- fields do
+      for method <- ["PUT", "POST"] do
+        # Reject the field whether the executor smuggles it in the body or in
+        # the query map, which a Rails-backed GitLab API merges into params.
+        body = call(method, %{field => value})
+        refute body["success"]
+        assert body["output"] =~ "human-owned"
+
+        query = call(method, %{"body" => "Ordinary comment"}, %{field => value})
+        refute query["success"]
+        assert query["output"] =~ "human-owned"
+      end
+    end
+
+    # The guard does not interfere with ordinary notes or evidence submission.
+    assert call("POST", %{"body" => "Verified intermediate result"})["success"]
+    assert call("POST", %{"body" => "<!-- symphony-workflow {\"action\":\"manifest\"} -->"})["success"]
+    assert call("PUT", %{"state_event" => "close"})["success"]
+    assert call("GET", nil, %{"labels" => "symphony:ready"})["success"]
+    # Without the versioned workflow the fields are not human-owned.
+    assert call("PUT", %{"add_labels" => "symphony:ready"}, %{}, false)["success"]
+    assert call("PUT", nil, %{"description" => "Edited"}, false)["success"]
+  end
 end

@@ -7,6 +7,7 @@ defmodule SymphonyElixir.GitLab.AgentTool do
 
   @gitlab_api_tool "gitlab_api"
   @allowed_methods ["GET", "POST", "PUT", "DELETE"]
+  @human_owned_fields ["add_labels", "remove_labels", "labels", "description", "title"]
   @gitlab_api_description """
   Execute a GitLab REST API request using Symphony's configured auth.
   """
@@ -85,12 +86,20 @@ defmodule SymphonyElixir.GitLab.AgentTool do
     settings = opts[:tracker_settings] || SymphonyElixir.Config.settings!().tracker
     texts = [if(is_map(body), do: body["body"]), query["body"]]
 
-    if settings.provider["task_workflow"] == true and Enum.any?(texts, &control_decision?/1) do
-      {:error, :human_control_decision_cannot_be_authored_by_executor}
-    else
-      :ok
+    cond do
+      settings.provider["task_workflow"] == true and (human_owned_fields?(body) or human_owned_fields?(query)) ->
+        {:error, :human_owned_issue_fields}
+
+      settings.provider["task_workflow"] == true and Enum.any?(texts, &control_decision?/1) ->
+        {:error, :human_control_decision_cannot_be_authored_by_executor}
+
+      true ->
+        :ok
     end
   end
+
+  defp human_owned_fields?(body) when is_map(body), do: Enum.any?(@human_owned_fields, &Map.has_key?(body, &1))
+  defp human_owned_fields?(_body), do: false
 
   defp control_decision?(text) when is_binary(text) do
     case Regex.scan(~r/<!-- symphony-workflow\s+(\{.*?\})\s*-->/s, text) do
@@ -189,6 +198,14 @@ defmodule SymphonyElixir.GitLab.AgentTool do
 
   defp tool_error_payload(:invalid_query) do
     %{"error" => %{"message" => "gitlab_api.query must be a JSON object when provided."}}
+  end
+
+  defp tool_error_payload(:human_owned_issue_fields) do
+    %{
+      "error" => %{
+        "message" => "gitlab_api cannot write add_labels, remove_labels, labels, description, or title; these fields are human-owned and change task authorization."
+      }
+    }
   end
 
   defp tool_error_payload(:missing_gitlab_api_key) do

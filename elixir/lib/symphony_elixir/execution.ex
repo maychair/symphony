@@ -89,7 +89,8 @@ defmodule SymphonyElixir.Execution do
   defp workflow_recovery?(record) do
     flow = record["workflow"] || %{}
 
-    record["native_stop_confirmed"] == true and flow["resume_requested"] == true and
+    (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true) and
+      flow["resume_requested"] == true and
       flow["allowed_criteria"] != [] and flow["state"] == "ready"
   end
 
@@ -151,12 +152,18 @@ defmodule SymphonyElixir.Execution do
 
       record = count_retry(record, result)
       {phase, error} = final_phase(issue, record, result)
+      record = if phase == "incident", do: clear_resume_requested(record), else: record
 
       with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => error}) do
         RunJournal.complete(updated, phase)
       end
     end
   end
+
+  defp clear_resume_requested(%{"workflow" => flow} = record),
+    do: Map.put(record, "workflow", Map.put(flow, "resume_requested", false))
+
+  defp clear_resume_requested(record), do: record
 
   defp count_retry(record, :ok), do: record
   defp count_retry(record, {:error, :scheduler_stop}), do: record
@@ -341,6 +348,8 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp finish_interrupted(record, message) do
+    record = clear_resume_requested(record)
+
     with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => message}),
          :ok <- RunJournal.complete(updated, "incident") do
       {:blocked, message}
@@ -354,8 +363,7 @@ defmodule SymphonyElixir.Execution do
     if enabled?() do
       case RunJournal.read(RunJournal.directory(journal_root(), issue.id)) do
         {:ok, %{"phase" => "incident"} = record} ->
-          workflow_recovery?(record) and
-            (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true)
+          workflow_recovery?(record)
 
         _ ->
           false
@@ -525,15 +533,47 @@ defmodule SymphonyElixir.Execution do
 
     body = handoff_body(args)
 
-    with {:ok, posted} <- ensure_handoff_notice(client, path <> suffix, settings, body, record),
-         :ok <- add_labels(settings, issue, ["symphony:review"], opts),
+    with {:ok, posted} <- ensure_handoff_notice(client, path <> suffix, settings, body, record) do
+      # The versioned workflow keeps the human authorization label and marks the
+      # handoff with the engine-owned review label; the legacy workflow restores
+      # the previous routing-label removal so the run actually stops.
+      if TaskReconciler.enabled?(),
+        do: mark_review(settings, issue, path, client, posted, opts),
+        else: release_routing(settings, issue, path, client, posted, opts)
+    end
+  end
+
+  defp post_handoff(_, _, _, _, _), do: {:error, :repository_tracker_required}
+
+  defp mark_review(settings, issue, path, client, posted, opts) do
+    with :ok <- add_labels(settings, issue, ["symphony:review"], opts),
          {:ok, %{status: 200, body: %{} = current}} <- client.("GET", path, %{}, nil, tracker_settings: settings),
          true <- "symphony:review" in label_names(current["labels"]) do
       {:ok, posted}
     end
   end
 
-  defp post_handoff(_, _, _, _, _), do: {:error, :repository_tracker_required}
+  defp release_routing(settings, issue, path, client, posted, opts) do
+    with :ok <- remove_labels(settings, issue, legacy_routing_labels(settings), opts),
+         {:ok, %{status: 200, body: %{} = current}} <- client.("GET", path, %{}, nil, tracker_settings: settings),
+         labels when is_list(labels) <- current["labels"],
+         true <- routing_released?(labels, settings) do
+      {:ok, posted}
+    end
+  end
+
+  # Only the legacy path keeps the pre-upgrade routing labels, so an Issue that
+  # still carries `symphony:retry` stops being routed after the handoff.
+  defp legacy_routing_labels(settings), do: settings.required_labels ++ ["symphony:retry"]
+
+  defp routing_released?(labels, settings) do
+    routing = legacy_routing_labels(settings)
+
+    Enum.all?(labels, fn label ->
+      name = if is_map(label), do: label["name"], else: label
+      is_binary(name) and String.downcase(String.trim(name)) not in routing
+    end)
+  end
 
   defp label_names(labels) do
     labels
@@ -559,20 +599,25 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
-  defp add_labels(%{kind: "github"} = settings, issue, labels, opts) do
+  defp add_labels(%{kind: "gitlab"} = settings, issue, labels, opts) do
+    {client, path} = client_path(settings, issue, opts)
+    response(client.("PUT", path, %{}, %{"add_labels" => Enum.join(labels, ",")}, tracker_settings: settings))
+  end
+
+  defp remove_labels(%{kind: "github"} = settings, issue, labels, opts) do
     {client, path} = client_path(settings, issue, opts)
 
     Enum.reduce_while(labels, :ok, fn label, :ok ->
-      case client.("POST", path <> "/labels", %{}, %{"labels" => [label]}, tracker_settings: settings) do
-        {:ok, %{status: status}} when status in 200..299 -> {:cont, :ok}
+      case client.("DELETE", path <> "/labels/" <> URI.encode_www_form(label), %{}, nil, tracker_settings: settings) do
+        {:ok, %{status: status}} when status in 200..299 or status == 404 -> {:cont, :ok}
         error -> {:halt, {:error, error}}
       end
     end)
   end
 
-  defp add_labels(%{kind: "gitlab"} = settings, issue, labels, opts) do
+  defp remove_labels(%{kind: "gitlab"} = settings, issue, labels, opts) do
     {client, path} = client_path(settings, issue, opts)
-    response(client.("PUT", path, %{}, %{"add_labels" => Enum.join(labels, ",")}, tracker_settings: settings))
+    response(client.("PUT", path, %{}, %{"remove_labels" => Enum.join(labels, ",")}, tracker_settings: settings))
   end
 
   defp client_path(%{kind: "github"} = settings, issue, opts),

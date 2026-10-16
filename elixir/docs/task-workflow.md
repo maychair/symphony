@@ -34,21 +34,27 @@ The sole assigned user confirms the first agreement with two facts: the
 ```
 
 `contract_sha` is SHA-256 of the remaining JSON object (UTF-8, compact JSON,
-sorted keys, unescaped Unicode). The block authorizes anything only when that
-digest verifies against its own payload, so editing the description invalidates
-the recorded authorization until a human applies `symphony:ready` again. The
-description contains the human-confirmed goal, scope, permissions and acceptance
-criteria. IDs in `criteria` and `deliverables` refer to that agreement. An
-agreement names an acceptor and optional reviewers explicitly delegated to request
-in-scope rework. GitLab membership or an ordinary comment grants no authority.
-Later authorization changes require that recorded authorizer.
+sorted keys, unescaped Unicode). The `symphony:ready` label authorizes only when
+that digest verifies against its own payload. The recorded authorization stores
+`issue_version`, the digest of the whole Issue description; editing any part of
+the description, inside or outside the block, invalidates it until a human applies
+`symphony:ready` again. The description contains the human-confirmed goal, scope,
+permissions and acceptance criteria. IDs in `criteria` and `deliverables` refer to
+that agreement. An agreement names an acceptor and optional reviewers explicitly
+delegated to request in-scope rework. GitLab membership or an ordinary comment
+grants no authority. Later authorization changes require that recorded authorizer.
+When a valid description block exists, a note that carries the `authorize` action
+must repeat the block's agreement fields (`type`, `criteria`, `deliverables`,
+`acceptance_mode`, `acceptor`, `reviewers`, `deadline`, `close_on_conclusion`,
+`dependencies`, `budget_ms`) before it is accepted; a note cannot install a different
+agreement than the block.
 
 Later decisions are ordinary human-readable Issue notes with this structured
 trailer:
 
 ```html
 <!-- symphony-workflow
-{"action":"rework","contract":"note:AUTH_ID@AUTH_VERSION","data":{"criteria":["result"],"changes":[]}}
+{"action":"rework","contract":"label:42@1@2026-10-16T00:00:00Z","data":{"criteria":["result"],"changes":[]}}
 -->
 ```
 
@@ -64,12 +70,14 @@ list `scope`; omitted scope blocks the whole task. Dependencies are in the same
 repository and resolve on native closure or merge.
 
 A decision reference is `note:ID@VERSION`, where VERSION hashes the compact JSON
-object containing `body` and `updated_at`, with sorted keys. Every later decision
-names a top-level `contract` with the confirmed authorization reference, alongside
-`action` and `data`. For example, this is a complete pause decision:
+object containing `body` and `updated_at`, with sorted keys. The authorization
+reference is `label:ID@ACTOR@CREATED_AT`, taken from the authorizing
+`symphony:ready` label event. Every later decision names a top-level `contract`
+with the confirmed authorization reference, alongside `action` and `data`. For
+example, this is a complete pause decision:
 
 ```json
-{"action":"pause","contract":"note:AUTH_ID@AUTH_VERSION","data":{"restriction":"manual-pause"}}
+{"action":"pause","contract":"label:42@1@2026-10-16T00:00:00Z","data":{"restriction":"manual-pause"}}
 ```
 
 These complete decision objects are the contents of Workspace's `--decision-file`;
@@ -138,9 +146,9 @@ Publish an overall `manifest` decision using this complete `--decision-file` obj
 ```json
 {
   "action": "manifest",
-  "contract": "note:AUTH_ID@AUTH_VERSION",
+  "contract": "label:42@1@2026-10-16T00:00:00Z",
   "data": {
-    "contract": "note:AUTH_ID@AUTH_VERSION",
+    "contract": "label:42@1@2026-10-16T00:00:00Z",
     "items": [{"id":"code","kind":"mr","url":"https://gitlab.example/team/project/-/merge_requests/9","version":"FINAL_SOURCE_SHA","criteria":["result"],"checks":true,"review":true}]
   }
 }
@@ -170,11 +178,16 @@ acceptance requires the acceptor's `accept` decision naming that exact manifest.
 Its complete `--decision-file` object is:
 
 ```json
-{"action":"accept","contract":"note:AUTH_ID@AUTH_VERSION","data":{"manifest":"note:MANIFEST_ID@MANIFEST_VERSION"}}
+{"action":"accept","contract":"label:42@1@2026-10-16T00:00:00Z","data":{"manifest":"note:MANIFEST_ID@MANIFEST_VERSION"}}
 ```
 
-Use the authorization note's reference for `contract` and the submitted manifest
+Use the authorization label's reference for `contract` and the submitted manifest
 note's reference for `data.manifest`; they identify different source decisions.
+The authorization reference comes from the `symphony:ready` label, so use its
+`label:ID@ACTOR@CREATED_AT` value. The `symphony:accept` label carries no manifest
+ref of its own: it accepts the manifest current when the poll reduces events, so a
+manifest note and an `symphony:accept` label that arrive in the same poll are
+applied in source order.
 
 Merge acceptance requires the declared single MR, verified source version,
 recorded checks/review evidence and native merge. A substantive report or source
@@ -201,6 +214,11 @@ counter. One confirmed-stopped transient failure is reworked automatically; the
 next failure becomes a persistent Incident that only a new human decision clears.
 There is no retry label, and a fresh decision does not reset the counter or the
 execution budget.
+Recording an Incident clears any pending `resume_requested`, so a rework granted
+while a run was still executing cannot silently recover a later failure. Recovery
+requires a new human decision and an executor state of confirmed stop: a run that
+failed before it allocated a thread is recoverable by a later decision, while a
+possibly-live thread stays an incident until the native stop is confirmed.
 
 Cleanup additionally compares current decision-note versions with the last
 observation saved by the engine; a newly arrived or edited decision prevents

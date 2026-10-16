@@ -151,6 +151,11 @@ defmodule SymphonyElixir.TaskReconcilerTest do
   defp append(server, note), do: Agent.update(server, &%{&1 | notes: &1.notes ++ [note]})
   defp current(record), do: elem(RunJournal.read(record["directory"]), 1)
 
+  defp write_lock_owner(record) do
+    path = Path.join([record["directory"], "executor.lock", "executor-owner.json"])
+    File.write!(path, Jason.encode!(Map.take(record, ["attempt_id", "host", "executor_os_pid"])))
+  end
+
   test "pause, separately satisfied dependency and explicit resume survive unlabelled polling and restart", %{server: server, issue: issue, contract: contract} do
     assert TaskReconciler.enabled?()
     assert {:ok, _, opts} = Execution.prepare(issue, [])
@@ -220,7 +225,9 @@ defmodule SymphonyElixir.TaskReconcilerTest do
   end
 
   test "human label events translate to control events and unknown labels are ignored" do
-    contract = TaskReconciler.description_contract(contract_block(development_contract()))
+    description = "Deliver the result\n\n" <> contract_block(development_contract())
+    contract = TaskReconciler.description_contract(description)
+    issue_version = TaskWorkflow.digest(description)
     flow = %{"contract" => %{"ref" => "note:1@v1", "criteria" => ["a"], "authorizer" => "2"}, "manifest" => %{"ref" => "note:9@v1"}, "restrictions" => %{}}
 
     events =
@@ -235,18 +242,19 @@ defmodule SymphonyElixir.TaskReconcilerTest do
         ],
         flow,
         contract,
+        issue_version,
         "1"
       )
 
     assert [ready, rework, accept] = events
     assert ready["action"] == "authorize"
-    assert ready["data"] == Map.put(contract, "issue_version", contract["contract_sha"])
+    assert ready["data"] == Map.put(contract, "issue_version", issue_version)
     assert rework["action"] == "rework"
     assert rework["contract"] == "note:1@v1"
     assert rework["data"] == %{"criteria" => ["a"], "changes" => []}
     assert accept["action"] == "accept"
     assert accept["contract"] == "note:1@v1"
-    assert accept["data"] == %{"manifest" => "note:9@v1"}
+    assert accept["data"] == %{}
 
     assert Enum.map(events, & &1["ref"]) == [
              "label:11@1@2026-10-16T00:00:01Z",
@@ -270,6 +278,44 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     :ok = RunJournal.complete(record, "completed")
     assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
     refute File.exists?(Path.join(record["directory"], "executor.lock"))
+  end
+
+  test "issue_version binds the whole description and editing it invalidates authorization", %{server: server, issue: issue} do
+    description = Agent.get(server, & &1.raw["description"])
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    assert record["workflow"]["contract"]["issue_version"] == TaskWorkflow.digest(description)
+
+    # Editing the description changes its digest, so the recorded authorization
+    # no longer matches the confirmed agreement and the engine raises the
+    # baseline decision restriction until a human reapplies the label.
+    Agent.update(server, &put_in(&1.raw["description"], description <> "\n\nReworded scope."))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["restrictions"]["baseline"]
+    assert record["workflow"]["state"] == "waiting"
+  end
+
+  test "an unexplained routing removal after handoff restricts an already started task", %{server: server, issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    flow = TaskWorkflow.handoff(record["workflow"], %{"kind" => "review"})
+    {:ok, record} = RunJournal.checkpoint(record, %{"workflow" => flow, "native_stop_confirmed" => true, "thread_allocation_intent" => true, "thread_id" => "same"})
+    :ok = RunJournal.complete(record, "completed")
+
+    assert record["workflow"]["started"]
+    Agent.update(server, &%{&1 | raw: Map.put(&1.raw, "labels", ["type:development"])})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["restrictions"]["external_routing"]
+  end
+
+  test "a never-routed task is not restricted just because the label was absent", %{server: server, issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    # A fresh record has not started, so an absent routing label is a legitimate
+    # pre-authorization state rather than an unexplained removal.
+    record = Map.take(opts[:run_record], ["attempt_id", "directory", "issue_id", "issue_url"])
+    Agent.update(server, &%{&1 | raw: Map.put(&1.raw, "labels", ["type:development"])})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    refute (record["workflow"]["restrictions"] || %{})["external_routing"]
   end
 
   test "a verified intermediate merge restores routing, preserving task-level delivery and budget", %{server: server, issue: issue} do
@@ -364,6 +410,45 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["state"] == "waiting"
     refute record["workflow"]["acceptance"]
+  end
+
+  test "a manifest note and an accept label that arrive in one poll are accepted", %{server: server, issue: issue} do
+    Agent.update(server, fn state ->
+      research = %{
+        "type" => "research",
+        "criteria" => ["answer"],
+        "acceptor" => "2",
+        "acceptance_mode" => "separate",
+        "deliverables" => [%{"id" => "report", "kind" => "report"}]
+      }
+
+      raw =
+        state.raw
+        |> Map.put("labels", ["symphony:ready", "type:research"])
+        |> Map.put("description", "Research the answer\n\n" <> contract_block(research))
+
+      %{state | raw: raw}
+    end)
+
+    {:ok, _, opts} = Execution.prepare(%{issue | labels: ["symphony:ready", "type:research"]}, [])
+    record = opts[:run_record]
+    contract = record["workflow"]["contract"]["ref"]
+    append(server, %{note(2, "report", %{}) | "body" => "The evidenced answer."})
+
+    item = %{"id" => "report", "kind" => "report", "url" => issue.url <> "#note_2", "version" => TaskWorkflow.digest("The evidenced answer."), "criteria" => ["answer"]}
+    submission = note(7, "manifest", %{"contract" => contract, "items" => [item]}, contract)
+    append(server, submission)
+    # A human cannot accept a delivery that does not exist yet, so the accept
+    # label is timestamped after the manifest note and must still reduce last.
+    # With the chronological sort the note lands first regardless of its id.
+    accept = label_event(3, "symphony:accept", "2026-10-16T00:00:08Z", "add", 2)
+    Agent.update(server, &%{&1 | label_events: &1.label_events ++ [accept]})
+
+    # The accept label carries no manifest ref; it must resolve against the
+    # manifest reduced from the note earlier in the same refresh.
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["acceptance"]["ref"] == "label:3@2@2026-10-16T00:00:08Z"
+    assert record["workflow"]["acceptance"]["manifest"] == TaskReconciler.source_ref(submission)
   end
 
   test "failed native facts and label readbacks cannot grant admission or automatic recovery", context do
@@ -579,18 +664,22 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
   test "repeated MR links retain every item's validation and review requirements", %{issue: issue, server: server} do
     agreement = %{
-      "issue_version" => TaskWorkflow.digest("Deliver the result"),
       "type" => "development",
       "criteria" => ["a", "b"],
       "acceptor" => "2",
+      "reviewers" => ["3"],
       "acceptance_mode" => "separate",
-      "close_on_conclusion" => true,
       "deliverables" => [%{"id" => "first", "kind" => "mr"}, %{"id" => "second", "kind" => "mr"}]
     }
 
+    # The description block is the confirmed agreement; the note authorization
+    # must match it. Both items point at the same merged MR.
+    description = "Deliver the result\n\n" <> contract_block(agreement)
+    Agent.update(server, &put_in(&1.raw["description"], description))
+
     url = "https://gitlab.test/group/project/-/merge_requests/9"
     mr = %{"web_url" => url, "sha" => "v1", "source_project_id" => 1, "target_project_id" => 1, "state" => "merged", "merged_at" => "2026-10-16T00:00:00Z"}
-    Agent.update(server, &%{&1 | notes: [note(1, "authorize", agreement)], mr: mr})
+    Agent.update(server, &%{&1 | notes: [note(1, "authorize", Map.put(agreement, "issue_version", TaskWorkflow.digest(description)))], mr: mr})
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
     contract = record["workflow"]["contract"]["ref"]
@@ -604,6 +693,13 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute record["workflow"]["delivery_ready"]
     refute TaskWorkflow.valid_conclusion?(record["workflow"])
     assert Agent.get(server, & &1.raw["state"]) == "opened"
+
+    # Requiring both checks and review on every item is the safeguard under test;
+    # satisfying the second item lets delivery readiness succeed.
+    satisfied = %{second | "checks" => true, "review" => true}
+    append(server, note(5, "manifest", %{"contract" => contract, "items" => [first, satisfied]}, contract))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["delivery_ready"]
   end
 
   test "stopped-run polling recovers final MR publication and submits its manifest without a replacement executor", %{issue: issue, server: server, client: client} do
@@ -677,7 +773,8 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
     append(server, note(2, "rework", %{"criteria" => ["a"], "changes" => []}, contract, 2))
-    {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => true, "retry_count" => 1, "attempt_count" => 10})
+    {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => true, "retry_count" => 1, "attempt_count" => 10, "executor_os_pid" => "99999999"})
+    write_lock_owner(record)
     {:ok, record} = TaskReconciler.refresh(record, false)
     :ok = RunJournal.complete(record, "incident")
     assert Execution.resumable?(issue)

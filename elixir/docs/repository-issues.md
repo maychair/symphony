@@ -27,7 +27,9 @@ For a custom internal GitLab HTTP endpoint, explicitly set
 The dynamic `task_handoff` tool accepts `kind: review|decision|blocked`, a specific
 `reason`, and an optional result `url`. It comments on the assigned Issue and adds
 the engine-owned `symphony:review` label, verified by readback; it never writes the
-human authorization label. A completed model turn does not close the Issue. Use repository
+human authorization label. With the versioned task workflow enabled it keeps the
+`symphony:ready` authorization label; with that workflow disabled it removes the
+routing labels so the run stops while the human decision is pending. A completed model turn does not close the Issue. Use repository
 closing references on a PR/MR when merge satisfies the complete task; otherwise
 close only after all agreed acceptance conditions have been met. Dependency links
 remain repository content; automatic dependency scheduling is not implemented.

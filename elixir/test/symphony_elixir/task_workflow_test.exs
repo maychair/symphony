@@ -320,4 +320,110 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert reopened["state"] == "waiting"
     refute Flow.valid_conclusion?(reopened)
   end
+
+  test "digest canonicalizes nested keys and unescaped Unicode like the Python producer" do
+    wide = Map.new(for i <- 1..40, do: {String.pad_leading(to_string(i), 3, "0"), i})
+
+    value = %{
+      "z" => 1,
+      "a" => %{
+        "nested" => [%{"beta" => 2, "alpha" => [%{"k" => "中文", "j" => true}]}],
+        "y" => nil,
+        "wide" => wide
+      },
+      "m" => [3, %{"b" => 1, "a" => 2}]
+    }
+
+    # Produced by the Python decision CLI: json.dumps(..., ensure_ascii=False,
+    # sort_keys=True, separators=(',', ':')) then sha256 of the UTF-8 bytes.
+    assert Flow.digest(value) == "7d340028af383a9ee1efbac93bced1ec27529c77c2b0389edfee5cc960d16893"
+    # Erlang's default key order encodes this wide map differently, so the
+    # fixture fails against the order-dependent implementation.
+    refute Flow.digest(value) == :crypto.hash(:sha256, Jason.encode!(value)) |> Base.encode16(case: :lower)
+    assert Flow.digest("中文") == "ae5501d6922ab917c22d22b489ec065bd1ac48244a124277f858fba6f722efd5"
+  end
+
+  test "digest lowercases control-character escapes without touching literal backslash-u text" do
+    # Python json.dumps escapes these control characters as `\uXXXX` with
+    # lowercase hex; Jason emits uppercase hex, so the digest must lowercase
+    # only real escapes.
+    value = %{"control" => "line" <> <<0x0B>> <> "break", "literal" => "\\u004B", "z" => 2, "a" => 1}
+
+    # sha256 of json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).
+    assert Flow.digest(value) == "aed85472b4ef597250917b568e2308f57f0b445ee4a079caae2b3af54db28344"
+    assert Flow.digest(<<0x0B>>) == "0b3c45b45a3ea9ac8dec30a87e230862c3e7e6e2e6f83f4dca0009aee5bc71f8"
+    assert Flow.digest("\\u004B") == "12091d5849861a347e42a2a1c80aabbbe0869d287db6b3dfceb86bbbd93172d9"
+
+    # The canonical bytes are valid JSON and round-trip to the input, and the
+    # `\u000b` escape is lowercase while the literal `\u004B` text stays escaped.
+    canonical = Flow.canonical_json(value)
+    assert canonical =~ ~S(\u000b)
+    assert canonical =~ ~S(\\u004B)
+    assert Jason.decode!(canonical) == value
+  end
+
+  test "a note authorization cannot install a different agreement than the description block" do
+    agreement = Map.drop(authorization()["data"], ["issue_version", "contract_sha"])
+    block = Map.put(agreement, "issue_version", "body")
+
+    forged = Map.put(agreement, "criteria", ["other"])
+    note = event("authorize", "note-auth", 2, forged |> Map.put("issue_version", "body") |> Map.put("contract_sha", Flow.digest(forged)))
+    flow = Flow.reconcile(Flow.new(1_000, 0), facts(%{"contract" => block}), [note], 0)
+    assert flow["events"]["note-auth"] == "rejected_authorization"
+    assert flow["contract"] == nil
+
+    # A matching note still authorizes, and the legacy path stays open when no
+    # valid description block exists.
+    matching = event("authorize", "note-ok", 2, block |> Map.put("contract_sha", Flow.digest(agreement)))
+    assert Flow.reconcile(Flow.new(1_000, 0), facts(%{"contract" => block}), [matching], 0)["contract"]["ref"] == "note-ok"
+    assert Flow.reconcile(Flow.new(1_000, 0), facts(), [authorization()], 0)["contract"]["ref"] == "auth"
+  end
+
+  test "a note authorization cannot add budget or dependencies the block omits" do
+    agreement = Map.drop(authorization()["data"], ["issue_version", "contract_sha"])
+    block = Map.put(agreement, "issue_version", "body")
+
+    for forged <- [
+          Map.put(agreement, "budget_ms", 9_999_999),
+          Map.put(agreement, "dependencies", [%{"id" => "dep", "kind" => "issue", "number" => 7}])
+        ] do
+      note = event("authorize", "note-forged", 2, forged |> Map.put("issue_version", "body") |> Map.put("contract_sha", Flow.digest(forged)))
+      flow = Flow.reconcile(Flow.new(1_000, 0), facts(%{"contract" => block}), [note], 0)
+      assert flow["events"]["note-forged"] == "rejected_authorization"
+      assert flow["contract"] == nil
+    end
+  end
+
+  test "a ready label then a later pause note reduces in time order and keeps the pause" do
+    # Ready authorizes at t=1 and the pause note arrives at t=2. A kind-first
+    # sort would reduce the note against the still-nil contract, record it as
+    # `missing_authorization`, and then let the later label come up ready,
+    # silently dropping the human pause.
+    ready_ref = "label:3@1@2026-10-16T00:00:01Z"
+    ready = %{authorization() | "id" => "label:3", "ref" => ready_ref, "at" => 1}
+
+    pause = %{
+      "id" => 9,
+      "version" => "pause-note",
+      "ref" => "note:9@pause-note",
+      "at" => 2,
+      "actor" => "1",
+      "action" => "pause",
+      "contract" => ready_ref,
+      "data" => %{"restriction" => "note:9@pause-note"}
+    }
+
+    flow = Flow.reconcile(Flow.new(1_000, 0), facts(), [pause, ready], 0)
+
+    assert flow["contract"]["ref"] == ready_ref
+    assert flow["events"]["note:9@pause-note"] == "restricted"
+    assert flow["restrictions"]["note:9@pause-note"]["kind"] == "pause"
+    assert flow["state"] == "waiting"
+  end
+
+  test "handoff records the review restriction and stops requesting an immediate resume" do
+    flow = Flow.handoff(authorized(), %{"kind" => "review"})
+    refute flow["resume_requested"]
+    assert flow["restrictions"]["handoff"]["kind"] == "review"
+  end
 end
