@@ -2,9 +2,52 @@ defmodule SymphonyElixir.TaskWorkflow do
   @moduledoc "Execution controls and evidence references derived from repository decisions."
 
   @human ["pause", "decision", "review", "acceptance", "scope", "cancel", "budget"]
+  @agreement_fields [
+    "type",
+    "criteria",
+    "deliverables",
+    "acceptance_mode",
+    "acceptor",
+    "reviewers",
+    "deadline",
+    "close_on_conclusion",
+    "dependencies",
+    "budget_ms"
+  ]
 
   @spec digest(term()) :: String.t()
-  def digest(value), do: :crypto.hash(:sha256, Jason.encode!(value)) |> Base.encode16(case: :lower)
+  def digest(value), do: :crypto.hash(:sha256, canonical_json(value)) |> Base.encode16(case: :lower)
+
+  # Encode canonically so the bytes match the Python producer's
+  # `json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(',', ':'))`.
+  # Jason emits `\uXXXX` escapes with uppercase hex while Python uses lowercase.
+  @spec canonical_json(term()) :: String.t()
+  def canonical_json(value), do: value |> canonical() |> Jason.encode!() |> lowercase_unicode_hex()
+
+  defp lowercase_unicode_hex("\\" <> rest), do: expand_backslashes(1, rest)
+  defp lowercase_unicode_hex(<<byte, rest::binary>>), do: <<byte>> <> lowercase_unicode_hex(rest)
+  defp lowercase_unicode_hex(""), do: ""
+
+  # Count the whole backslash run before deciding. An odd run ends with a live
+  # escape, so `\uXXXX` is a real escape and its hex is lowercased; an even run
+  # is a literal backslash sequence such as `\\u004B` and must stay untouched.
+  defp expand_backslashes(count, <<"\\", rest::binary>>), do: expand_backslashes(count + 1, rest)
+
+  defp expand_backslashes(count, <<"u", hex::binary-size(4), rest::binary>>) when rem(count, 2) == 1,
+    do: String.duplicate("\\", count) <> "u" <> String.downcase(hex) <> lowercase_unicode_hex(rest)
+
+  defp expand_backslashes(count, rest),
+    do: String.duplicate("\\", count) <> lowercase_unicode_hex(rest)
+
+  defp canonical(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, item} -> {to_string(key), canonical(item)} end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Jason.OrderedObject.new()
+  end
+
+  defp canonical(value) when is_list(value), do: Enum.map(value, &canonical/1)
+  defp canonical(value), do: value
 
   @spec new(non_neg_integer(), integer()) :: map()
   def new(budget, now) do
@@ -23,7 +66,6 @@ defmodule SymphonyElixir.TaskWorkflow do
       "manifest" => nil,
       "acceptance" => nil,
       "resume_requested" => false,
-      "routing_removed" => false,
       "started" => false
     }
   end
@@ -55,7 +97,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp apply_events(flow, events, facts) do
     events
-    |> Enum.sort_by(&{&1["at"], &1["id"], &1["version"]})
+    |> Enum.sort_by(&{&1["at"], event_priority(&1), &1["id"], &1["version"]})
     |> Enum.reduce(flow, fn event, acc ->
       key = event["ref"]
 
@@ -86,7 +128,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     owner = get_in(flow, ["contract", "authorizer"]) || facts["owner"]
 
     if event["actor"] == owner and valid_contract?(data, facts) and newer?(event, flow["contract"]) do
-      fields = ["issue_version", "type", "criteria", "deliverables", "acceptance_mode", "acceptor", "reviewers", "deadline", "close_on_conclusion"]
+      fields = ["issue_version", "contract_sha", "type", "criteria", "deliverables", "acceptance_mode", "acceptor", "reviewers", "deadline", "close_on_conclusion"]
       contract = Map.take(data, fields)
       contract = Map.merge(contract, Map.put(order(event), "authorizer", owner))
       updated = %{flow | "contract" => contract, "manifest" => nil, "acceptance" => nil, "budget_ms" => data["budget_ms"] || flow["budget_ms"]}
@@ -158,8 +200,10 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp transition(flow, %{"action" => "accept"} = event) do
     manifest = flow["manifest"]
+    ref = event["data"]["manifest"]
+    ref = if is_binary(ref), do: ref, else: manifest && manifest["ref"]
 
-    if is_map(manifest) and event["data"]["manifest"] == manifest["ref"],
+    if is_map(manifest) and ref == manifest["ref"],
       do: {flow |> Map.put("acceptance", %{"ref" => event["ref"], "manifest" => manifest["ref"]}) |> Map.put("acceptance_order", order(event)), "accepted_version"},
       else: {flow, "no_authorized_transition"}
   end
@@ -173,6 +217,8 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp remember_natural_resume(flow, _), do: flow
 
   defp order(event), do: Map.take(event, ["at", "id", "version", "ref"])
+  defp event_priority(%{"ref" => "note:" <> _}), do: 0
+  defp event_priority(_), do: 1
 
   defp obsolete_delivery?(flow, %{"action" => action} = event) when action in ["manifest", "rework", "accept"] do
     latest = [flow["delivery_order"], flow["acceptance_order"]] |> Enum.reject(&is_nil/1) |> Enum.max_by(&source_order/1, fn -> nil end)
@@ -201,11 +247,16 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp record_cancellation(flow, _), do: flow
 
   defp valid_contract?(data, facts) do
-    baseline = data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"]
+    baseline =
+      data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"] and
+        data["contract_sha"] == digest(Map.drop(data, ["contract_sha", "issue_version"]))
 
-    baseline and valid_controls?(data) and nonempty_strings?(data["criteria"]) and
+    baseline and matches_description?(data, facts["contract"]) and valid_controls?(data) and nonempty_strings?(data["criteria"]) and
       valid_deliverables?(data["deliverables"], data["type"]) and valid_mode?(data)
   end
+
+  defp matches_description?(_data, nil), do: true
+  defp matches_description?(data, block), do: Map.take(data, @agreement_fields) == Map.take(block, @agreement_fields)
 
   defp valid_controls?(data) do
     owner = is_binary(data["acceptor"]) and data["acceptor"] != ""
@@ -534,7 +585,7 @@ defmodule SymphonyElixir.TaskWorkflow do
   @spec handoff(map(), map()) :: map()
   def handoff(flow, args) do
     kind = if args["kind"] == "review", do: "review", else: "decision"
-    flow |> automatic("handoff", kind) |> Map.put("routing_removed", true) |> Map.put("resume_requested", false)
+    flow |> automatic("handoff", kind) |> Map.put("resume_requested", false)
   end
 
   @spec start(map(), integer()) :: map()
