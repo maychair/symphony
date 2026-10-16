@@ -66,10 +66,15 @@ defmodule SymphonyElixir.Execution do
         record["phase"] == "completed" -> :ok
         resumable?(issue) -> release_for_resume(record)
         record["phase"] == "incident" -> {:error, {:execution_requires_recovery, record["blocker_reason"]}}
-        RunJournal.executor_state(record) == :stopped and (is_binary(record["thread_id"]) or record["thread_allocation_intent"] != true) -> release_for_resume(record)
+        stopped_with_known_allocation?(record) -> release_for_resume(record)
         true -> {:error, {:execution_requires_recovery, record["blocker_reason"] || record["phase"]}}
       end
     end
+  end
+
+  defp stopped_with_known_allocation?(record) do
+    RunJournal.executor_state(record) == :stopped and
+      (is_binary(record["thread_id"]) or record["thread_allocation_intent"] != true)
   end
 
   defp consume_retry(issue, opts) do
@@ -115,14 +120,17 @@ defmodule SymphonyElixir.Execution do
         :ok
 
       initial ->
-        with {:ok, record} <- RunJournal.read(initial["directory"]) do
-          {phase, error} = final_phase(issue, record, result)
+        finish_record(issue, initial, result)
+    end
+  end
 
-          with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => error}),
-               :ok <- RunJournal.complete(updated, phase) do
-            :ok
-          end
-        end
+  defp finish_record(issue, initial, result) do
+    with {:ok, record} <- RunJournal.read(initial["directory"]) do
+      {phase, error} = final_phase(issue, record, result)
+
+      with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => error}) do
+        RunJournal.complete(updated, phase)
+      end
     end
   end
 
@@ -138,10 +146,7 @@ defmodule SymphonyElixir.Execution do
     else
       case Tracker.fetch_issues_by_ids([issue.id]) do
         {:ok, [current]} ->
-          if current.state in Config.settings!().tracker.terminal_states or
-               not Tracker.Issue.routable?(current, Config.settings!().tracker),
-             do: {"completed", nil},
-             else: {"incident", "Goal ended while the Issue still requests execution; inspect the result or add symphony:retry."}
+          issue_final_phase(current)
 
         {:ok, []} ->
           {"completed", nil}
@@ -158,6 +163,14 @@ defmodule SymphonyElixir.Execution do
     if (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true) and (record["attempt_count"] || 0) < 3,
       do: {"completed", inspect(result)},
       else: {"incident", inspect(result)}
+  end
+
+  defp issue_final_phase(current) do
+    settings = Config.settings!().tracker
+
+    if current.state in settings.terminal_states or not Tracker.Issue.routable?(current, settings),
+      do: {"completed", nil},
+      else: {"incident", "Goal ended while the Issue still requests execution; inspect the result or add symphony:retry."}
   end
 
   @spec worker_down(String.t(), term()) :: :ok | {:blocked, String.t()}
@@ -310,9 +323,7 @@ defmodule SymphonyElixir.Execution do
          {:ok, pending} <- RunJournal.checkpoint(record, %{"handoff_pending" => true}) do
       case post_handoff(settings, issue, arguments, pending, opts) do
         {:ok, posted} ->
-          with {:ok, updated} <- RunJournal.checkpoint(posted, %{"handoff_pending" => false, "handoff" => arguments}) do
-            {:ok, Map.take(updated, ["issue_url", "handoff"])}
-          end
+          complete_handoff(posted, arguments)
 
         error ->
           {:ok, current} = RunJournal.read(record["directory"])
@@ -325,6 +336,12 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp do_handoff(_, _), do: {:error, :invalid_handoff}
+
+  defp complete_handoff(posted, arguments) do
+    with {:ok, updated} <- RunJournal.checkpoint(posted, %{"handoff_pending" => false, "handoff" => arguments}) do
+      {:ok, Map.take(updated, ["issue_url", "handoff"])}
+    end
+  end
 
   defp post_handoff(%{kind: kind} = settings, issue, args, record, opts) when kind in ["github", "gitlab"] do
     {client, path} = client_path(settings, issue, opts)

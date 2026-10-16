@@ -16,10 +16,8 @@ defmodule SymphonyElixir.BuildInfo do
                  |> then(&:crypto.hash(:sha256, &1))
                  |> Base.encode16(case: :lower)
 
-  @spec capture() :: :ok
-  def capture do
-    executable = executable_path()
-
+  @spec capture(Path.t() | nil) :: :ok
+  def capture(executable \\ executable_path(:init.get_plain_arguments())) do
     :persistent_term.put(__MODULE__, %{
       source_sha256: @source_sha256,
       executable_sha256: executable_hash(executable),
@@ -53,11 +51,10 @@ defmodule SymphonyElixir.BuildInfo do
     digest != @source_sha256
   end
 
-  defp executable_path do
-    :escript.script_name() |> to_string() |> Path.expand()
-  rescue
-    _ -> nil
-  end
+  @doc false
+  @spec executable_path([String.t() | charlist()]) :: Path.t() | nil
+  def executable_path([]), do: nil
+  def executable_path([script | _]), do: Path.expand(to_string(script))
 
   defp executable_hash(path) when is_binary(path) do
     case File.read(path) do

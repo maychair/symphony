@@ -1,18 +1,16 @@
 defmodule SymphonyElixir.MailReview.Runner do
   @moduledoc "Runs one fixed-base/head read-only review in a disposable source snapshot."
-  alias SymphonyElixir.Workspace
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.MailReview.{GitLab, Listener}
+  alias SymphonyElixir.Workspace
 
   @spec run(SymphonyElixir.Tracker.Issue.t(), pid() | nil, keyword()) :: :ok
   def run(issue, recipient, opts \\ []) do
-    try do
-      do_run(issue, recipient, opts)
-    rescue
-      error ->
-        Listener.checkpoint(issue.id, %{"phase" => "failed", "error" => Exception.message(error)})
-        reraise error, __STACKTRACE__
-    end
+    do_run(issue, recipient, opts)
+  rescue
+    error ->
+      Listener.checkpoint(issue.id, %{"phase" => "failed", "error" => Exception.message(error)})
+      reraise error, __STACKTRACE__
   end
 
   defp do_run(issue, recipient, opts) do
@@ -39,7 +37,11 @@ defmodule SymphonyElixir.MailReview.Runner do
           if is_pid(recipient), do: send(recipient, {:codex_worker_update, issue.id, message})
         end
 
-        with {:ok, _} <- AppServer.run_turn(session, prompt(record, config, mr, discussions), issue, deadline: opts[:deadline], on_message: handler),
+        instructions = prompt(record, config, mr, discussions)
+
+        turn_opts = [deadline: opts[:deadline], on_message: handler]
+
+        with {:ok, _} <- AppServer.run_turn(session, instructions, issue, turn_opts),
              {:ok, issues} <- Listener.issues(),
              true <- Enum.any?(issues, &(&1.id == issue.id and &1.native_ref["phase"] == "completed")) do
           :ok
@@ -70,7 +72,7 @@ defmodule SymphonyElixir.MailReview.Runner do
     # only the allowlisted MR ref from the configured host/project, never email URLs.
     with {:ok, project} <- GitLab.request(config, "GET", "projects/" <> URI.encode_www_form(record["project"])),
          remote = project["ssh_url_to_repo"] || project["http_url_to_repo"],
-         true <- (project["path_with_namespace"] == record["project"] and valid_remote?(remote, config, record)) || {:error, :unsafe_project_remote},
+         true <- safe_project?(project, remote, config, record) || {:error, :unsafe_project_remote},
          true <- not File.exists?(repository) || {:error, :review_snapshot_already_exists},
          {:ok, _} <- GitLab.command("git", ["clone", "--no-local", "--no-checkout", "--no-hardlinks", "--", checkout, repository]),
          {:ok, _} <- GitLab.command("git", ["-C", repository, "remote", "set-url", "origin", remote]),
@@ -81,6 +83,10 @@ defmodule SymphonyElixir.MailReview.Runner do
     else
       error -> error
     end
+  end
+
+  defp safe_project?(project, remote, config, record) do
+    project["path_with_namespace"] == record["project"] and valid_remote?(remote, config, record)
   end
 
   defp valid_remote?(remote, config, record) when is_binary(remote) do

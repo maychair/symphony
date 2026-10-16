@@ -4,9 +4,9 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{RunJournal, Execution}
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, ExecutionBackend, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
+  alias SymphonyElixir.MailReview.Runner
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -25,7 +25,7 @@ defmodule SymphonyElixir.AgentRunner do
     opts = if Execution.enabled?(), do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
 
     if SymphonyElixir.MailReview.job?(issue),
-      do: SymphonyElixir.MailReview.Runner.run(issue, codex_update_recipient, opts),
+      do: Runner.run(issue, codex_update_recipient, opts),
       else: do_run(issue, codex_update_recipient, opts)
   end
 
@@ -170,7 +170,7 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          if opts[:run_record], do: {:error, :agent_turn_budget_exhausted}, else: :ok
+          exhausted_turn_budget(opts)
 
         {:done, _refreshed_issue} ->
           :ok
@@ -181,16 +181,24 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp exhausted_turn_budget(opts) do
+    if opts[:run_record], do: {:error, :agent_turn_budget_exhausted}, else: :ok
+  end
+
   defp next_action(issue, opts, fetcher) do
     if opts[:run_record] do
       Execution.reconcile_delivery(issue, opts)
 
       with {:ok, current} <- RunJournal.read(opts[:run_record]["directory"]) do
-        if current["handoff"] || current["blocker_reason"], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
+        action_after_delivery(current, issue, fetcher)
       end
     else
       continue_with_issue?(issue, fetcher)
     end
+  end
+
+  defp action_after_delivery(current, issue, fetcher) do
+    if current["handoff"] || current["blocker_reason"], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
   end
 
   defp run_goal(session, issue, recipient, opts) do

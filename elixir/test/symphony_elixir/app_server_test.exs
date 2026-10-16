@@ -23,7 +23,8 @@ defmodule SymphonyElixir.AppServerTest do
       """)
 
       File.chmod!(binary, 0o755)
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace), codex_command: binary)
+      settings = [workspace_root: Path.dirname(workspace), codex_command: binary]
+      write_workflow_file!(Workflow.workflow_file_path(), settings)
 
       assert {:error, :native_turn_not_reconciled} =
                AppServer.start_session(workspace,

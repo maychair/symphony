@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ExecutionBackend do
   @moduledoc "Project-selected execution transport. Tracker and delivery policy remain shared."
-  alias SymphonyElixir.RunJournal
   alias SymphonyElixir.Config
+  alias SymphonyElixir.RunJournal
 
   @spec kind() :: String.t()
   def kind, do: System.get_env("SYMPHONY_EXECUTION_BACKEND") || Config.settings!().agent.backend

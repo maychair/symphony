@@ -162,12 +162,23 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
 
+    @fields [
+      :backend,
+      :goal_mode,
+      :run_budget_ms,
+      :run_budget_ms_by_issue,
+      :run_journal_dir,
+      :max_concurrent_agents,
+      :max_turns,
+      :max_retry_backoff_ms,
+      :max_concurrent_agents_by_state
+    ]
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
       |> cast(
         attrs,
-        [:backend, :goal_mode, :run_budget_ms, :run_budget_ms_by_issue, :run_journal_dir, :max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        @fields,
         empty_values: []
       )
       |> validate_inclusion(:backend, ["codex", "omp"])

@@ -35,7 +35,21 @@ defmodule SymphonyElixir.MailReview.Listener do
   @impl true
   def init(opts) do
     Process.send_after(self(), :configure, 100)
-    {:ok, %{config: nil, port: nil, buffer: "", health: :disabled, restarts: 0, records: %{}, seen: [], last_event_at: nil, error: nil, initial_config: opts[:config]}}
+
+    state = %{
+      config: nil,
+      port: nil,
+      buffer: "",
+      health: :disabled,
+      restarts: 0,
+      records: %{},
+      seen: [],
+      last_event_at: nil,
+      error: nil,
+      initial_config: opts[:config]
+    }
+
+    {:ok, state}
   end
 
   @impl true
@@ -116,7 +130,7 @@ defmodule SymphonyElixir.MailReview.Listener do
 
   @impl true
   def handle_info(:configure, state) do
-    settings = if state.initial_config, do: {:ok, %{tracker: %{provider: %{"mail_review" => state.initial_config}}}}, else: Config.settings()
+    settings = initial_settings(state.initial_config)
 
     case settings do
       {:ok, %{tracker: %{provider: %{"mail_review" => %{"enabled" => true} = config}}}} ->
@@ -175,6 +189,9 @@ defmodule SymphonyElixir.MailReview.Listener do
   def terminate(_reason, %{port: port}) when is_port(port), do: close_watch(port)
   def terminate(_reason, _state), do: :ok
 
+  defp initial_settings(nil), do: Config.settings()
+  defp initial_settings(config), do: {:ok, %{tracker: %{provider: %{"mail_review" => config}}}}
+
   defp current_config?(%{initial_config: config}) when is_map(config), do: true
 
   defp current_config?(state) do
@@ -219,11 +236,7 @@ defmodule SymphonyElixir.MailReview.Listener do
     with :ok <- File.mkdir_p(config["state_dir"]) do
       case File.read(path) do
         {:ok, content} ->
-          with {:ok, data} <- Jason.decode(content), true <- is_map(data["records"]) and scope(data["scope"] || %{}) == scope(config) do
-            {:ok, %{state | config: config, records: data["records"], seen: data["seen"] || []}}
-          else
-            _ -> {:error, :invalid_review_journal}
-          end
+          restore(state, config, content)
 
         {:error, :enoent} ->
           {:ok, %{state | config: config}}
@@ -231,6 +244,15 @@ defmodule SymphonyElixir.MailReview.Listener do
         error ->
           error
       end
+    end
+  end
+
+  defp restore(state, config, content) do
+    with {:ok, data} <- Jason.decode(content),
+         true <- is_map(data["records"]) and scope(data["scope"] || %{}) == scope(config) do
+      {:ok, %{state | config: config, records: data["records"], seen: data["seen"] || []}}
+    else
+      _ -> {:error, :invalid_review_journal}
     end
   end
 
@@ -315,12 +337,17 @@ defmodule SymphonyElixir.MailReview.Listener do
   end
 
   defp valid_mr?(mr, project, iid, config) do
-    uri = URI.parse(mr["web_url"] || "")
-
     mr["iid"] == iid and is_integer(get_in(mr, ["author", "id"])) and
-      Enum.all?([mr["sha"], get_in(mr, ["diff_refs", "base_sha"])], fn sha ->
-        is_binary(sha) and Regex.match?(~r/^[a-f0-9]{40,64}$/, sha)
-      end) and uri.scheme in ["http", "https"] and uri.host == config["host"] and
+      Enum.all?([mr["sha"], get_in(mr, ["diff_refs", "base_sha"])], &valid_sha?/1) and
+      valid_mr_url?(mr["web_url"], project, iid, config)
+  end
+
+  defp valid_sha?(sha), do: is_binary(sha) and Regex.match?(~r/^[a-f0-9]{40,64}$/, sha)
+
+  defp valid_mr_url?(url, project, iid, config) do
+    uri = URI.parse(url || "")
+
+    uri.scheme in ["http", "https"] and uri.host == config["host"] and
       uri.path == "/#{project}/-/merge_requests/#{iid}" and
       is_nil(uri.userinfo) and is_nil(uri.query) and is_nil(uri.fragment)
   end
@@ -351,22 +378,23 @@ defmodule SymphonyElixir.MailReview.Listener do
     |> Enum.reduce(state, fn record, current ->
       newer = Enum.any?(current.records, fn {_id, r} -> r["project"] == record["project"] and r["iid"] == record["iid"] and r["round"] > record["round"] end)
 
-      if newer do
-        current
-      else
-        path = GitLab.mr_path(record["project"], record["iid"])
-
-        with {:ok, mr} <- GitLab.request(state.config, "GET", path),
-             true <- valid_mr?(mr, record["project"], record["iid"], state.config) and Policy.requested_reviewer?(mr, state.config["username"]),
-             {:ok, discussions} <- GitLab.discussions(state.config, path),
-             true <- Policy.answered?(record["findings"], discussions, record["author_id"]),
-             {:ok, next} <- queue(current, record["project"], record["iid"], mr, record["round"] + 1) do
-          next
-        else
-          _ -> current
-        end
-      end
+      if newer, do: current, else: reconcile_record(current, record)
     end)
+  end
+
+  defp reconcile_record(state, record) do
+    path = GitLab.mr_path(record["project"], record["iid"])
+
+    with {:ok, mr} <- GitLab.request(state.config, "GET", path),
+         true <- valid_mr?(mr, record["project"], record["iid"], state.config),
+         true <- Policy.requested_reviewer?(mr, state.config["username"]),
+         {:ok, discussions} <- GitLab.discussions(state.config, path),
+         true <- Policy.answered?(record["findings"], discussions, record["author_id"]),
+         {:ok, next} <- queue(state, record["project"], record["iid"], mr, record["round"] + 1) do
+      next
+    else
+      _ -> state
+    end
   end
 
   defp issue(record) do
@@ -386,14 +414,14 @@ defmodule SymphonyElixir.MailReview.Listener do
   defp publish(state, id, %{"findings" => findings}) when is_list(findings) and length(findings) <= 50 do
     record = state.records[record_key(id)]
 
-    if (record && record["phase"] in ["running", "publishing"]) and Enum.all?(findings, &valid_finding?/1) do
+    if publishable?(record, findings) do
       record = Map.put_new(record, "submission", findings) |> Map.put("phase", "publishing")
       state = put_record(state, record)
       path = GitLab.mr_path(record["project"], record["iid"])
 
       with true <- record["submission"] == findings || {:error, :changed_submission},
            {:ok, mr} <- GitLab.request(state.config, "GET", path),
-           true <- (mr["sha"] == record["head"] and Policy.requested_reviewer?(mr, state.config["username"])) || {:error, :mr_head_changed},
+           true <- same_review?(mr, record, state.config) || {:error, :mr_head_changed},
            {:ok, user} <- GitLab.request(state.config, "GET", "user"),
            true <- user["username"] == state.config["username"] || {:error, :gitlab_identity_mismatch},
            {:ok, discussions} <- GitLab.discussions(state.config, path),
@@ -403,10 +431,6 @@ defmodule SymphonyElixir.MailReview.Listener do
         {:error, reason} ->
           next = put_record(state, record |> Map.put("phase", "fenced") |> Map.put("error", inspect(reason)))
           {:error, reason, next}
-
-        _ ->
-          next = put_record(state, record |> Map.put("phase", "fenced") |> Map.put("error", "Invalid publication response"))
-          {:error, :invalid_publication_response, next}
       end
     else
       {:error, :invalid_review_submission, state}
@@ -414,6 +438,12 @@ defmodule SymphonyElixir.MailReview.Listener do
   end
 
   defp publish(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
+
+  defp publishable?(nil, _findings), do: false
+
+  defp publishable?(record, findings) do
+    record["phase"] in ["running", "publishing"] and Enum.all?(findings, &valid_finding?/1)
+  end
 
   defp valid_finding?(finding) do
     is_binary(finding) and byte_size(finding) in 1..16_384 and
@@ -427,29 +457,40 @@ defmodule SymphonyElixir.MailReview.Listener do
     |> Enum.with_index()
     |> Enum.reduce_while({:ok, []}, fn {body, index}, {:ok, receipts} ->
       marker = Policy.marker(record["id"], index)
-      existing = Enum.find(discussions, fn d -> Enum.any?(d["notes"] || [], &(String.contains?(&1["body"] || "", marker) and get_in(&1, ["author", "username"]) == config["username"])) end)
+      existing = Enum.find(discussions, &owned_note(&1["notes"] || [], marker, config))
       result = if existing, do: {:ok, existing}, else: post_at_head(config, path, record, body <> "\n\n" <> marker)
-
-      case result do
-        {:ok, %{"id" => discussion_id, "notes" => notes}} ->
-          note = Enum.find(notes, &(String.contains?(&1["body"] || "", marker) and get_in(&1, ["author", "username"]) == config["username"]))
-
-          if note && is_integer(note["id"]),
-            do: {:cont, {:ok, receipts ++ [%{"discussion_id" => discussion_id, "note_id" => note["id"]}]}},
-            else: {:halt, {:error, :invalid_owned_note_receipt}}
-
-        {:error, reason} ->
-          {:halt, {:error, reason}}
-
-        _ ->
-          {:halt, {:error, :invalid_discussion_receipt}}
-      end
+      collect_receipt(result, marker, config, receipts)
     end)
+  end
+
+  defp owned_note(notes, marker, config) do
+    Enum.find(
+      notes,
+      &(String.contains?(&1["body"] || "", marker) and
+          get_in(&1, ["author", "username"]) == config["username"])
+    )
+  end
+
+  defp collect_receipt({:ok, %{"id" => discussion_id, "notes" => notes}}, marker, config, receipts) do
+    case owned_note(notes, marker, config) do
+      %{"id" => id} when is_integer(id) ->
+        {:cont, {:ok, receipts ++ [%{"discussion_id" => discussion_id, "note_id" => id}]}}
+
+      _ ->
+        {:halt, {:error, :invalid_owned_note_receipt}}
+    end
+  end
+
+  defp collect_receipt({:error, reason}, _marker, _config, _receipts), do: {:halt, {:error, reason}}
+  defp collect_receipt(_result, _marker, _config, _receipts), do: {:halt, {:error, :invalid_discussion_receipt}}
+
+  defp same_review?(mr, record, config) do
+    mr["sha"] == record["head"] and Policy.requested_reviewer?(mr, config["username"])
   end
 
   defp post_at_head(config, path, record, body) do
     with {:ok, mr} <- GitLab.request(config, "GET", path),
-         true <- (mr["sha"] == record["head"] and Policy.requested_reviewer?(mr, config["username"])) || {:error, :mr_head_or_reviewer_changed} do
+         true <- same_review?(mr, record, config) || {:error, :mr_head_or_reviewer_changed} do
       GitLab.request(config, "POST", path <> "/discussions", %{"body" => body})
     end
   end

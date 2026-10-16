@@ -283,7 +283,9 @@ defmodule SymphonyElixir.ExecutionTest do
   test "failed handoff leaves execution active and reports the API error", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     client = fn _, _, _, _, _ -> {:ok, %{status: 503}} end
-    result = Execution.handoff(%{"kind" => "blocked", "reason" => "missing resource"}, issue: issue, tracker_settings: Config.settings!().tracker, github_client: client)
+    arguments = %{"kind" => "blocked", "reason" => "missing resource"}
+    settings = Config.settings!().tracker
+    result = Execution.handoff(arguments, issue: issue, tracker_settings: settings, github_client: client)
     refute result["success"]
     refute Execution.handing_off?(issue.id)
     {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
@@ -598,6 +600,103 @@ defmodule SymphonyElixir.ExecutionTest do
     refute Execution.handoff(args, options)["success"]
     {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
     refute record["handoff"]
+  end
+
+  test "completion checks the current Issue and preserves lookup failures", %{issue: issue} do
+    for {current, phase} <- [{%{issue | dispatchable: true}, "incident"}, {%{issue | state: "closed"}, "completed"}, {nil, "completed"}] do
+      id = issue.id <> phase <> inspect(current && current.state)
+      task = %{issue | id: id}
+      switch_tracker("memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, if(current, do: [%{current | id: id}], else: []))
+      {:ok, _, opts} = Execution.prepare(task, [])
+      assert :ok = Execution.finish(task, opts, :ok)
+      {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+      assert record["phase"] == phase
+    end
+
+    switch_tracker("github")
+    text = File.read!(Workflow.workflow_file_path()) |> String.replace("token: fixture-token", "token: fixture-token\n    api_url: https://127.0.0.1:1")
+    File.write!(Workflow.workflow_file_path(), text)
+    :ok = WorkflowStore.force_reload()
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    assert :ok = Execution.finish(issue, opts, :ok)
+    {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
+    assert record["blocker_reason"] =~ "Cannot confirm the Issue"
+    assert :ok = Execution.finish(issue, nil, :ok)
+    assert :ok = Execution.finish(issue, [], :ok)
+  end
+
+  test "journal environment paths and invalid per-Issue budgets use configured fallbacks", %{issue: issue} do
+    root = Execution.journal_root()
+    text = File.read!(Workflow.workflow_file_path())
+    text = String.replace(text, Jason.encode!(root), "$SYMPHONY_TEST_JOURNAL")
+    text = String.replace(text, "goal_mode: true", "goal_mode: true\n  run_budget_ms_by_issue: {\"42\": 0}")
+    File.write!(Workflow.workflow_file_path(), text)
+    System.put_env("SYMPHONY_TEST_JOURNAL", root)
+    on_exit(fn -> System.delete_env("SYMPHONY_TEST_JOURNAL") end)
+    :ok = WorkflowStore.force_reload()
+    assert Execution.journal_root() == root
+    assert Execution.run_budget_ms(issue.id) == Config.settings!().agent.run_budget_ms
+    refute Execution.handing_off?(issue.id)
+    refute Execution.resumable?(%{issue | labels: ["symphony:retry"]})
+    assert :ok = Execution.reconcile_delivery(issue, [])
+    refute Execution.handoff(%{}, [])["success"]
+    {:ok, _, _} = Execution.prepare(issue, [])
+    settings = %{kind: "gitlab", provider: %{"project_path" => "group/repo"}, required_labels: []}
+
+    client = fn method, _, _, _, _ ->
+      if method == "PUT", do: {:error, :offline}, else: {:ok, %{status: 200, body: []}}
+    end
+
+    args = %{"kind" => "blocked", "reason" => "Need input"}
+    refute Execution.handoff(args, issue: issue, tracker_settings: settings, gitlab_client: client)["success"]
+  end
+
+  test "cleanup locks and failed writes stop recovery without releasing ownership", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "turn_running", "executor_os_pid" => "99999999"})
+    lock = Path.join(record["directory"], "executor.lock")
+    owner = Path.join(lock, "cleanup-owner.json")
+    File.write!(owner, "owned")
+    assert {:error, :merge_cleanup_in_progress} = Execution.prepare(issue, [])
+    File.rm!(owner)
+    File.write!(Path.join(lock, "unexpected"), "keep")
+    assert {:error, reason} = Execution.prepare(issue, [])
+    assert reason in [:eexist, :enotempty]
+    {:ok, _} = RunJournal.checkpoint(record, %{"phase" => "turn_running", "executor_os_pid" => "99999999"})
+    File.mkdir!(Path.join(record["directory"], "run.json.pending"))
+    assert {:error, :eisdir} = Execution.prepare(issue, [])
+    File.rm_rf!(Path.join(record["directory"], "run.json.pending"))
+    File.rm!(Path.join(record["directory"], "run.json"))
+    File.mkdir!(Path.join(record["directory"], "run.json"))
+    assert {:error, :eisdir} = RunJournal.read(record["directory"])
+    assert {:error, :eisdir} = Execution.reconcile_delivery(issue, [])
+  end
+
+  test "unconfirmed thread allocation cannot be readmitted; unsupported trackers cannot hand off", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    options = [issue: issue, tracker_settings: %{kind: "memory"}]
+    refute Execution.handoff(%{"kind" => "blocked", "reason" => "Need input"}, options)["success"]
+    switch_tracker("memory")
+    assert {:error, :repository_tracker_required} = Execution.prepare(%{issue | labels: ["symphony:retry"]}, [])
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => nil, "thread_allocation_intent" => true})
+    :ok = RunJournal.complete(record, "completed")
+    assert {:error, :uncertain_thread_allocation} = RunJournal.admit(Execution.journal_root(), issue.id)
+    binding = %{adapter: SymphonyElixir.Tracker.Memory, tracker_settings: Config.settings!().tracker}
+    refute Tracker.execute_bound_agent_tool(binding, "task_handoff", %{}, issue: issue)["success"]
+    # Optional adapter callbacks remain part of the shared boundary.
+    assert :ok = Tracker.finish_run(issue, [tracker_adapter: __MODULE__], :ok)
+  end
+
+  @spec finish_run(Issue.t(), keyword(), term()) :: :ok
+  def finish_run(_issue, _opts, _result), do: :ok
+
+  defp switch_tracker(kind) do
+    text = File.read!(Workflow.workflow_file_path()) |> String.replace(~r/kind: (github|memory)/, "kind: " <> kind)
+    File.write!(Workflow.workflow_file_path(), text)
+    :ok = WorkflowStore.force_reload()
   end
 
   defp native_ok(method, path) do

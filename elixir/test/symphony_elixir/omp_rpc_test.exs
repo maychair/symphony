@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.OmpRpcTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.Omp.Rpc
   alias SymphonyElixir.ExecutionBackend
+  alias SymphonyElixir.Omp.Rpc
 
   setup do
     root = Path.dirname(Workflow.workflow_file_path())
@@ -91,7 +91,9 @@ defmodule SymphonyElixir.OmpRpcTest do
   end
 
   test "resume cannot allocate another session without confirmed native stop", %{workspace: workspace} do
-    assert {:error, :omp_native_outcome_unknown} = Rpc.start_session(workspace, resume_thread_id: "old", run_record: %{"backend" => "omp", "thread_id" => "old"})
+    record = %{"backend" => "omp", "thread_id" => "old"}
+    opts = [resume_thread_id: "old", run_record: record]
+    assert {:error, :omp_native_outcome_unknown} = Rpc.start_session(workspace, opts)
   end
 
   test "workspace root itself is not an execution checkout", %{workspace: workspace} do

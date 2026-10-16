@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Execution
+  alias SymphonyElixir.MailReview.Listener
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -235,7 +236,7 @@ defmodule SymphonyElixir.Orchestrator do
     if reason == :normal do
       release_issue_claim(state, issue_id)
     else
-      SymphonyElixir.MailReview.Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Review worker exited: #{inspect(reason)}"})
+      Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Review worker exited: #{inspect(reason)}"})
       block_issue_from_entry(state, issue_id, running_entry, "Review worker failed; native execution requires reconciliation")
     end
   end
@@ -635,7 +636,7 @@ defmodule SymphonyElixir.Orchestrator do
         stop_running_task(pid, ref, state.task_supervisor)
 
         if SymphonyElixir.MailReview.job?(Map.get(running_entry, :issue)) do
-          SymphonyElixir.MailReview.Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Scheduler stopped the review worker; native session must be reconciled before retry"})
+          Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Scheduler stopped the review worker; native session must be reconciled before retry"})
         end
 
         if cleanup_workspace do

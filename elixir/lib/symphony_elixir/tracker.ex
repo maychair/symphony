@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.MailReview.Listener
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
@@ -84,7 +85,7 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp review_issues do
-    if SymphonyElixir.MailReview.enabled?() and Process.whereis(SymphonyElixir.MailReview.Listener), do: SymphonyElixir.MailReview.Listener.issues(), else: {:ok, []}
+    if SymphonyElixir.MailReview.enabled?() and Process.whereis(SymphonyElixir.MailReview.Listener), do: Listener.issues(), else: {:ok, []}
   end
 
   @doc """

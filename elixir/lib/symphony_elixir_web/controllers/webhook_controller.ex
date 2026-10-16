@@ -4,6 +4,7 @@ defmodule SymphonyElixirWeb.WebhookController do
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
 
+  alias SymphonyElixir.MailReview.Listener
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
   def read_body(conn, opts) do
     case Conn.read_body(conn, opts) do
@@ -47,11 +48,11 @@ defmodule SymphonyElixirWeb.WebhookController do
   end
 
   defp request_mail_review(%{"message_id" => id}) when is_binary(id) and byte_size(id) in 1..512 do
-    SymphonyElixir.MailReview.Listener.ingest(%{"ok" => true, "data" => %{"event" => %{"message_id" => id}}})
+    Listener.ingest(%{"ok" => true, "data" => %{"event" => %{"message_id" => id}}})
   end
 
   defp request_mail_review(%{"project" => project, "iid" => iid}) when is_binary(project) and is_integer(iid) do
-    SymphonyElixir.MailReview.Listener.request_review(project, iid)
+    Listener.request_review(project, iid)
   end
 
   defp request_mail_review(_payload), do: {:error, :invalid_mail_review_request}
@@ -79,8 +80,6 @@ defmodule SymphonyElixirWeb.WebhookController do
     expected = URI.parse(settings["api_url"] || "https://gitlab.com/api/v4")
     if actual.host == expected.host and get_in(payload, ["project", "path_with_namespace"]) == settings["project_path"], do: :ok, else: {:error, :repository_mismatch}
   end
-
-  defp scope(_, _, _), do: {:error, :repository_mismatch}
 
   defp resolve("$" <> name), do: System.get_env(name)
   defp resolve(value), do: value

@@ -1,6 +1,19 @@
 defmodule SymphonyElixir.BuildInfoTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case
   alias SymphonyElixir.BuildInfo
+
+  test "release launch identity tolerates absent and unreadable executable paths" do
+    identity = BuildInfo.identity()
+    on_exit(fn -> :persistent_term.put(BuildInfo, identity) end)
+    assert BuildInfo.executable_path([]) == nil
+    assert BuildInfo.executable_path(["relative"]) == Path.expand("relative")
+    assert :ok = BuildInfo.capture(nil)
+    assert BuildInfo.identity().executable_sha256 == nil
+    assert :ok = BuildInfo.capture("/not-an-executable/absent")
+    assert BuildInfo.identity().executable_sha256 == nil
+    assert :ok = BuildInfo.capture(__ENV__.file)
+    assert is_binary(BuildInfo.identity().executable_sha256)
+  end
 
   test "embedded source identity matches the Workspace launcher's independent path-component ordering" do
     code = """

@@ -1,7 +1,6 @@
 defmodule SymphonyElixir.Omp.Rpc do
   @moduledoc "OMP's native JSONL transport; host task policy stays in Tracker."
-  alias SymphonyElixir.RunJournal
-  alias SymphonyElixir.{Config, ExecutionBackend, PathSafety, Tracker}
+  alias SymphonyElixir.{Config, ExecutionBackend, PathSafety, RunJournal, Tracker}
   @response_ms 30_000
   @max_frame 67_108_864
 
@@ -129,7 +128,6 @@ defmodule SymphonyElixir.Omp.Rpc do
       Keyword.get(opts, :on_thread_started, fn _ -> :ok end).(state["sessionId"])
       {:ok, session}
     else
-      false -> {:error, :omp_invalid_state}
       other -> other
     end
   end
@@ -186,7 +184,6 @@ defmodule SymphonyElixir.Omp.Rpc do
       send_frame(session.port, %{"id" => id, "type" => "prompt", "message" => prompt})
       await_turn(session, issue, callback, id, deadline, nil)
     else
-      false -> {:error, :omp_invalid_state}
       error -> error
     end
   end
@@ -317,14 +314,15 @@ defmodule SymphonyElixir.Omp.Rpc do
         _ -> {:error, :omp_native_stop_unconfirmed}
       end
 
-    pid =
-      case Port.info(session.port, :os_pid) do
-        {:os_pid, pid} -> Integer.to_string(pid)
-        _ -> nil
-      end
+    pid = native_pid(session.port)
 
     close(session)
-    result = if result == :ok, do: wait_stopped(pid, now() + 2_000), else: result
+
+    result =
+      if result == :ok and is_binary(pid),
+        do: wait_stopped(pid, now() + 2_000),
+        else: {:error, :omp_native_stop_unconfirmed}
+
     record = current_record(session)
 
     checkpoint(session, %{
@@ -335,11 +333,17 @@ defmodule SymphonyElixir.Omp.Rpc do
     result
   end
 
+  defp native_pid(port) when is_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} -> Integer.to_string(pid)
+      _ -> nil
+    end
+  end
+
+  defp native_pid(_port), do: nil
+
   defp wait_stopped(pid, deadline) do
     cond do
-      is_nil(pid) ->
-        {:error, :omp_native_stop_unconfirmed}
-
       not native_alive?(pid) ->
         :ok
 
