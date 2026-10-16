@@ -115,16 +115,18 @@ budget extension and pause release each affect only their own restrictions.
 People can also write ordinary explicit requests such as `请暂停这个任务。`,
 `Please pause this task.` or `Please resume execution.`. These intents use verified authorizer
 identity and source order; resume releases preceding pauses, including an older
-pause observed later, and any pending decision handoff. Unclear requests to pause
-or resume enter a clarification wait.
+pause observed later, and the decision handoff of the question it answers. Unclear
+requests to pause or resume enter a clarification wait.
 
 A blocking question is answered in the Issue itself. While the agent's handoff
 holds a task-scope decision restriction, the sole assignee's first note after the
 engine posted its question releases that restriction and resumes execution, so
-answering needs no label. Engine notices end with
-`<!-- symphony-engine-notice -->`, which keeps the engine from answering its own
-question and keeps a quoted notice from counting as the person's answer. A review
-handoff is unchanged and still waits for `symphony:accept` or `symphony:rework`.
+answering needs no label. Notes carry second precision, so a note in the
+question's own second counts only when its note id follows the notice. Engine
+notices end with a `<!-- symphony-engine-notice -->` line of their own; the engine
+never answers its own question, and a reply that quotes the notice counts. A
+review handoff is unchanged and still waits for `symphony:accept` or
+`symphony:rework`.
 
 Other prose remains discussion and requires a concrete decision where its meaning
 is unclear.

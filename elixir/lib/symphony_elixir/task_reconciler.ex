@@ -25,7 +25,10 @@ defmodule SymphonyElixir.TaskReconciler do
   def engine_notice_marker, do: @engine_notice_marker
 
   @spec engine_notice?(map()) :: boolean()
-  def engine_notice?(note), do: String.ends_with?(String.trim_trailing(note["body"] || ""), @engine_notice_marker)
+  def engine_notice?(note) do
+    body = String.trim_trailing(note["body"] || "")
+    body == @engine_notice_marker or String.ends_with?(body, "\n" <> @engine_notice_marker)
+  end
 
   @spec enabled?() :: boolean()
   def enabled? do
@@ -335,12 +338,12 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec events([map()], map(), String.t() | nil) :: [map()]
   def events(notes, flow, owner) do
-    asked_at = question_at(notes)
+    question = question(notes)
 
     parsed =
       notes
       |> Enum.reject(&(&1["system"] == true))
-      |> Enum.map(&parse_note(&1, flow, owner, asked_at))
+      |> Enum.map(&parse_note(&1, flow, owner, question))
       |> Enum.reject(&is_nil/1)
 
     contracts = Enum.filter(parsed, &(&1["action"] == "authorize" and &1["actor"] == (get_in(flow, ["contract", "authorizer"]) || owner)))
@@ -357,13 +360,10 @@ defmodule SymphonyElixir.TaskReconciler do
   defp bind_natural(event, _, _, _), do: event
 
   # The restrictions a natural note releases: an answer releases the decision
-  # that asked for it, `resume` releases both that decision and its pauses.
+  # that asked for it, `resume` releases its own pauses. Only a note that
+  # follows the question is an answer, so an older resume cannot release a
+  # decision raised after it.
   defp natural_restrictions(%{"answer" => true}, _parsed, flow), do: decision_handoff(flow)
-
-  # `resume` and an answer say the same thing, so both release the decision that
-  # is waiting for the human.
-  defp natural_restrictions(%{"action" => "resume"} = event, parsed, flow),
-    do: pause_releases(event, parsed, flow) ++ decision_handoff(flow)
 
   defp natural_restrictions(event, parsed, flow), do: pause_releases(event, parsed, flow)
 
@@ -376,10 +376,10 @@ defmodule SymphonyElixir.TaskReconciler do
     if get_in(flow, ["restrictions", "handoff", "kind"]) == "decision", do: ["handoff"], else: []
   end
 
-  defp parse_note(note, flow, owner, asked_at) do
+  defp parse_note(note, flow, owner, question) do
     body = note["body"] || ""
-
-    payload = note_payload(body) || answer_payload(note, flow, owner, asked_at)
+    answers? = answer?(note, flow, owner, question)
+    payload = note_payload(body) || (answers? and %{"action" => "resume", "natural" => true})
 
     if is_map(payload) and is_map(payload["data"] || %{}) do
       version = note_version(note)
@@ -394,29 +394,43 @@ defmodule SymphonyElixir.TaskReconciler do
         "contract" => payload["contract"],
         "data" => payload["data"] || %{},
         "natural" => payload["natural"] == true,
-        "answer" => payload["answer"] == true
+        "answer" => answer_event?(answers?, payload)
       }
     end
   end
+
+  # A note answers the question only when it both follows the question and
+  # resumes, so a clarification or pause request is not an answer.
+  defp answer_event?(true, %{"action" => "resume", "natural" => true}), do: true
+  defp answer_event?(_answers?, _payload), do: false
 
   # A blocking question is answered in the Issue itself: while the agent's
   # handoff holds a task-scope decision restriction, the owner's first comment
   # after the question reached the Issue is the answer. Anchoring on an engine
   # notice keeps an earlier comment from answering a question it predates, and
   # the notice marker keeps the engine from answering its own question.
-  defp answer_payload(note, flow, owner, asked_at) do
+  defp answer?(note, flow, owner, question) do
     handoff = get_in(flow, ["restrictions", "handoff"])
 
-    if is_integer(asked_at) and is_map(handoff) and handoff["kind"] == "decision" and
-         is_binary(owner) and to_string(get_in(note, ["author", "id"])) == owner and
-         not engine_notice?(note) and note_at(note) >= asked_at do
-      %{"action" => "resume", "natural" => true, "answer" => true}
-    end
+    is_map(handoff) and handoff["kind"] == "decision" and is_binary(owner) and
+      to_string(get_in(note, ["author", "id"])) == owner and
+      not engine_notice?(note) and after_question?(note, question)
   end
 
   # The newest engine notice is when the pending question reached the Issue.
-  defp question_at(notes) do
-    notes |> Enum.filter(&engine_notice?/1) |> Enum.map(&note_at/1) |> Enum.max(fn -> nil end)
+  defp question(notes),
+    do: notes |> Enum.filter(&engine_notice?/1) |> Enum.max_by(&{note_at(&1), &1["id"] || 0}, fn -> nil end)
+
+  defp after_question?(_note, nil), do: false
+
+  # Notes carry second precision, so a note in the question's own second counts
+  # only when its note id follows the notice.
+  defp after_question?(note, question) do
+    at = note_at(note)
+    asked_at = note_at(question)
+
+    at > asked_at or
+      (at == asked_at and is_integer(note["id"]) and is_integer(question["id"]) and note["id"] > question["id"])
   end
 
   defp note_at(note), do: time(note["updated_at"] || note["created_at"])
