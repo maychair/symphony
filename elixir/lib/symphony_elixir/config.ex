@@ -122,9 +122,18 @@ defmodule SymphonyElixir.Config do
       backend = System.get_env("SYMPHONY_EXECUTION_BACKEND") || settings.agent.backend
 
       with true <- backend in ["codex", "omp"] || {:error, :invalid_execution_backend},
+           :ok <- validate_task_workflow(settings, backend),
            :ok <- Tracker.validate_config(settings.tracker) do
         SymphonyElixir.MailReview.validate_config(settings.tracker)
       end
+    end
+  end
+
+  defp validate_task_workflow(settings, backend) do
+    if settings.tracker.provider["task_workflow"] == true do
+      if settings.tracker.kind == "gitlab" and backend == "codex" and settings.agent.goal_mode, do: :ok, else: {:error, :task_workflow_requires_gitlab_native_goal}
+    else
+      :ok
     end
   end
 

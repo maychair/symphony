@@ -37,6 +37,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       :merge_cleanup_ref,
+      :task_reconcile_ref,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -122,12 +123,23 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
+    state = maybe_reconcile_tasks(state)
     state = maybe_start_merge_cleanup(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info({ref, :task_reconciled}, %{task_reconcile_ref: ref} = state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | task_reconcile_ref: nil}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task_reconcile_ref: ref} = state) when is_reference(ref) do
+    Logger.warning("Task reconciliation stopped reason=#{inspect(reason)}")
+    {:noreply, %{state | task_reconcile_ref: nil}}
   end
 
   def handle_info({ref, {_output, status}}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
@@ -354,6 +366,24 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp maybe_reconcile_tasks(%State{task_reconcile_ref: nil} = state) do
+    if SymphonyElixir.TaskReconciler.enabled?() do
+      ids = Map.keys(state.running) |> MapSet.new()
+
+      task =
+        Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+          SymphonyElixir.TaskReconciler.poll(ids)
+          :task_reconciled
+        end)
+
+      %{state | task_reconcile_ref: task.ref}
+    else
+      state
+    end
+  end
+
+  defp maybe_reconcile_tasks(state), do: state
 
   defp reconcile_running_issues(%State{} = state) do
     state = reconcile_stalled_running_issues(state)
@@ -1218,21 +1248,27 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
-    case Map.get(metadata, :workspace_path) do
-      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
+    if SymphonyElixir.TaskReconciler.enabled?() do
+      :ok
+    else
+      case Map.get(metadata, :workspace_path) do
+        workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+          Workspace.remove_recorded(workspace_path, Map.get(metadata, :worker_host))
 
-      _ ->
-        cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+        _ ->
+          cleanup_issue_workspace(issue_or_identifier, Map.get(metadata, :worker_host))
+      end
     end
   end
 
   defp cleanup_issue_workspace(%Issue{} = issue, worker_host) do
-    Workspace.remove_issue_workspaces(issue, worker_host)
+    if SymphonyElixir.TaskReconciler.enabled?(), do: :ok, else: Workspace.remove_issue_workspaces(issue, worker_host)
   end
 
   defp cleanup_issue_workspace(identifier, worker_host) when is_binary(identifier) do
-    Workspace.remove_issue_workspaces(identifier, worker_host)
+    unless SymphonyElixir.TaskReconciler.enabled?() do
+      Workspace.remove_issue_workspaces(identifier, worker_host)
+    end
   end
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok

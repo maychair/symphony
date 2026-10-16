@@ -13,7 +13,12 @@ defmodule SymphonyElixir.RunJournal do
     with :ok <- File.mkdir_p(directory),
          :ok <- File.mkdir(Path.join(directory, "executor.lock")) do
       result = admit_locked(directory, issue_id)
-      if match?({:error, _}, result), do: File.rmdir(Path.join(directory, "executor.lock"))
+
+      if match?({:error, _}, result) do
+        File.rm(Path.join([directory, "executor.lock", "executor-owner.json"]))
+        File.rmdir(Path.join(directory, "executor.lock"))
+      end
+
       result
     else
       {:error, reason} -> {:error, {:run_admission_blocked, issue_id, reason}}
@@ -27,17 +32,23 @@ defmodule SymphonyElixir.RunJournal do
 
       record =
         record
-        |> Map.drop(["handoff", "handoff_pending", "handoff_notice", "delivery", "stage_results", "blocker_reason", "native_stop_confirmed"])
+        |> Map.drop(["handoff", "handoff_pending", "handoff_notice", "delivery", "stage_results", "blocker_reason", "control_restart"])
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
         |> Map.put("host", to_string(host))
         |> Map.put("executor_os_pid", System.pid())
 
-      with {:ok, record} <- carry_pending_review(previous, record) do
+      with {:ok, record} <- carry_pending_review(previous, record),
+           :ok <- save_lock_owner(record) do
         checkpoint(record, %{"phase" => "admitted"})
       end
     end
+  end
+
+  defp save_lock_owner(record) do
+    owner = Map.take(record, ["attempt_id", "host", "executor_os_pid"])
+    write_synced(Path.join([record["directory"], "executor.lock", "executor-owner.json"]), Jason.encode!(owner))
   end
 
   defp carry_pending_review(%{"thread_id" => thread} = previous, record) when is_binary(thread) do
@@ -68,6 +79,7 @@ defmodule SymphonyElixir.RunJournal do
     event = Map.take(changes, ["phase", "thread_id", "turn_id"]) |> Map.put("at", now) |> Map.put("attempt_id", record["attempt_id"])
     events = Enum.take((record["events"] || []) ++ [event], -200)
     updated = record |> Map.merge(changes) |> Map.put("updated_at", now) |> Map.put("events", events)
+    updated = account_budget(updated, changes)
     updated = Map.put(updated, "stage_results", stage_results(updated))
     path = Path.join(directory, "run.json")
     temporary = path <> ".pending"
@@ -78,22 +90,78 @@ defmodule SymphonyElixir.RunJournal do
     end
   end
 
+  defp account_budget(%{"workflow" => %{} = flow} = record, changes) do
+    flow = SymphonyElixir.TaskWorkflow.tick(flow, System.system_time(:millisecond))
+    human = SymphonyElixir.TaskWorkflow.human_wait?(flow)
+    flow = if changes["native_stop_confirmed"] == true and (human or flow["manifest"]), do: Map.put(flow, "charging", false), else: flow
+    Map.put(record, "workflow", flow)
+  end
+
+  defp account_budget(record, _changes), do: record
+
   @spec stage_results(map()) :: map()
   def stage_results(record) do
-    %{
+    stages = %{
       "execution_admitted" => if(record["attempt_id"], do: "passed", else: "not_verified"),
       "mr_publication" => if(get_in(record, ["delivery", "mr_verified"]) == true, do: "passed", else: "not_verified"),
       "review_handoff" => if(get_in(record, ["handoff", "kind"]) == "review", do: "passed", else: "not_verified"),
       "native_execution_stopped" => if(record["native_stop_confirmed"] == true, do: "passed", else: "not_verified"),
-      "business_validation" => "see_mr_evidence",
+      "business_validation" => business_evidence(record),
       "error" => record["blocker_reason"]
     }
+
+    if get_in(record, ["workflow", "contract", "type"]) == "research",
+      do: Map.merge(stages, %{"mr_publication" => "not_applicable", "review_handoff" => "not_applicable"}),
+      else: stages
+  end
+
+  defp business_evidence(record) do
+    Map.get(%{"research" => "see_issue_evidence", "mixed" => "see_manifest_evidence"}, get_in(record, ["workflow", "contract", "type"]), "see_mr_evidence")
   end
 
   @spec complete(map(), String.t()) :: :ok | {:error, term()}
   def complete(record, phase) do
     with {:ok, _record} <- checkpoint(record, %{"phase" => phase}) do
-      File.rmdir(Path.join(record["directory"], "executor.lock"))
+      release_lock(record)
+    end
+  end
+
+  @spec release_lock(map()) :: :ok | {:error, term()}
+  def release_lock(record) do
+    path = Path.join([record["directory"], "executor.lock", "executor-owner.json"])
+
+    case File.read(path) do
+      {:ok, body} ->
+        with {:ok, owner} <- Jason.decode(body),
+             true <- owner == Map.take(record, ["attempt_id", "host", "executor_os_pid"]),
+             {:ok, ["executor-owner.json"]} <- File.ls(Path.dirname(path)),
+             :ok <- File.rm(path) do
+          File.rmdir(Path.dirname(path))
+        else
+          error -> {:error, {:execution_lock_owner_changed, error}}
+        end
+
+      {:error, :enoent} ->
+        File.rmdir(Path.dirname(path))
+
+      error ->
+        error
+    end
+  end
+
+  @spec recoverable_lock?(map()) :: boolean()
+  def recoverable_lock?(record) do
+    lock = Path.join(record["directory"], "executor.lock")
+
+    if File.exists?(lock) do
+      with {:ok, body} <- File.read(Path.join(lock, "executor-owner.json")),
+           {:ok, owner} <- Jason.decode(body) do
+        owner == Map.take(record, ["attempt_id", "host", "executor_os_pid"])
+      else
+        _ -> false
+      end
+    else
+      true
     end
   end
 

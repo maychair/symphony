@@ -2340,3 +2340,7 @@ The command must confirm native merge success independently of Issue closure, ma
 Repository tracker extension: `tracker.assignee` restricts GitLab/GitHub routing to that sole native owner. Ownership checks compose with required labels across admission, reconciliation, retry/recovery and continuation. Other tracker assignment semantics remain provider-owned.
 
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
+
+## Repository task workflow extension
+
+The optional GitLab/Codex native Goal extension in [the execution contract](elixir/docs/task-workflow.md) adds five logical states, versioned authorized decisions, independent restrictions, cumulative execution accounting and delivery-bound acceptance. Native Issue state and routing labels keep their existing meanings. A successful execution attempt is not overall completion.

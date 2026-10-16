@@ -337,3 +337,7 @@ Repository Issue workflows can enable `agent.goal_mode` and set a durable
 [repository execution](docs/repository-issues.md).
 
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
+
+## Versioned task workflow
+
+GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Enable it only after migrating retained private workflows and their Issue agreements.

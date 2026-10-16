@@ -37,11 +37,14 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, prepared_issue, prepared_opts} <-
            Tracker.prepare_run(issue, Keyword.put(opts, :worker_host, worker_host)),
-         result <- run_on_worker_host(prepared_issue, codex_update_recipient, prepared_opts, worker_host),
+         result <- run_on_worker_host(prepared_issue, codex_update_recipient, prepared_opts, Keyword.get(prepared_opts, :worker_host, worker_host)),
          :ok <- Tracker.finish_run(prepared_issue, prepared_opts, result),
-         :ok <- worker_result(result) do
+         :ok <- worker_result(result, prepared_opts) do
       :ok
     else
+      {:error, :task_workflow_waiting} ->
+        :ok
+
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
@@ -113,15 +116,26 @@ defmodule SymphonyElixir.AgentRunner do
       expected_turn_id: record && (record["turn_id"] || :no_turns),
       suspend_goal: Execution.enabled?(),
       on_thread_intent: fn -> journal!(record, %{"phase" => "thread_start_intent", "workspace" => workspace, "thread_allocation_intent" => true}) end,
-      on_thread_started: fn thread_id -> journal!(record, %{"phase" => "thread_ready", "thread_id" => thread_id, "workspace" => workspace}) end
+      on_thread_started: fn thread_id -> journal!(record, %{"phase" => "thread_ready", "thread_id" => thread_id, "workspace" => workspace, "native_stop_confirmed" => true}) end
     ]
 
     with {:ok, session} <- backend.start_session(workspace, session_opts) do
       try do
-        if native_goal?(backend, opts) do
-          run_goal(session, issue, codex_update_recipient, opts)
-        else
-          do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        with {:ok, active_opts} <- Execution.activation_options(opts) do
+          if native_goal?(backend, opts) do
+            run_goal(session, issue, codex_update_recipient, active_opts)
+          else
+            do_run_codex_turns(
+              session,
+              workspace,
+              issue,
+              codex_update_recipient,
+              active_opts,
+              issue_state_fetcher,
+              1,
+              max_turns
+            )
+          end
         end
       after
         stopped = backend.stop_session(session)
@@ -130,8 +144,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp worker_result({:error, :scheduler_stop}), do: :ok
-  defp worker_result(result), do: result
+  defp worker_result({:error, :scheduler_stop}, _opts), do: :ok
+
+  defp worker_result({:error, {:native_goal_stopped, "blocked"}} = result, opts) do
+    if Execution.controlled_stop?(opts), do: :ok, else: result
+  end
+
+  defp worker_result(result, _opts), do: result
 
   defp native_goal?(AppServer, _opts), do: Execution.enabled?()
   defp native_goal?(_backend, _opts), do: false
@@ -146,7 +165,7 @@ defmodule SymphonyElixir.AgentRunner do
              prompt,
              issue,
              deadline: opts[:deadline],
-             before_turn: fn -> journal!(opts[:run_record], %{"phase" => "turn_start_intent"}) end,
+             before_turn: fn -> journal!(opts[:run_record], %{"phase" => "turn_start_intent", "native_stop_confirmed" => false}) end,
              on_message: journal_message_handler(opts[:run_record], codex_update_recipient, issue)
            ) do
       checkpoint_completed(opts[:run_record], turn_session, turn_number)
@@ -203,7 +222,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_goal(session, issue, recipient, opts) do
     record = opts[:run_record]
-    prompt = build_turn_prompt(issue, opts, 1, 1)
+    prompt = build_turn_prompt(issue, opts, 1, 1) <> execution_controls(record)
     brief = Path.join(record["directory"], "goal-instructions.txt")
     File.write!(brief, prompt)
 
@@ -229,16 +248,7 @@ defmodule SymphonyElixir.AgentRunner do
         resume_goal: is_binary(record["recovery"]),
         on_message: journal_message_handler(record, recipient, issue),
         before_goal: fn -> journal!(record, %{"phase" => "goal_start_intent", "execution_mode" => "goal"}) end,
-        handoff_status: fn ->
-          Execution.reconcile_delivery(issue, opts)
-          {:ok, current} = RunJournal.read(record["directory"])
-
-          cond do
-            current["handoff"] -> "complete"
-            current["blocker_reason"] -> "blocked"
-            true -> nil
-          end
-        end,
+        handoff_status: fn -> goal_control_status(record, issue, opts) end,
         latest_turn: fn ->
           {:ok, current} = RunJournal.read(record["directory"])
           current["turn_id"]
@@ -258,6 +268,103 @@ defmodule SymphonyElixir.AgentRunner do
 
       error ->
         error
+    end
+  end
+
+  defp execution_controls(%{"workflow" => flow}) do
+    """
+
+    Current execution controls (derived from confirmed Issue decisions):
+    Contract reference: #{get_in(flow, ["contract", "ref"])}
+    Work only on these acceptance criteria: #{Jason.encode!(flow["allowed_criteria"])}
+    Read the current Issue decisions before every implementation or publication step.
+    Other criteria remain restricted. Do not expand the contract or treat routing as authorization.
+    """
+  end
+
+  defp execution_controls(_), do: ""
+
+  defp goal_control_status(record, issue, opts) do
+    refresh_task_controls(record)
+    Execution.reconcile_delivery(issue, opts)
+    {:ok, current} = RunJournal.read(record["directory"])
+
+    cond do
+      current["workflow"] && current["workflow"]["state"] in ["waiting", "review", "ended"] -> "blocked"
+      current["handoff"] -> "complete"
+      current["blocker_reason"] -> "blocked"
+      true -> nil
+    end
+  end
+
+  defp refresh_task_controls(record) do
+    if SymphonyElixir.TaskReconciler.enabled?() do
+      now = System.monotonic_time(:millisecond)
+
+      case Process.get(:workflow_observer) do
+        nil -> start_task_observation(record, now)
+        pending -> receive_task_observation(record, pending, now)
+      end
+    end
+  end
+
+  defp start_task_observation(record, now) do
+    if now >= Process.get(:workflow_refresh_at, now) do
+      Process.put(:workflow_refresh_at, now + Config.settings!().polling.interval_ms)
+      {:ok, current} = RunJournal.read(record["directory"])
+      owner = self()
+
+      {pid, monitor} =
+        spawn_monitor(fn ->
+          send(owner, {:workflow_observation, self(), SymphonyElixir.TaskReconciler.observe(current)})
+        end)
+
+      Process.put(:workflow_observer, {pid, monitor, now})
+    end
+  end
+
+  defp receive_task_observation(record, {pid, monitor, started}, now) do
+    receive do
+      {:workflow_observation, ^pid, result} ->
+        Process.demonitor(monitor, [:flush])
+        Process.delete(:workflow_observer)
+        apply_task_observation(record, result)
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        Process.delete(:workflow_observer)
+        journal!(record, %{"blocker_reason" => "Task fact read failed: #{inspect(reason)}"})
+    after
+      0 -> expire_task_observation(record, pid, now - started)
+    end
+  end
+
+  defp apply_task_observation(record, result) do
+    {:ok, current} = RunJournal.read(record["directory"])
+
+    applied =
+      with {:ok, observation} <- result do
+        SymphonyElixir.TaskReconciler.apply_observation(current, observation, true)
+      end
+
+    case applied do
+      {:ok, updated} -> stop_for_scope_change(record, current, updated)
+      {:error, reason} -> journal!(record, %{"blocker_reason" => "Task controls could not be verified: #{inspect(reason)}"})
+    end
+  end
+
+  defp stop_for_scope_change(record, before, updated) do
+    previous = get_in(before, ["workflow", "allowed_criteria"])
+    following = get_in(updated, ["workflow", "allowed_criteria"])
+
+    if previous != following do
+      journal!(record, %{"control_restart" => true, "blocker_reason" => "Work scope changed; reconcile native stop before continuing"})
+    end
+  end
+
+  defp expire_task_observation(record, pid, elapsed) do
+    if elapsed > 60_000 do
+      Process.exit(pid, :kill)
+      journal!(record, %{"blocker_reason" => "Task fact read exceeded its stop-safe time limit"})
     end
   end
 

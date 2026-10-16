@@ -516,7 +516,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp open_existing_thread(port, id, workspace, policies, opts) do
-    if opts[:inspect_only], do: inspect_thread(port, id, opts), else: resume_thread(port, id, workspace, policies, opts)
+    cond do
+      opts[:halt_only] ->
+        with :ok <- suspend_goal_for_resume(port, id, opts), do: inspect_thread(port, id, opts)
+
+      opts[:inspect_only] ->
+        inspect_thread(port, id, opts)
+
+      true ->
+        resume_thread(port, id, workspace, policies, opts)
+    end
   end
 
   defp resume_thread(port, thread_id, workspace, policies, opts) do
@@ -536,7 +545,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           :ok
 
         {:ok, _goal} ->
-          ensure_goal_halted(session)
+          halt_goal_for_resume(session, opts)
 
         error ->
           error
@@ -545,6 +554,37 @@ defmodule SymphonyElixir.Codex.AppServer do
       :ok
     end
   end
+
+  defp halt_goal_for_resume(session, opts) do
+    with :ok <- ensure_goal_halted(session), do: maybe_interrupt_active(session, opts)
+  end
+
+  defp maybe_interrupt_active(session, opts) do
+    if opts[:interrupt_active] do
+      send_message(session.port, %{"id" => @goal_inspect_id, "method" => "thread/read", "params" => %{"threadId" => session.thread_id, "includeTurns" => true}})
+
+      case await_response(session.port, @goal_inspect_id) do
+        {:ok, %{"thread" => %{"id" => id, "turns" => turns}}} when id == session.thread_id and is_list(turns) ->
+          turns |> Enum.filter(&(&1["status"] == "inProgress")) |> Enum.reduce_while(:ok, &interrupt_active_turn(session, &1, &2))
+
+        error ->
+          {:error, {:native_stop_inspection_failed, error}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp interrupt_active_turn(session, %{"id" => turn}, :ok) do
+    send_message(session.port, %{"id" => @goal_interrupt_id, "method" => "turn/interrupt", "params" => %{"threadId" => session.thread_id, "turnId" => turn}})
+
+    case await_response(session.port, @goal_interrupt_id) do
+      {:ok, _} -> {:cont, :ok}
+      error -> {:halt, {:error, {:native_turn_interrupt_unconfirmed, error}}}
+    end
+  end
+
+  defp interrupt_active_turn(_, _, _), do: {:halt, {:error, :native_turn_identity_missing}}
 
   defp ensure_goal_halted(session) do
     case halt_goal(session) do
@@ -585,12 +625,24 @@ defmodule SymphonyElixir.Codex.AppServer do
       reconciled_turn?(thread, expected) ->
         {:ok, %{turn_id: expected, additional_turns: 0}}
 
-      opts[:reconcile_terminal_turns] and suffix != [] and Enum.all?(suffix, &(&1["status"] in ["completed", "failed", "interrupted"])) ->
+      halted_observation?(turns, opts) ->
+        {:ok, %{turn_id: get_in(List.last(turns) || %{}, ["id"]), additional_turns: length(turns)}}
+
+      terminal_suffix?(suffix, opts) ->
         {:ok, %{turn_id: List.last(suffix)["id"], additional_turns: length(suffix) - 1}}
 
       true ->
         {:error, :native_turn_not_reconciled}
     end
+  end
+
+  defp halted_observation?(turns, opts) do
+    opts[:halt_only] == true and Enum.all?(turns, &(&1["status"] in ["completed", "failed", "interrupted"]))
+  end
+
+  defp terminal_suffix?(turns, opts) do
+    opts[:reconcile_terminal_turns] == true and turns != [] and
+      Enum.all?(turns, &(&1["status"] in ["completed", "failed", "interrupted"]))
   end
 
   defp do_resume_thread(port, thread_id, workspace, policies, opts) do
@@ -710,6 +762,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    receive do
+      :symphony_stop when is_map_key(tool_executor, :goal_mode) -> {:error, :scheduler_stop}
+    after
+      0 -> receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     tool_executor = check_goal_handoff(port, tool_executor)
     remaining = remaining_time(tool_executor[:deadline], timeout_ms)
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
