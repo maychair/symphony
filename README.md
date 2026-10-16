@@ -40,23 +40,4 @@ help with the setup:
 
 This project is licensed under the [Apache License 2.0](LICENSE).
 
-The Elixir implementation also supports a scoped [native Beads development loop](elixir/docs/beads.md): Beads owns tasks and human acceptance, while Symphony journals native execution identities and preserves worktrees.
-
-The Beads extension supports remote review/CI reconciliation in Symphony's existing poll loop, authenticated Webhook hints, bounded same-session repair and verified manual-merge closure. See [Beads operation](elixir/docs/beads.md).
-
-Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](elixir/docs/beads.md).
-
-Beads runs can freeze task-specific validation policies, expose scoped host task
-reads, and preflight strict prompts before claiming work. Opt-in host checks bind
-receipts to a clean commit and attempt. Corrected session evidence keeps process
-results separate from tool transport status; see [operation](elixir/docs/beads.md).
-
-Beads host delivery uses `beads_checkpoint` (scoped commit only), then
-`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
-
-Beads workflows support retained-worktree preflight, typed blocked/review handoffs,
-separate runtime recovery budgets, opt-in compact task briefs and resumable
-`beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
-keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
-
-Undelivered Beads runs retain preparation blockers for operator recovery; bound PR/MR deliveries retain explicit acceptance and merge gates.
+The Elixir implementation supports repository Issues directly through the GitHub and GitLab adapters. Native Goal execution and durable run identities are tracker-independent. See [repository execution](elixir/docs/repository-issues.md).

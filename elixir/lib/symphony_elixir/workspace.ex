@@ -13,6 +13,22 @@ defmodule SymphonyElixir.Workspace do
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    if Config.settings!().tracker.provider["workbench_primary_checkout"] == true and is_nil(worker_host) do
+      primary = System.get_env("SYMPHONY_TARGET_REPO")
+
+      with true <- is_binary(primary) and File.dir?(primary),
+           {top, 0} <- System.cmd("git", ["-C", primary, "rev-parse", "--show-toplevel"], stderr_to_stdout: false),
+           true <- String.trim(top) == Path.expand(primary) do
+        {:ok, primary}
+      else
+        _ -> {:error, :invalid_operator_primary_checkout}
+      end
+    else
+      create_isolated_for_issue(issue_or_identifier, worker_host)
+    end
+  end
+
+  defp create_isolated_for_issue(issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -34,6 +50,17 @@ defmodule SymphonyElixir.Workspace do
       error in [ArgumentError, ErlangError, File.Error] ->
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
         {:error, error}
+    end
+  end
+
+  @doc "Create a local isolated review directory without development lifecycle hooks."
+  @spec create_for_review(map()) :: {:ok, Path.t()} | {:error, term()}
+  def create_for_review(issue) do
+    with {:ok, workspace} <- workspace_path_for_issue(workspace_key(issue), nil),
+         :ok <- validate_workspace_path(workspace, nil),
+         {:ok, workspace, _created} <- ensure_workspace(workspace, nil),
+         :ok <- mark_retained(workspace, nil) do
+      {:ok, workspace}
     end
   end
 
@@ -132,7 +159,7 @@ defmodule SymphonyElixir.Workspace do
 
   defp retain_workspace? do
     settings = Config.settings!()
-    settings.workspace.retain or settings.tracker.kind == "beads"
+    settings.workspace.retain
   end
 
   defp do_remove_local(workspace) do
@@ -632,9 +659,8 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
-    native_ref = Map.get(issue, :native_ref) || %{}
-    environment = if is_binary(native_ref["beads_dir"]), do: [{"BEADS_DIR", native_ref["beads_dir"]}], else: []
+  defp issue_context(%{id: issue_id, identifier: identifier}) do
+    environment = []
 
     %{
       agent_environment: environment,

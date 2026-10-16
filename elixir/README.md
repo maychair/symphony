@@ -404,25 +404,6 @@ you.
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
 
-## Beads tracker
+## Repository Issue execution
 
-For a scoped local Beads development loop with durable native Codex identities, retained Git worktrees and explicit merged-review/human acceptance, see [the Beads guide](docs/beads.md) and [example workflow](WORKFLOW.beads.md).
-
-For event-driven Beads tasks, configure `remote_reconcile`, `accepted_merge_actors`, `required_checks` and repair/run budgets. The host never merges; it reconciles a developer merge before closing the linked Issue and Bead. Native CLI credentials and webhook secrets stay outside source. See [operation](docs/beads.md).
-
-Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](docs/beads.md).
-
-Use `mix beads.preflight --workflow WORKFLOW.md [--issue ID]` before dispatch to
-check configuration and a concrete Beads prompt without admission. Task validation
-and the private `scripts/session_evidence.py` exporter are described in the
-[Beads guide](docs/beads.md). No extra scheduler or agent harness is required.
-
-Beads host delivery uses `beads_checkpoint` (scoped commit only), then
-`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
-
-Beads workflows support retained-worktree preflight, typed blocked/review handoffs,
-separate runtime recovery budgets, opt-in compact task briefs and resumable
-`beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
-keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
-
-Undelivered Beads runs retain a preparation blocker and resume through operator recovery; only bound PR/MR deliveries await acceptance.
+See [repository execution](docs/repository-issues.md) for native Goal sessions, durable execution records and handoffs.

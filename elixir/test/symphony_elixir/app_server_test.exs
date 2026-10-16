@@ -1,6 +1,41 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "recovery inspection never resumes or reconciles active, foreign or missing native turns" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "inspection/issue")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "inspection-server")
+
+    for turns <- [
+          [%{id: "recorded", status: "completed"}, %{id: "newer", status: "inProgress"}],
+          [%{id: "foreign", status: "completed"}],
+          []
+        ] do
+      File.write!(binary, """
+      #!/usr/bin/env python3
+      import json,sys
+      for line in sys.stdin:
+        q=json.loads(line);m=q.get('method')
+        if m=='initialize': print(json.dumps({'id':q['id'],'result':{}}),flush=True)
+        elif m=='thread/read': print(json.dumps({'id':q['id'],'result':{'thread':{'id':'inspect-thread','status':{'type':'notLoaded'},'turns':#{Jason.encode!(turns)}}}}),flush=True)
+        elif m is not None and m!='initialized': raise AssertionError('inspection must not start native execution')
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace), codex_command: binary)
+
+      assert {:error, :native_turn_not_reconciled} =
+               AppServer.start_session(workspace,
+                 resume_thread_id: "inspect-thread",
+                 expected_turn_id: "recorded",
+                 inspect_only: true,
+                 reconcile_terminal_turns: true,
+                 on_thread_observed: fn _ -> flunk("Uncertain native identity must remain fenced") end
+               )
+    end
+  end
+
   test "root turn waits past child completion and rejects failed parent envelopes" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace_root = Path.join(root, "protocol-workspaces")

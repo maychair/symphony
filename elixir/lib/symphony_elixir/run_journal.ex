@@ -1,9 +1,9 @@
-defmodule SymphonyElixir.Beads.RunJournal do
+defmodule SymphonyElixir.RunJournal do
   @moduledoc """
-  Durable execution checkpoints, separate from Beads task data.
+  Durable execution checkpoints, separate from repository Issue data.
 
-  An exclusive directory fences admission across processes. An uncertain checkpoint
-  is never reclaimed automatically, including when its recorded process has exited.
+  An exclusive directory fences admission across processes. Thread allocation uncertainty requires recovery; recorded threads are resumed
+  only after native idle validation.
   """
 
   @spec admit(Path.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -11,28 +11,30 @@ defmodule SymphonyElixir.Beads.RunJournal do
     directory = Path.join(root, key(issue_id))
 
     with :ok <- File.mkdir_p(directory),
-         :ok <- File.mkdir(Path.join(directory, "executor.lock")),
-         {:ok, previous} <- read(directory),
+         :ok <- File.mkdir(Path.join(directory, "executor.lock")) do
+      result = admit_locked(directory, issue_id)
+      if match?({:error, _}, result), do: File.rmdir(Path.join(directory, "executor.lock"))
+      result
+    else
+      {:error, reason} -> {:error, {:run_admission_blocked, issue_id, reason}}
+    end
+  end
+
+  defp admit_locked(directory, issue_id) do
+    with {:ok, previous} <- read(directory),
          {:ok, record} <- admission(previous, issue_id) do
       {:ok, host} = :inet.gethostname()
 
       record =
         record
-        |> Map.delete("delivery")
-        |> Map.delete("pre_session_blocked")
-        |> Map.delete("blocker_reason")
+        |> Map.drop(["handoff", "handoff_pending", "blocker_reason", "native_stop_confirmed"])
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
         |> Map.put("host", to_string(host))
         |> Map.put("executor_os_pid", System.pid())
 
-      case checkpoint(record, %{"phase" => "admitted"}) do
-        {:ok, record} -> {:ok, record}
-        error -> error
-      end
-    else
-      {:error, reason} -> {:error, {:run_admission_blocked, issue_id, reason}}
+      checkpoint(record, %{"phase" => "admitted"})
     end
   end
 
@@ -67,6 +69,20 @@ defmodule SymphonyElixir.Beads.RunJournal do
     end
   end
 
+  @spec executor_state(map()) :: :alive | :stopped | :unknown
+  def executor_state(record) do
+    {:ok, host} = :inet.gethostname()
+    pid = record["executor_os_pid"]
+
+    cond do
+      record["host"] != to_string(host) -> :unknown
+      not is_binary(pid) or not String.match?(pid, ~r/^[1-9][0-9]*$/) -> :unknown
+      not File.dir?("/proc") -> :unknown
+      File.exists?(Path.join("/proc", pid)) -> :alive
+      true -> :stopped
+    end
+  end
+
   @spec directory(Path.t(), String.t()) :: Path.t()
   def directory(root, issue_id), do: Path.join(root, key(issue_id))
 
@@ -77,25 +93,12 @@ defmodule SymphonyElixir.Beads.RunJournal do
      %{"host" => to_string(host), "executor_os_pid" => System.pid(), "issue_id" => issue_id, "owner" => "symphony-" <> Base.encode16(:crypto.strong_rand_bytes(16), case: :lower), "turn_count" => 0}}
   end
 
-  defp admission(%{"phase" => "completed", "thread_id" => thread, "turn_id" => turn} = record, issue_id)
-       when is_binary(thread) and is_binary(turn) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
-  end
-
-  defp admission(%{"phase" => "completed", "thread_id" => thread, "turn_id" => nil, "turn_count" => 0, "recovery" => "operator confirmed stopped; native resume proved idle"} = record, issue_id)
-       when is_binary(thread) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
-  end
-
-  defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_turn_recovered" => true, "abandoned_pre_turn_thread_id" => abandoned} = record, issue_id)
-       when is_binary(abandoned) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
-  end
-
-  defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_session_blocked" => true} = record, issue_id) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]),
-      do: {:ok, Map.put(record, "pre_turn_recovered", true)},
-      else: {:error, :issue_identity_mismatch}
+  defp admission(%{"phase" => "completed"} = record, issue_id) do
+    cond do
+      record["issue_id"] != issue_id or not is_binary(record["owner"]) -> {:error, :issue_identity_mismatch}
+      is_binary(record["thread_id"]) or record["thread_allocation_intent"] != true -> {:ok, record}
+      true -> {:error, :uncertain_thread_allocation}
+    end
   end
 
   defp admission(_record, _issue_id), do: {:error, :uncertain_or_awaiting_run}

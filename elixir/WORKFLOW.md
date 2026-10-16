@@ -328,24 +328,6 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 - <only include when something was confusing during execution>
 ````
 
-For the Beads provider contract and bounded native development loop, use the separate [Beads example](WORKFLOW.beads.md) and [provider guide](docs/beads.md).
-
-For the optional Beads provider, `remote_reconcile: true` enables event hints plus polling, same-session repair and manual-merge acceptance. Publication additionally requires explicit task/paths authorization. See [Beads contract](docs/beads.md).
-
-Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](docs/beads.md).
-
-For Beads workflows only, trusted local `metadata.symphony_validation` overrides
-`tracker.provider.validation_policy` before admission. Opt-in
-`allow_host_validation` enables frozen argv checks through `beads_validate` on a
-clean commit. Read tasks through `beads_task_context`; never infer acceptance or
-merge authority from successful validation. See `docs/beads.md` for the contract.
-
-Beads host delivery uses `beads_checkpoint` (scoped commit only), then
-`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
-
-Beads workflows support retained-worktree preflight, typed blocked/review handoffs,
-separate runtime recovery budgets, opt-in compact task briefs and resumable
-`beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
-keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
-
-Beads preparation blockers use `beads_block` (or reason-only `beads_await_human`); delivered review handoffs require both review URL and head SHA.
+Repository Issue workflows can enable `agent.goal_mode` and set a durable
+`agent.run_journal_dir`. Task content stays on the provider; see
+[repository execution](docs/repository-issues.md).
