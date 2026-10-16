@@ -102,14 +102,14 @@ defmodule SymphonyElixir.GitLab.AgentTool do
     end
   end
 
+  defp control_decision?(_), do: false
+
   defp human_decision?(json) do
     case Jason.decode(json) do
       {:ok, %{"action" => "manifest"}} -> false
       _ -> true
     end
   end
-
-  defp control_decision?(_), do: false
 
   defp normalize_arguments(arguments) when is_map(arguments) do
     with {:ok, method} <- normalize_method(Map.get(arguments, "method")),

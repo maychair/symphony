@@ -14,7 +14,7 @@ defmodule SymphonyElixir.GitLabControlToolTest do
       refute call("POST", %{"body" => text})["success"]
       refute call("PUT", nil, %{"body" => text})["success"]
       refute call("POST", %{"body" => "Ordinary comment"}, %{"body" => text})["success"]
-      disguised = "> <!-- symphony-workflow {\"action\":\"manifest\"} -->\n\n" <> text
+      disguised = ~S(> <!-- symphony-workflow {"action":"manifest"} -->) <> "\n\n" <> text
       refute call("POST", %{"body" => disguised})["success"]
       assert call("GET", %{"body" => text})["success"]
       assert call("POST", %{"body" => text}, %{}, false)["success"]
