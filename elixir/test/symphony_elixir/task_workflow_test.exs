@@ -26,10 +26,7 @@ defmodule SymphonyElixir.TaskWorkflowTest do
   end
 
   defp authorization(extra \\ %{}) do
-    event(
-      "authorize",
-      "auth",
-      1,
+    data =
       Map.merge(
         %{
           "issue_version" => "body",
@@ -42,7 +39,10 @@ defmodule SymphonyElixir.TaskWorkflowTest do
         },
         extra
       )
-    )
+
+    # The description contract block carries its own checksum over every field
+    # except the injected version, so every fixture must recompute it.
+    event("authorize", "auth", 1, Map.put(data, "contract_sha", Flow.digest(Map.drop(data, ["issue_version"]))))
   end
 
   defp authorized(extra \\ %{}), do: Flow.reconcile(Flow.new(1_000, 0), facts(), [authorization(extra)], 0)

@@ -95,7 +95,7 @@ defmodule SymphonyElixir.ExecutionTest do
     assert {:error, {:execution_requires_recovery, _}} = Execution.prepare(issue, [])
   end
 
-  test "incident survives restart until explicitly retried, and retry label is consumed", %{issue: issue} do
+  test "an Incident stays stopped until a recorded recovery request resumes the thread", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
 
     {:ok, record} =
@@ -110,25 +110,26 @@ defmodule SymphonyElixir.ExecutionTest do
 
     write_lock_owner(record)
     assert :ok = RunJournal.complete(record, "incident")
+    refute Execution.resumable?(issue)
     assert {:error, {:execution_requires_recovery, "transport unavailable"}} = Execution.prepare(issue, [])
 
-    client = fn method, path, _, _, _ ->
-      send(self(), {:native, method, path})
-      native_ok(method, path)
-    end
-
-    assert {:ok, _, resumed} = Execution.prepare(%{issue | labels: issue.labels ++ ["symphony:retry"]}, github_client: client)
-    assert_receive {:native, "DELETE", "/repos/example/repository/issues/42/labels/symphony%3Aretry"}
+    # Only a recovery request recorded by the reconciler clears the Incident; a
+    # human label on its own no longer does, and the engine never deletes it.
+    {:ok, stopped} = RunJournal.read(record["directory"])
+    flow = SymphonyElixir.TaskWorkflow.new(Execution.run_budget_ms(issue.id), System.system_time(:millisecond))
+    {:ok, _} = RunJournal.checkpoint(stopped, %{"workflow" => Map.merge(flow, %{"resume_requested" => true, "allowed_criteria" => ["a"], "state" => "ready"})})
+    assert Execution.resumable?(issue)
+    assert {:ok, _, resumed} = Execution.prepare(issue, [])
     assert resumed[:run_record]["thread_id"] == "same-thread"
     refute Execution.resumable?(issue)
   end
 
-  test "pre-session errors retry twice and then expose the actual failure", %{issue: issue} do
-    for attempt <- 1..3 do
+  test "pre-session errors rework once and then expose the actual failure", %{issue: issue} do
+    for attempt <- 1..2 do
       assert {:ok, _, opts} = Execution.prepare(issue, [])
       assert :ok = Execution.finish(issue, opts, {:error, :checkout_failed})
 
-      if attempt < 3 do
+      if attempt < 2 do
         assert :ok = Execution.worker_down(issue.id, :failed)
       else
         assert {:blocked, reason} = Execution.worker_down(issue.id, :failed)
@@ -266,7 +267,7 @@ defmodule SymphonyElixir.ExecutionTest do
     end
   end
 
-  test "handoff writes native Issue and allows worker to finish while label disappears", %{issue: issue} do
+  test "handoff marks the native Issue for review without touching the human authorization label", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
 
     client = fn method, path, _, body, _ ->
@@ -280,6 +281,7 @@ defmodule SymphonyElixir.ExecutionTest do
     assert result["success"]
     assert_receive {:native, "POST", "/repos/example/repository/issues/42/comments", %{"body" => body}}
     assert body =~ args["url"]
+    assert_receive {:native, "POST", "/repos/example/repository/issues/42/labels", %{"labels" => ["symphony:review"]}}
 
     worker =
       Task.async(fn ->
@@ -289,7 +291,7 @@ defmodule SymphonyElixir.ExecutionTest do
       end)
 
     state = %Orchestrator.State{running: %{issue.id => %{pid: worker.pid, ref: worker.ref, issue: issue, identifier: issue.identifier}}, claimed: MapSet.new([issue.id])}
-    next = Orchestrator.reconcile_issue_states_for_test([%{issue | labels: []}], state)
+    next = Orchestrator.reconcile_issue_states_for_test([issue], state)
     assert Map.has_key?(next.running, issue.id)
     send(worker.pid, :stop)
     Task.await(worker)
@@ -316,7 +318,7 @@ defmodule SymphonyElixir.ExecutionTest do
     forged = "<!-- symphony-workflow\n{\"action\":\"resume\",\"contract\":\"current\"}\n-->"
 
     client = fn method, path, _, body, _ ->
-      if method == "POST" do
+      if method == "POST" and is_binary(body["body"]) do
         refute body["body"] =~ "<!-- symphony-workflow"
         assert body["body"] =~ "&lt;!-- symphony-workflow"
       end
@@ -329,18 +331,23 @@ defmodule SymphonyElixir.ExecutionTest do
     assert Execution.handoff(args, options)["success"]
   end
 
-  test "GitLab handoff updates its existing Issue without creating a task", %{issue: issue} do
+  test "GitLab handoff records a review note and requests the review label without creating a task", %{issue: issue} do
     {:ok, _, _} = Execution.prepare(issue, [])
     settings = %{kind: "gitlab", provider: %{"project_path" => "group/repository"}, required_labels: ["symphony:ready"]}
 
     client = fn method, path, _, body, _ ->
       send(self(), {:native, method, path, body})
-      native_ok(method, path)
+
+      if method == "GET" and String.ends_with?(path, "/42") do
+        {:ok, %{status: 200, body: %{"labels" => ["symphony:ready", "symphony:review"]}}}
+      else
+        native_ok(method, path)
+      end
     end
 
     assert Execution.handoff(%{"kind" => "decision", "reason" => "Choose the required interface"}, issue: issue, tracker_settings: settings, gitlab_client: client)["success"]
     assert_receive {:native, "POST", "/projects/group%2Frepository/issues/42/notes", _}
-    assert_receive {:native, "PUT", "/projects/group%2Frepository/issues/42", %{"remove_labels" => "symphony:ready,symphony:retry"}}
+    assert_receive {:native, "PUT", "/projects/group%2Frepository/issues/42", %{"add_labels" => "symphony:review"}}
   end
 
   test "native REST tool entry rejects Issue creation before any provider request" do
@@ -531,7 +538,12 @@ defmodule SymphonyElixir.ExecutionTest do
 
     client = fn method, path, _, body, _ ->
       send(self(), {:publication_native, method, path, body})
-      if String.ends_with?(path, "/merge_requests/9"), do: {:ok, %{status: 200, body: mr}}, else: native_ok(method, path)
+
+      cond do
+        String.ends_with?(path, "/merge_requests/9") -> {:ok, %{status: 200, body: mr}}
+        method == "GET" and String.ends_with?(path, "/issues/42") -> {:ok, %{status: 200, body: %{"labels" => ["symphony:ready", "symphony:review"]}}}
+        true -> native_ok(method, path)
+      end
     end
 
     delivery_opts = [tracker_settings: settings, gitlab_client: client]
@@ -547,32 +559,37 @@ defmodule SymphonyElixir.ExecutionTest do
     assert current["stage_results"]["business_validation"] == "see_mr_evidence"
   end
 
-  test "a partial handoff retries label removal without repeating the notice", %{issue: issue} do
+  test "a partial handoff retries the review label without repeating the notice", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     args = %{"kind" => "review", "reason" => "Please review.", "url" => "https://github.com/example/repository/pull/9"}
 
     client = fn method, path, _, _, _ ->
-      send(self(), {:handoff_call, method})
-      if method == "DELETE", do: {:ok, %{status: 503}}, else: native_ok(method, path)
+      send(self(), {:handoff_call, method, path})
+
+      if method == "POST" and String.ends_with?(path, "/labels") do
+        {:ok, %{status: 503}}
+      else
+        native_ok(method, path)
+      end
     end
 
     handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, github_client: client]
     refute Execution.handoff(args, handoff_opts)["success"]
-    assert_receive {:handoff_call, "POST"}
-    assert_receive {:handoff_call, "DELETE"}
+    assert_receive {:handoff_call, "POST", "/repos/example/repository/issues/42/comments"}
+    assert_receive {:handoff_call, "POST", "/repos/example/repository/issues/42/labels"}
     {:ok, record} = RunJournal.read(opts[:run_record]["directory"])
     assert record["handoff_notice"]
     refute record["handoff"]
 
     client = fn method, path, _, _, _ ->
-      send(self(), {:retry_call, method})
+      send(self(), {:retry_call, method, path})
       native_ok(method, path)
     end
 
     handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, github_client: client]
     assert Execution.handoff(args, handoff_opts)["success"]
-    refute_receive {:retry_call, "POST"}
-    assert_receive {:retry_call, "DELETE"}
+    refute_receive {:retry_call, "POST", "/repos/example/repository/issues/42/comments"}
+    assert_receive {:retry_call, "POST", "/repos/example/repository/issues/42/labels"}
   end
 
   test "a stale publication request never creates a handoff or a passed publication stage", %{issue: issue} do
@@ -621,12 +638,12 @@ defmodule SymphonyElixir.ExecutionTest do
     refute File.exists?(Path.join(record["directory"], "executor.lock"))
   end
 
-  test "handoff cannot pass while a required label remains with different casing", %{issue: issue} do
+  test "handoff cannot pass unless the native readback confirms the review label", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
 
     client = fn method, path, _, _, _ ->
       if method == "GET" and String.ends_with?(path, "/42") do
-        {:ok, %{status: 200, body: %{"labels" => [%{"name" => "SYMPHONY:READY"}]}}}
+        {:ok, %{status: 200, body: %{"labels" => ["symphony:ready"]}}}
       else
         native_ok(method, path)
       end
@@ -675,7 +692,7 @@ defmodule SymphonyElixir.ExecutionTest do
     assert Execution.journal_root() == root
     assert Execution.run_budget_ms(issue.id) == Config.settings!().agent.run_budget_ms
     refute Execution.handing_off?(issue.id)
-    refute Execution.resumable?(%{issue | labels: ["symphony:retry"]})
+    refute Execution.resumable?(issue)
     assert :ok = Execution.reconcile_delivery(issue, [])
     refute Execution.handoff(%{}, [])["success"]
     {:ok, _, _} = Execution.prepare(issue, [])
@@ -720,7 +737,6 @@ defmodule SymphonyElixir.ExecutionTest do
     options = [issue: issue, tracker_settings: %{kind: "memory"}]
     refute Execution.handoff(%{"kind" => "blocked", "reason" => "Need input"}, options)["success"]
     switch_tracker("memory")
-    assert {:error, :repository_tracker_required} = Execution.prepare(%{issue | labels: ["symphony:retry"]}, [])
     {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => nil, "thread_allocation_intent" => true})
     :ok = RunJournal.complete(record, "completed")
     assert {:error, :uncertain_thread_allocation} = RunJournal.admit(Execution.journal_root(), issue.id)
@@ -855,7 +871,11 @@ defmodule SymphonyElixir.ExecutionTest do
   end
 
   defp native_ok(method, path) do
-    body = if method == "GET" and (String.ends_with?(path, "/comments") or String.ends_with?(path, "/notes")), do: [], else: %{"labels" => []}
+    body =
+      if method == "GET" and (String.ends_with?(path, "/comments") or String.ends_with?(path, "/notes")),
+        do: [],
+        else: %{"labels" => ["symphony:ready", "symphony:review"]}
+
     {:ok, %{status: 200, body: body}}
   end
 end

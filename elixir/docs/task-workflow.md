@@ -3,9 +3,17 @@
 Enable `tracker.provider.task_workflow: true` for GitLab with Codex native Goals.
 Other trackers retain their existing execution contract. Configuration rejects an
 unsupported combination. The five logical states are `ready`, `running`,
-`waiting`, `review` and `ended`; routing still uses `symphony:ready` and the
-one-use `symphony:retry`. Select exactly one ordinary type label:
+`waiting`, `review` and `ended`. Select exactly one ordinary type label:
 `type:research`, `type:development` or `type:mixed`.
+
+People and the engine own different labels. Humans own `symphony:ready`
+(authorization and scheduling, kept while the task is live; removing it revokes
+scheduling), `symphony:rework` (in-scope rework against an existing criterion) and
+`symphony:accept` (accept the current manifest). The engine owns
+`symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed`;
+it never writes a human label, and it repairs its own state label from the journal
+on every poll. Each human label event is consumed once by its native event ID, so
+a label left in place does not act twice.
 
 Repository Issues own scope, deliverables, decisions and acceptance. The existing
 run journal stores decision references, execution restrictions, native identity,
@@ -16,24 +24,36 @@ slots and includes retained tasks without routing labels or with closed Issues.
 
 ## Confirmed agreement
 
-The sole assigned user confirms the first agreement. Its note is the authority
-baseline; later authorization changes require that recorded authorizer. An
-agreement names an acceptor and optional reviewers explicitly delegated to request
-in-scope rework. GitLab membership or an ordinary comment grants no authority.
-
-Decisions are ordinary human-readable Issue notes with this structured trailer:
+The sole assigned user confirms the first agreement with two facts: the
+`symphony:ready` label and a self-checked contract block in the Issue description.
 
 ```html
-<!-- symphony-workflow
-{"action":"authorize","data":{"issue_version":"DESCRIPTION_DIGEST","type":"development","criteria":["result"],"deliverables":[{"id":"code","kind":"mr"}],"acceptor":"123","reviewers":[],"acceptance_mode":"separate","budget_ms":21600000}}
+<!-- symphony-contract
+{"contract_sha":"SHA","type":"development","criteria":["result"],"deliverables":[{"id":"code","kind":"mr"}],"acceptor":"123","reviewers":[],"acceptance_mode":"separate","budget_ms":21600000}
 -->
 ```
 
-`issue_version` is SHA-256 of the JSON-encoded Issue description (UTF-8, compact
-JSON, unescaped Unicode). The description contains the human-confirmed goal,
-scope, permissions and acceptance criteria. IDs in `criteria` and `deliverables`
-refer to that agreement. Research requires reports; development requires MRs;
-mixed tasks require both. `separate` is the default. `merge` is permitted only for
+`contract_sha` is SHA-256 of the remaining JSON object (UTF-8, compact JSON,
+sorted keys, unescaped Unicode). The block authorizes anything only when that
+digest verifies against its own payload, so editing the description invalidates
+the recorded authorization until a human applies `symphony:ready` again. The
+description contains the human-confirmed goal, scope, permissions and acceptance
+criteria. IDs in `criteria` and `deliverables` refer to that agreement. An
+agreement names an acceptor and optional reviewers explicitly delegated to request
+in-scope rework. GitLab membership or an ordinary comment grants no authority.
+Later authorization changes require that recorded authorizer.
+
+Later decisions are ordinary human-readable Issue notes with this structured
+trailer:
+
+```html
+<!-- symphony-workflow
+{"action":"rework","contract":"note:AUTH_ID@AUTH_VERSION","data":{"criteria":["result"],"changes":[]}}
+-->
+```
+
+Research requires reports; development requires MRs; mixed tasks require both.
+`separate` is the default. `merge` is permitted only for
 one MR that completely delivers a development task. Set `close_on_conclusion: true` only when the authorizer explicitly grants native
 Issue closure after valid acceptance or cancellation. Omitted or false leaves
 closure to the human. A stopped execution and successful close readback are
@@ -71,6 +91,11 @@ acceptance evidence cannot grant new permission or prove completion.
 | `manifest` | Authorizer or acceptor; complete delivery data below |
 | `accept` | Acceptor; `manifest` names the submitted manifest reference |
 | `cancel` | Authorizer; nonempty `reason`; cancellation is distinct from acceptance |
+
+`symphony:rework` and `symphony:accept` are the label form of the `rework` and
+`accept` decisions: the engine derives `criteria` from the recorded agreement and
+the manifest from the latest submission, so the labels need no payload. Pause,
+resume, restrict, budget, manifest and cancel still use the note form above.
 
 Unmapped rework or nonempty changes creates a scope restriction. It does not
 expand authorization. Local restrictions leave independent criteria available;
@@ -166,14 +191,16 @@ without restarting an agent. Cleanup is independent of business acceptance.
 
 The first configured limit is frozen into cumulative execution accounting unless
 the authorizer specifies another budget. Active execution, automatic waiting and
-retry backoff charge the task, including across restart. Human pause, decisions,
+rework backoff charge the task, including across restart. Human pause, decisions,
 MR review and overall acceptance stop charging only after native stop confirmation.
 Intervals are settled once; retries and new attempts do not reset consumption.
 Each attempt is capped by both the configured run limit and remaining allowance.
 A backwards wall clock stops work for a decision rather than granting new time.
 Successful handoff/rework attempts do not consume the separate cumulative failure
-retry counter. Two confirmed-stopped transient failures can retry automatically;
-an explicit retry request does not reset that counter or the execution budget.
+counter. One confirmed-stopped transient failure is reworked automatically; the
+next failure becomes a persistent Incident that only a new human decision clears.
+There is no retry label, and a fresh decision does not reset the counter or the
+execution budget.
 
 Cleanup additionally compares current decision-note versions with the last
 observation saved by the engine; a newly arrived or edited decision prevents
@@ -181,10 +208,12 @@ deletion until reconciliation. It never reconstructs a second decision reducer.
 Executor lock receipts bind recovery and release to the recorded attempt/owner;
 a late callback from another scheduler cannot finalize the new execution.
 
-A scheduler-owned label removal is recorded before mutation and verified by native
-readback. Automatic restoration requires the enabling decision, all restrictions
-cleared, unique ownership and confirmed stop. After confirmed stop, scope disputes, exhausted budgets and unclear control
-requests produce a deduplicated Issue notice with the required next action.
+The engine writes only its own state labels, and every write is verified by native
+readback before it is trusted. It never adds or removes a human label; an
+unexplained removal of `symphony:ready` creates an `external_routing` restriction
+that needs an explicit authorizer release. After confirmed stop, scope disputes,
+exhausted budgets and unclear control requests produce a deduplicated Issue notice
+with the required next action.
 Repeated polls and a lost local notice receipt do not repost the request.
 An unexplained external removal creates `external_routing`; it requires an explicit authorizer release and is not
 automatically undone. Every admission and post-hook activation rereads facts.

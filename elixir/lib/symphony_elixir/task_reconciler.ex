@@ -4,6 +4,19 @@ defmodule SymphonyElixir.TaskReconciler do
   alias SymphonyElixir.{Config, Execution, RunJournal, TaskWorkflow}
   alias SymphonyElixir.GitLab.Client
 
+  # Human labels. The engine never writes them: authorization, rework and
+  # acceptance are always human actions, and removing `symphony:ready` revokes
+  # scheduling.
+  @human_labels ["symphony:ready", "symphony:rework", "symphony:accept"]
+  # Engine labels. The engine owns them; people never write them.
+  @engine_labels ["symphony:running", "symphony:review", "symphony:blocked", "symphony:failed"]
+
+  @spec human_labels() :: [String.t()]
+  def human_labels, do: @human_labels
+
+  @spec engine_labels() :: [String.t()]
+  def engine_labels, do: @engine_labels
+
   @spec enabled?() :: boolean()
   def enabled? do
     tracker = Config.settings!().tracker
@@ -96,7 +109,8 @@ defmodule SymphonyElixir.TaskReconciler do
     with {:ok, raw} <- get(client, path, settings),
          true <- raw["web_url"] == record["issue_url"],
          {:ok, notes} <- pages(client, path <> "/notes", settings, 1, []),
-         {:ok, facts, events} <- facts(raw, notes, record, prefix, client, settings) do
+         {:ok, label_events} <- pages(client, path <> "/resource_label_events", settings, 1, []),
+         {:ok, facts, events} <- facts(raw, notes, label_events, record, prefix, client, settings) do
       observation = %{facts: facts, events: events, raw: raw, path: path, settings: settings, client: client}
       {:ok, Map.put(observation, :attempt_id, record["attempt_id"])}
     else
@@ -218,7 +232,7 @@ defmodule SymphonyElixir.TaskReconciler do
       TaskWorkflow.valid_conclusion?(flow) and stopped?(record)
   end
 
-  defp facts(raw, notes, record, prefix, client, settings) do
+  defp facts(raw, notes, label_events, record, prefix, client, settings) do
     owner =
       case raw["assignees"] do
         [%{"id" => id}] -> to_string(id)
@@ -229,12 +243,13 @@ defmodule SymphonyElixir.TaskReconciler do
     type = if length(type) == 1, do: String.replace(hd(type), "type:", ""), else: nil
     now = System.system_time(:millisecond)
     flow = record["workflow"] || TaskWorkflow.new(Execution.run_budget_ms(record["issue_id"]), now)
-    events = events(notes, flow, owner)
+    contract = description_contract(raw["description"])
+    events = label_events(label_events, flow, contract, owner) ++ events(notes, flow, owner)
 
     basic = %{
       "owner" => owner,
       "type" => type,
-      "issue_version" => TaskWorkflow.digest(raw["description"] || ""),
+      "issue_version" => contract && contract["contract_sha"],
       "closed" => raw["state"] == "closed",
       "labels" => raw["labels"],
       "versions" => %{},
@@ -253,6 +268,53 @@ defmodule SymphonyElixir.TaskReconciler do
       {:ok, Map.merge(basic, evidence), events}
     end
   end
+
+  @spec description_contract(String.t() | nil) :: map() | nil
+  def description_contract(description) do
+    with [_, json] <- Regex.run(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
+         {:ok, %{"contract_sha" => sha} = block} when is_binary(sha) <- Jason.decode(json),
+         data = Map.delete(block, "contract_sha"),
+         true <- sha == TaskWorkflow.digest(data) do
+      Map.put(data, "contract_sha", sha)
+    else
+      _ -> nil
+    end
+  end
+
+  @spec label_events([map()], map(), map() | nil, String.t() | nil) :: [map()]
+  def label_events(raw_events, flow, contract, owner) do
+    raw_events
+    |> Enum.filter(&(&1["action"] == "add"))
+    |> Enum.flat_map(&label_event(&1, flow, contract, owner))
+  end
+
+  defp label_event(%{"label" => %{"name" => name}, "id" => id} = raw, flow, contract, owner) do
+    actor = to_string(get_in(raw, ["user", "id"]) || owner)
+    base = %{"id" => "label:#{id}", "ref" => "label:#{id}@#{actor}@#{raw["created_at"]}", "at" => time(raw["created_at"]), "actor" => actor}
+
+    case name do
+      "symphony:ready" ->
+        [base |> Map.put("action", "authorize") |> Map.put("contract", nil) |> Map.put("data", authorize_data(contract))]
+
+      "symphony:rework" ->
+        [base |> Map.put("action", "rework") |> Map.put("contract", contract_ref(flow)) |> Map.put("data", rework_data(flow))]
+
+      "symphony:accept" ->
+        [base |> Map.put("action", "accept") |> Map.put("contract", contract_ref(flow)) |> Map.put("data", %{"manifest" => get_in(flow, ["manifest", "ref"])})]
+
+      _ ->
+        []
+    end
+  end
+
+  defp label_event(_, _, _, _), do: []
+
+  defp contract_ref(flow), do: get_in(flow, ["contract", "ref"])
+
+  defp authorize_data(nil), do: %{}
+  defp authorize_data(contract), do: Map.put(contract, "issue_version", contract["contract_sha"])
+
+  defp rework_data(flow), do: %{"criteria" => get_in(flow, ["contract", "criteria"]) || [], "changes" => []}
 
   @spec events([map()], map(), String.t() | nil) :: [map()]
   def events(notes, flow, owner) do
@@ -428,46 +490,76 @@ defmodule SymphonyElixir.TaskReconciler do
   end
 
   defp routing(record, raw, path, settings, client, active) do
-    flow = record["workflow"]
-    remove = flow["state"] in ["waiting", "review", "ended"]
-    add = restore_routing?(record, active)
-    labels = settings.required_labels ++ ["symphony:retry"]
-    routed = Enum.any?(labels, &(&1 in raw["labels"]))
+    desired = state_labels(record, active)
+    current = raw["labels"] |> List.wrap() |> Enum.filter(&(&1 in @engine_labels))
+    add = desired -- current
+    remove = current -- desired
 
-    cond do
-      remove and routed ->
-        with {:ok, intent} <- RunJournal.checkpoint(record, %{"workflow" => Map.put(flow, "routing_removed", true)}),
-             {:ok, _} <- request(client, "PUT", path, %{"remove_labels" => Enum.join(labels, ",")}, settings),
-             {:ok, current} <- get(client, path, settings),
-             true <- Enum.all?(labels, &(&1 not in current["labels"])) do
-          {:ok, intent}
-        else
-          error -> {:error, {:routing_release_unconfirmed, error}}
-        end
-
-      add and not routed ->
-        with {:ok, _} <- request(client, "PUT", path, %{"add_labels" => Enum.join(settings.required_labels, ",")}, settings),
-             {:ok, current} <- get(client, path, settings),
-             true <- Enum.all?(settings.required_labels, &(&1 in current["labels"])) do
-          # The next admission reads all decisions again, including a racing pause.
-          RunJournal.checkpoint(record, %{"workflow" => Map.put(flow, "routing_removed", false)})
-        else
-          error -> {:error, {:routing_restore_unconfirmed, error}}
-        end
-
-      true ->
+    if add == [] and remove == [] do
+      {:ok, record}
+    else
+      with :ok <- write_state_labels(client, path, settings, add, remove),
+           :ok <- verify_state_labels(client, path, settings, desired, add, remove) do
         {:ok, record}
+      end
     end
   end
 
-  defp restore_routing?(record, active) do
-    flow = record["workflow"]
-
-    not active and flow["state"] == "ready" and flow["routing_removed"] and
-      flow["resume_requested"] and stopped?(record) and retry_admissible?(record)
+  defp write_state_labels(client, path, settings, add, remove) do
+    case request(client, "PUT", path, label_change(add, remove), settings) do
+      {:ok, _} -> :ok
+      error -> {:error, {:state_label_unconfirmed, error}}
+    end
   end
 
-  defp retry_admissible?(record), do: record["phase"] != "incident" or (record["retry_count"] || 0) <= 2
+  defp verify_state_labels(client, path, settings, desired, add, remove) do
+    case get(client, path, settings) do
+      {:ok, %{} = current_issue} ->
+        if observed_engine_labels(current_issue) == Enum.sort(desired) do
+          :ok
+        else
+          {:error, {:state_label_unconfirmed, {current_issue["labels"], desired, add, remove}}}
+        end
+
+      error ->
+        {:error, {:state_label_unconfirmed, error}}
+    end
+  end
+
+  defp label_change(add, remove) do
+    %{}
+    |> then(&if(add == [], do: &1, else: Map.put(&1, "add_labels", Enum.join(add, ","))))
+    |> then(&if(remove == [], do: &1, else: Map.put(&1, "remove_labels", Enum.join(remove, ","))))
+  end
+
+  defp observed_engine_labels(issue) do
+    issue["labels"] |> List.wrap() |> Enum.filter(&(&1 in @engine_labels)) |> Enum.sort()
+  end
+
+  # The engine's own labels always describe the current logical state, so a poll
+  # repairs a stale or missing state label without touching human labels.
+  defp state_labels(%{"phase" => "incident"} = record, _active) do
+    if stopped?(record), do: ["symphony:failed"], else: []
+  end
+
+  defp state_labels(record, active) do
+    flow = record["workflow"] || %{}
+
+    cond do
+      flow["state"] in [nil, "ended"] -> []
+      review_label?(flow) -> ["symphony:review"]
+      flow["state"] == "waiting" -> ["symphony:blocked"]
+      flow["state"] == "running" -> ["symphony:running"]
+      flow["state"] == "ready" and active -> ["symphony:running"]
+      true -> []
+    end
+  end
+
+  defp review_label?(flow), do: flow["state"] == "review" or review_handoff?(flow)
+
+  # A review handoff also waits for the human, but `symphony:review` says so
+  # without reading as a question the human still has to answer.
+  defp review_handoff?(flow), do: get_in(flow, ["restrictions", "handoff", "kind"]) == "review"
 
   defp stopped?(record), do: record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true
 

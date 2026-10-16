@@ -430,8 +430,8 @@ See [repository execution](docs/repository-issues.md) for native Goal sessions, 
 
 Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
 
-Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR, posts the deduplicated review notification and requests the engine-owned `symphony:review` label, without another Agent call. Handoff never writes or removes the human `symphony:ready` authorization label. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
 
 ## Versioned task workflow
 
-GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Enable it only after migrating retained private workflows and their Issue agreements.
+GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels. Enable it only after migrating retained private workflows and their Issue agreements.

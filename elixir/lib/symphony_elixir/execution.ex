@@ -32,7 +32,6 @@ defmodule SymphonyElixir.Execution do
   def prepare(issue, opts) do
     if enabled?() do
       with :ok <- ExecutionBackend.check_record(journal_root(), issue.id),
-           :ok <- consume_retry(issue, opts),
            :ok <- recover_stopped(issue),
            {:ok, record} <- RunJournal.admit(journal_root(), issue.id),
            {:ok, record} <-
@@ -91,20 +90,12 @@ defmodule SymphonyElixir.Execution do
     flow = record["workflow"] || %{}
 
     record["native_stop_confirmed"] == true and flow["resume_requested"] == true and
-      flow["allowed_criteria"] != [] and flow["state"] == "ready" and (record["retry_count"] || 0) <= 2
+      flow["allowed_criteria"] != [] and flow["state"] == "ready"
   end
 
   defp stopped_with_known_allocation?(record) do
     RunJournal.executor_state(record) == :stopped and
       (is_binary(record["thread_id"]) or record["thread_allocation_intent"] != true)
-  end
-
-  defp consume_retry(issue, opts) do
-    if "symphony:retry" in issue.labels do
-      remove_labels(Config.settings!().tracker, issue, ["symphony:retry"], opts)
-    else
-      :ok
-    end
   end
 
   @spec handing_off?(String.t()) :: boolean()
@@ -310,9 +301,9 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp final_phase(_issue, record, result) do
-    # Keep the existing scheduler retry loop for confirmed-stopped transient
-    # failures. Two retries are enough before surfacing the actual incident.
-    if (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true) and (record["retry_count"] || 0) <= 2,
+    # Confirmed-stopped transient failures get exactly one automatic rework
+    # before the Incident is surfaced for a human decision.
+    if (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true) and (record["retry_count"] || 0) <= 1,
       do: {"completed", inspect(result)},
       else: {"incident", inspect(result)}
   end
@@ -322,7 +313,7 @@ defmodule SymphonyElixir.Execution do
 
     if current.state in settings.terminal_states or not Tracker.Issue.routable?(current, settings),
       do: {"completed", nil},
-      else: {"incident", "Goal ended while the Issue still requests execution; inspect the result or add symphony:retry."}
+      else: {"incident", "Goal ended while the Issue still requests execution; review the result and reapply symphony:ready."}
   end
 
   @spec worker_down(String.t(), term()) :: :ok | {:blocked, String.t()}
@@ -363,8 +354,8 @@ defmodule SymphonyElixir.Execution do
     if enabled?() do
       case RunJournal.read(RunJournal.directory(journal_root(), issue.id)) do
         {:ok, %{"phase" => "incident"} = record} ->
-          requested = "symphony:retry" in issue.labels or workflow_recovery?(record)
-          requested and (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true)
+          workflow_recovery?(record) and
+            (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true)
 
         _ ->
           false
@@ -380,7 +371,8 @@ defmodule SymphonyElixir.Execution do
       [
         %{
           "name" => "task_handoff",
-          "description" => "Record a concrete review, decision or blocker on this repository Issue and release its routing label. Does not create a task, merge or close the Issue.",
+          "description" =>
+            "Record a concrete review, decision or blocker on this repository Issue and mark it for review. Never writes a human authorization label; does not create a task, merge or close the Issue.",
           "inputSchema" => %{
             "type" => "object",
             "additionalProperties" => false,
@@ -534,21 +526,19 @@ defmodule SymphonyElixir.Execution do
     body = handoff_body(args)
 
     with {:ok, posted} <- ensure_handoff_notice(client, path <> suffix, settings, body, record),
-         :ok <- remove_labels(settings, issue, settings.required_labels ++ ["symphony:retry"], opts),
+         :ok <- add_labels(settings, issue, ["symphony:review"], opts),
          {:ok, %{status: 200, body: %{} = current}} <- client.("GET", path, %{}, nil, tracker_settings: settings),
-         labels when is_list(labels) <- current["labels"],
-         true <- routing_released?(labels, settings) do
+         true <- "symphony:review" in label_names(current["labels"]) do
       {:ok, posted}
     end
   end
 
   defp post_handoff(_, _, _, _, _), do: {:error, :repository_tracker_required}
 
-  defp routing_released?(labels, settings) do
-    Enum.all?(labels, fn label ->
-      name = if is_map(label), do: label["name"], else: label
-      is_binary(name) and String.downcase(String.trim(name)) not in (settings.required_labels ++ ["symphony:retry"])
-    end)
+  defp label_names(labels) do
+    labels
+    |> List.wrap()
+    |> Enum.map(fn label -> if is_map(label), do: label["name"], else: label end)
   end
 
   defp ensure_handoff_notice(_client, _path, _settings, body, %{"handoff_notice" => previous} = record)
@@ -569,23 +559,21 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
-  defp remove_labels(%{kind: "github"} = settings, issue, labels, opts) do
+  defp add_labels(%{kind: "github"} = settings, issue, labels, opts) do
     {client, path} = client_path(settings, issue, opts)
 
     Enum.reduce_while(labels, :ok, fn label, :ok ->
-      case client.("DELETE", path <> "/labels/" <> URI.encode_www_form(label), %{}, nil, tracker_settings: settings) do
-        {:ok, %{status: status}} when status in 200..299 or status == 404 -> {:cont, :ok}
+      case client.("POST", path <> "/labels", %{}, %{"labels" => [label]}, tracker_settings: settings) do
+        {:ok, %{status: status}} when status in 200..299 -> {:cont, :ok}
         error -> {:halt, {:error, error}}
       end
     end)
   end
 
-  defp remove_labels(%{kind: "gitlab"} = settings, issue, labels, opts) do
+  defp add_labels(%{kind: "gitlab"} = settings, issue, labels, opts) do
     {client, path} = client_path(settings, issue, opts)
-    response(client.("PUT", path, %{}, %{"remove_labels" => Enum.join(labels, ",")}, tracker_settings: settings))
+    response(client.("PUT", path, %{}, %{"add_labels" => Enum.join(labels, ",")}, tracker_settings: settings))
   end
-
-  defp remove_labels(_, _, _, _), do: {:error, :repository_tracker_required}
 
   defp client_path(%{kind: "github"} = settings, issue, opts),
     do: {opts[:github_client] || (&SymphonyElixir.GitHub.Client.request/5), "/repos/#{settings.provider["repo"]}/issues/#{issue.id}"}

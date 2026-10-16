@@ -86,7 +86,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     owner = get_in(flow, ["contract", "authorizer"]) || facts["owner"]
 
     if event["actor"] == owner and valid_contract?(data, facts) and newer?(event, flow["contract"]) do
-      fields = ["issue_version", "type", "criteria", "deliverables", "acceptance_mode", "acceptor", "reviewers", "deadline", "close_on_conclusion"]
+      fields = ["issue_version", "contract_sha", "type", "criteria", "deliverables", "acceptance_mode", "acceptor", "reviewers", "deadline", "close_on_conclusion"]
       contract = Map.take(data, fields)
       contract = Map.merge(contract, Map.put(order(event), "authorizer", owner))
       updated = %{flow | "contract" => contract, "manifest" => nil, "acceptance" => nil, "budget_ms" => data["budget_ms"] || flow["budget_ms"]}
@@ -201,7 +201,9 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp record_cancellation(flow, _), do: flow
 
   defp valid_contract?(data, facts) do
-    baseline = data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"]
+    baseline =
+      data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"] and
+        data["contract_sha"] == digest(Map.drop(data, ["contract_sha", "issue_version"]))
 
     baseline and valid_controls?(data) and nonempty_strings?(data["criteria"]) and
       valid_deliverables?(data["deliverables"], data["type"]) and valid_mode?(data)
@@ -301,7 +303,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
     if criteria != [] and Enum.all?(criteria, &(&1 in flow["contract"]["criteria"])) and data["changes"] == [] do
       updated = flow |> Map.put("manifest", nil) |> Map.put("acceptance", nil) |> clear("handoff") |> Map.put("delivery_order", order(event))
-      {Map.put(updated, "resume_requested", true), "in_scope_rework"}
+      {updated |> Map.put("resume_requested", true) |> Map.put("routing_removed", false), "in_scope_rework"}
     else
       {restrict(flow, event["ref"], "scope", restriction_scope(data["scope"], flow), event), "scope_confirmation_required"}
     end
