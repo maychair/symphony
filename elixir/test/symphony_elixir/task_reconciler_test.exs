@@ -953,6 +953,25 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert record["workflow"]["restrictions"]["handoff"]["kind"] == "decision"
   end
 
+  test "an answering resume also releases the pause it follows", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    append(server, reply(50, "Please pause this task.", 1, "2026-10-16T00:00:02Z"))
+
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "decision", "reason" => "Pick a fixture."}, handoff_opts)["success"]
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "waiting"
+
+    append(server, reply(96, "Please resume this task."))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+
+    assert record["workflow"]["state"] == "ready"
+    refute record["workflow"]["restrictions"]["handoff"]
+    refute Enum.any?(record["workflow"]["restrictions"], fn {_, restriction} -> restriction["kind"] == "pause" end)
+  end
+
   test "a comment in the question's own second answers only after the notice note", %{issue: issue, server: server, client: client} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]

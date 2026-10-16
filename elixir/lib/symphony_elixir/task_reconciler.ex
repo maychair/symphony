@@ -359,11 +359,12 @@ defmodule SymphonyElixir.TaskReconciler do
 
   defp bind_natural(event, _, _, _), do: event
 
-  # The restrictions a natural note releases: an answer releases the decision
-  # that asked for it, `resume` releases its own pauses. Only a note that
-  # follows the question is an answer, so an older resume cannot release a
-  # decision raised after it.
-  defp natural_restrictions(%{"answer" => true}, _parsed, flow), do: decision_handoff(flow)
+  # The restrictions a natural note releases: an answer resumes the task, so it
+  # releases the decision that asked for it and the pauses that precede it. Only
+  # a note that follows the question is an answer, so an older resume cannot
+  # release a decision raised after it.
+  defp natural_restrictions(%{"answer" => true} = event, parsed, flow),
+    do: pause_releases(event, parsed, flow) ++ decision_handoff(flow)
 
   defp natural_restrictions(event, parsed, flow), do: pause_releases(event, parsed, flow)
 
