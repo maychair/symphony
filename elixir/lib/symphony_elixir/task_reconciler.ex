@@ -10,12 +10,22 @@ defmodule SymphonyElixir.TaskReconciler do
   @human_labels ["symphony:ready", "symphony:rework", "symphony:accept"]
   # Engine labels. The engine owns them; people never write them.
   @engine_labels ["symphony:running", "symphony:review", "symphony:blocked", "symphony:failed"]
+  # Engine notices carry a hidden marker. The engine currently writes through the
+  # same credentials as the human, so the marker is what tells its own question
+  # apart from the owner's answer.
+  @engine_notice_marker "<!-- symphony-engine-notice -->"
 
   @spec human_labels() :: [String.t()]
   def human_labels, do: @human_labels
 
   @spec engine_labels() :: [String.t()]
   def engine_labels, do: @engine_labels
+
+  @spec engine_notice_marker() :: String.t()
+  def engine_notice_marker, do: @engine_notice_marker
+
+  @spec engine_notice?(map()) :: boolean()
+  def engine_notice?(note), do: String.contains?(note["body"] || "", @engine_notice_marker)
 
   @spec enabled?() :: boolean()
   def enabled? do
@@ -190,7 +200,7 @@ defmodule SymphonyElixir.TaskReconciler do
         _ -> ""
       end
 
-    "**Symphony 需要确认**\n\n" <> message <> source
+    "**Symphony 需要确认**\n\n" <> message <> source <> "\n\n" <> @engine_notice_marker
   end
 
   defp post_wait_notice(notes, body, path, settings, client) do
@@ -325,7 +335,14 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec events([map()], map(), String.t() | nil) :: [map()]
   def events(notes, flow, owner) do
-    parsed = notes |> Enum.reject(&(&1["system"] == true)) |> Enum.map(&parse_note/1) |> Enum.reject(&is_nil/1)
+    asked_at = question_at(notes)
+
+    parsed =
+      notes
+      |> Enum.reject(&(&1["system"] == true))
+      |> Enum.map(&parse_note(&1, flow, owner, asked_at))
+      |> Enum.reject(&is_nil/1)
+
     contracts = Enum.filter(parsed, &(&1["action"] == "authorize" and &1["actor"] == (get_in(flow, ["contract", "authorizer"]) || owner)))
 
     Enum.map(parsed, &bind_natural(&1, contracts, parsed, flow))
@@ -333,17 +350,27 @@ defmodule SymphonyElixir.TaskReconciler do
 
   defp bind_natural(%{"natural" => true} = event, contracts, parsed, flow) do
     contract = contracts |> Enum.filter(&(&1["at"] <= event["at"])) |> Enum.max_by(& &1["at"], fn -> flow["contract"] end)
-    ids = (flow["restrictions"] || %{}) |> Enum.filter(fn {_, value} -> value["kind"] == "pause" end) |> Enum.map(&elem(&1, 0))
-    ids = ids ++ (parsed |> Enum.filter(&(&1["action"] == "pause" and &1["at"] <= event["at"])) |> Enum.map(& &1["ref"]))
+    ids = natural_restrictions(event, parsed, flow)
     event |> Map.put("contract", contract && contract["ref"]) |> Map.update!("data", &Map.put(&1, "restrictions", Enum.uniq(ids)))
   end
 
   defp bind_natural(event, _, _, _), do: event
 
-  defp parse_note(note) do
+  # An answer releases the decision that asked for it. A standalone resume note
+  # keeps its narrower pause-only meaning.
+  defp natural_restrictions(%{"answer" => true}, _parsed, flow) do
+    if get_in(flow, ["restrictions", "handoff", "kind"]) == "decision", do: ["handoff"], else: []
+  end
+
+  defp natural_restrictions(event, parsed, flow) do
+    ids = (flow["restrictions"] || %{}) |> Enum.filter(fn {_, value} -> value["kind"] == "pause" end) |> Enum.map(&elem(&1, 0))
+    ids ++ (parsed |> Enum.filter(&(&1["action"] == "pause" and &1["at"] <= event["at"])) |> Enum.map(& &1["ref"]))
+  end
+
+  defp parse_note(note, flow, owner, asked_at) do
     body = note["body"] || ""
 
-    payload = note_payload(body)
+    payload = note_payload(body) || answer_payload(note, flow, owner, asked_at)
 
     if is_map(payload) and is_map(payload["data"] || %{}) do
       version = note_version(note)
@@ -352,15 +379,38 @@ defmodule SymphonyElixir.TaskReconciler do
         "id" => note["id"],
         "version" => version,
         "ref" => "note:#{note["id"]}@#{version}",
-        "at" => time(note["updated_at"] || note["created_at"]),
+        "at" => note_at(note),
         "actor" => to_string(get_in(note, ["author", "id"])),
         "action" => payload["action"],
         "contract" => payload["contract"],
         "data" => payload["data"] || %{},
-        "natural" => payload["natural"] == true
+        "natural" => payload["natural"] == true,
+        "answer" => payload["answer"] == true
       }
     end
   end
+
+  # A blocking question is answered in the Issue itself: while the agent's
+  # handoff holds a task-scope decision restriction, the owner's first comment
+  # after the question reached the Issue is the answer. Anchoring on an engine
+  # notice keeps an earlier comment from answering a question it predates, and
+  # the notice marker keeps the engine from answering its own question.
+  defp answer_payload(note, flow, owner, asked_at) do
+    handoff = get_in(flow, ["restrictions", "handoff"])
+
+    if is_integer(asked_at) and is_map(handoff) and handoff["kind"] == "decision" and
+         is_binary(owner) and to_string(get_in(note, ["author", "id"])) == owner and
+         not engine_notice?(note) and note_at(note) >= asked_at do
+      %{"action" => "resume", "natural" => true, "answer" => true}
+    end
+  end
+
+  # The newest engine notice is when the pending question reached the Issue.
+  defp question_at(notes) do
+    notes |> Enum.filter(&engine_notice?/1) |> Enum.map(&note_at/1) |> Enum.max(fn -> nil end)
+  end
+
+  defp note_at(note), do: time(note["updated_at"] || note["created_at"])
 
   defp note_payload(body) do
     case Regex.run(~r/(?:^|\n)<!-- symphony-workflow\s+(\{.*?\})\s*-->\s*$/s, body) do

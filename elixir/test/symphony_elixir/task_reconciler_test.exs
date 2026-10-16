@@ -149,6 +149,14 @@ defmodule SymphonyElixir.TaskReconcilerTest do
   end
 
   defp append(server, note), do: Agent.update(server, &%{&1 | notes: &1.notes ++ [note]})
+
+  # Engine notices are posted at the current time, so a comment that answers one
+  # has to be later than that.
+  defp reply(id, body, actor \\ 1, at \\ nil) do
+    at = at || DateTime.to_iso8601(DateTime.add(DateTime.utc_now(), 60))
+    %{"id" => id, "body" => body, "author" => %{"id" => actor}, "created_at" => at, "updated_at" => at}
+  end
+
   defp current(record), do: elem(RunJournal.read(record["directory"]), 1)
 
   defp write_lock_owner(record) do
@@ -800,5 +808,72 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute record["thread_id"]
     refute record["blocker_reason"]
     refute File.exists?(Path.join(record["directory"], "executor.lock"))
+  end
+
+  test "a decision handoff is answered by the owner's first later comment", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "decision", "reason" => "Which fixture should the replay use?"}, handoff_opts)["success"]
+
+    # The question is an engine notice written with the same credentials as the
+    # owner, so its marker is what keeps it from answering itself.
+    question = Enum.find(Agent.get(server, & &1.notes), &(&1["body"] =~ "**decision**"))
+    assert question["author"]["id"] == 1
+    assert TaskReconciler.engine_notice?(question)
+
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "waiting"
+    assert record["workflow"]["restrictions"]["handoff"]["kind"] == "decision"
+    assert "symphony:blocked" in Agent.get(server, & &1.raw["labels"])
+
+    append(server, reply(92, "I agree with that plan.", 3))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "waiting"
+
+    append(server, reply(93, "Use the replay fixture."))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "ready"
+    refute record["workflow"]["restrictions"]["handoff"]
+    assert record["workflow"]["resume_requested"]
+    assert record["workflow"]["allowed_criteria"] == ["a", "b"]
+    refute "symphony:blocked" in Agent.get(server, & &1.raw["labels"])
+
+    assert :ok = Execution.finish(issue, opts, {:error, {:native_goal_stopped, "blocked"}})
+    assert {:ok, _, resumed} = Execution.prepare(issue, [])
+    assert resumed[:run_record]["thread_id"] == "native"
+  end
+
+  test "an earlier owner comment and the engine notice never answer the question", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    append(server, reply(70, "Nice progress so far.", 1, "2026-10-16T00:00:05Z"))
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "decision", "reason" => "Pick a fixture."}, handoff_opts)["success"]
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    refute record["workflow"]["resume_requested"]
+    assert record["workflow"]["state"] == "waiting"
+    assert record["workflow"]["restrictions"]["handoff"]["kind"] == "decision"
+  end
+
+  test "a review handoff keeps waiting for an explicit human label", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "review", "reason" => "Review the delivery."}, handoff_opts)["success"]
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "waiting"
+    assert "symphony:review" in Agent.get(server, & &1.raw["labels"])
+
+    append(server, reply(94, "Looks good to me."))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "waiting"
+    assert record["workflow"]["restrictions"]["handoff"]["kind"] == "review"
+    refute record["workflow"]["resume_requested"]
   end
 end
