@@ -914,4 +914,20 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert record["workflow"]["resume_requested"]
     refute "symphony:blocked" in Agent.get(server, & &1.raw["labels"])
   end
+
+  test "only the sole assignee's later comment parses as the answer to a decision" do
+    asked = "2026-10-16T00:00:01Z"
+    answered = "2026-10-16T00:00:02Z"
+    flow = %{"contract" => nil, "restrictions" => %{"handoff" => %{"kind" => "decision"}}}
+
+    notes = [
+      reply(1, "**Symphony 需要确认**\n\nPick a fixture.\n\n" <> TaskReconciler.engine_notice_marker(), 1, asked),
+      reply(2, "Looks fine to me.", 9, answered),
+      reply(3, "Use the replay fixture.", 1, answered)
+    ]
+
+    # The reducer also refuses a stranger's resume, so this pins the parse
+    # itself: the engine notice and the other author produce no event.
+    assert TaskReconciler.events(notes, flow, "1") |> Enum.map(& &1["id"]) == [3]
+  end
 end
