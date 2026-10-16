@@ -704,6 +704,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
 
     receive do
+      :symphony_stop when is_map_key(tool_executor, :goal_mode) ->
+        {:error, :scheduler_stop}
+
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
         handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)

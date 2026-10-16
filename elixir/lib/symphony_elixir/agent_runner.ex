@@ -39,7 +39,7 @@ defmodule SymphonyElixir.AgentRunner do
            Tracker.prepare_run(issue, Keyword.put(opts, :worker_host, worker_host)),
          result <- run_on_worker_host(prepared_issue, codex_update_recipient, prepared_opts, worker_host),
          :ok <- Tracker.finish_run(prepared_issue, prepared_opts, result),
-         :ok <- result do
+         :ok <- worker_result(result) do
       :ok
     else
       {:error, reason} ->
@@ -129,6 +129,9 @@ defmodule SymphonyElixir.AgentRunner do
       end
     end
   end
+
+  defp worker_result({:error, :scheduler_stop}), do: :ok
+  defp worker_result(result), do: result
 
   defp native_goal?(AppServer, _opts), do: Execution.enabled?()
   defp native_goal?(_backend, _opts), do: false

@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @execution_stop_grace_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -201,6 +202,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  def handle_info({:execution_stop_timeout, issue_id, ref}, state) do
+    case Map.get(state.running, issue_id) do
+      %{ref: ^ref, pid: pid, stop_requested: true} ->
+        stop_running_task(pid, ref, state.task_supervisor)
+        handle_info({:DOWN, ref, :process, pid, :scheduler_stop_timeout}, state)
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
@@ -220,6 +232,11 @@ defmodule SymphonyElixir.Orchestrator do
       {:blocked, message} -> block_issue_from_entry(state, issue_id, running_entry, message)
       :ok -> handle_provider_agent_down(reason, state, issue_id, running_entry, session_id)
     end
+  end
+
+  defp handle_provider_agent_down(_reason, state, issue_id, %{stop_requested: true} = entry, _session_id) do
+    if Map.get(entry, :cleanup_workspace, false), do: cleanup_issue_workspace(entry.issue, entry)
+    release_issue_claim(state, issue_id)
   end
 
   defp handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -443,12 +460,12 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        stop_reconciled_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        stop_reconciled_issue(state, issue.id, false)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -456,7 +473,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        stop_reconciled_issue(state, issue.id, false)
     end
   end
 
@@ -509,11 +526,11 @@ defmodule SymphonyElixir.Orchestrator do
       |> MapSet.new()
 
     Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
-      if MapSet.member?(visible_issue_ids, issue_id) do
+      if MapSet.member?(visible_issue_ids, issue_id) or Execution.handing_off?(issue_id) do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        stop_reconciled_issue(state_acc, issue_id, false)
       end
     end)
   end
@@ -572,6 +589,25 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         state
+    end
+  end
+
+  # Keep the worker as the journal's sole writer until native shutdown is confirmed.
+  defp stop_reconciled_issue(%State{} = state, issue_id, cleanup_workspace) do
+    entry = Map.get(state.running, issue_id)
+
+    if Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex" and
+         is_map(entry) and is_pid(entry[:pid]) and Process.alive?(entry.pid) and
+         not SymphonyElixir.MailReview.job?(entry[:issue]) do
+      unless entry[:stop_requested] do
+        send(entry.pid, :symphony_stop)
+        Process.send_after(self(), {:execution_stop_timeout, issue_id, entry.ref}, @execution_stop_grace_ms)
+      end
+
+      entry = Map.merge(entry, %{stop_requested: true, cleanup_workspace: cleanup_workspace or Map.get(entry, :cleanup_workspace, false)})
+      %{state | running: Map.put(state.running, issue_id, entry)}
+    else
+      terminate_running_issue(state, issue_id, cleanup_workspace)
     end
   end
 

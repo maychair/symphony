@@ -120,6 +120,12 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
+  defp final_phase(_issue, record, {:error, :scheduler_stop}) do
+    if record["native_stop_confirmed"] == true,
+      do: {"completed", nil},
+      else: {"incident", "Scheduler requested shutdown, but the native Goal could not be confirmed stopped."}
+  end
+
   defp final_phase(issue, record, :ok) do
     if record["handoff"] do
       {"completed", nil}
@@ -157,14 +163,22 @@ defmodule SymphonyElixir.Execution do
 
         {:ok, %{"phase" => phase} = record} when phase != "completed" ->
           message = "Execution interrupted at #{phase}: #{inspect(reason)}"
-          RunJournal.checkpoint(record, %{"phase" => "incident", "blocker_reason" => message})
-          {:blocked, message}
+          finish_interrupted(record, message)
 
         _ ->
           :ok
       end
     else
       :ok
+    end
+  end
+
+  defp finish_interrupted(record, message) do
+    with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => message}),
+         :ok <- RunJournal.complete(updated, "incident") do
+      {:blocked, message}
+    else
+      error -> {:blocked, "Cannot finalize interrupted execution: #{inspect(error)}"}
     end
   end
 

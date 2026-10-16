@@ -29,6 +29,8 @@ the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
+In native Goal mode, it retains the running entry until the worker confirms native
+shutdown and finalizes the durable journal; an unconfirmed stop remains an incident.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked

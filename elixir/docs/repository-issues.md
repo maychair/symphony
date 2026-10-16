@@ -29,6 +29,17 @@ closing references on a PR/MR when merge satisfies the complete task; otherwise
 close only after all agreed acceptance conditions have been met. Dependency links
 remain repository content; automatic dependency scheduling is not implemented.
 
+When polling observes a terminal, unrouted or no-longer-visible Issue during a
+native Goal, the scheduler requests cooperative shutdown and keeps its running
+entry and claim until the worker exits. The worker blocks the Goal, interrupts
+its active turn, verifies that turn has stopped, then completes the journal and
+releases the executor lock. An unconfirmed native stop is an incident, not a
+successful completion. If shutdown has not finished after 60 seconds, the scheduler
+stops the worker and records an incident with the executor lock released; it does
+not infer that the native Goal stopped. Completion here ends the execution attempt,
+not the repository task. This shutdown is independent of the automatic retry limit;
+ordinary turn completion and review handoffs retain their existing behavior.
+
 Native REST tools can read and update existing Issues. They reject Issue creation;
 creation requires explicit user authorization through the operator's task entry.
 The optional MR mail-review lane uses its own execution journal and does not create
