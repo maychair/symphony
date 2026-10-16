@@ -876,4 +876,42 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert record["workflow"]["restrictions"]["handoff"]["kind"] == "review"
     refute record["workflow"]["resume_requested"]
   end
+
+  test "a reply that quotes the engine notice still answers the question", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "decision", "reason" => "Pick a fixture."}, handoff_opts)["success"]
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+
+    # Quoting the notice carries its marker into the reply, but the reply does not
+    # end with it, so the owner still answers the question.
+    quoted = Enum.find(Agent.get(server, & &1.notes), &TaskReconciler.engine_notice?/1)["body"]
+    quote_only = Enum.map_join(String.split(quoted, "\n"), "\n", &("> " <> &1))
+    append(server, reply(95, quote_only <> "\n\nUse the replay fixture."))
+
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "ready"
+    refute record["workflow"]["restrictions"]["handoff"]
+  end
+
+  test "a standalone resume note answers a decision handoff", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    assert Execution.handoff(%{"kind" => "decision", "reason" => "Pick a fixture."}, handoff_opts)["success"]
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"thread_id" => "native", "thread_allocation_intent" => true, "native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+
+    # Several comments can arrive before the next poll; the first one answers.
+    append(server, reply(96, "Please resume this task."))
+    append(server, reply(97, "Use the replay fixture."))
+
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert record["workflow"]["state"] == "ready"
+    refute record["workflow"]["restrictions"]["handoff"]
+    assert record["workflow"]["resume_requested"]
+    refute "symphony:blocked" in Agent.get(server, & &1.raw["labels"])
+  end
 end

@@ -25,7 +25,7 @@ defmodule SymphonyElixir.TaskReconciler do
   def engine_notice_marker, do: @engine_notice_marker
 
   @spec engine_notice?(map()) :: boolean()
-  def engine_notice?(note), do: String.contains?(note["body"] || "", @engine_notice_marker)
+  def engine_notice?(note), do: String.ends_with?(String.trim_trailing(note["body"] || ""), @engine_notice_marker)
 
   @spec enabled?() :: boolean()
   def enabled? do
@@ -356,15 +356,24 @@ defmodule SymphonyElixir.TaskReconciler do
 
   defp bind_natural(event, _, _, _), do: event
 
-  # An answer releases the decision that asked for it. A standalone resume note
-  # keeps its narrower pause-only meaning.
-  defp natural_restrictions(%{"answer" => true}, _parsed, flow) do
-    if get_in(flow, ["restrictions", "handoff", "kind"]) == "decision", do: ["handoff"], else: []
-  end
+  # The restrictions a natural note releases: an answer releases the decision
+  # that asked for it, `resume` releases both that decision and its pauses.
+  defp natural_restrictions(%{"answer" => true}, _parsed, flow), do: decision_handoff(flow)
 
-  defp natural_restrictions(event, parsed, flow) do
+  # `resume` and an answer say the same thing, so both release the decision that
+  # is waiting for the human.
+  defp natural_restrictions(%{"action" => "resume"} = event, parsed, flow),
+    do: pause_releases(event, parsed, flow) ++ decision_handoff(flow)
+
+  defp natural_restrictions(event, parsed, flow), do: pause_releases(event, parsed, flow)
+
+  defp pause_releases(event, parsed, flow) do
     ids = (flow["restrictions"] || %{}) |> Enum.filter(fn {_, value} -> value["kind"] == "pause" end) |> Enum.map(&elem(&1, 0))
     ids ++ (parsed |> Enum.filter(&(&1["action"] == "pause" and &1["at"] <= event["at"])) |> Enum.map(& &1["ref"]))
+  end
+
+  defp decision_handoff(flow) do
+    if get_in(flow, ["restrictions", "handoff", "kind"]) == "decision", do: ["handoff"], else: []
   end
 
   defp parse_note(note, flow, owner, asked_at) do
