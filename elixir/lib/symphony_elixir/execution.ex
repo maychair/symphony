@@ -594,7 +594,9 @@ defmodule SymphonyElixir.Execution do
     do: {opts[:gitlab_client] || (&SymphonyElixir.GitLab.Client.request/5), "/projects/#{URI.encode_www_form(settings.provider["project_path"])}/issues/#{issue.id}"}
 
   defp handoff_body(args) do
-    body = "**#{args["kind"]}**\n\n#{args["reason"]}" <> if(args["url"], do: "\n\n#{args["url"]}", else: "")
+    body =
+      ("**#{args["kind"]}**\n\n#{args["reason"]}" <> if(args["url"], do: "\n\n#{args["url"]}", else: ""))
+      |> String.replace("<", "&lt;")
 
     case args["manifest"] do
       nil ->
@@ -602,7 +604,7 @@ defmodule SymphonyElixir.Execution do
 
       manifest ->
         decision = %{"action" => "manifest", "contract" => manifest["contract"], "data" => manifest}
-        summary = Enum.map_join(manifest["items"], "\n", &"- [#{&1["id"]}](#{&1["url"]})")
+        summary = Enum.map_join(manifest["items"], "\n", &"- [#{&1["id"]}](#{&1["url"]})") |> String.replace("<", "&lt;")
 
         body <>
           "\n\n全部约定成果已提交；请先完成尚未合入 MR 的审查与合并，再按此清单完成整体验收：\n\n" <>
