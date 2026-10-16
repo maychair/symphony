@@ -6,8 +6,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
-  alias SymphonyElixir.Beads.{Adapter, RunJournal}
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Execution, RunJournal}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -17,10 +16,8 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec run(Conn.t(), map()) :: Conn.t()
   def run(conn, %{"issue_identifier" => id}) do
-    settings = Config.settings!().tracker
-
-    if settings.kind == "beads" do
-      directory = RunJournal.directory(Adapter.journal_root(settings), id)
+    if Execution.enabled?() do
+      directory = RunJournal.directory(Execution.journal_root(), id)
 
       case RunJournal.read(directory) do
         {:ok, %{} = record} ->
@@ -28,16 +25,14 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
             conn,
             Map.take(record, [
               "issue_id",
+              "issue_url",
               "phase",
               "attempt_id",
               "attempt_count",
-              "repair_count",
               "thread_id",
               "turn_id",
-              "delivery",
-              "remote_state",
-              "validation_policy",
-              "validation_receipt",
+              "handoff",
+              "blocker_reason",
               "updated_at",
               "events"
             ])

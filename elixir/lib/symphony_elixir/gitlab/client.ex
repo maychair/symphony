@@ -216,7 +216,9 @@ defmodule SymphonyElixir.GitLab.Client do
     |> Map.new()
   end
 
-  defp assignee_id(%{"assignees" => [assignee | _]}) when is_map(assignee), do: assignee_id(assignee)
+  defp assignee_id(%{"assignees" => [assignee]}) when is_map(assignee), do: assignee_id(assignee)
+
+  defp assignee_id(%{"assignees" => _}), do: nil
 
   defp assignee_id(%{"assignee" => assignee}) when is_map(assignee), do: assignee_id(assignee)
 
@@ -301,7 +303,7 @@ defmodule SymphonyElixir.GitLab.Client do
     api_key = resolve_setting(provider["api_key"], System.get_env("GITLAB_PAT"))
 
     cond do
-      not valid_api_url?(api_url) ->
+      not (valid_api_url?(api_url) or (provider["allow_insecure_http"] == true and match?(%URI{scheme: "http", host: host} when is_binary(host), URI.parse(api_url)))) ->
         {:error, :invalid_gitlab_api_url}
 
       not present_string?(project_path) ->

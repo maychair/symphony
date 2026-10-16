@@ -33,12 +33,14 @@ defmodule SymphonyElixir.Application do
   @doc false
   @spec start_runtime() :: Supervisor.on_start()
   def start_runtime do
+    :ok = SymphonyElixir.BuildInfo.capture()
     :ok = SymphonyElixir.LogFile.configure()
 
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.AgentRuntimeSupervisor,
+      SymphonyElixir.MailReview.Listener,
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard
     ]

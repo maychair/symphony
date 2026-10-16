@@ -59,6 +59,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
     client_opts = Keyword.take(opts, [:tracker_settings])
 
     with {:ok, method, path, params, body} <- normalize_arguments(arguments),
+         :ok <- allow_request(method, path),
          {:ok, %{status: status, body: response_body}} <-
            github_client.(method, path, params, body, client_opts),
          true <- is_integer(status) do
@@ -68,6 +69,14 @@ defmodule SymphonyElixir.GitHub.AgentTool do
       _ -> failure_response(tool_error_payload(:github_unknown_payload))
     end
   end
+
+  defp allow_request("POST", path) do
+    if Regex.match?(~r{^/repos/[^/]+/[^/]+/issues/?$}, URI.decode(path |> String.split("?") |> hd())),
+      do: {:error, :issue_creation_requires_explicit_user_permission_use_repo_issue_cli},
+      else: :ok
+  end
+
+  defp allow_request(_, _), do: :ok
 
   defp normalize_arguments(arguments) when is_map(arguments) do
     with {:ok, method} <- normalize_method(Map.get(arguments, "method")),

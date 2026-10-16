@@ -119,7 +119,12 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      Tracker.validate_config(settings.tracker)
+      backend = System.get_env("SYMPHONY_EXECUTION_BACKEND") || settings.agent.backend
+
+      with true <- backend in ["codex", "omp"] || {:error, :invalid_execution_backend},
+           :ok <- Tracker.validate_config(settings.tracker) do
+        SymphonyElixir.MailReview.validate_config(settings.tracker)
+      end
     end
   end
 

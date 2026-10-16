@@ -8,10 +8,10 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.MailReview.Listener
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
-    "beads" => SymphonyElixir.Beads.Adapter,
     "asana" => SymphonyElixir.Asana.Adapter,
     "github" => SymphonyElixir.GitHub.Adapter,
     "gitlab" => SymphonyElixir.GitLab.Adapter,
@@ -43,13 +43,19 @@ defmodule SymphonyElixir.Tracker do
   @spec prepare_run(Issue.t(), keyword()) :: {:ok, Issue.t(), keyword()} | {:error, term()}
   def prepare_run(issue, opts) do
     selected = adapter()
-    optional(selected, :prepare_run, [issue, Keyword.put(opts, :tracker_adapter, selected)], {:ok, issue, opts})
+
+    with {:ok, issue, opts} <- optional(selected, :prepare_run, [issue, Keyword.put(opts, :tracker_adapter, selected)], {:ok, issue, opts}) do
+      SymphonyElixir.Execution.prepare(issue, opts)
+    end
   end
 
   @spec finish_run(Issue.t(), keyword(), term()) :: :ok | {:error, term()}
   def finish_run(issue, opts, result) do
     selected = opts[:tracker_adapter] || adapter()
-    optional(selected, :finish_run, [issue, opts, result], :ok)
+
+    with :ok <- SymphonyElixir.Execution.finish(issue, opts, result) do
+      optional(selected, :finish_run, [issue, opts, result], :ok)
+    end
   end
 
   defp optional(adapter, callback, args, fallback) do
@@ -62,12 +68,24 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
-    adapter().fetch_issues_by_states(states)
+    with {:ok, issues} <- adapter().fetch_issues_by_states(states),
+         {:ok, reviews} <- review_issues() do
+      {:ok, Enum.reject(issues, &("symphony-review" in &1.labels)) ++ Enum.filter(reviews, &(&1.state in states))}
+    end
   end
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
-    adapter().fetch_issues_by_ids(issue_ids)
+    {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "mail-review:"))
+
+    with {:ok, issues} <- adapter().fetch_issues_by_ids(normal_ids),
+         {:ok, reviews} <- review_issues() do
+      {:ok, Enum.reject(issues, &("symphony-review" in &1.labels)) ++ Enum.filter(reviews, &(&1.id in review_ids))}
+    end
+  end
+
+  defp review_issues do
+    if SymphonyElixir.MailReview.enabled?() and Process.whereis(SymphonyElixir.MailReview.Listener), do: Listener.issues(), else: {:ok, []}
   end
 
   @doc """
@@ -84,7 +102,7 @@ defmodule SymphonyElixir.Tracker do
       agent_environment: optional(adapter, :agent_environment, [tracker_settings], %{}),
       adapter: adapter,
       tracker_settings: tracker_settings,
-      tool_specs: adapter_agent_tool_specs(adapter),
+      tool_specs: adapter_agent_tool_specs(adapter) ++ SymphonyElixir.Execution.tool_specs(),
       secret_environment_names: adapter_secret_environment_names(adapter, tracker_settings)
     }
   end
@@ -96,12 +114,16 @@ defmodule SymphonyElixir.Tracker do
         arguments,
         opts \\ []
       ) do
-    execute_agent_tool_with_adapter(
-      adapter,
-      tool,
-      arguments,
-      Keyword.put(opts, :tracker_settings, tracker_settings)
-    )
+    if tool == "task_handoff" do
+      SymphonyElixir.Execution.handoff(arguments, Keyword.put(opts, :tracker_settings, tracker_settings))
+    else
+      execute_agent_tool_with_adapter(
+        adapter,
+        tool,
+        arguments,
+        Keyword.put(opts, :tracker_settings, tracker_settings)
+      )
+    end
   end
 
   @spec validate_config(map()) :: :ok | {:error, term()}

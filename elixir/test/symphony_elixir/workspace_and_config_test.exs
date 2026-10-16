@@ -440,6 +440,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
   end
 
+  test "repository routing requires the configured owner as well as labels" do
+    for kind <- ["gitlab", "github"] do
+      tracker = %{kind: kind, required_labels: ["symphony:ready"], assignee: "20"}
+      issue = %Issue{labels: ["symphony:ready"], dispatchable: true, assignee_id: "20"}
+      assert Issue.routable?(issue, tracker)
+      refute Issue.routable?(%{issue | assignee_id: nil}, tracker)
+      refute Issue.routable?(%{issue | assignee_id: "21"}, tracker)
+      refute Issue.routable?(%{issue | labels: []}, tracker)
+      refute Issue.routable?(%{issue | dispatchable: false}, tracker)
+      refute Issue.routable?(issue, %{tracker | assignee: ""})
+    end
+  end
+
   test "linear client normalizes blockers from inverse relations" do
     raw_issue = %{
       "id" => "issue-1",

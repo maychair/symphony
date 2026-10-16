@@ -17,6 +17,7 @@ defmodule SymphonyElixir.PromptBuilder do
     template
     |> Solid.render!(
       %{
+        "execution_backend" => SymphonyElixir.ExecutionBackend.kind(),
         "attempt" => Keyword.get(opts, :attempt),
         "issue" => issue |> Map.from_struct() |> to_solid_map()
       },
@@ -36,7 +37,7 @@ defmodule SymphonyElixir.PromptBuilder do
   rescue
     error ->
       reraise %RuntimeError{
-                message: "template_parse_error: #{Exception.message(error)}"
+                message: "template_parse_error: #{Exception.message(error)} template=#{inspect(prompt)}"
               },
               __STACKTRACE__
   end

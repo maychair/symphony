@@ -8,11 +8,13 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Beads.{Adapter, Reconciler, RunJournal}
+  alias SymphonyElixir.Execution
+  alias SymphonyElixir.MailReview.Listener
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @execution_stop_grace_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -34,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :merge_cleanup_ref,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -71,7 +74,6 @@ defmodule SymphonyElixir.Orchestrator do
         }
 
         run_terminal_workspace_cleanup()
-        state = restore_beads_gates(state)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -119,13 +121,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    :ok = Reconciler.poll(Config.settings!().tracker)
     state = maybe_dispatch(state)
+    state = maybe_start_merge_cleanup(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info({ref, {_output, status}}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    if status != 0, do: Logger.warning("Merged-workspace cleanup command failed status=#{status}; retained execution records")
+    {:noreply, %{state | merge_cleanup_ref: nil}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
+    Logger.warning("Merged-workspace cleanup command stopped reason=#{inspect(reason)}")
+    {:noreply, %{state | merge_cleanup_ref: nil}}
   end
 
   def handle_info(
@@ -203,84 +216,41 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  def handle_info({:execution_stop_timeout, issue_id, ref}, state) do
+    case Map.get(state.running, issue_id) do
+      %{ref: ^ref, pid: pid, stop_requested: true} ->
+        stop_running_task(pid, ref, state.task_supervisor)
+        handle_info({:DOWN, ref, :process, pid, :scheduler_stop_timeout}, state)
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
 
-  defp restore_beads_gates(state) do
-    if Config.settings!().tracker.kind == "beads" do
-      case Tracker.fetch_issues_by_states(["blocked"]) do
-        {:ok, issues} ->
-          Enum.reduce(issues, state, &restore_beads_gate/2)
-
-        {:error, reason} ->
-          Logger.warning("Beads gate restoration failed reason=#{inspect(reason)}")
-          state
-      end
+  defp handle_agent_down(reason, state, "mail-review:" <> _ = issue_id, running_entry, _session_id) do
+    if reason == :normal do
+      release_issue_claim(state, issue_id)
     else
-      state
-    end
-  end
-
-  defp restore_beads_gate(issue, state) do
-    required = Config.settings!().tracker.required_labels
-
-    if beads_terminal_gate?(issue) and Enum.all?(required, &(&1 in issue.labels)) do
-      block_issue_from_entry(state, issue.id, %{identifier: issue.identifier, issue: issue}, beads_gate_error(issue.id, issue))
-    else
-      state
-    end
-  end
-
-  defp beads_gate_error(issue_id, issue) do
-    settings = Config.settings!().tracker
-    directory = RunJournal.directory(Adapter.journal_root(settings), issue_id)
-
-    record =
-      case RunJournal.read(directory) do
-        {:ok, %{} = record} -> record
-        _ -> %{}
-      end
-
-    cond do
-      record["phase"] == "awaiting_human" and is_binary(get_in(record, ["delivery", "review_url"])) ->
-        "awaiting human acceptance"
-
-      match?(%Issue{native_ref: %{"dependency_blocked" => true}}, issue) ->
-        "blocked by task dependencies"
-
-      is_binary(record["blocker_reason"]) and record["blocker_reason"] != "" ->
-        "blocked: " <> record["blocker_reason"]
-
-      true ->
-        "run requires human reconciliation"
-    end
-  end
-
-  defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if Config.settings!().tracker.kind == "beads" do
-      park_beads_worker_exit(issue_id, :normal)
-      block_issue_from_entry(state, issue_id, running_entry, beads_gate_error(issue_id, Map.get(running_entry, :issue)))
-    else
-      handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id)
+      Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Review worker exited: #{inspect(reason)}"})
+      block_issue_from_entry(state, issue_id, running_entry, "Review worker failed; native execution requires reconciliation")
     end
   end
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
-    if Config.settings!().tracker.kind == "beads" do
-      park_beads_worker_exit(issue_id, reason)
-      block_issue_from_entry(state, issue_id, running_entry, beads_gate_error(issue_id, Map.get(running_entry, :issue)))
-    else
-      handle_provider_agent_down(reason, state, issue_id, running_entry, session_id)
+    case Execution.worker_down(issue_id, reason) do
+      {:blocked, message} -> block_issue_from_entry(state, issue_id, running_entry, message)
+      :ok -> handle_provider_agent_down(reason, state, issue_id, running_entry, session_id)
     end
   end
 
-  defp park_beads_worker_exit(issue_id, reason) do
-    case Reconciler.park_worker_exit(Config.settings!().tracker, issue_id, reason) do
-      :ok -> :ok
-      error -> Logger.warning("Coordinator exit reconciliation failed issue_id=#{issue_id} issue_identifier=#{issue_id} reason=#{inspect(error)}")
-    end
+  defp handle_provider_agent_down(_reason, state, issue_id, %{stop_requested: true} = entry, _session_id) do
+    if Map.get(entry, :cleanup_workspace, false), do: cleanup_issue_workspace(entry.issue, entry)
+    release_issue_claim(state, issue_id)
   end
 
   defp handle_provider_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -498,18 +468,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
+      Execution.handing_off?(issue.id) ->
+        refresh_running_issue_state(state, issue)
+
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
-
-      beads_terminal_gate?(issue) ->
-        refresh_running_issue_state(state, issue)
+        stop_reconciled_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        stop_reconciled_issue(state, issue.id, false)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -517,7 +487,7 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, false)
+        stop_reconciled_issue(state, issue.id, false)
     end
   end
 
@@ -541,15 +511,11 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
         release_issue_claim(state, issue.id)
 
-      beads_terminal_gate?(issue) ->
-        refresh_blocked_issue_state(state, issue)
-
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
 
-      active_issue_state?(issue.state, active_states) and Config.settings!().tracker.kind == "beads" and
-          beads_dispatch_released?(issue) ->
+      active_issue_state?(issue.state, active_states) and Execution.resumable?(issue) ->
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -563,21 +529,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
 
-  defp beads_dispatch_released?(issue) do
-    gate = get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"])
-    settings = Config.settings!().tracker
-    directory = RunJournal.directory(Adapter.journal_root(settings), issue.id)
-    gate == "resumed" or (gate == "ready" and RunJournal.read(directory) == {:ok, nil})
-  end
-
-  defp beads_terminal_gate?(issue) do
-    settings = Config.settings!().tracker
-
-    settings.kind == "beads" and issue.state == "blocked" and
-      get_in(issue.native_ref || %{}, ["metadata", "symphony_gate"]) in ["awaiting_human", "blocked"] and
-      Enum.all?(settings.required_labels, &(&1 in issue.labels))
-  end
-
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
     visible_issue_ids =
@@ -589,11 +540,11 @@ defmodule SymphonyElixir.Orchestrator do
       |> MapSet.new()
 
     Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
-      if MapSet.member?(visible_issue_ids, issue_id) do
+      if MapSet.member?(visible_issue_ids, issue_id) or Execution.handing_off?(issue_id) do
         state_acc
       else
         log_missing_running_issue(state_acc, issue_id)
-        terminate_running_issue(state_acc, issue_id, false)
+        stop_reconciled_issue(state_acc, issue_id, false)
       end
     end)
   end
@@ -648,11 +599,29 @@ defmodule SymphonyElixir.Orchestrator do
     case Map.get(state.blocked, issue.id) do
       %{issue: _} = blocked_entry ->
         updated = Map.put(blocked_entry, :issue, issue)
-        updated = if beads_terminal_gate?(issue), do: Map.put(updated, :error, beads_gate_error(issue.id, issue)), else: updated
         %{state | blocked: Map.put(state.blocked, issue.id, updated)}
 
       _ ->
         state
+    end
+  end
+
+  # Keep the worker as the journal's sole writer until native shutdown is confirmed.
+  defp stop_reconciled_issue(%State{} = state, issue_id, cleanup_workspace) do
+    entry = Map.get(state.running, issue_id)
+
+    if Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex" and
+         is_map(entry) and is_pid(entry[:pid]) and Process.alive?(entry.pid) and
+         not SymphonyElixir.MailReview.job?(entry[:issue]) do
+      unless entry[:stop_requested] do
+        send(entry.pid, :symphony_stop)
+        Process.send_after(self(), {:execution_stop_timeout, issue_id, entry.ref}, @execution_stop_grace_ms)
+      end
+
+      entry = Map.merge(entry, %{stop_requested: true, cleanup_workspace: cleanup_workspace or Map.get(entry, :cleanup_workspace, false)})
+      %{state | running: Map.put(state.running, issue_id, entry)}
+    else
+      terminate_running_issue(state, issue_id, cleanup_workspace)
     end
   end
 
@@ -665,6 +634,10 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
 
         stop_running_task(pid, ref, state.task_supervisor)
+
+        if SymphonyElixir.MailReview.job?(Map.get(running_entry, :issue)) do
+          Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Scheduler stopped the review worker; native session must be reconciled before retry"})
+        end
 
         if cleanup_workspace do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
@@ -703,10 +676,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
-    if Map.has_key?(state.blocked, issue_id) do
-      state
-    else
-      restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
+    goal_mode = Execution.enabled?()
+
+    cond do
+      Map.has_key?(state.blocked, issue_id) -> state
+      goal_mode and not input_required_blocker?(running_entry) -> state
+      true -> restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
     end
   end
 
@@ -975,7 +950,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    Issue.routable?(issue, Config.settings!().tracker)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
@@ -1278,6 +1253,12 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
     end
   end
+
+  defp maybe_start_merge_cleanup(%{merge_cleanup_ref: nil} = state) do
+    %{state | merge_cleanup_ref: SymphonyElixir.MergedWorkspaceCleanup.start(state.task_supervisor)}
+  end
+
+  defp maybe_start_merge_cleanup(state), do: state
 
   defp notify_dashboard do
     StatusDashboard.notify_update()

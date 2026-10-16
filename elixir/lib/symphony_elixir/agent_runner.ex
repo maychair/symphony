@@ -4,9 +4,9 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Beads.{RunJournal, Validation}
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
+  alias SymphonyElixir.MailReview.Runner
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -21,10 +21,12 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
-    settings = Config.settings!().tracker
-    budget = settings.provider["run_budget_ms"] || 600_000
-    opts = if settings.kind == "beads", do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
-    do_run(issue, codex_update_recipient, opts)
+    budget = Execution.run_budget_ms(issue.id)
+    opts = if Execution.enabled?(), do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
+
+    if SymphonyElixir.MailReview.job?(issue),
+      do: Runner.run(issue, codex_update_recipient, opts),
+      else: do_run(issue, codex_update_recipient, opts)
   end
 
   defp do_run(issue, codex_update_recipient, opts) do
@@ -37,7 +39,7 @@ defmodule SymphonyElixir.AgentRunner do
            Tracker.prepare_run(issue, Keyword.put(opts, :worker_host, worker_host)),
          result <- run_on_worker_host(prepared_issue, codex_update_recipient, prepared_opts, worker_host),
          :ok <- Tracker.finish_run(prepared_issue, prepared_opts, result),
-         :ok <- result do
+         :ok <- worker_result(result) do
       :ok
     else
       {:error, reason} ->
@@ -54,8 +56,7 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
-               :ok <- Validation.preflight_workspace(workspace, opts[:run_record]) do
+          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
             run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
           end
         after
@@ -102,34 +103,45 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
     record = opts[:run_record]
+    backend = ExecutionBackend.module()
 
     session_opts = [
       worker_host: worker_host,
+      run_record: record,
       tracker_settings: opts[:tracker_settings],
       resume_thread_id: record && record["thread_id"],
       expected_turn_id: record && (record["turn_id"] || :no_turns),
+      suspend_goal: Execution.enabled?(),
       on_thread_intent: fn -> journal!(record, %{"phase" => "thread_start_intent", "workspace" => workspace, "thread_allocation_intent" => true}) end,
       on_thread_started: fn thread_id -> journal!(record, %{"phase" => "thread_ready", "thread_id" => thread_id, "workspace" => workspace}) end
     ]
 
-    with {:ok, session} <- AppServer.start_session(workspace, session_opts) do
+    with {:ok, session} <- backend.start_session(workspace, session_opts) do
       try do
-        if opts[:tracker_settings] && opts[:tracker_settings].provider["goal_mode"] == true do
+        if native_goal?(backend, opts) do
           run_goal(session, issue, codex_update_recipient, opts)
         else
           do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
         end
       after
-        AppServer.stop_session(session)
+        stopped = backend.stop_session(session)
+        if not native_goal?(backend, opts), do: journal!(record, %{"native_stop_confirmed" => stopped == :ok})
       end
     end
   end
 
+  defp worker_result({:error, :scheduler_stop}), do: :ok
+  defp worker_result(result), do: result
+
+  defp native_goal?(AppServer, _opts), do: Execution.enabled?()
+  defp native_goal?(_backend, _opts), do: false
+
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    backend = Map.get(app_session, :backend, AppServer)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
+           backend.run_turn(
              app_session,
              prompt,
              issue,
@@ -158,7 +170,7 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          if opts[:run_record], do: {:error, :agent_turn_budget_exhausted}, else: :ok
+          exhausted_turn_budget(opts)
 
         {:done, _refreshed_issue} ->
           :ok
@@ -169,14 +181,24 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
+  defp exhausted_turn_budget(opts) do
+    if opts[:run_record], do: {:error, :agent_turn_budget_exhausted}, else: :ok
+  end
+
   defp next_action(issue, opts, fetcher) do
     if opts[:run_record] do
+      Execution.reconcile_delivery(issue, opts)
+
       with {:ok, current} <- RunJournal.read(opts[:run_record]["directory"]) do
-        if current["delivery"] || current["blocker_reason"], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
+        action_after_delivery(current, issue, fetcher)
       end
     else
       continue_with_issue?(issue, fetcher)
     end
+  end
+
+  defp action_after_delivery(current, issue, fetcher) do
+    if current["handoff"] || current["blocker_reason"], do: {:done, issue}, else: continue_with_issue?(issue, fetcher)
   end
 
   defp run_goal(session, issue, recipient, opts) do
@@ -186,11 +208,14 @@ defmodule SymphonyElixir.AgentRunner do
     File.write!(brief, prompt)
 
     objective = """
-    Execute Beads task #{issue.identifier} as its receiving Coordinator under Symphony.
+    Execute repository Issue #{issue.url || issue.identifier} under Symphony.
     Before taking any action, read the complete execution instructions at:
     #{brief}
     That file contains the workflow, task scope, acceptance criteria and authority.
-    Call beads_task_context for current task notes and frozen validation policy.
+    Read the current repository Issue and its comments through the native provider tool.
+    For GitLab MR delivery, use the configured publication entry with --handoff.
+    Symphony completes the review handoff automatically; do not post a duplicate notice.
+    Use task_handoff directly for a concrete decision, blocker or other delivery provider.
     Continue authorized work until validated delivery or a specific real blocker.
     Follow all verification, resource admission, publication and acceptance gates.
     A normal turn ending or idle parent chat is not a blocker.
@@ -205,10 +230,11 @@ defmodule SymphonyElixir.AgentRunner do
         on_message: journal_message_handler(record, recipient, issue),
         before_goal: fn -> journal!(record, %{"phase" => "goal_start_intent", "execution_mode" => "goal"}) end,
         handoff_status: fn ->
+          Execution.reconcile_delivery(issue, opts)
           {:ok, current} = RunJournal.read(record["directory"])
 
           cond do
-            current["delivery"] -> "complete"
+            current["handoff"] -> "complete"
             current["blocker_reason"] -> "blocked"
             true -> nil
           end
@@ -304,7 +330,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous Codex turn completed normally, but the tracker work item is still in an active state.
+    - The previous agent turn completed normally, but the tracker work item is still in an active state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
@@ -341,7 +367,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp active_issue_state?(_state_name), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    Issue.routable?(issue, Config.settings!().tracker)
   end
 
   defp selected_worker_host(nil, []), do: nil

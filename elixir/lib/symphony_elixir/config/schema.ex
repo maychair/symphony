@@ -112,13 +112,14 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:retain, :boolean, default: false)
+      field(:merge_cleanup_command, :string)
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root, :retain], empty_values: [])
+      |> cast(attrs, [:root, :retain, :merge_cleanup_command], empty_values: [])
     end
   end
 
@@ -150,26 +151,57 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:backend, :string, default: "codex")
+      field(:goal_mode, :boolean, default: false)
+      field(:run_budget_ms, :integer, default: 600_000)
+      field(:run_budget_ms_by_issue, :map, default: %{})
+      field(:run_journal_dir, :string)
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
 
+    @fields [
+      :backend,
+      :goal_mode,
+      :run_budget_ms,
+      :run_budget_ms_by_issue,
+      :run_journal_dir,
+      :max_concurrent_agents,
+      :max_turns,
+      :max_retry_backoff_ms,
+      :max_concurrent_agents_by_state
+    ]
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        @fields,
         empty_values: []
       )
+      |> validate_inclusion(:backend, ["codex", "omp"])
+      |> validate_number(:run_budget_ms, greater_than: 0)
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
+  end
+
+  defmodule Omp do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "omp --mode rpc --no-ui")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs), do: cast(schema, attrs, [:command]) |> validate_required([:command])
   end
 
   defmodule Codex do
@@ -296,6 +328,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:omp, Omp, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -390,6 +423,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
+    |> cast_embed(:omp, with: &Omp.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
@@ -456,9 +490,6 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp tracker_states(settings) do
     case settings.tracker.kind do
-      "beads" ->
-        {settings.tracker.active_states || ["open", "in_progress"], settings.tracker.terminal_states || ["closed"]}
-
       kind when kind in ["linear", "memory"] ->
         {
           settings.tracker.active_states || @linear_active_states,

@@ -13,6 +13,8 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         %{
           generated_at: generated_at,
+          build: SymphonyElixir.BuildInfo.identity(),
+          backend: SymphonyElixir.ExecutionBackend.kind(),
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
@@ -22,7 +24,8 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          mail_review_listener: mail_review_health()
         }
 
       :timeout ->
@@ -61,6 +64,16 @@ defmodule SymphonyElixirWeb.Presenter do
       payload ->
         {:ok, Map.update!(payload, :requested_at, &DateTime.to_iso8601/1)}
     end
+  end
+
+  defp mail_review_health do
+    if Process.whereis(SymphonyElixir.MailReview.Listener) do
+      GenServer.call(SymphonyElixir.MailReview.Listener, :health, 100)
+    else
+      %{health: :disabled}
+    end
+  catch
+    :exit, _ -> %{health: :busy}
   end
 
   defp issue_payload_body(issue_identifier, running, retry, blocked) do

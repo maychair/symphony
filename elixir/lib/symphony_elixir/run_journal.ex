@@ -1,9 +1,9 @@
-defmodule SymphonyElixir.Beads.RunJournal do
+defmodule SymphonyElixir.RunJournal do
   @moduledoc """
-  Durable execution checkpoints, separate from Beads task data.
+  Durable execution checkpoints, separate from repository Issue data.
 
-  An exclusive directory fences admission across processes. An uncertain checkpoint
-  is never reclaimed automatically, including when its recorded process has exited.
+  An exclusive directory fences admission across processes. Thread allocation uncertainty requires recovery; recorded threads are resumed
+  only after native idle validation.
   """
 
   @spec admit(Path.t(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -11,32 +11,56 @@ defmodule SymphonyElixir.Beads.RunJournal do
     directory = Path.join(root, key(issue_id))
 
     with :ok <- File.mkdir_p(directory),
-         :ok <- File.mkdir(Path.join(directory, "executor.lock")),
-         {:ok, previous} <- read(directory),
+         :ok <- File.mkdir(Path.join(directory, "executor.lock")) do
+      result = admit_locked(directory, issue_id)
+      if match?({:error, _}, result), do: File.rmdir(Path.join(directory, "executor.lock"))
+      result
+    else
+      {:error, reason} -> {:error, {:run_admission_blocked, issue_id, reason}}
+    end
+  end
+
+  defp admit_locked(directory, issue_id) do
+    with {:ok, previous} <- read(directory),
          {:ok, record} <- admission(previous, issue_id) do
       {:ok, host} = :inet.gethostname()
 
       record =
         record
-        |> Map.delete("delivery")
-        |> Map.delete("pre_session_blocked")
-        |> Map.delete("blocker_reason")
-        |> Map.delete("native_stop_confirmed")
-        |> Map.delete("resume_authorized")
+        |> Map.drop(["handoff", "handoff_pending", "handoff_notice", "delivery", "stage_results", "blocker_reason", "native_stop_confirmed"])
         |> Map.put("attempt_count", (record["attempt_count"] || 0) + 1)
         |> Map.put("attempt_id", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower))
         |> Map.put("directory", directory)
         |> Map.put("host", to_string(host))
         |> Map.put("executor_os_pid", System.pid())
 
-      case checkpoint(record, %{"phase" => "admitted"}) do
-        {:ok, record} -> {:ok, record}
-        error -> error
+      with {:ok, record} <- carry_pending_review(previous, record) do
+        checkpoint(record, %{"phase" => "admitted"})
       end
-    else
-      {:error, reason} -> {:error, {:run_admission_blocked, issue_id, reason}}
     end
   end
+
+  defp carry_pending_review(%{"thread_id" => thread} = previous, record) when is_binary(thread) do
+    old = Path.join(record["directory"], "review-request-#{previous["attempt_id"]}.json")
+
+    if previous["handoff"] || not File.exists?(old) do
+      {:ok, record}
+    else
+      path = Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json")
+
+      with {:ok, data} <- File.read(old),
+           {:ok, %{} = request} <- Jason.decode(data),
+           true <- request["attempt_id"] == previous["attempt_id"] and request["issue_url"] == previous["issue_url"],
+           :ok <- write_synced(path <> ".pending", Jason.encode!(Map.put(request, "attempt_id", record["attempt_id"]))),
+           :ok <- File.rename(path <> ".pending", path) do
+        {:ok, Map.put(record, "handoff_notice", previous["handoff_notice"])}
+      else
+        error -> {:error, {:pending_review_recovery_failed, error}}
+      end
+    end
+  end
+
+  defp carry_pending_review(_, record), do: {:ok, record}
 
   @spec checkpoint(map(), map()) :: {:ok, map()} | {:error, term()}
   def checkpoint(%{"directory" => directory} = record, changes) do
@@ -44,6 +68,7 @@ defmodule SymphonyElixir.Beads.RunJournal do
     event = Map.take(changes, ["phase", "thread_id", "turn_id"]) |> Map.put("at", now) |> Map.put("attempt_id", record["attempt_id"])
     events = Enum.take((record["events"] || []) ++ [event], -200)
     updated = record |> Map.merge(changes) |> Map.put("updated_at", now) |> Map.put("events", events)
+    updated = Map.put(updated, "stage_results", stage_results(updated))
     path = Path.join(directory, "run.json")
     temporary = path <> ".pending"
 
@@ -51,6 +76,18 @@ defmodule SymphonyElixir.Beads.RunJournal do
          :ok <- File.rename(temporary, path) do
       {:ok, updated}
     end
+  end
+
+  @spec stage_results(map()) :: map()
+  def stage_results(record) do
+    %{
+      "execution_admitted" => if(record["attempt_id"], do: "passed", else: "not_verified"),
+      "mr_publication" => if(get_in(record, ["delivery", "mr_verified"]) == true, do: "passed", else: "not_verified"),
+      "review_handoff" => if(get_in(record, ["handoff", "kind"]) == "review", do: "passed", else: "not_verified"),
+      "native_execution_stopped" => if(record["native_stop_confirmed"] == true, do: "passed", else: "not_verified"),
+      "business_validation" => "see_mr_evidence",
+      "error" => record["blocker_reason"]
+    }
   end
 
   @spec complete(map(), String.t()) :: :ok | {:error, term()}
@@ -93,25 +130,12 @@ defmodule SymphonyElixir.Beads.RunJournal do
      %{"host" => to_string(host), "executor_os_pid" => System.pid(), "issue_id" => issue_id, "owner" => "symphony-" <> Base.encode16(:crypto.strong_rand_bytes(16), case: :lower), "turn_count" => 0}}
   end
 
-  defp admission(%{"phase" => "completed", "thread_id" => thread, "turn_id" => turn} = record, issue_id)
-       when is_binary(thread) and is_binary(turn) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
-  end
-
-  defp admission(%{"phase" => "completed", "thread_id" => thread, "turn_id" => nil, "turn_count" => 0, "recovery" => "operator confirmed stopped; native resume proved idle"} = record, issue_id)
-       when is_binary(thread) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
-  end
-
-  defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_turn_recovered" => true, "abandoned_pre_turn_thread_id" => abandoned} = record, issue_id)
-       when is_binary(abandoned) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]), do: {:ok, record}, else: {:error, :issue_identity_mismatch}
-  end
-
-  defp admission(%{"phase" => "completed", "thread_id" => nil, "turn_id" => nil, "turn_count" => 0, "pre_session_blocked" => true} = record, issue_id) do
-    if record["issue_id"] == issue_id and is_binary(record["owner"]),
-      do: {:ok, Map.put(record, "pre_turn_recovered", true)},
-      else: {:error, :issue_identity_mismatch}
+  defp admission(%{"phase" => "completed"} = record, issue_id) do
+    cond do
+      record["issue_id"] != issue_id or not is_binary(record["owner"]) -> {:error, :issue_identity_mismatch}
+      is_binary(record["thread_id"]) or record["thread_allocation_intent"] != true -> {:ok, record}
+      true -> {:error, :uncertain_thread_allocation}
+    end
   end
 
   defp admission(_record, _issue_id), do: {:error, :uncertain_or_awaiting_run}

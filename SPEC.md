@@ -2329,3 +2329,14 @@ Beads runtime recovery and review repair may have separate bounded budgets, whil
 retaining native idle and ownership fencing. Host delivery composes durable guarded
 steps without atomicity or merge authority. Typed native event evidence must preserve
 unknown outcomes and explicit identities rather than infer success from wrappers.
+
+
+## Optional merged-delivery cleanup extension
+
+An implementation may accept `workspace.merge_cleanup_command`, a trusted operator command disabled by default. On the existing polling cycle it starts at most one asynchronous pass at a time, without delaying task dispatch or reconciliation. Failures release the single-flight slot so later polls may reconcile again.
+
+The command must confirm native merge success independently of Issue closure, match the stopped execution and exact workspace/branch, preserve execution evidence, and stop on dirty or unpublished changes. Ordinary workspace retention is unchanged. Provider-specific commands own safe deletion, durable partial-failure recovery and operator notification; they must not create tasks or restart Agents.
+
+Repository tracker extension: `tracker.assignee` restricts GitLab/GitHub routing to that sole native owner. Ownership checks compose with required labels across admission, reconciliation, retry/recovery and continuation. Other tracker assignment semantics remain provider-owned.
+
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.

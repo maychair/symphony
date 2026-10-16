@@ -29,6 +29,26 @@ the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
+In native Goal mode, it retains the running entry until the worker confirms native
+shutdown and finalizes the durable journal; an unconfirmed stop remains an incident.
+
+### Merged-delivery cleanup
+
+`workspace.merge_cleanup_command` is an optional trusted operator command,
+disabled by default. The existing poll cycle starts one asynchronous pass at a
+time; slow or failed cleanup does not block task reconciliation. Startup and
+subsequent polls use the same path, and changing configuration affects later
+passes. The command must independently confirm the native review is merged,
+the recorded task is stopped, and the exact local worktree/branch are safe to
+remove. Closing an Issue alone is not merge evidence. Ordinary `workspace.retain`
+semantics remain unchanged.
+
+The command owns provider-specific merge checks, exclusive execution fencing,
+data protection, durable cleanup receipts and operator notices. It must preserve
+execution records, stop on dirty or unpublished work, avoid forced removal, and
+support restart/partial-failure recovery. A successful command exit means a pass
+finished, not that every candidate was removed. This is lifecycle reconciliation,
+not another task source or Agent retry loop.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
@@ -404,27 +424,10 @@ you.
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
 
-## Beads tracker
+## Repository Issue execution
 
-For a scoped local Beads development loop with durable native Codex identities, retained Git worktrees and explicit merged-review/human acceptance, see [the Beads guide](docs/beads.md) and [example workflow](WORKFLOW.beads.md).
+See [repository execution](docs/repository-issues.md) for native Goal sessions, durable execution records and handoffs.
 
-For event-driven Beads tasks, configure `remote_reconcile`, `accepted_merge_actors`, `required_checks` and repair/run budgets. The host never merges; it reconciles a developer merge before closing the linked Issue and Bead. Native CLI credentials and webhook secrets stay outside source. See [operation](docs/beads.md).
+Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
 
-Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](docs/beads.md).
-
-Use `mix beads.preflight --workflow WORKFLOW.md [--issue ID]` before dispatch to
-check configuration and a concrete Beads prompt without admission. Task validation
-and the private `scripts/session_evidence.py` exporter are described in the
-[Beads guide](docs/beads.md). No extra scheduler or agent harness is required.
-
-Beads host delivery uses `beads_checkpoint` (scoped commit only), then
-`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
-
-Beads workflows support retained-worktree preflight, typed blocked/review handoffs,
-separate runtime recovery budgets, opt-in compact task briefs and resumable
-`beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
-keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
-
-Undelivered Beads runs retain a preparation blocker and resume through operator recovery; only bound PR/MR deliveries await acceptance.
-
-The authenticated `/api/v1/workbench` API supports bound decisions, verified artifacts and safe repair dispatch. Set `SYMPHONY_WORKBENCH_TOKEN` outside Git; see [the contract](docs/beads.md#operator-workbench).
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.

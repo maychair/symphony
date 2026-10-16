@@ -3,6 +3,11 @@
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+The Elixir implementation supports an opt-in merged-delivery cleanup command on
+its existing polling cycle. Operators can verify merged reviews and retire only
+the corresponding safe local worktrees while retaining execution evidence; see
+[the lifecycle contract](elixir/README.md#merged-delivery-cleanup).
+
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
 _In this [demo video](https://player.vimeo.com/video/1186371009?h=5626e4b899), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
@@ -40,25 +45,8 @@ help with the setup:
 
 This project is licensed under the [Apache License 2.0](LICENSE).
 
-The Elixir implementation also supports a scoped [native Beads development loop](elixir/docs/beads.md): Beads owns tasks and human acceptance, while Symphony journals native execution identities and preserves worktrees.
+The Elixir implementation supports repository Issues directly through the GitHub and GitLab adapters. Native Goal execution and durable run identities are tracker-independent. See [repository execution](elixir/docs/repository-issues.md).
 
-The Beads extension supports remote review/CI reconciliation in Symphony's existing poll loop, authenticated Webhook hints, bounded same-session repair and verified manual-merge closure. See [Beads operation](elixir/docs/beads.md).
+Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
 
-Self-managed GitLab Beads delivery uses an explicit `tracker.provider.gitlab_web_url` web origin, a matching `review_repository` (`host/group/project`), and native `glab --hostname` authentication. Optional `git_remote` (default `origin`), `publish_base` (default `main`) and exact `publish_paths` scope host publication. See [Beads configuration](elixir/docs/beads.md).
-
-Beads runs can freeze task-specific validation policies, expose scoped host task
-reads, and preflight strict prompts before claiming work. Opt-in host checks bind
-receipts to a clean commit and attempt. Corrected session evidence keeps process
-results separate from tool transport status; see [operation](elixir/docs/beads.md).
-
-Beads host delivery uses `beads_checkpoint` (scoped commit only), then
-`beads_validate` and `beads_publish`; verification never requires sandbox Git writes.
-
-Beads workflows support retained-worktree preflight, typed blocked/review handoffs,
-separate runtime recovery budgets, opt-in compact task briefs and resumable
-`beads_deliver`. Host receipts derive from captured log bytes. Native-event JSON/OTLP
-keeps operation outcomes separate from exec wrappers; see the Beads operation guide.
-
-Undelivered Beads runs retain preparation blockers for operator recovery; bound PR/MR deliveries retain explicit acceptance and merge gates.
-
-The operator workbench exposes structured decisions, delivery review and repair incidents through authenticated Beads interfaces. See [the workbench contract](elixir/docs/beads.md#operator-workbench).
+Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR and completes deduplicated review notification and routing-label release, without another Agent call. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.

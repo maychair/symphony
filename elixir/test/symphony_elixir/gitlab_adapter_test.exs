@@ -113,6 +113,13 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
              )
   end
 
+  test "empty and multiple assignees cannot inherit a stale singular assignee" do
+    for assignees <- [[], [%{"id" => 20, "login" => "owner"}, %{"id" => 21, "login" => "other"}]] do
+      raw = raw_issue(42) |> Map.put("assignees", assignees)
+      assert GitLabClient.normalize_issue_for_test(raw, tracker_settings()).assignee_id == nil
+    end
+  end
+
   test "client normalizes GitLab issues without dropping provider details" do
     issue = GitLabClient.normalize_issue_for_test(raw_issue(42), tracker_settings())
 
