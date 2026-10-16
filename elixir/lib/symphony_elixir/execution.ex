@@ -633,7 +633,10 @@ defmodule SymphonyElixir.Execution do
 
     case args["manifest"] do
       nil ->
-        body
+        # A manifest-less handoff asks the human a question, so the notice carries
+        # the engine marker: the owner's first later comment answers it, and this
+        # notice must never answer itself.
+        body <> "\n\n" <> TaskReconciler.engine_notice_marker()
 
       manifest ->
         decision = %{"action" => "manifest", "contract" => manifest["contract"], "data" => manifest}

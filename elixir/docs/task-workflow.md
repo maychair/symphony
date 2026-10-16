@@ -114,9 +114,23 @@ budget extension and pause release each affect only their own restrictions.
 
 People can also write ordinary explicit requests such as `请暂停这个任务。`,
 `Please pause this task.` or `Please resume execution.`. These intents use verified authorizer
-identity and source order; resume releases preceding pauses only, including an older pause observed later.
-Unclear requests to pause or resume enter a clarification wait. Other prose
-remains discussion and requires a concrete decision where its meaning is unclear.
+identity and source order; resume releases preceding pauses, including an older
+pause observed later, and the decision handoff of the question it answers. Unclear
+requests to pause or resume enter a clarification wait.
+
+A blocking question is answered in the Issue itself. While the agent's handoff
+holds a task-scope decision restriction, the sole assignee's first note after the
+engine posted its question releases that restriction, so answering needs no
+label. Answering is not resuming: it leaves a pause the owner asked for in
+place, and only an explicit resume releases that pause. Notes carry second
+precision, so a note in the question's own second counts only when its note id
+follows the notice. Engine notices end with a `<!-- symphony-engine-notice -->`
+line of their own; the engine never answers its own question, and a reply that
+quotes the notice counts. A review handoff is unchanged and still waits for
+`symphony:accept` or `symphony:rework`.
+
+Other prose remains discussion and requires a concrete decision where its meaning
+is unclear.
 A coordinating human session can translate an authorized decision into the
 structured entry. The executing agent may submit manifests and evidence; native
 dynamic tools and the decision CLI reject its attempts to originate human control
