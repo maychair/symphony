@@ -2,6 +2,20 @@ defmodule SymphonyElixir.ExecutionTest do
   use SymphonyElixir.TestSupport
   alias SymphonyElixir.{Execution, RunJournal}
 
+  defmodule StopProbe do
+    @spec start_session(Path.t(), keyword()) :: term()
+    def start_session(workspace, opts) do
+      send(self(), {:stop_probe, workspace, opts})
+      Process.get(:stop_probe_result, {:ok, %{}})
+    end
+
+    @spec stop_session(map()) :: :ok
+    def stop_session(_session) do
+      send(self(), :stop_probe_closed)
+      :ok
+    end
+  end
+
   setup do
     root = Path.dirname(Workflow.workflow_file_path())
 
@@ -720,6 +734,95 @@ defmodule SymphonyElixir.ExecutionTest do
     File.rm!(Path.join(record["directory"], "run.json"))
     File.mkdir!(Path.join(record["directory"], "run.json"))
     assert {:error, :eisdir} = Execution.activation_options(opts)
+  end
+
+  test "orphan recovery halts and validates the recorded thread, preserves its host and never invents a session", %{issue: issue} do
+    assert {:ok, _} = Execution.reconcile_native_stop(%{"thread_allocation_intent" => false})
+    {:ok, _, opts} = Execution.prepare(issue, worker_host: "worker-a")
+    workspace = Path.join(opts[:run_record]["directory"], "task-workspace")
+
+    {:ok, record} =
+      RunJournal.checkpoint(opts[:run_record], %{
+        "thread_allocation_intent" => true,
+        "thread_id" => "recorded",
+        "turn_id" => "recorded-turn",
+        "workspace" => workspace,
+        "native_stop_confirmed" => false
+      })
+
+    {:ok, stopped} = Execution.reconcile_native_stop(record, backend: StopProbe)
+    assert stopped["native_stop_confirmed"]
+    assert_receive {:stop_probe, ^workspace, recovery}
+    assert recovery[:resume_thread_id] == "recorded"
+    assert recovery[:expected_turn_id] == "recorded-turn"
+    assert recovery[:suspend_goal]
+    assert recovery[:worker_host] == "worker-a"
+    assert_receive :stop_probe_closed
+    Process.put(:stop_probe_result, {:error, :native_thread_not_idle})
+    {:ok, uncertain} = Execution.reconcile_native_stop(record, backend: StopProbe)
+    refute uncertain["native_stop_confirmed"]
+    assert_receive {:stop_probe, ^workspace, _}
+    refute_receive :stop_probe_closed
+    {:ok, unknown} = Execution.reconcile_native_stop(Map.delete(uncertain, "thread_id"), backend: StopProbe)
+    refute unknown["native_stop_confirmed"]
+    {:ok, _} = Execution.reconcile_native_stop(Map.put(unknown, "backend", "omp"), backend: StopProbe)
+    refute_receive {:stop_probe, _, _}
+    {:ok, restored} = RunJournal.checkpoint(stopped, %{"backend" => "codex"})
+    :ok = RunJournal.complete(restored, "completed")
+    {:ok, _, resumed} = Execution.prepare(issue, worker_host: "worker-b")
+    assert resumed[:worker_host] == "worker-a"
+    assert resumed[:run_record]["thread_id"] == "recorded"
+  end
+
+  test "orphan stop interrupts an unobserved active turn without resuming or allocating a thread", %{issue: issue} do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "workspaces/orphan")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "orphan-server")
+    trace = Path.join(root, "orphan-requests.jsonl")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    trace=#{Jason.encode!(trace)}
+    goal={'threadId':'recorded','objective':'fixture','status':'active'}
+    interrupted=False
+    def emit(q,result): print(json.dumps({'id':q['id'],'result':result}),flush=True)
+    def thread():
+      return {'id':'recorded','status':{'type':'idle' if interrupted else 'active'},
+              'turns':[{'id':'old','status':'completed'},{'id':'unobserved','status':'interrupted' if interrupted else 'inProgress'}]}
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method');p=q.get('params',{})
+      with open(trace,'a') as f: f.write(json.dumps(q)+'\\n')
+      if m=='initialize': emit(q,{})
+      elif m=='thread/goal/get': emit(q,{'goal':goal})
+      elif m=='thread/goal/set':
+        assert p['status']=='blocked'
+        goal['status']='blocked';emit(q,{'goal':goal})
+      elif m=='thread/read': emit(q,{'thread':thread()})
+      elif m=='turn/interrupt':
+        assert p['turnId']=='unobserved';interrupted=True;emit(q,{})
+      elif 'id' in q: raise RuntimeError('unexpected activation: '+m)
+    """)
+
+    File.chmod!(binary, 0o755)
+    [front, config, prompt] = String.split(File.read!(Workflow.workflow_file_path()), "---", parts: 3)
+    config = config <> "\nworkspace:\n  root: #{Jason.encode!(Path.dirname(workspace))}\ncodex:\n  command: #{Jason.encode!(binary)}\n"
+    File.write!(Workflow.workflow_file_path(), front <> "---" <> config <> "---" <> prompt)
+    :ok = WorkflowStore.force_reload()
+    {:ok, _, opts} = Execution.prepare(issue, [])
+
+    {:ok, record} =
+      RunJournal.checkpoint(opts[:run_record], %{"thread_id" => "recorded", "turn_id" => "old", "thread_allocation_intent" => true, "native_stop_confirmed" => false, "workspace" => workspace})
+
+    {:ok, stopped} = Execution.reconcile_native_stop(record)
+    assert stopped["native_stop_confirmed"]
+    assert stopped["turn_id"] == "unobserved"
+    requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    methods = Enum.map(requests, & &1["method"])
+    assert "turn/interrupt" in methods
+    refute Enum.any?(methods, &(&1 in ["thread/start", "thread/resume", "turn/start"]))
+    refute Enum.any?(requests, &(get_in(&1, ["params", "status"]) == "active"))
   end
 
   defp write_lock_owner(record) do

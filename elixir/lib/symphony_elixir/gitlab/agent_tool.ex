@@ -83,9 +83,9 @@ defmodule SymphonyElixir.GitLab.AgentTool do
 
   defp allow_decision(_method, query, body, opts) do
     settings = opts[:tracker_settings] || SymphonyElixir.Config.settings!().tracker
-    text = if is_map(body), do: body["body"] || query["body"], else: query["body"]
+    texts = [if(is_map(body), do: body["body"]), query["body"]]
 
-    if settings.provider["task_workflow"] == true and control_decision?(text) do
+    if settings.provider["task_workflow"] == true and Enum.any?(texts, &control_decision?/1) do
       {:error, :human_control_decision_cannot_be_authored_by_executor}
     else
       :ok
@@ -93,15 +93,19 @@ defmodule SymphonyElixir.GitLab.AgentTool do
   end
 
   defp control_decision?(text) when is_binary(text) do
-    case Regex.run(~r/<!-- symphony-workflow\s+(\{.*?\})\s*-->/s, text) do
-      [_, json] ->
-        case Jason.decode(json) do
-          {:ok, %{"action" => "manifest"}} -> false
-          _ -> true
-        end
-
-      _ ->
+    case Regex.scan(~r/<!-- symphony-workflow\s+(\{.*?\})\s*-->/s, text) do
+      [] ->
         is_map(SymphonyElixir.TaskReconciler.intent(String.trim(text)))
+
+      markers ->
+        Enum.any?(markers, fn [_, json] -> human_decision?(json) end)
+    end
+  end
+
+  defp human_decision?(json) do
+    case Jason.decode(json) do
+      {:ok, %{"action" => "manifest"}} -> false
+      _ -> true
     end
   end
 
@@ -128,7 +132,7 @@ defmodule SymphonyElixir.GitLab.AgentTool do
     trimmed = String.trim(path)
 
     if String.starts_with?(trimmed, "/") and
-         not String.contains?(trimmed, ["://", "\n", "\r", <<0>>]) do
+         not String.contains?(trimmed, ["://", "?", "#", "\n", "\r", <<0>>]) do
       {:ok, trimmed}
     else
       {:error, :invalid_path}
@@ -180,7 +184,7 @@ defmodule SymphonyElixir.GitLab.AgentTool do
   end
 
   defp tool_error_payload(:invalid_path) do
-    %{"error" => %{"message" => "gitlab_api.path must be a relative GitLab REST path."}}
+    %{"error" => %{"message" => "gitlab_api.path must be a relative GitLab REST path without query or fragment; use query for parameters."}}
   end
 
   defp tool_error_payload(:invalid_query) do

@@ -37,8 +37,11 @@ defmodule SymphonyElixir.TaskReconciler do
         try do
           File.write!(Path.join(lock, "reconcile-owner"), System.pid())
 
-          with {:ok, current} <- RunJournal.read(record["directory"]) do
-            refresh(current, false)
+          with {:ok, current} <- RunJournal.read(record["directory"]),
+               {:ok, current} <- Execution.reconcile_native_stop(current) do
+            with {:ok, _} <- refresh(current, false) do
+              reconcile_pending_delivery(current)
+            end
           end
         after
           File.rm(Path.join(lock, "reconcile-owner"))
@@ -51,6 +54,12 @@ defmodule SymphonyElixir.TaskReconciler do
       error ->
         Logger.warning("Task reconciliation lock failed issue_id=#{record["issue_id"]} error=#{inspect(error)}")
     end
+  end
+
+  defp reconcile_pending_delivery(record) do
+    issue = %SymphonyElixir.Tracker.Issue{id: record["issue_id"], url: record["issue_url"], identifier: record["issue_identifier"]}
+    client = Application.get_env(:symphony_elixir, :task_workflow_client, &Client.request/5)
+    Execution.reconcile_delivery(issue, tracker_settings: Config.settings!().tracker, gitlab_client: client)
   end
 
   @spec admit(SymphonyElixir.Tracker.Issue.t(), map()) :: {:ok, map()} | {:error, term()}
@@ -237,7 +246,6 @@ defmodule SymphonyElixir.TaskReconciler do
 
     candidate = TaskWorkflow.reconcile(flow, basic, events, now)
     items = Enum.flat_map(List.wrap(candidate["manifest"]), & &1["items"]) ++ List.wrap(flow["intermediate"])
-    items = Enum.uniq_by(items, & &1["url"])
 
     with {:ok, versions, merged, merged_urls} <- versions(items, prefix, raw["web_url"], notes, client, settings),
          {:ok, satisfied} <- dependencies(candidate, prefix, client, settings) do
@@ -286,7 +294,7 @@ defmodule SymphonyElixir.TaskReconciler do
   end
 
   defp note_payload(body) do
-    case Regex.run(~r/<!-- symphony-workflow\s+(\{.*?\})\s*-->/s, body) do
+    case Regex.run(~r/(?:^|\n)<!-- symphony-workflow\s+(\{.*?\})\s*-->\s*$/s, body) do
       [_, json] -> decode_payload(json)
       _ -> intent(String.trim(body))
     end
@@ -456,12 +464,17 @@ defmodule SymphonyElixir.TaskReconciler do
     flow = record["workflow"]
 
     not active and flow["state"] == "ready" and flow["routing_removed"] and
-      flow["resume_requested"] and stopped?(record)
+      flow["resume_requested"] and stopped?(record) and retry_admissible?(record)
   end
+
+  defp retry_admissible?(record), do: record["phase"] != "incident" or (record["retry_count"] || 0) <= 2
 
   defp stopped?(record), do: record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true
 
   defp get(client, path, settings), do: request(client, "GET", path, nil, settings)
+
+  @spec read_notes(function(), String.t(), map()) :: {:ok, [map()]} | {:error, term()}
+  def read_notes(client, path, settings), do: pages(client, path, settings, 1, [])
 
   defp request(client, method, path, body, settings) do
     case client.(method, path, %{}, body, tracker_settings: settings) do

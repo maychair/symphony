@@ -189,6 +189,9 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     Agent.update(server, &%{&1 | notes: &1.notes ++ filler})
     append(server, %{note(200, "pause", %{}) | "body" => "<!-- symphony-workflow {bad} -->"})
     append(server, %{note(201, "pause", %{}) | "body" => "Ordinary review suggestion"})
+    quoted = note(999, "pause", %{}, contract)
+    quoted = %{quoted | "body" => "```html\n" <> quoted["body"] <> "\n```"}
+    assert TaskReconciler.events([quoted], %{}, "1") == []
     assert {:ok, observation} = TaskReconciler.observe(record)
     assert length(observation.events) == 1
     stale = %{record | "attempt_id" => "other"}
@@ -383,6 +386,8 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert Agent.get(server, & &1.raw["state"]) == "closed"
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["state"] == "ended"
+    assert :ok = Execution.finish(issue, opts, {:error, {:native_goal_stopped, "blocked"}})
+    refute current(record)["retry_count"]
   end
 
   test "legacy malformed artifacts fail closed and unknown native payloads do not grant completion", %{issue: issue, server: server} do
@@ -431,5 +436,136 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["restrictions"]["budget"]
     assert Enum.any?(Agent.get(server, & &1.notes), &String.contains?(&1["body"], "累计执行预算已用完"))
+  end
+
+  test "repeated MR links retain every item's validation and review requirements", %{issue: issue, server: server} do
+    agreement = %{
+      "issue_version" => TaskWorkflow.digest("Deliver the result"),
+      "type" => "development",
+      "criteria" => ["a", "b"],
+      "acceptor" => "2",
+      "acceptance_mode" => "separate",
+      "close_on_conclusion" => true,
+      "deliverables" => [%{"id" => "first", "kind" => "mr"}, %{"id" => "second", "kind" => "mr"}]
+    }
+
+    url = "https://gitlab.test/group/project/-/merge_requests/9"
+    mr = %{"web_url" => url, "sha" => "v1", "source_project_id" => 1, "target_project_id" => 1, "state" => "merged", "merged_at" => "2026-10-16T00:00:00Z"}
+    Agent.update(server, &%{&1 | notes: [note(1, "authorize", agreement)], mr: mr})
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    contract = record["workflow"]["contract"]["ref"]
+    first = %{"id" => "first", "kind" => "mr", "url" => url, "version" => "v1", "criteria" => ["a"], "checks" => true, "review" => true}
+    second = %{first | "id" => "second", "criteria" => ["b"], "checks" => false, "review" => false}
+    submission = note(3, "manifest", %{"contract" => contract, "items" => [first, second]}, contract)
+    append(server, submission)
+    append(server, note(4, "accept", %{"manifest" => TaskReconciler.source_ref(submission)}, contract, 2))
+    {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => true})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    refute record["workflow"]["delivery_ready"]
+    refute TaskWorkflow.valid_conclusion?(record["workflow"])
+    assert Agent.get(server, & &1.raw["state"]) == "opened"
+  end
+
+  test "stopped-run polling recovers final MR publication and submits its manifest without a replacement executor", %{issue: issue, server: server, client: client} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    url = "https://gitlab.test/group/project/-/merge_requests/9"
+
+    mr = %{
+      "iid" => 9,
+      "web_url" => url,
+      "sha" => "v1",
+      "source_project_id" => 1,
+      "target_project_id" => 1,
+      "source_branch" => "task",
+      "target_branch" => "main",
+      "state" => "merged",
+      "merged_at" => "2026-10-16T00:00:00Z",
+      "squash" => true,
+      "force_remove_source_branch" => true
+    }
+
+    Agent.update(server, &%{&1 | mr: mr})
+    item = %{"id" => "code", "kind" => "mr", "url" => url, "version" => "v1", "criteria" => ["a", "b"], "checks" => true, "review" => true}
+    manifest = %{"contract" => record["workflow"]["contract"]["ref"], "items" => [item]}
+    invalid = %{"kind" => "review", "reason" => "Review", "manifest" => []}
+    handoff_opts = [issue: issue, tracker_settings: Config.settings!().tracker, gitlab_client: client]
+    refute Execution.handoff(invalid, handoff_opts)["success"]
+    refute Execution.handoff(%{invalid | "manifest" => %{}}, handoff_opts)["success"]
+
+    request = %{
+      "schema_version" => 1,
+      "attempt_id" => record["attempt_id"],
+      "issue_url" => issue.url,
+      "kind" => "review",
+      "reason" => "Review the complete delivery.",
+      "url" => url,
+      "publication" => mr,
+      "manifest" => manifest
+    }
+
+    File.write!(Path.join(record["directory"], "review-request-#{record["attempt_id"]}.json"), Jason.encode!(request))
+
+    fail_release = fn method, path, query, body, options ->
+      if method == "PUT", do: {:error, :offline}, else: client.(method, path, query, body, options)
+    end
+
+    delivery_opts = [tracker_settings: Config.settings!().tracker, gitlab_client: fail_release]
+    assert {:error, _} = Execution.reconcile_delivery(issue, delivery_opts)
+    filler = for id <- 100..199, do: Map.put(note(id, "ignored", %{}), "system", true)
+    Agent.update(server, &%{&1 | notes: filler ++ &1.notes})
+    # Simulate a lost receipt for the already posted notice, now beyond page one.
+    {:ok, _} = RunJournal.checkpoint(current(record), %{"handoff_notice" => nil})
+    {:ok, record} = RunJournal.checkpoint(current(record), %{"native_stop_confirmed" => true, "thread_id" => "original", "thread_allocation_intent" => true})
+    :ok = RunJournal.complete(record, "completed")
+    :ok = TaskReconciler.poll(MapSet.new())
+    assert current(record)["handoff"]["manifest"] == manifest
+    count = Agent.get(server, &Enum.count(&1.calls, fn {method, _, _, _} -> method == "POST" end))
+    :ok = TaskReconciler.poll(MapSet.new())
+    final = current(record)
+    assert final["workflow"]["manifest"]["items"] == [item]
+    assert final["workflow"]["state"] == "review"
+    assert final["thread_id"] == "original"
+    assert final["attempt_id"] == record["attempt_id"]
+    assert Agent.get(server, &Enum.count(&1.calls, fn {method, _, _, _} -> method == "POST" end)) == count
+    assert Execution.controlled_stop?(opts)
+    refute Execution.controlled_stop?([])
+  end
+
+  test "authorized recovery respects the cumulative failure count across successful handoffs", context do
+    %{issue: issue, server: server, contract: contract, client: client} = context
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    append(server, note(2, "rework", %{"criteria" => ["a"], "changes" => []}, contract, 2))
+    {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => true, "retry_count" => 1, "attempt_count" => 10})
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    :ok = RunJournal.complete(record, "incident")
+    assert Execution.resumable?(issue)
+    {:ok, _, resumed} = Execution.prepare(issue, [])
+    assert resumed[:run_record]["retry_count"] == 1
+    assert resumed[:run_record]["attempt_count"] == 11
+    # Successful review/rework attempts did not spend the two transient retries.
+    assert :ok = Execution.finish(issue, resumed, {:error, :fixture_failure})
+    {:ok, record} = RunJournal.read(record["directory"])
+    assert record["retry_count"] == 2 and record["phase"] == "completed"
+    {:ok, _, third} = Execution.prepare(issue, [])
+    assert :ok = Execution.finish(issue, third, {:error, :fixture_failure})
+    {:ok, record} = RunJournal.read(record["directory"])
+    assert record["retry_count"] == 3 and record["phase"] == "incident"
+    refute Execution.resumable?(issue)
+    retry = %{issue | labels: issue.labels ++ ["symphony:retry"]}
+    {:ok, _, explicit} = Execution.prepare(retry, gitlab_client: client)
+    assert explicit[:run_record]["retry_count"] == 3
+  end
+
+  test "waiting admission exits normally without allocating a native execution", %{issue: issue, server: server} do
+    Agent.update(server, &%{&1 | notes: []})
+    assert :ok = SymphonyElixir.AgentRunner.run(issue)
+    {:ok, record} = RunJournal.read(RunJournal.directory(Execution.journal_root(), issue.id))
+    assert record["workflow"]["state"] == "waiting"
+    refute record["thread_id"]
+    refute record["blocker_reason"]
+    refute File.exists?(Path.join(record["directory"], "executor.lock"))
   end
 end

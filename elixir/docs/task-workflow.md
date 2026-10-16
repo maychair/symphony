@@ -88,6 +88,15 @@ review waits for human review. A verified publication request may specify
 release that review wait. Remaining work then passes admission again. Without
 that explicit continuation, review comments and merge do not requeue execution.
 Use native `Related to` for separate acceptance, mixed tasks and multiple MRs.
+For the final MR, the Workspace publisher accepts `--handoff --manifest-file FILE`.
+Prepare every delivery item before publication and use paired `$publication`
+placeholders in the current MR item's URL and version. The publisher binds that
+verified MR and saves the complete manifest in the same atomic review request.
+Symphony verifies the contract and item coverage, posts a human-readable full
+checklist with its versioned manifest, and stops execution. Do not combine final
+submission with intermediate continuation. Stopped-run polls recover unfinished
+review requests, including an already merged MR or a notice beyond the first
+comments page, without allocating a replacement executor.
 
 Publish an overall `manifest` decision with data like:
 
@@ -106,7 +115,9 @@ protocol accepts same-repository MRs and Issue-note reports. Other artifact type
 must be represented by an evidenced report note; arbitrary mutable URLs are not
 accepted as versioned deliverables.
 
-Submitting the manifest enters overall acceptance and stops execution. Separate
+Submitting the complete manifest stops execution. Pending technical review or
+unmerged MRs keep the task waiting; only complete native delivery evidence enters
+overall acceptance. Separate
 acceptance requires the acceptor's `accept` decision naming that exact manifest.
 Merge acceptance requires the declared single MR, verified source version,
 recorded checks/review evidence and native merge. A substantive report or source
@@ -128,6 +139,9 @@ MR review and overall acceptance stop charging only after native stop confirmati
 Intervals are settled once; retries and new attempts do not reset consumption.
 Each attempt is capped by both the configured run limit and remaining allowance.
 A backwards wall clock stops work for a decision rather than granting new time.
+Successful handoff/rework attempts do not consume the separate cumulative failure
+retry counter. Two confirmed-stopped transient failures can retry automatically;
+an explicit retry request does not reset that counter or the execution budget.
 
 Cleanup additionally compares current decision-note versions with the last
 observation saved by the engine; a newly arrived or edited decision prevents
@@ -142,7 +156,12 @@ requests produce a deduplicated Issue notice with the required next action.
 Repeated polls and a lost local notice receipt do not repost the request.
 An unexplained external removal creates `external_routing`; it requires an explicit authorizer release and is not
 automatically undone. Every admission and post-hook activation rereads facts.
-Queued stop messages take priority over native Goal handoff checks; active fact
+When the old worker is gone, the poll owner halts the recorded Goal, interrupts
+its active native turn and validates native idle under the same execution lock.
+It neither starts a new thread nor resumes the stopped Goal. Confirmed observations
+update the last turn identity for later recovery; unknown allocation, native errors
+or an unproved stop remain waiting. The recorded worker host remains bound to a
+resumed thread. Queued stop messages take priority over native Goal handoff checks; active fact
 reads are asynchronous and fail closed on error or expiry.
 
 Deploy both the engine and its integration before enabling the option in retained

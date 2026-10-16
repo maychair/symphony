@@ -172,6 +172,9 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert {:ok, _} = Flow.submit(flow, manifest())
     flow = Flow.reconcile(flow, facts(), [event("manifest", "manifest", 2, Map.delete(manifest(), "ref"))], 0)
     assert flow["state"] == "review"
+    pending = Flow.reconcile(flow, facts(%{"deliveries_ready" => false}), [], 0)
+    assert pending["state"] == "waiting"
+    assert Flow.reconcile(pending, facts(), [], 0)["state"] == "review"
     assert Flow.reconcile(authorized(), facts(), [event("manifest", "bad-manifest", 2, %{})], 0)["events"]["bad-manifest"] == "manifest_rejected"
   end
 
@@ -216,7 +219,16 @@ defmodule SymphonyElixir.TaskWorkflowTest do
   end
 
   test "malformed agreements and manifests cannot authorize work; reopening requires an explicit release" do
-    for invalid <- [%{"acceptance_mode" => "unknown"}, %{"budget_ms" => -1}, %{"criteria" => ["a", "a"]}, %{"deliverables" => [nil]}, %{"type" => "unknown"}, %{"reviewers" => []}] do
+    for invalid <- [
+          %{"acceptance_mode" => "unknown"},
+          %{"deadline" => "tomorrow"},
+          %{"reviewers" => "invalid"},
+          %{"budget_ms" => -1},
+          %{"criteria" => ["a", "a"]},
+          %{"deliverables" => [nil]},
+          %{"type" => "unknown"},
+          %{"reviewers" => []}
+        ] do
       result = Flow.reconcile(Flow.new(1_000, 0), facts(%{"type" => invalid["type"] || "development"}), [authorization(invalid)], 0)
       if invalid == %{"reviewers" => []}, do: assert(result["contract"]), else: refute(result["contract"])
     end
@@ -239,7 +251,7 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert flow["restrictions"]["dependency:input"]
     assert Flow.reconcile(flow, facts(%{"satisfied" => ["dependency:input"]}), [], 0)["state"] == "ready"
 
-    for dependencies <- ["invalid", [nil], [%{"id" => "x", "kind" => "issue", "number" => -1}]] do
+    for dependencies <- ["invalid", [nil], [%{"id" => "x", "kind" => "issue", "number" => -1}], [dependency, dependency]] do
       refute Flow.reconcile(Flow.new(1_000, 0), facts(), [authorization(%{"dependencies" => dependencies})], 0)["contract"]
     end
 
@@ -286,5 +298,26 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     flow = Flow.reconcile(flow, facts(%{"deliveries_ready" => false, "closed" => true}), [event("accept", "accept", 5, %{"manifest" => "manifest"}, "2")], 0)
     assert flow["state"] == "waiting"
     refute Flow.valid_conclusion?(flow)
+  end
+
+  test "invalid restriction scopes and kinds cannot silently leave work unrestricted" do
+    flow = Flow.reconcile(authorized(), facts(), [event("restrict", "d", 2, %{"kind" => "unknown", "scope" => ["unknown"]})], 0)
+    assert flow["restrictions"]["d"]["scope"] == "task"
+    assert flow["restrictions"]["d"]["kind"] == "decision"
+    assert flow["state"] == "waiting"
+  end
+
+  test "late releases cannot lower the resume boundary and reopening cancellation needs a decision" do
+    newer = event("release", "new-release", 30, %{"restrictions" => ["pause"]})
+    older = event("release", "old-release", 20, %{"restrictions" => ["pause"]})
+    flow = Flow.reconcile(authorized(), facts(), [newer], 0)
+    flow = Flow.reconcile(flow, facts(), [older], 0)
+    flow = Flow.reconcile(flow, facts(), [event("pause", "late-pause", 25, %{"restriction" => "pause"})], 0)
+    assert flow["state"] == "ready"
+    cancelled = Flow.reconcile(authorized(), facts(%{"source_refs" => ["auth", "cancel"], "closed" => true}), [event("cancel", "cancel", 2, %{"reason" => "Cancel"})], 0)
+    assert cancelled["state"] == "ended"
+    reopened = Flow.reconcile(cancelled, facts(%{"source_refs" => ["auth", "cancel"]}), [], 0)
+    assert reopened["state"] == "waiting"
+    refute Flow.valid_conclusion?(reopened)
   end
 end

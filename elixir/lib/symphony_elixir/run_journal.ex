@@ -101,14 +101,22 @@ defmodule SymphonyElixir.RunJournal do
 
   @spec stage_results(map()) :: map()
   def stage_results(record) do
-    %{
+    stages = %{
       "execution_admitted" => if(record["attempt_id"], do: "passed", else: "not_verified"),
       "mr_publication" => if(get_in(record, ["delivery", "mr_verified"]) == true, do: "passed", else: "not_verified"),
       "review_handoff" => if(get_in(record, ["handoff", "kind"]) == "review", do: "passed", else: "not_verified"),
       "native_execution_stopped" => if(record["native_stop_confirmed"] == true, do: "passed", else: "not_verified"),
-      "business_validation" => "see_mr_evidence",
+      "business_validation" => business_evidence(record),
       "error" => record["blocker_reason"]
     }
+
+    if get_in(record, ["workflow", "contract", "type"]) == "research",
+      do: Map.merge(stages, %{"mr_publication" => "not_applicable", "review_handoff" => "not_applicable"}),
+      else: stages
+  end
+
+  defp business_evidence(record) do
+    Map.get(%{"research" => "see_issue_evidence", "mixed" => "see_manifest_evidence"}, get_in(record, ["workflow", "contract", "type"]), "see_mr_evidence")
   end
 
   @spec complete(map(), String.t()) :: :ok | {:error, term()}

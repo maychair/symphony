@@ -40,6 +40,7 @@ defmodule SymphonyElixir.Execution do
                "issue_url" => issue.url,
                "issue_identifier" => issue.identifier,
                "backend" => ExecutionBackend.kind(),
+               "worker_host" => if(is_binary(record["thread_id"]), do: record["worker_host"], else: opts[:worker_host]),
                "recovery" => if(record["thread_id"], do: "resume existing native thread", else: nil),
                "handoff" => nil,
                "blocker_reason" => nil
@@ -55,7 +56,7 @@ defmodule SymphonyElixir.Execution do
     case TaskReconciler.admit(issue, record) do
       {:ok, admitted} ->
         budget = min(run_budget_ms(issue.id), admitted["remaining_budget_ms"] || run_budget_ms(issue.id))
-        options = Keyword.merge(opts, run_record: admitted, deadline: System.monotonic_time(:millisecond) + budget, tracker_settings: Config.settings!().tracker)
+        options = Keyword.merge(opts, run_record: admitted, worker_host: admitted["worker_host"], deadline: System.monotonic_time(:millisecond) + budget, tracker_settings: Config.settings!().tracker)
         {:ok, issue, options}
 
       error ->
@@ -84,6 +85,13 @@ defmodule SymphonyElixir.Execution do
         true -> {:error, {:execution_requires_recovery, record["blocker_reason"] || record["phase"]}}
       end
     end
+  end
+
+  defp workflow_recovery?(record) do
+    flow = record["workflow"] || %{}
+
+    record["native_stop_confirmed"] == true and flow["resume_requested"] == true and
+      flow["allowed_criteria"] != [] and flow["state"] == "ready" and (record["retry_count"] || 0) <= 2
   end
 
   defp stopped_with_known_allocation?(record) do
@@ -150,6 +158,7 @@ defmodule SymphonyElixir.Execution do
           _ -> record
         end
 
+      record = count_retry(record, result)
       {phase, error} = final_phase(issue, record, result)
 
       with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => error}) do
@@ -158,9 +167,73 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
+  defp count_retry(record, :ok), do: record
+  defp count_retry(record, {:error, :scheduler_stop}), do: record
+
+  defp count_retry(%{"native_stop_confirmed" => true, "workflow" => %{"state" => state}} = record, _)
+       when state in ["waiting", "review", "ended"], do: record
+
+  defp count_retry(%{"native_stop_confirmed" => true, "control_restart" => true} = record, _), do: record
+  defp count_retry(record, _), do: Map.update(record, "retry_count", 1, &(&1 + 1))
+
   @spec refresh_workflow(map(), boolean()) :: {:ok, map()} | {:error, term()}
   def refresh_workflow(record, active) do
     if TaskReconciler.enabled?(), do: TaskReconciler.refresh(record, active), else: {:ok, record}
+  end
+
+  @spec reconcile_native_stop(map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def reconcile_native_stop(record, opts \\ []) do
+    cond do
+      record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true ->
+        {:ok, record}
+
+      (record["backend"] || "codex") != "codex" ->
+        RunJournal.checkpoint(record, %{"native_stop_recovery" => "Recorded backend requires explicit native recovery"})
+
+      true ->
+        halt_recorded_thread(record, opts)
+    end
+  end
+
+  defp halt_recorded_thread(%{"thread_id" => thread, "workspace" => workspace} = record, opts)
+       when is_binary(thread) and is_binary(workspace) do
+    backend = Keyword.get(opts, :backend, SymphonyElixir.Codex.AppServer)
+    observation_ref = make_ref()
+
+    session_opts = [
+      resume_thread_id: thread,
+      expected_turn_id: record["turn_id"] || :no_turns,
+      suspend_goal: true,
+      interrupt_active: true,
+      halt_only: true,
+      on_thread_observed: fn observation -> send(self(), {:native_stop_observed, observation_ref, observation}) end,
+      reconcile_terminal_turns: true,
+      worker_host: record["worker_host"],
+      tracker_settings: Config.settings!().tracker
+    ]
+
+    case backend.start_session(workspace, session_opts) do
+      {:ok, session} ->
+        backend.stop_session(session)
+
+        observed =
+          receive do
+            {:native_stop_observed, ^observation_ref, observation} -> observation[:turn_id]
+          after
+            0 -> record["turn_id"]
+          end
+
+        turn = if is_binary(observed), do: observed
+        evidence = %{"native_stop_confirmed" => true, "turn_id" => turn, "native_stop_recovery" => "recorded Goal halted and native idle verified"}
+        RunJournal.checkpoint(record, evidence)
+
+      {:error, reason} ->
+        RunJournal.checkpoint(record, %{"native_stop_recovery" => "Recorded native stop remains unconfirmed: #{inspect(reason)}"})
+    end
+  end
+
+  defp halt_recorded_thread(record, _opts) do
+    RunJournal.checkpoint(record, %{"native_stop_recovery" => "Unrecorded native allocation requires explicit recovery"})
   end
 
   @spec activation_options(keyword()) :: {:ok, keyword()} | {:error, term()}
@@ -196,6 +269,18 @@ defmodule SymphonyElixir.Execution do
 
   defp activation_budget(record, opts), do: {:ok, Keyword.put(opts, :run_record, record)}
 
+  @spec controlled_stop?(keyword()) :: boolean()
+  def controlled_stop?(opts) do
+    with %{} = initial <- opts[:run_record],
+         {:ok, current} <- RunJournal.read(initial["directory"]) do
+      known = current["attempt_id"] == initial["attempt_id"] and current["native_stop_confirmed"] == true
+      control = get_in(current, ["workflow", "state"]) in ["waiting", "review", "ended"] or current["control_restart"] == true
+      known and control
+    else
+      _ -> false
+    end
+  end
+
   defp final_phase(_issue, %{"native_stop_confirmed" => true, "workflow" => %{"state" => state}}, _result)
        when state in ["waiting", "review", "ended"], do: {"completed", nil}
 
@@ -227,7 +312,7 @@ defmodule SymphonyElixir.Execution do
   defp final_phase(_issue, record, result) do
     # Keep the existing scheduler retry loop for confirmed-stopped transient
     # failures. Two retries are enough before surfacing the actual incident.
-    if (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true) and (record["attempt_count"] || 0) < 3,
+    if (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true) and (record["retry_count"] || 0) <= 2,
       do: {"completed", inspect(result)},
       else: {"incident", inspect(result)}
   end
@@ -275,10 +360,14 @@ defmodule SymphonyElixir.Execution do
 
   @spec resumable?(Tracker.Issue.t()) :: boolean()
   def resumable?(issue) do
-    if enabled?() and "symphony:retry" in issue.labels do
+    if enabled?() do
       case RunJournal.read(RunJournal.directory(journal_root(), issue.id)) do
-        {:ok, %{"phase" => "incident"} = record} -> record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true
-        _ -> false
+        {:ok, %{"phase" => "incident"} = record} ->
+          requested = "symphony:retry" in issue.labels or workflow_recovery?(record)
+          requested and (record["native_stop_confirmed"] == true or record["thread_allocation_intent"] != true)
+
+        _ ->
+          false
       end
     else
       false
@@ -354,7 +443,7 @@ defmodule SymphonyElixir.Execution do
          true <- same_publication?(publication, mr),
          delivery = %{"url" => request["url"], "kind" => "mr", "version" => sha, "mr_verified" => true, "attempt_id" => record["attempt_id"]},
          {:ok, _} <- RunJournal.checkpoint(record, %{"delivery" => delivery}),
-         %{"success" => true} <- handoff(Map.take(request, ["kind", "reason", "url", "stage", "continue_after"]), opts) do
+         %{"success" => true} <- handoff(Map.take(request, ["kind", "reason", "url", "stage", "continue_after", "manifest"]), opts) do
       :ok
     else
       error -> {:error, {:review_delivery_not_verified, error}}
@@ -393,6 +482,7 @@ defmodule SymphonyElixir.Execution do
 
     with {:ok, %{} = record} <- RunJournal.read(RunJournal.directory(journal_root(), issue.id)),
          true <- record["issue_url"] == issue.url,
+         :ok <- valid_handoff_manifest(record, arguments),
          {:ok, pending} <- RunJournal.checkpoint(record, handoff_intent(record, arguments)) do
       case post_handoff(settings, issue, arguments, pending, opts) do
         {:ok, posted} ->
@@ -409,6 +499,16 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp do_handoff(_, _), do: {:error, :invalid_handoff}
+
+  defp valid_handoff_manifest(record, %{"manifest" => manifest}) when is_map(manifest) do
+    case SymphonyElixir.TaskWorkflow.submit(record["workflow"], Map.put(manifest, "ref", "pending")) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp valid_handoff_manifest(_, %{"manifest" => _}), do: {:error, :invalid_manifest}
+  defp valid_handoff_manifest(_, _), do: :ok
 
   defp handoff_intent(record, arguments) do
     changes = %{"handoff_pending" => true}
@@ -455,8 +555,7 @@ defmodule SymphonyElixir.Execution do
        when previous == body, do: {:ok, record}
 
   defp ensure_handoff_notice(client, path, settings, body, record) do
-    with {:ok, %{status: 200, body: notes}} when is_list(notes) <-
-           client.("GET", path, %{"per_page" => 100}, nil, tracker_settings: settings),
+    with {:ok, notes} <- TaskReconciler.read_notes(client, path, settings),
          :ok <- post_notice_unless_present(client, path, settings, body, notes) do
       RunJournal.checkpoint(record, %{"handoff_notice" => body})
     end
@@ -494,7 +593,24 @@ defmodule SymphonyElixir.Execution do
   defp client_path(%{kind: "gitlab"} = settings, issue, opts),
     do: {opts[:gitlab_client] || (&SymphonyElixir.GitLab.Client.request/5), "/projects/#{URI.encode_www_form(settings.provider["project_path"])}/issues/#{issue.id}"}
 
-  defp handoff_body(args), do: "**#{args["kind"]}**\n\n#{args["reason"]}" <> if(args["url"], do: "\n\n#{args["url"]}", else: "")
+  defp handoff_body(args) do
+    body = "**#{args["kind"]}**\n\n#{args["reason"]}" <> if(args["url"], do: "\n\n#{args["url"]}", else: "")
+
+    case args["manifest"] do
+      nil ->
+        body
+
+      manifest ->
+        decision = %{"action" => "manifest", "contract" => manifest["contract"], "data" => manifest}
+        summary = Enum.map_join(manifest["items"], "\n", &"- [#{&1["id"]}](#{&1["url"]})")
+
+        body <>
+          "\n\n全部约定成果已提交；请先完成尚未合入 MR 的审查与合并，再按此清单完成整体验收：\n\n" <>
+          summary <>
+          "\n\n<!-- symphony-workflow\n" <> Jason.encode!(decision) <> "\n-->"
+    end
+  end
+
   defp response({:ok, %{status: status}}) when status in 200..299, do: :ok
   defp response(error), do: {:error, error}
 end

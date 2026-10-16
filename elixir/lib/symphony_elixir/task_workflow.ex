@@ -35,6 +35,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     |> check_reopen(facts)
     |> apply_events(events, facts)
     |> check_baseline(facts)
+    |> check_occupancy(facts)
     |> check_decision_sources(facts)
     |> check_manifest(facts)
     |> check_conditions(facts)
@@ -124,9 +125,9 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp transition(flow, %{"action" => action} = event) when action in ["pause", "cancel", "restrict"] do
     data = event["data"]
-    kind = if action == "restrict", do: data["kind"] || "decision", else: action
+    kind = if action == "restrict", do: restriction_kind(data["kind"]), else: action
     id = data["restriction"] || event["ref"]
-    scope = if action in ["pause", "cancel"], do: "task", else: data["scope"] || "task"
+    scope = if action in ["pause", "cancel"], do: "task", else: restriction_scope(data["scope"], flow)
     updated = restrict(flow, id, kind, scope, event)
     updated = apply_restriction_data(updated, id, event)
     {updated, "restricted"}
@@ -208,9 +209,9 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp valid_controls?(data) do
     owner = is_binary(data["acceptor"]) and data["acceptor"] != ""
-    reviewers = data["reviewers"] || []
 
-    owner and valid_budget?(data["budget_ms"]) and valid_close?(data["close_on_conclusion"]) and is_list(reviewers) and Enum.all?(reviewers, &is_binary/1) and
+    owner and valid_budget?(data["budget_ms"]) and valid_deadline?(data["deadline"]) and
+      valid_close?(data["close_on_conclusion"]) and valid_reviewers?(data["reviewers"] || []) and
       valid_dependencies?(data["dependencies"] || [])
   end
 
@@ -218,14 +219,22 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp valid_budget?(budget), do: is_integer(budget) and budget > 0
   defp valid_close?(value), do: value in [nil, true, false]
 
-  defp valid_dependencies?(dependencies) when is_list(dependencies) do
-    Enum.all?(dependencies, fn
-      %{"id" => id, "kind" => kind, "number" => number} ->
-        is_binary(id) and kind in ["issue", "mr"] and is_integer(number) and number > 0
+  defp valid_deadline?(nil), do: true
+  defp valid_deadline?(value), do: is_integer(value) and value > 0
+  defp valid_reviewers?(values) when is_list(values), do: Enum.all?(values, &is_binary/1)
+  defp valid_reviewers?(_), do: false
 
-      _ ->
-        false
-    end)
+  defp valid_dependencies?(dependencies) when is_list(dependencies) do
+    valid =
+      Enum.all?(dependencies, fn
+        %{"id" => id, "kind" => kind, "number" => number} ->
+          is_binary(id) and kind in ["issue", "mr"] and is_integer(number) and number > 0
+
+        _ ->
+          false
+      end)
+
+    valid and length(Enum.uniq_by(dependencies, & &1["id"])) == length(dependencies)
   end
 
   defp valid_dependencies?(_), do: false
@@ -233,7 +242,16 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp install_dependencies(flow, event) do
     Enum.reduce(event["data"]["dependencies"] || [], flow, fn dependency, current ->
       id = "dependency:" <> dependency["id"]
-      restriction = %{"kind" => "dependency", "scope" => dependency["scope"] || "task", "condition" => dependency, "source" => event["ref"], "at" => event["at"]}
+      scope = restriction_scope(dependency["scope"], flow)
+
+      restriction = %{
+        "kind" => "dependency",
+        "scope" => scope,
+        "condition" => dependency,
+        "source" => event["ref"],
+        "at" => event["at"]
+      }
+
       put_in(current, ["restrictions", id], restriction)
     end)
   end
@@ -285,9 +303,18 @@ defmodule SymphonyElixir.TaskWorkflow do
       updated = flow |> Map.put("manifest", nil) |> Map.put("acceptance", nil) |> clear("handoff") |> Map.put("delivery_order", order(event))
       {Map.put(updated, "resume_requested", true), "in_scope_rework"}
     else
-      {restrict(flow, event["ref"], "scope", data["scope"] || "task", event), "scope_confirmation_required"}
+      {restrict(flow, event["ref"], "scope", restriction_scope(data["scope"], flow), event), "scope_confirmation_required"}
     end
   end
+
+  defp restriction_scope(scope, flow) when is_list(scope) and scope != [] do
+    if Enum.all?(scope, &(&1 in flow["contract"]["criteria"])), do: scope, else: "task"
+  end
+
+  defp restriction_scope(_, _), do: "task"
+
+  defp restriction_kind(kind) when kind in ["dependency", "resource", "review", "decision", "scope", "acceptance"], do: kind
+  defp restriction_kind(_), do: "decision"
 
   defp restrict(flow, id, kind, scope, event) do
     released = flow["released"][id]
@@ -307,7 +334,7 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp release(flow, id, event) do
     restriction = flow["restrictions"][id]
 
-    if is_nil(restriction) or newer?(event, restriction) do
+    if (is_nil(restriction) or newer?(event, restriction)) and not released_after?(flow["released"][id], event) do
       flow |> clear(id) |> put_in(["released", id], order(event))
     else
       flow
@@ -326,6 +353,15 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp check_decision_sources(flow, facts) do
     if is_binary(flow["cancellation"]) and flow["cancellation"] not in facts["source_refs"], do: automatic(flow, "cancellation_source", "decision"), else: clear(flow, "cancellation_source")
+  end
+
+  defp check_occupancy(flow, facts) do
+    if flow["started"] and facts["active"] != true and facts["stopped"] != true do
+      automatic(flow, "native_stop", "decision")
+    else
+      flow = if flow["restrictions"]["native_stop"], do: Map.put(flow, "resume_requested", true), else: flow
+      clear(flow, "native_stop")
+    end
   end
 
   @spec submit(map(), map()) :: {:ok, map()} | {:error, atom()}
@@ -437,6 +473,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     not Map.has_key?(flow["restrictions"], "baseline") and
       not Map.has_key?(flow["restrictions"], "conclusion_conflict") and
       not Map.has_key?(flow["restrictions"], "cancellation_source") and
+      not Map.has_key?(flow["restrictions"], "reopen") and
       (is_binary(flow["cancellation"]) or accepted_conclusion?(flow))
   end
 
@@ -468,10 +505,12 @@ defmodule SymphonyElixir.TaskWorkflow do
   end
 
   @spec human_wait?(map()) :: boolean()
-  def human_wait?(flow), do: Enum.any?(Map.values(flow["restrictions"]), &(&1["scope"] == "task" and &1["kind"] in @human))
+  def human_wait?(flow) do
+    is_map(flow["manifest"]) or Enum.any?(Map.values(flow["restrictions"]), &(&1["scope"] == "task" and &1["kind"] in @human))
+  end
 
   defp billable?(flow, facts, human), do: facts["stopped"] != true or (not human and not review?(flow))
-  defp review?(flow), do: is_map(flow["manifest"]) and not Map.has_key?(flow["restrictions"], "delivery_changed")
+  defp review?(flow), do: is_map(flow["manifest"]) and flow["delivery_ready"] == true and not Map.has_key?(flow["restrictions"], "delivery_changed")
 
   defp logical_state(flow, facts, allowed) do
     ended = ended?(flow, facts)
@@ -481,6 +520,7 @@ defmodule SymphonyElixir.TaskWorkflow do
       ended -> "ended"
       waiting -> "waiting"
       review?(flow) -> "review"
+      is_map(flow["manifest"]) -> "waiting"
       allowed == [] -> "waiting"
       facts["active"] == true -> "running"
       true -> "ready"
