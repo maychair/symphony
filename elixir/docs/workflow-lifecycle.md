@@ -472,7 +472,8 @@ its thread; native idle/turn identity checks still precede resumption. Each tran
 claims its own persisted session ID. An open or uncertain transport blocks another
 claim; confirmed stop permits a new ID. Old callbacks and bound role tools cannot
 act through the replacement, even within the same process and attempt. Rotation
-retains the session ID/phase in generation history and clears the current fields. Remote hosts
+retains the session ID/phase and observation error in generation history and clears
+the current fields. Remote hosts
 and non-Codex recorded transports are rejected before allocation.
 
 The final `on_thread_intent` callback rechecks current plan authority, native
@@ -503,13 +504,44 @@ that may now be owned by a replacement. The session API never releases the
 execution admission lock, closes an Issue or treats native Goal completion as
 technical verification or business acceptance.
 
+`TaskSession.run_goal/3` runs the managed Goal with owned native event checkpoints
+and an asynchronous `TaskObserver`. The observer starts reading only after the
+final activation check and intent checkpoint. One reader is linked to the observer,
+which is linked to the session owner; pending reads terminate with their owner.
+Only that owner may consume results or stop the observer. A reader never writes
+the execution journal. Reads use the configured polling interval by default and
+a bounded 60-second timeout; internal callers may supply positive
+`observation_interval_ms` and `observation_timeout_ms` values.
+
+`TaskExecution.observe_running/3` rechecks native plan and delivery snapshots,
+and rejects changes to execution ownership or task evidence during a read.
+It permits only native event/turn/Goal progress and budget clock ticks to advance.
+`apply_running/2` checks the observed task revision against the owner's latest
+record, reassesses with current accounting and checkpoints the result. It does
+not overwrite newer turn progress with an old snapshot. Unknown task fields are
+part of the comparison. Expired results, failed readers, changed evidence and
+physical workspace corruption stop the Goal and retain an observation error.
+A fresh activation must revalidate authority before clearing that error.
+
+A healthy observation keeps the Goal running. A pause, changed candidate or other
+stop-required projection requests native Goal blocking and turn interruption.
+The native event loop remains responsive to its deadline and scheduler stop while
+a provider read is pending. Stop effects, including implicit error cleanup and
+late turn interruption, first recheck the owning session. The observer is stopped
+when the Goal returns; native stop is then explicitly confirmed and the stopped
+lifecycle is refreshed. The result retains `native_result` separately from the
+current record and flow: an outer `{:ok, result}` does not mean the Goal succeeded,
+a candidate passed verification or the task completed. The admission lock remains
+with the caller for finalization.
+
 These APIs are exercised together with native Issue fixtures and a real local
 app-server protocol process, including Goal activation, same-thread resume,
-late callbacks, controls arriving between preparation and allocation, expired
-budgets and failed stop readback. They are not yet the polling worker entry point.
-The role-specific Goal prompt, ongoing asynchronous control observation, worker
-finalization/recovery, configuration resolution and scheduler continuation still
-need integration before version 2 automatic dispatch can be enabled.
+late callbacks, controls arriving before and during execution, candidate publication,
+healthy repeated observations, workspace corruption, reader timeout/crash/owner
+exit, budget expiration and failed stop readback. They are not yet the polling
+worker entry point. The role-specific Goal prompt, worker finalization/recovery,
+configuration resolution and scheduler continuation still need integration before
+version 2 automatic dispatch can be enabled.
 
 ## Native evidence publication
 

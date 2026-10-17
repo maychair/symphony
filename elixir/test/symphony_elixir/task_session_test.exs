@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskSessionTest do
   use SymphonyElixir.TestSupport, runtime: false
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.{TaskExecution, TaskPlan, TaskSession, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{RunJournal, TaskExecution, TaskObserver, TaskPlan, TaskSession, TaskWorkflow, WorkRef}
 
   defp contract(work, parent) do
     data = %{
@@ -63,15 +63,25 @@ defmodule SymphonyElixir.TaskSessionTest do
 
     state = start_supervised!({Agent, fn -> objects end})
     request = fn "github", "GET", path, _, _ -> {:ok, %{status: 200, body: Agent.get(state, &Map.fetch!(&1, path))}} end
+
+    writer = fn "github", "POST", "/repos/team/repo/issues/2/comments" = path, _, %{"body" => body}, _ ->
+      Agent.get_and_update(state, fn objects ->
+        comment = note(body, 100 + length(objects[path])) |> Map.put("user", %{"id" => 99})
+        {{:ok, %{status: 201, body: comment}}, Map.update!(objects, path, &(&1 ++ [comment]))}
+      end)
+    end
+
     repository = Map.take(work, ~w(provider host repository_id)) |> Map.merge(%{"path" => "team/repo", "api_url" => "https://github.test/api/v3", "credential" => "$UNUSED_SESSION_FIXTURE"})
     policy = %{"engine_actor" => "99", "max_retries" => 2, "max_repairs" => 2, "checks" => %{"review" => %{"kind" => "review"}}}
     directory = SymphonyElixir.RunJournal.directory(Path.join(root, "runs"), WorkRef.key(work))
     registry = %{WorkRef.key(work) => %{directory: directory, policy: policy}}
-    opts = [request: request, repositories: [repository], workspace_root: Path.join(root, "workspaces")]
+    opts = [request: request, write_request: writer, repositories: [repository], workspace_root: Path.join(root, "workspaces"), observation_interval_ms: 10]
     binary = Path.join(root, "role-server")
     trace = Path.join(root, "trace.jsonl")
     native = Path.join(root, "native.json")
     failure = Path.join(root, "fail-read")
+    mode = Path.join(root, "mode")
+    File.write!(mode, "complete")
 
     File.write!(binary, """
     #!/usr/bin/env python3
@@ -99,11 +109,21 @@ defmodule SymphonyElixir.TaskSessionTest do
         state['goal']={'threadId':state['id'],'objective':p.get('objective','approved role'),'status':p['status']}
         emit(q,{'goal':state['goal']})
         if p['status']=='active':
-          state['turns']=[{'id':'owned-turn','status':'completed'}]
+          mode=pathlib.Path(#{Jason.encode!(mode)}).read_text()
+          state['turns']=[{'id':'owned-turn','status':'inProgress'}]
           print(json.dumps({'method':'turn/started','params':{'threadId':state['id'],'turn':{'id':'owned-turn'}}}),flush=True)
-          print(json.dumps({'method':'turn/completed','params':{'threadId':state['id'],'turn':state['turns'][0]}}),flush=True)
-          state['goal']['status']='complete'
-          print(json.dumps({'method':'thread/goal/updated','params':{'threadId':state['id'],'goal':state['goal']}}),flush=True)
+          if mode=='complete':
+            state['turns'][0]['status']='completed'
+            print(json.dumps({'method':'turn/completed','params':{'threadId':state['id'],'turn':state['turns'][0]}}),flush=True)
+            state['goal']['status']='complete'
+            print(json.dumps({'method':'thread/goal/updated','params':{'threadId':state['id'],'goal':state['goal']}}),flush=True)
+          elif mode=='candidate':
+            args={'artifacts':[{'id':'report','body':'# Result\\n\\nThe approved result is reproducible.'}],'summary':'Candidate ready'}
+            print(json.dumps({'id':'candidate-call','method':'item/tool/call','params':{'tool':'task_candidate','arguments':args,'callId':'candidate-call','threadId':state['id'],'turnId':'owned-turn'}}),flush=True)
+      elif m=='turn/interrupt':
+        state['turns'][0]['status']='interrupted';emit(q,{})
+        print(json.dumps({'method':'turn/completed','params':{'threadId':state['id'],'turn':state['turns'][0]}}),flush=True)
+      elif q.get('id')=='candidate-call':assert q['result']['success'] is True
       else:raise AssertionError('unexpected method: '+str(m))
       path.write_text(json.dumps(state))
     """)
@@ -112,7 +132,7 @@ defmodule SymphonyElixir.TaskSessionTest do
     settings = [tracker_kind: "memory", workspace_root: opts[:workspace_root], codex_command: binary]
     write_workflow_file!(Workflow.workflow_file_path(), settings)
     {:ok, admitted} = TaskExecution.admit(parent, work, registry, opts)
-    {:ok, root: root, work: work, plan: plan, state: state, registry: registry, opts: opts, record: admitted.record, trace: trace, failure: failure}
+    {:ok, root: root, work: work, parent: parent, plan: plan, state: state, registry: registry, opts: opts, record: admitted.record, trace: trace, failure: failure, mode: mode}
   end
 
   defp current(c), do: elem(SymphonyElixir.RunJournal.read(c.record["directory"]), 1)
@@ -242,5 +262,310 @@ defmodule SymphonyElixir.TaskSessionTest do
     File.rm!(c.failure)
     assert {:error, :workspace_execution_not_ready} = TaskSession.start(current(c), c.registry, c.opts)
     assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+  end
+
+  test "active observations preserve native progress and accounting but cannot overwrite newer task facts", c do
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    :ok = TaskSession.checkpoint(session, %{"native_stop_confirmed" => false})
+    record = current(c)
+
+    request = fn provider, method, path, query, settings ->
+      now = current(c)
+      :ok = TaskSession.checkpoint(session, %{"turn_id" => "progress", "turn_count" => now["turn_count"] + 1, "phase" => "goal_waiting"})
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    assert {:ok, observed} = TaskExecution.observe_running(record, c.registry, Keyword.put(c.opts, :request, request))
+    before = current(c)
+    assert before["turn_count"] > observed.record["turn_count"]
+    assert {:ok, applied} = TaskExecution.apply_running(before, observed)
+    assert applied.record["turn_count"] == before["turn_count"]
+    assert applied.record["workflow"]["used_ms"] >= before["workflow"]["used_ms"]
+    assert applied.flow["state"] == "running"
+    assert {:error, :stale_or_unowned_execution_checkpoint} = TaskExecution.apply_running(before, observed)
+    assert current(c) == applied.record
+    assert {:error, :execution_observation_superseded} = TaskExecution.apply_running(Map.put(before, "new_task_fact", true), observed)
+    assert {:error, :execution_attempt_changed} = TaskExecution.observe_running(Map.put(record, "task_session_id", "old"), c.registry, c.opts)
+    assert :ok = TaskSession.stop(session)
+  end
+
+  test "active observation cannot recreate a missing journal or conceal native read failure", c do
+    journal = Path.join(c.record["directory"], "run.json")
+    stored = File.read!(journal)
+    File.rm!(journal)
+    assert {:error, :execution_attempt_changed} = TaskExecution.observe_running(c.record, c.registry, c.opts)
+    refute File.exists?(journal)
+    File.write!(journal, stored)
+    request = fn _, _, _, _, _ -> {:error, :source_unavailable} end
+    assert {:error, _} = TaskExecution.observe_running(c.record, c.registry, Keyword.put(c.opts, :request, request))
+    assert File.read!(journal) == stored
+  end
+
+  test "managed Goal completion persists native progress without claiming task completion", c do
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    assert {:ok, result} = TaskSession.run_goal(session, "Produce the approved report")
+    assert {:ok, %{goal_status: "complete"}} = result.native_result
+    assert result.record["turn_id"] == "owned-turn"
+    assert result.record["turn_count"] == 1
+    assert result.record["native_stop_confirmed"]
+    refute result.flow["closeable"]
+    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    assert {:error, :task_session_not_ready} = TaskSession.run_goal(session, "Do not reuse a closed transport")
+  end
+
+  test "a pause during an active Goal interrupts its native turn and persists the restriction", c do
+    File.write!(c.mode, "hold")
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+
+    handler = fn
+      %{event: :session_started} ->
+        pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+        Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+
+      _ ->
+        :ok
+    end
+
+    assert {:ok, result} = TaskSession.run_goal(session, "Wait for native control", on_message: handler)
+    assert result.record["native_stop_confirmed"]
+    assert result.record["task_session_phase"] == "stopped"
+    assert result.flow["state"] == "waiting"
+    refute result.flow["charging"]
+    assert map_size(result.record["control_receipts"]) > 0
+    assert Enum.any?(requests(c), &(&1["method"] == "turn/interrupt"))
+  end
+
+  test "candidate publication through a live Goal selects a separate verifier after confirmed stop", c do
+    File.write!(c.mode, "candidate")
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    assert {:ok, result} = TaskSession.run_goal(session, "Publish the fixed report")
+    assert result.flow["next_binding"]["role"] == "verifier"
+    assert result.record["native_stop_confirmed"]
+    assert Enum.any?(requests(c), &(&1["id"] == "candidate-call" and &1["result"]["success"]))
+    assert :ok = RunJournal.complete(result.record, "completed")
+    assert {:ok, verifying} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    assert verifying.record["execution_generation"] == 2
+    refute verifying.record["task_session_id"]
+    assert hd(verifying.record["execution_history"])["task_session_phase"] == "stopped"
+  end
+
+  defp after_running(c, effect) do
+    owner = self()
+    reacted = start_supervised!({Agent, fn -> false end}, id: :running_observation_effect)
+
+    request = fn provider, method, path, query, settings ->
+      record = current(c)
+
+      if self() != owner and record["workflow"]["state"] == "running" and Agent.get_and_update(reacted, &{not &1, true}) do
+        effect.(record)
+        send(owner, {:running_observed, record["workflow"]["used_ms"]})
+      end
+
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    Keyword.merge(c.opts, request: request, deadline: System.monotonic_time(:millisecond) + 8_000)
+  end
+
+  test "healthy observations keep the Goal active and a subsequent native pause stops it", c do
+    File.write!(c.mode, "hold")
+
+    opts =
+      after_running(c, fn _ ->
+        pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+        Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+      end)
+
+    {:ok, session} = TaskSession.start(c.record, c.registry, opts)
+    assert {:ok, result} = TaskSession.run_goal(session, "Observe until paused")
+    assert_receive {:running_observed, used_ms}
+    assert result.record["workflow"]["used_ms"] >= used_ms
+    refute result.record["task_observation_error"]
+    assert result.flow["state"] == "waiting"
+    assert result.record["native_stop_confirmed"]
+    assert Enum.any?(requests(c), &(&1["method"] == "turn/interrupt"))
+  end
+
+  test "physical input corruption during a healthy Goal stops it before applying new facts", c do
+    File.write!(c.mode, "hold")
+    opts = after_running(c, fn record -> File.write!(Path.join(record["task_workspace"]["directory"], "manifest.json"), "corrupt") end)
+    {:ok, session} = TaskSession.start(c.record, c.registry, opts)
+    assert {:ok, result} = TaskSession.run_goal(session, "Keep fixed inputs")
+    assert_receive {:running_observed, _}
+    assert result.record["task_observation_error"] == ":role_workspace_changed"
+    assert result.record["native_stop_confirmed"]
+    assert Enum.any?(requests(c), &(&1["method"] == "turn/interrupt"))
+  end
+
+  defp blocked_reader(c, extra) do
+    owner = self()
+
+    request = fn provider, method, path, query, settings ->
+      if self() != owner and not Process.get(:read_released, false) do
+        send(owner, {:reader, self()})
+
+        receive do
+          :release -> Process.put(:read_released, true)
+        end
+      end
+
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    c.opts |> Keyword.put(:request, request) |> Keyword.merge(extra)
+  end
+
+  test "a timed-out native fact read blocks the Goal and its reader cannot survive cleanup", c do
+    File.write!(c.mode, "hold")
+    opts = blocked_reader(c, observation_timeout_ms: 100)
+    {:ok, session} = TaskSession.start(c.record, c.registry, opts)
+    assert {:ok, result} = TaskSession.run_goal(session, "Wait for current facts")
+    assert result.record["task_observation_error"] == ":observation_timeout"
+    assert result.record["native_stop_confirmed"]
+    assert_receive {:reader, reader}
+    refute Process.alive?(reader)
+  end
+
+  test "pending native reads cannot delay the Goal budget deadline", c do
+    File.write!(c.mode, "hold")
+    opts = blocked_reader(c, observation_timeout_ms: 60_000, deadline: System.monotonic_time(:millisecond) + 2_000)
+    {:ok, session} = TaskSession.start(c.record, c.registry, opts)
+    started = System.monotonic_time(:millisecond)
+    assert {:ok, result} = TaskSession.run_goal(session, "Respect the native deadline")
+    assert result.native_result == {:error, :execution_budget_exhausted}
+    assert result.record["native_stop_confirmed"]
+    assert System.monotonic_time(:millisecond) - started < 5_000
+    assert_receive {:reader, reader}
+    refute Process.alive?(reader)
+  end
+
+  defp observed_result(observer, remaining \\ 200) do
+    case :sys.get_state(observer).result do
+      :pending when remaining > 0 ->
+        Process.sleep(10)
+        observed_result(observer, remaining - 1)
+
+      :pending ->
+        flunk("native observation did not settle")
+
+      result ->
+        result
+    end
+  end
+
+  test "observation ownership and freshness are checked without blocking the native caller", c do
+    invalid = [observation_interval_ms: 0]
+    assert {:error, :invalid_observation_timing} = TaskObserver.start_link(c.record, c.registry, invalid)
+    opts = blocked_reader(c, observation_timeout_ms: 1_000)
+    {:ok, observer} = TaskObserver.start_link(c.record, c.registry, opts)
+    assert :pending = TaskObserver.take(observer)
+    denied = {:error, :observation_not_owned}
+    other = Task.async(fn -> {TaskObserver.take(observer), TaskObserver.activate(observer), TaskObserver.stop(observer)} end)
+    assert {^denied, ^denied, ^denied} = Task.await(other)
+    assert :ok = TaskObserver.activate(observer)
+    assert {:error, :observation_already_active} = TaskObserver.activate(observer)
+    assert_receive {:reader, reader}
+    assert :pending = TaskObserver.take(observer)
+    send(reader, :release)
+    assert {:ok, _} = observed_result(observer)
+    Process.sleep(1_050)
+    assert {:error, :observation_expired} = TaskObserver.take(observer)
+    assert :ok = TaskObserver.stop(observer)
+  end
+
+  test "a crashed observation becomes an error while the session owner and journal remain intact", c do
+    before = current(c)
+    request = fn _, _, _, _, _ -> raise "native reader fixture failure" end
+    {:ok, observer} = TaskObserver.start_link(c.record, c.registry, Keyword.put(c.opts, :request, request))
+
+    capture_log(fn ->
+      assert :ok = TaskObserver.activate(observer)
+      assert {:error, {:observation_process_failed, _}} = observed_result(observer)
+    end)
+
+    assert {:error, {:observation_process_failed, _}} = TaskObserver.take(observer)
+    assert current(c) == before
+    assert :ok = TaskObserver.stop(observer)
+  end
+
+  test "owner death terminates the observer and its pending reader without a journal write", c do
+    before = current(c)
+    parent = self()
+    opts = blocked_reader(c, observation_timeout_ms: 60_000)
+
+    {owner, owner_ref} =
+      spawn_monitor(fn ->
+        {:ok, observer} = TaskObserver.start_link(c.record, c.registry, opts)
+        :ok = TaskObserver.activate(observer)
+        send(parent, {:observer, observer})
+
+        receive do
+          :finish -> :ok
+        end
+      end)
+
+    assert_receive {:observer, observer}
+    assert_receive {:reader, reader}
+    observer_ref = Process.monitor(observer)
+    reader_ref = Process.monitor(reader)
+
+    capture_log(fn ->
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}
+      assert_receive {:DOWN, ^observer_ref, :process, ^observer, _}
+      assert_receive {:DOWN, ^reader_ref, :process, ^reader, _}
+    end)
+
+    assert current(c) == before
+  end
+
+  test "an old Goal loop cannot interrupt a replacement execution", c do
+    File.write!(c.mode, "hold")
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+
+    handler = fn
+      %{event: :session_started} ->
+        replacement = Map.put(current(c), "attempt_id", "replacement")
+        File.write!(Path.join(c.record["directory"], "run.json"), Jason.encode!(replacement))
+
+      _ ->
+        :ok
+    end
+
+    assert {:error, :task_session_no_longer_owned} = TaskSession.run_goal(session, "Lose ownership", on_message: handler)
+    assert current(c)["attempt_id"] == "replacement"
+    refute Enum.any?(requests(c), &(&1["method"] == "turn/interrupt" or get_in(&1, ["params", "status"]) == "blocked"))
+  end
+
+  test "native stop fences also prevent implicit cleanup from issuing unauthorized Goal writes", c do
+    File.write!(c.mode, "hold")
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    {:ok, opts} = TaskSession.activation_options(session)
+    opts = Keyword.merge(opts, handoff_status: fn -> "blocked" end, before_goal_stop: fn -> {:error, :owner_changed} end)
+    issue = %Issue{id: c.record["issue_id"], identifier: "ROLE", title: "Fence cleanup", state: "open"}
+    assert {:error, {:goal_stream_failed, _}} = AppServer.run_goal(session.native, "Stop fence fixture", issue, opts)
+    refute Enum.any?(requests(c), &(&1["method"] == "turn/interrupt" or get_in(&1, ["params", "status"]) == "blocked"))
+    assert :ok = TaskSession.stop(session)
+  end
+
+  test "transport and caller failures retain uncertainty or obtain explicit native stop proof", c do
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    :ok = AppServer.stop_session(session.native)
+    assert {:error, :native_stop_transport_unavailable} = TaskSession.run_goal(session, "Closed transport")
+    refute current(c)["native_stop_confirmed"]
+  end
+
+  test "a throwing event consumer still stops its native Goal and retains the failed result", c do
+    File.write!(c.mode, "hold")
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+
+    handler = fn
+      %{event: :session_started} -> throw(:consumer_failed)
+      _ -> :ok
+    end
+
+    assert {:ok, result} = TaskSession.run_goal(session, "Fail the consumer", on_message: handler)
+    assert {:error, {:task_goal_failed, :throw, ":consumer_failed"}} = result.native_result
+    assert result.record["native_stop_confirmed"]
   end
 end

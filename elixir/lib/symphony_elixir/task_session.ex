@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskSession do
   @moduledoc "Owned local Codex sessions and final activation fences for admitted plan-member generations."
-  alias SymphonyElixir.{Codex.AppServer, Config, NativeStop, RunJournal, TaskExecution, TaskWorkspace}
+  alias SymphonyElixir.{Codex.AppServer, Config, NativeStop, RunJournal, TaskExecution, TaskObserver, TaskWorkspace}
+  alias SymphonyElixir.Tracker.Issue
 
   @identity ~w(directory issue_id attempt_id execution_binding execution_generation workspace task_workspace task_session_id)
   @type t :: %{native: AppServer.session(), task_session: map()}
@@ -24,7 +25,7 @@ defmodule SymphonyElixir.TaskSession do
     with {:ok, record} <- current(context),
          true <- is_nil(record["task_session_id"]) or record["task_session_phase"] == "stopped" or {:error, :task_session_requires_recovery},
          id = Base.encode16(:crypto.strong_rand_bytes(16), case: :lower),
-         {:ok, record} <- RunJournal.checkpoint(record, %{"task_session_id" => id, "task_session_phase" => "opening"}) do
+         {:ok, record} <- RunJournal.checkpoint(record, %{"task_session_id" => id, "task_session_phase" => "opening", "task_observation_error" => nil}) do
       {:ok, %{context | record: record}}
     end
   end
@@ -104,6 +105,104 @@ defmodule SymphonyElixir.TaskSession do
     latest = now + max(0, flow["budget_ms"] - flow["used_ms"])
     deadline = min(Keyword.get(opts, :deadline, latest), latest)
     if is_integer(deadline) and deadline > now, do: {:ok, deadline}, else: {:error, :task_activation_budget_exhausted}
+  end
+
+  @doc "Run this role's native Goal with bounded asynchronous control reads, owned event checkpoints and explicit stop proof."
+  @spec run_goal(t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def run_goal(%{task_session: context} = session, objective, opts \\ []) do
+    with {:ok, activation} <- activation_options(session),
+         {:ok, record} <- current(context),
+         true <- record["task_session_phase"] == "ready" or {:error, :task_session_not_ready},
+         {:ok, observer} <- TaskObserver.start_link(record, context.executions, context.opts) do
+      result =
+        try do
+          native_goal(session, objective, observer, activation, opts)
+        after
+          TaskObserver.stop(observer)
+        end
+
+      with :ok <- stop(session), do: reconcile_stopped(context, result)
+    end
+  end
+
+  defp native_goal(%{task_session: context} = session, objective, observer, activation, opts) do
+    issue = %Issue{id: context.record["issue_id"], identifier: context.record["issue_id"], title: "Plan member", state: "open"}
+
+    owned = [
+      before_goal: fn -> with :ok <- activation[:before_goal].(), do: TaskObserver.activate(observer) end,
+      handoff_status: fn -> control_status(context, observer) end,
+      before_goal_stop: fn -> with {:ok, _} <- current(context), do: :ok end,
+      latest_turn: fn -> current!(context)["turn_id"] end,
+      on_message: fn event ->
+        native_event(context, event)
+        Keyword.get(opts, :on_message, fn _ -> :ok end).(event)
+      end
+    ]
+
+    AppServer.run_goal(session.native, objective, issue, Keyword.merge(activation, owned))
+  rescue
+    error -> {:error, {:task_goal_failed, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {:task_goal_failed, kind, inspect(reason)}}
+  end
+
+  defp current!(context) do
+    case current(context) do
+      {:ok, record} -> record
+      {:error, reason} -> raise "Task session ownership lost: #{inspect(reason)}"
+    end
+  end
+
+  defp control_status(context, observer) do
+    record = current!(context)
+
+    if record["task_observation_error"] do
+      "blocked"
+    else
+      control_result(context, record, TaskObserver.take(observer))
+    end
+  end
+
+  defp control_result(_, _, :pending), do: nil
+
+  defp control_result(context, record, {:ok, observation}) do
+    result =
+      with :ok <- TaskWorkspace.validate(record),
+           {:ok, current} <- TaskExecution.apply_running(record, observation) do
+        {:ok, current.flow["stop_required"]}
+      end
+
+    case result do
+      {:ok, true} -> "blocked"
+      {:ok, false} -> nil
+      error -> control_result(context, record, error)
+    end
+  end
+
+  defp control_result(context, _, {:error, reason}) do
+    :ok = save(context, %{"task_observation_error" => inspect(reason)})
+    "blocked"
+  end
+
+  defp native_event(context, %{event: :session_started, thread_id: thread, turn_id: turn}),
+    do: save_event(context, %{"phase" => "turn_running", "thread_id" => thread, "turn_id" => turn})
+
+  defp native_event(context, %{event: :goal_updated, goal: goal}),
+    do: save_event(context, %{"goal_status" => goal["status"], "goal_thread_id" => goal["threadId"]})
+
+  defp native_event(context, %{event: :turn_completed, payload: payload}) do
+    record = current!(context)
+    save_event(context, %{"phase" => "goal_waiting", "turn_id" => get_in(payload, ["params", "turn", "id"]), "turn_count" => (record["turn_count"] || 0) + 1})
+  end
+
+  defp native_event(_, _), do: :ok
+  defp save_event(context, changes), do: :ok = save(context, changes)
+
+  defp reconcile_stopped(context, result) do
+    with {:ok, record} <- current(context),
+         {:ok, observation} <- TaskExecution.refresh(record, context.executions, Keyword.put(context.opts, :active, false)) do
+      {:ok, %{native_result: result, record: observation.record, flow: observation.flow}}
+    end
   end
 
   @doc "Persist native callbacks only for this caller, attempt, role generation and workspace."

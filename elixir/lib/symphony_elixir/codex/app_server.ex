@@ -218,6 +218,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           goal_running: false,
           goal_stop_requested: nil,
           deadline: opts[:deadline] || System.monotonic_time(:millisecond) + Config.settings!().codex.turn_timeout_ms,
+          before_goal_stop: Keyword.get(opts, :before_goal_stop, fn -> :ok end),
           handoff_status: Keyword.get(opts, :handoff_status, fn -> nil end)
         })
 
@@ -288,7 +289,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp stop_goal_after_error(session, opts) do
     turn_id = Keyword.get(opts, :latest_turn, fn -> nil end).()
 
-    with {:ok, goal} <- halt_goal(session),
+    with :ok <- Keyword.get(opts, :before_goal_stop, fn -> :ok end).(),
+         {:ok, goal} <- halt_goal(session),
          true <- goal["threadId"] == session.thread_id do
       emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
 
@@ -914,6 +916,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         context = %{context | turn_id: turn_id, goal_running: true}
 
         if context.goal_stop_requested do
+          :ok = context.before_goal_stop.()
           interrupt_goal_turn(port, context.thread_id, turn_id)
         end
 
@@ -947,6 +950,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp maybe_request_goal_handoff(port, %{goal_mode: true, goal_stop_requested: nil} = context) do
     case context.handoff_status.() do
       status when status in ["complete", "blocked"] ->
+        :ok = context.before_goal_stop.()
+
         send_message(port, %{
           "id" => @goal_stop_id,
           "method" => "thread/goal/set",

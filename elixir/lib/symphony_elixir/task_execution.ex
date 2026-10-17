@@ -4,10 +4,14 @@ defmodule SymphonyElixir.TaskExecution do
   alias SymphonyElixir.{TaskEvidence, TaskLifecycle, TaskPlanPreflight, WorkRef}
 
   @identity ~w(directory issue_id attempt_id execution_binding execution_generation)
+  @running_identity @identity ++ ~w(workspace task_workspace task_session_id thread_id)
+  @native_progress ~w(events updated_at journal_version turn_id turn_count phase goal_status goal_thread_id)
 
   @doc "Assemble a current member assessment from native facts and host execution locations/policies. No executor is allocated."
   @spec observe(map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def observe(parent, work, executions, opts) do
+  def observe(parent, work, executions, opts), do: do_observe(parent, work, executions, opts, :exact)
+
+  defp do_observe(parent, work, executions, opts, mode) do
     with :ok <- WorkRef.validate(work),
          {:ok, plan} <- TaskPlanPreflight.inspect_plan(parent, opts),
          :ok <- configuration(plan, executions),
@@ -22,7 +26,7 @@ defmodule SymphonyElixir.TaskExecution do
          evidence = evidence(facts, dependencies, deliveries, opts[:active] == true),
          context = %{plan: plan, work: work, runtime: record, policy: policy, evidence: evidence},
          {:ok, flow} <- TaskLifecycle.assess(context, System.system_time(:millisecond)),
-         :ok <- unchanged(plan, directory, stored, deliveries, opts) do
+         :ok <- unchanged(plan, directory, stored, deliveries, opts, mode) do
       {:ok, %{record: record, flow: flow, plan: plan, policy: policy, evidence: evidence}}
     else
       {:error, _} = error -> error
@@ -77,15 +81,55 @@ defmodule SymphonyElixir.TaskExecution do
     }
   end
 
-  defp unchanged(plan, directory, stored, deliveries, opts) do
+  defp unchanged(plan, directory, stored, deliveries, opts, mode) do
     with {:ok, current} <- TaskPlanPreflight.inspect_plan(plan.plan["parent"], opts),
          true <- fingerprint(current) == fingerprint(plan),
          true <- Enum.all?(deliveries, &(is_nil(&1.snapshot) or TaskDelivery.current?(&1.snapshot, opts))),
-         {:ok, ^stored} <- RunJournal.read(directory) do
+         {:ok, current_record} <- RunJournal.read(directory),
+         true <- same_runtime?(stored, current_record, mode) do
       :ok
     else
       {:error, _} = error -> error
       _ -> {:error, :execution_evidence_changed_during_read}
+    end
+  end
+
+  defp same_runtime?(before, after_read, :exact), do: before == after_read
+  defp same_runtime?(before, after_read, :running), do: runtime_revision(before) == runtime_revision(after_read)
+
+  defp runtime_revision(record) when is_map(record) do
+    record
+    |> Map.drop(@native_progress)
+    |> Map.update("workflow", nil, fn flow -> if is_map(flow), do: Map.drop(flow, ~w(used_ms clock_at)), else: flow end)
+  end
+
+  defp runtime_revision(record), do: record
+
+  @doc "Read active-role facts off the native event loop; tolerate only native progress and clock ticks during the read."
+  @spec observe_running(map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def observe_running(record, executions, opts) do
+    with {:ok, binding} <- ExecutionBinding.normalize(record["execution_binding"]),
+         {:ok, observation} <- do_observe(binding["authority"]["work"], binding["work"], executions, Keyword.put(opts, :active, true), :running),
+         true <- Map.take(observation.record, @running_identity) == Map.take(record, @running_identity) do
+      {:ok, observation}
+    else
+      false -> {:error, :execution_attempt_changed}
+      error -> error
+    end
+  end
+
+  @doc "Apply an observed active-role result under the current owner, preserving intervening native progress and charging."
+  @spec apply_running(map(), map()) :: {:ok, map()} | {:error, term()}
+  def apply_running(record, observation) do
+    with true <- same_runtime?(record, observation.record, :running),
+         binding = record["execution_binding"],
+         context = %{plan: observation.plan, work: binding["work"], runtime: record, policy: observation.policy, evidence: Map.put(observation.evidence, "active", true)},
+         {:ok, flow} <- TaskLifecycle.assess(context, System.system_time(:millisecond)),
+         {:ok, record} <- RunJournal.checkpoint(record, %{"workflow" => flow, "control_receipts" => observation.evidence["control_receipts"]}) do
+      {:ok, %{observation | record: record, flow: record["workflow"]}}
+    else
+      false -> {:error, :execution_observation_superseded}
+      error -> error
     end
   end
 

@@ -33,7 +33,7 @@ defmodule SymphonyElixir.ExecutionBindingTest do
   test "developer, verifier and repair use separate generations without resetting consumed budget", %{root: root} do
     {:ok, developer} = RunJournal.admit(root, "2", execution_binding: fixture_binding())
     flow = TaskWorkflow.new(10_000, System.system_time(:millisecond)) |> Map.put("used_ms", 4_000)
-    {:ok, developer} = RunJournal.checkpoint(developer, %{"workflow" => flow, "retry_count" => 1, "repair_count" => 2})
+    {:ok, developer} = RunJournal.checkpoint(developer, %{"workflow" => flow, "retry_count" => 1, "repair_count" => 2, "task_observation_error" => ":observation_timeout"})
     developer = stop(developer, "developer-thread")
 
     {:ok, verifier} = RunJournal.admit(root, "2", execution_binding: fixture_binding("verifier"))
@@ -46,6 +46,8 @@ defmodule SymphonyElixir.ExecutionBindingTest do
     assert [receipt] = verifier["execution_history"]
     assert receipt["thread_id"] == "developer-thread"
     assert receipt["native_stop_confirmed"]
+    assert receipt["task_observation_error"] == ":observation_timeout"
+    refute verifier["task_observation_error"]
     assert receipt["execution_binding"]["role"] == "developer"
 
     before = File.read!(Path.join(verifier["directory"], "run.json"))
