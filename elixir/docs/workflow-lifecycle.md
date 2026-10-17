@@ -710,6 +710,39 @@ can otherwise approve, merge or close native work through a comment. The same
 body check protects native Issue evidence publication; rejected submissions do
 not acquire a send intent.
 
+## Live review cancellation
+
+The scheduler requests graceful stop when an active review loses eligibility,
+closes, merges, or is superseded. It retains the running slot while the worker
+handles that request. Before native allocation, the worker checks for a pending
+stop; with no prior allocation or recorded thread, that establishes that no
+native work started. Otherwise transport closure is never stop evidence.
+
+The live worker uses `NativeStop.confirm_session/1` through the same app-server
+transport that owns its thread. It halts any native Goal, interrupts active turns
+even when no Goal exists, and requires a subsequent `thread/read` to prove idle
+state and reconciled terminal turns before closing that transport. It never
+calls `thread/start`, `thread/resume`, or `turn/start` during stop. An interrupt
+acknowledgment alone cannot establish stop. The caller persists the observation
+with the thread, final turn, workspace, host and observation time.
+
+`NativeStop.confirm/2` provides separate recorded-thread recovery, preserving the
+recorded workspace and worker host. Its caller must establish prior executor
+exclusion before using a new transport. Reading stored history does not prove
+that an earlier executor has exited; live cancellation never falls back to this
+path when its owning connection fails. This distinction follows the
+[app-server thread read and interrupt protocol](https://developers.openai.com/codex/app-server).
+
+Review execution errors use the same halt-and-readback path. Unknown state stays
+fenced. The scheduler's stop timeout may terminate a local worker, but preserves
+the review snapshot and does not manufacture native stop confirmation. The
+shared cleanup entry also preserves review snapshots during terminal polling,
+retry cleanup and startup cleanup. Snapshot retention release and automatic
+orphan review takeover remain unimplemented;
+restart recovery must first establish exclusive execution ownership and reject
+late callbacks from an earlier worker. The stop helper supplies observations,
+not ownership or permission to take over another worker's thread.
+
 ## Review and recovery
 
 Standalone review has a distinct work kind and assignment generation, fixed

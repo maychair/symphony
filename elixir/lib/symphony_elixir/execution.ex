@@ -236,45 +236,14 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
-  defp halt_recorded_thread(%{"thread_id" => thread, "workspace" => workspace} = record, opts)
-       when is_binary(thread) and is_binary(workspace) do
-    backend = Keyword.get(opts, :backend, SymphonyElixir.Codex.AppServer)
-    observation_ref = make_ref()
-
-    session_opts = [
-      resume_thread_id: thread,
-      expected_turn_id: record["turn_id"] || :no_turns,
-      suspend_goal: true,
-      interrupt_active: true,
-      halt_only: true,
-      on_thread_observed: fn observation -> send(self(), {:native_stop_observed, observation_ref, observation}) end,
-      reconcile_terminal_turns: true,
-      worker_host: record["worker_host"],
-      tracker_settings: Config.settings!().tracker
-    ]
-
-    case backend.start_session(workspace, session_opts) do
-      {:ok, session} ->
-        backend.stop_session(session)
-
-        observed =
-          receive do
-            {:native_stop_observed, ^observation_ref, observation} -> observation[:turn_id]
-          after
-            0 -> record["turn_id"]
-          end
-
-        turn = if is_binary(observed), do: observed
-        evidence = %{"native_stop_confirmed" => true, "turn_id" => turn, "native_stop_recovery" => "recorded Goal halted and native idle verified"}
-        RunJournal.checkpoint(record, evidence)
+  defp halt_recorded_thread(record, opts) do
+    case SymphonyElixir.NativeStop.confirm(record, opts) do
+      {:ok, evidence} ->
+        RunJournal.checkpoint(record, Map.put(evidence, "native_stop_recovery", "recorded Goal halted and native idle verified"))
 
       {:error, reason} ->
         RunJournal.checkpoint(record, %{"native_stop_recovery" => "Recorded native stop remains unconfirmed: #{inspect(reason)}"})
     end
-  end
-
-  defp halt_recorded_thread(record, _opts) do
-    RunJournal.checkpoint(record, %{"native_stop_recovery" => "Unrecorded native allocation requires explicit recovery"})
   end
 
   @spec activation_options(keyword()) :: {:ok, keyword()} | {:error, term()}

@@ -16,6 +16,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @goal_interrupt_id 7
   @goal_inspect_id 8
   @max_stream_log_bytes 1_000
+  defguardp interruptible(ctx) when is_map_key(ctx, :goal_mode) or :erlang.map_get(:interruptible, ctx) == true
+
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -120,7 +122,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     Keyword.get(opts, :before_turn, fn -> :ok end).()
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    started =
+      with :ok <- turn_admission(opts) do
+        start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy)
+      end
+
+    case started do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -139,7 +146,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         case await_turn_completion(
                port,
                on_message,
-               Map.put(execution_context(tool_executor, thread_id, turn_id, dynamic_tool_binding), :deadline, opts[:deadline]),
+               execution_context(tool_executor, thread_id, turn_id, dynamic_tool_binding)
+               |> Map.merge(%{deadline: opts[:deadline], interruptible: opts[:interruptible] == true}),
                auto_approve_requests
              ) do
           {:ok, result} ->
@@ -173,6 +181,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
         emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
         {:error, reason}
+    end
+  end
+
+  defp turn_admission(opts) do
+    interruptible = opts[:interruptible] == true
+
+    receive do
+      :symphony_stop when interruptible -> {:error, :scheduler_stop}
+    after
+      0 -> :ok
     end
   end
 
@@ -320,6 +338,15 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, %{"goal" => goal}} -> {:ok, goal}
       error -> error
     end
+  end
+
+  @doc "Halt the thread through its owning transport and observe terminal state before closing it."
+  @spec halt_session(session(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def halt_session(%{port: port, thread_id: thread}, opts) do
+    opts = Keyword.merge(opts, suspend_goal: true, interrupt_active: true, halt_only: true, reconcile_terminal_turns: true)
+    with :ok <- suspend_goal_for_resume(port, thread, opts), do: inspect_thread(port, thread, opts)
+  rescue
+    ArgumentError -> {:error, :native_stop_transport_unavailable}
   end
 
   @spec stop_session(session()) :: :ok
@@ -502,9 +529,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, opts, on_intent) do
-    with :ok <- send_initialize(port) do
-      on_intent.()
-
+    with :ok <- send_initialize(port), :ok <- on_intent.() do
       open_thread(port, workspace, session_policies, dynamic_tool_binding, opts)
     end
   end
@@ -543,7 +568,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       case read_goal(session) do
         {:ok, nil} ->
-          :ok
+          maybe_interrupt_active(session, opts)
 
         {:ok, _goal} ->
           halt_goal_for_resume(session, opts)
@@ -764,7 +789,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do
-      :symphony_stop when is_map_key(tool_executor, :goal_mode) -> {:error, :scheduler_stop}
+      :symphony_stop when interruptible(tool_executor) -> {:error, :scheduler_stop}
     after
       0 -> receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
     end
@@ -776,7 +801,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
 
     receive do
-      :symphony_stop when is_map_key(tool_executor, :goal_mode) ->
+      :symphony_stop when interruptible(tool_executor) ->
         {:error, :scheduler_stop}
 
       {^port, {:data, {:eol, chunk}}} ->

@@ -1,21 +1,20 @@
 defmodule SymphonyElixir.ReviewLane.Runner do
   @moduledoc "Runs one fixed-base/head read-only review in a disposable source snapshot."
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.NativeStop
   alias SymphonyElixir.ReviewLane.{GitLab, Listener}
   alias SymphonyElixir.Workspace
 
   @spec run(SymphonyElixir.Tracker.Issue.t(), pid() | nil, keyword()) :: :ok
   def run(issue, recipient, opts \\ []) do
-    do_run(issue, recipient, opts)
-  rescue
-    error ->
-      Listener.checkpoint(issue.id, %{"phase" => "failed", "error" => Exception.message(error)})
-      reraise error, __STACKTRACE__
+    case Listener.begin_run(issue.id) do
+      {:ok, record, config} -> run_admitted(issue, record, config, recipient, opts)
+      error -> raise "Review execution fenced: #{inspect(error)}"
+    end
   end
 
-  defp do_run(issue, recipient, opts) do
-    with {:ok, record, config} <- Listener.begin_run(issue.id),
-         {:ok, workspace} <- Workspace.create_for_review(issue),
+  defp run_admitted(issue, record, config, recipient, opts) do
+    with {:ok, workspace} <- Workspace.create_for_review(issue),
          {:ok, repository} <- snapshot(workspace, record, config),
          {:ok, mr} <- GitLab.request(config, "GET", GitLab.mr_path(record["project"], record["iid"])),
          {:ok, discussions} <- GitLab.discussions(config, GitLab.mr_path(record["project"], record["iid"])),
@@ -26,8 +25,9 @@ defmodule SymphonyElixir.ReviewLane.Runner do
              review_only: true,
              resume_thread_id: record["resume_thread_id"],
              expected_turn_id: record["resume_turn_id"],
+             suspend_goal: true,
              dynamic_tool_binding: SymphonyElixir.ReviewLane.binding(),
-             on_thread_intent: fn -> Listener.checkpoint(issue.id, %{"thread_allocation_intent" => true, "native_stop_confirmed" => false}) end,
+             on_thread_intent: fn -> before_thread(issue, repository) end,
              on_thread_started: fn thread -> Listener.checkpoint(issue.id, %{"thread_id" => thread}) end
            ) do
       if is_pid(recipient), do: send(recipient, {:worker_runtime_info, issue.id, %{worker_host: nil, workspace_path: repository}})
@@ -39,24 +39,61 @@ defmodule SymphonyElixir.ReviewLane.Runner do
         end
 
         instructions = prompt(record, config, mr, discussions)
-
-        turn_opts = [deadline: opts[:deadline], on_message: handler]
-
-        with {:ok, _} <- AppServer.run_turn(session, instructions, issue, turn_opts),
-             :ok <- Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true}),
-             {:ok, issues} <- Listener.issues(),
-             true <- Enum.any?(issues, &(&1.id == issue.id and &1.native_ref["phase"] == "completed")) do
-          :ok
-        else
-          error -> raise "Review did not complete through review_submit: #{inspect(error)}"
-        end
+        turn_opts = [deadline: opts[:deadline], on_message: handler, interruptible: true]
+        result = AppServer.run_turn(session, instructions, issue, turn_opts)
+        finish_turn(result, session, issue)
       after
         AppServer.stop_session(session)
       end
     else
+      {:error, :scheduler_stop} -> stopped_before_thread(issue, record)
       error -> raise "Review execution fenced: #{inspect(error)}"
     end
+  rescue
+    error ->
+      Listener.checkpoint(issue.id, %{"phase" => "failed", "error" => Exception.message(error)})
+      reraise error, __STACKTRACE__
   end
+
+  defp before_thread(issue, repository) do
+    receive do
+      :symphony_stop -> {:error, :scheduler_stop}
+    after
+      0 -> Listener.checkpoint(issue.id, %{"thread_allocation_intent" => true, "native_stop_confirmed" => false, "workspace" => repository, "worker_host" => nil, "backend" => "codex"})
+    end
+  end
+
+  defp stopped_before_thread(issue, record) do
+    if is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true and is_nil(record["resume_thread_id"]) do
+      Listener.checkpoint(issue.id, %{"phase" => "fenced", "native_stop_confirmed" => true, "native_stop_recovery" => "scheduler stopped admission before native allocation"})
+    else
+      record_stop(issue, NativeStop.confirm(record, stop_options()))
+    end
+  end
+
+  defp finish_turn({:ok, _}, _session, issue) do
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    {:ok, issues} = Listener.issues()
+    unless Enum.any?(issues, &(&1.id == issue.id and &1.native_ref["phase"] == "completed")), do: raise("Review did not complete through review_submit")
+    :ok
+  end
+
+  defp finish_turn({:error, reason}, session, issue) do
+    stopped = NativeStop.confirm_session(session)
+    record_stop(issue, stopped)
+    unless reason == :scheduler_stop and match?({:ok, _}, stopped), do: raise("Review turn failed: #{inspect(reason)}; native stop: #{inspect(stopped)}")
+    :ok
+  end
+
+  defp record_stop(issue, {:ok, evidence}) do
+    Listener.checkpoint(issue.id, Map.merge(evidence, %{"phase" => "fenced", "native_stop_recovery" => "recorded native thread halted and idle verified"}))
+  end
+
+  defp record_stop(issue, {:error, reason}) do
+    Listener.checkpoint(issue.id, %{"phase" => "fenced", "native_stop_confirmed" => false, "native_stop_recovery" => inspect(reason)})
+  end
+
+  defp stop_options, do: [review_only: true, dynamic_tool_binding: SymphonyElixir.ReviewLane.binding()]
 
   defp snapshot(workspace, %{"resume_thread_id" => thread} = record, _config) when is_binary(thread) do
     repository = Path.join(workspace, "source")

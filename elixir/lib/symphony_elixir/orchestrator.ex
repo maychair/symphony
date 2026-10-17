@@ -649,9 +649,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp stop_reconciled_issue(%State{} = state, issue_id, cleanup_workspace) do
     entry = Map.get(state.running, issue_id)
 
-    if Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex" and
-         is_map(entry) and is_pid(entry[:pid]) and Process.alive?(entry.pid) and
-         not SymphonyElixir.ReviewLane.job?(entry[:issue]) do
+    graceful = is_map(entry) and (SymphonyElixir.ReviewLane.job?(entry[:issue]) or (Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex"))
+
+    if graceful and is_pid(entry[:pid]) and Process.alive?(entry.pid) do
       unless entry[:stop_requested] do
         send(entry.pid, :symphony_stop)
         Process.send_after(self(), {:execution_stop_timeout, issue_id, entry.ref}, @execution_stop_grace_ms)
@@ -1261,6 +1261,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
+
+  # Review snapshots remain recovery evidence until retention release is implemented.
+  defp cleanup_issue_workspace(%Issue{kind: :review}, _metadata), do: :ok
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     if SymphonyElixir.TaskReconciler.enabled?() do

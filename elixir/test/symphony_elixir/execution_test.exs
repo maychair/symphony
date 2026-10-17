@@ -6,7 +6,9 @@ defmodule SymphonyElixir.ExecutionTest do
     @spec start_session(Path.t(), keyword()) :: term()
     def start_session(workspace, opts) do
       send(self(), {:stop_probe, workspace, opts})
-      Process.get(:stop_probe_result, {:ok, %{}})
+      result = Process.get(:stop_probe_result, {:ok, %{}})
+      if match?({:ok, _}, result) and Process.get(:stop_probe_observation, true), do: opts[:on_thread_observed].(%{turn_id: opts[:expected_turn_id]})
+      result
     end
 
     @spec stop_session(map()) :: :ok
@@ -985,6 +987,12 @@ defmodule SymphonyElixir.ExecutionTest do
     assert recovery[:suspend_goal]
     assert recovery[:worker_host] == "worker-a"
     assert_receive :stop_probe_closed
+    Process.put(:stop_probe_observation, false)
+    {:ok, unobserved} = Execution.reconcile_native_stop(record, backend: StopProbe)
+    refute unobserved["native_stop_confirmed"]
+    assert unobserved["native_stop_recovery"] =~ "native_stop_observation_missing"
+    assert_receive {:stop_probe, ^workspace, _}
+    assert_receive :stop_probe_closed
     Process.put(:stop_probe_result, {:error, :native_thread_not_idle})
     {:ok, uncertain} = Execution.reconcile_native_stop(record, backend: StopProbe)
     refute uncertain["native_stop_confirmed"]
@@ -999,6 +1007,17 @@ defmodule SymphonyElixir.ExecutionTest do
     {:ok, _, resumed} = Execution.prepare(issue, worker_host: "worker-b")
     assert resumed[:worker_host] == "worker-a"
     assert resumed[:run_record]["thread_id"] == "recorded"
+  end
+
+  test "native stop requires both recorded identities and normalizes a verified thread without turns" do
+    alias SymphonyElixir.NativeStop
+    assert {:error, :native_stop_identity_missing} = NativeStop.confirm(%{"thread_id" => "recorded"}, backend: StopProbe)
+    refute_receive {:stop_probe, _, _}
+    assert {:ok, evidence} = NativeStop.confirm(%{"thread_id" => "recorded", "workspace" => "/recorded"}, backend: StopProbe)
+    assert evidence["native_stop_confirmed"]
+    assert evidence["turn_id"] == nil
+    assert evidence["native_stop_receipt"]["thread_id"] == "recorded"
+    assert_receive :stop_probe_closed
   end
 
   test "orphan stop interrupts an unobserved active turn without resuming or allocating a thread", %{issue: issue} do

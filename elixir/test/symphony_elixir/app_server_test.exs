@@ -1,6 +1,42 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "stop after native thread allocation prevents turn allocation and verifies the empty thread" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "workspaces/stopped")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "stopped-server")
+    trace = Path.join(root, "requests.jsonl")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialized':continue
+      if m=='initialize':result={}
+      elif m=='thread/goal/get':result={'goal':None}
+      elif m in ['thread/start','thread/read']:result={'thread':{'id':'stopped','status':{'type':'idle'},'turns':[]}}
+      else:raise AssertionError('unexpected native execution: '+str(m))
+      print(json.dumps({'id':q['id'],'result':result}),flush=True)
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace), codex_command: binary)
+    {:ok, session} = AppServer.start_session(workspace)
+    issue = %Issue{id: "stopped", identifier: "STOP", title: "Stop before turn", state: "open"}
+    send(self(), :symphony_stop)
+    assert {:error, :scheduler_stop} = AppServer.run_turn(session, "do not start", issue, interruptible: true)
+    AppServer.stop_session(session)
+    assert {:ok, evidence} = SymphonyElixir.NativeStop.confirm(%{"thread_id" => "stopped", "workspace" => workspace})
+    assert evidence["native_stop_confirmed"]
+    assert evidence["native_stop_receipt"]["turn_id"] == nil
+    methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert Enum.count(methods, &(&1 == "thread/start")) == 1
+    refute Enum.any?(methods, &(&1 in ["thread/resume", "turn/start"]))
+  end
+
   test "recovery inspection never resumes or reconciles active, foreign or missing native turns" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "inspection/issue")
