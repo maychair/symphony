@@ -21,10 +21,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
-The Phoenix service exposes a repository Issue Taskboard at `/` and the lower-level runtime
-observability dashboard at `/runtime`. The Taskboard is a projection over configured GitHub,
-GitLab, or memory-backed Issues; it does not keep a second task database. Its four columns are
-user-facing views over tracker state, labels, and Symphony execution observations. See
+The Phoenix service exposes a read-only repository Issue Taskboard at `/` and the lower-level
+runtime observability dashboard at `/runtime`. The Taskboard is a projection over configured
+GitHub, GitLab, or memory-backed Issues; it does not keep a second task database. Its four columns
+are user-facing views over tracker state, labels, and Symphony execution observations. Each card
+links to the native tracker Issue, where task operations take place. See
 [Taskboard](docs/taskboard.md) for state mapping, operator authentication, and the JSON API.
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
@@ -341,7 +342,7 @@ codex:
 
 The web UI runs on a minimal Phoenix stack:
 
-- Four-column Repository Issue Taskboard at `/`
+- Read-only four-column Repository Issue Taskboard at `/`, with native tracker links
 - Original runtime observability dashboard at `/runtime`
 - Taskboard and operational JSON APIs under `/api/v1/*`
 - Bandit as the HTTP server

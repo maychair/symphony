@@ -63,14 +63,27 @@ defmodule SymphonyElixirWeb.TaskboardApiTest do
   test "serves Taskboard, Runtime, static assets, and read APIs" do
     taskboard_conn = get(build_conn(), "/")
     assert taskboard_conn.status == 200
-    assert html_response(taskboard_conn, 200) =~ "taskboard-app"
+    taskboard_html = html_response(taskboard_conn, 200)
+    assert taskboard_html =~ "taskboard-app"
+    assert taskboard_html =~ "Issue creation, comments, labels, review decisions"
+    refute taskboard_html =~ "taskboard-detail"
+    refute taskboard_html =~ "taskboard-create"
+    refute taskboard_html =~ "taskboard-palette"
+    refute taskboard_html =~ "Operator actions"
 
     runtime_conn = get(build_conn(), "/runtime")
     assert runtime_conn.status == 200
     assert html_response(runtime_conn, 200) =~ "Operations Dashboard"
 
     assert response(get(build_conn(), "/taskboard.css"), 200) =~ ".taskboard-board"
-    assert response(get(build_conn(), "/taskboard.js"), 200) =~ "/api/v1/taskboard"
+    taskboard_js = response(get(build_conn(), "/taskboard.js"), 200)
+    assert taskboard_js =~ "/api/v1/taskboard"
+    assert taskboard_js =~ "card.url"
+    assert taskboard_js =~ "Open issue"
+    refute taskboard_js =~ "operatorRequest"
+    refute taskboard_js =~ "/comments"
+    refute taskboard_js =~ "/actions/"
+    refute taskboard_js =~ "dragstart"
 
     state = json_response(get(build_conn(), "/api/v1/taskboard"), 200)
     assert state["columns"] == ["Todo", "In Progress", "Human Review", "Done"]

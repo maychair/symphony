@@ -8,7 +8,7 @@ orchestrator snapshot provide runtime evidence, but neither becomes a second tas
 
 | Path | Purpose |
 |---|---|
-| `/` | Four-column repository Issue Taskboard and side-panel review workflow |
+| `/` | Read-only four-column repository Issue board with native tracker links |
 | `/runtime` | Existing runtime, retry, token, and event observability dashboard |
 | `/api/v1/taskboard` | Aggregated Taskboard projection |
 | `/api/v1/taskboard/projects/:project_id` | One project projection used by remote aggregation |
@@ -20,8 +20,9 @@ orchestrator snapshot provide runtime evidence, but neither becomes a second tas
 
 The projection and detail GET endpoints are readable without a Taskboard control token. Treat the
 HTTP port as a private operational surface. When the dashboard leaves loopback, restrict it to a
-trusted LAN or place it behind an authenticated reverse proxy. All POST operations require the
-control token.
+trusted LAN or place it behind an authenticated reverse proxy. The Taskboard UI does not call the
+POST endpoints; issue operations happen in the native GitHub or GitLab issue page. Any other client
+using those APIs still requires the control token.
 
 ## Four-column projection
 
@@ -44,24 +45,16 @@ the transition.
 A successful Agent turn, published pull/merge request, or merged delivery alone does not produce
 Done. The existing acceptance decision and native Issue closure remain required.
 
-## Controlled actions
+## Navigation-only dashboard
 
-| Action | Valid projected state | Effect |
-|---|---|---|
-| Dispatch | Todo | Adds the human-owned `symphony:ready` label |
-| Pause | In Progress | Removes `symphony:ready` routing authorization |
-| Retry now | In Progress with a real retry entry | Requests immediate retry from the orchestrator retry queue |
-| Rework | Human Review | Adds an explicit human rework decision and optional comment |
-| Accept | Human Review | Adds the human `symphony:accept` decision and optional comment |
+Each Issue card links directly to the tracker-provided URL. The board has no detail panel, comment
+composer, drag-and-drop gesture, or scheduler action. Issue creation, comments, labels, review,
+acceptance, and merge decisions happen in GitHub or GitLab, where the repository workflow and native
+history remain visible.
 
-Drag and drop maps only to these actions. The API re-reads the current Issue before executing the
-action, rejects invalid transitions, and never writes orchestrator memory directly. Dispatch and
-pause change routing labels consumed by the existing scheduler. Rework and accept preserve the
-versioned task protocol.
-
-The Issue detail panel supports comment drafts on the Issue, linked pull/merge requests, review
-state, unresolved comments when the provider exposes them, and a compact execution record. Issue
-creation and comments use the configured operator token, not the scheduler token.
+The authenticated mutation APIs remain available for integrations that already use them. They
+re-read the current Issue before executing an action, reject invalid transitions, and never write
+orchestrator memory directly. Keeping those APIs does not make the dashboard an operator console.
 
 ## Identity model
 
@@ -69,7 +62,7 @@ Symphony separates two tracker identities:
 
 - The scheduler identity writes engine-owned state labels and runtime notices.
 - The human operator identity writes Issues, comments, `symphony:ready`, `symphony:rework`, and
-  `symphony:accept` when a person performs those actions in the Taskboard.
+  `symphony:accept` when a person performs those actions in the tracker or through the API.
 
 The operator token is configured as `taskboard.provider_token` and should resolve from
 `$SYMPHONY_OPERATOR_TRACKER_TOKEN`. The scheduler keeps using its own adapter token. The control
@@ -77,8 +70,8 @@ token (`taskboard.control_token`) authorizes the browser request and is independ
 tracker identities.
 
 Neither Taskboard secret belongs in Git or a repository-owned workflow. Both host environment
-variables, plus adapter credential variables, are removed from Codex child processes. The browser
-keeps the control token in session storage and clears it after an unauthorized response.
+variables, plus adapter credential variables, are removed from Codex child processes. The read-only
+Taskboard browser page does not request or store either token.
 
 ## Configuration
 
@@ -121,7 +114,7 @@ the local project projection.
 ## Deliberate boundaries
 
 - No Dashi dependency, local Taskboard service, or mirrored task store is introduced.
-- The browser cannot write scheduler memory directly.
+- The Taskboard browser page is read-only and cannot write scheduler memory directly.
 - Provider review enrichment is best effort; unsupported unresolved-thread queries are labelled
   unavailable instead of rendered as zero.
 - Closing an Issue without `symphony:accept` remains in Human Review.
