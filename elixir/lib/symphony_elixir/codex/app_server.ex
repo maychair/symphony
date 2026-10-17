@@ -61,7 +61,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                dynamic_tool_binding,
                opts,
                on_thread_intent
-             ) do
+             ),
+           :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(opts[:run_record] || %{}, %{"thread_id" => thread_id}) do
         on_thread_started.(thread_id)
 
         {:ok,

@@ -64,3 +64,5 @@ Plan graph validation is available; coordinated dispatch and the remaining
 lifecycle integration are still under development.
 
 Configured parent plans now receive [native preflight](elixir/docs/workflow-lifecycle.md#native-plan-preflight) on tracker reads. This verifies complete cross-repository scope and approval without granting child dispatch or treating Issue closure as dependency evidence.
+
+[Native execution generations](elixir/docs/workflow-lifecycle.md#native-execution-generations) bind roles and fixed inputs, preserve cumulative accounting, and require native stop before replacing a thread. Automatic role selection remains under development.

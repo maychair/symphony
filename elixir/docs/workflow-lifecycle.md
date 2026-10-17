@@ -10,6 +10,7 @@ Issues as coordination work. The existing GitLab task path also binds label
 decisions to unchanged native candidate notes and rejects unversioned acceptance.
 Configured parents now receive complete native scope/approval preflight on
 tracker reads, including GitHub/GitLab repository identity and member contracts.
+Native execution generation fencing is available for role separation and recovery.
 Child dispatch, artifact verification and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
@@ -183,6 +184,35 @@ Native reads use the documented [GitHub repository endpoint](https://docs.github
 [GitHub Issue comments](https://docs.github.com/en/rest/issues/comments#list-issue-comments),
 [GitLab project endpoint](https://docs.gitlab.com/api/projects/#get-a-single-project)
 and [GitLab Issue notes](https://docs.gitlab.com/api/notes/#list-all-issue-notes).
+
+## Native execution generations
+
+`RunJournal.admit/3` accepts an `execution_binding` derived by the lifecycle from
+verified native facts. It binds the full work identity, developer/verifier role,
+plan revision, child contract checksum, parent approval reference, fixed input
+versions and verification references, candidate digest and runtime policy digest.
+A verifier must name a candidate. Input ordering is canonicalized; reordering
+unchanged inputs resumes the same generation rather than allocating another.
+
+This binding is an execution boundary, not proof that its inputs are verified or
+that the work is authorized. The lifecycle must still check those native facts,
+all restrictions, remaining budget and finite retry/repair limits before calling
+admission. Automatic role selection and candidate verification are still pending.
+
+Changing role or fixed inputs requires a confirmed stop of the recorded native
+thread. Allocation without a known thread remains uncertain even if a local
+boolean says it stopped. An old unbound native session requires explicit
+migration. A new generation archives the previous role and native execution
+receipt, removes its resume identity, and preserves cumulative budget and retry
+and repair counters. The app-server client rejects a provider response that
+reuses an earlier generation's thread before it can start a verifier turn.
+
+Bound checkpoints require the current executor or reconciliation lock and a
+matching journal revision. Writes serialize inside the scheduler VM; a previous
+attempt or stale callback cannot overwrite a newer generation, clear its binding
+or release its lock. Damaged binding/history records fail closed on recovery.
+These guards do not imply child completion, independent verification success or
+permission to publish, merge or close an Issue.
 
 ## Execution and evidence
 
