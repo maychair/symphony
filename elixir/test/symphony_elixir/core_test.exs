@@ -1048,15 +1048,18 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_exit = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
+    # Same-sender ordering makes this call a barrier after the DOWN handler.
     state = :sys.get_state(pid)
+    after_exit = System.monotonic_time(:millisecond)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert due_at_ms >= before_exit + 1_000
+    assert due_at_ms <= after_exit + 1_000
   end
 
   test "normal worker exit at a human decision releases the claim without a continuation retry" do

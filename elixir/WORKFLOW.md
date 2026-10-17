@@ -341,3 +341,11 @@ Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMP
 ## Versioned task workflow
 
 GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels, verified by native readback. Enable it only after migrating retained private workflows and their Issue agreements.
+
+## Parent plans and standalone review
+
+The [repository lifecycle contract](docs/workflow-lifecycle.md) defines sealed cross-repository plans,
+version-bound evidence, parent acceptance and comments-only standalone review.
+Parent plan Issues are coordination work and never ordinary coding executions.
+Plan graph validation is available; coordinated dispatch and the remaining
+lifecycle integration are still under development.

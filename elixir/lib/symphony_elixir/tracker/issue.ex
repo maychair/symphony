@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Tracker.Issue do
     :branch_name,
     :url,
     :assignee_id,
+    kind: :task,
     blocked_by: [],
     labels: [],
     dispatchable: false,
@@ -38,6 +39,7 @@ defmodule SymphonyElixir.Tracker.Issue do
           branch_name: String.t() | nil,
           url: String.t() | nil,
           assignee_id: String.t() | nil,
+          kind: :task | :plan | :review,
           labels: [String.t()],
           blocked_by: [map()],
           dispatchable: boolean(),
@@ -51,6 +53,8 @@ defmodule SymphonyElixir.Tracker.Issue do
   end
 
   @spec routable?(t(), [String.t()] | map()) :: boolean()
+  def routable?(%__MODULE__{kind: :plan}, _requirements), do: false
+
   def routable?(%__MODULE__{} = issue, %{required_labels: labels} = tracker) do
     owner = if tracker.kind in ["github", "gitlab"], do: Map.get(tracker, :assignee)
 

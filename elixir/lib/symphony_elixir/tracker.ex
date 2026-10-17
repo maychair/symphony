@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Tracker do
   leak into scheduler policy.
   """
 
-  alias SymphonyElixir.Config
+  alias SymphonyElixir.{Config, TaskPlan}
   alias SymphonyElixir.MailReview.Listener
   alias SymphonyElixir.Tracker.Issue
 
@@ -70,7 +70,7 @@ defmodule SymphonyElixir.Tracker do
   def fetch_issues_by_states(states) do
     with {:ok, issues} <- adapter().fetch_issues_by_states(states),
          {:ok, reviews} <- review_issues() do
-      {:ok, Enum.reject(issues, &("symphony-review" in &1.labels)) ++ Enum.filter(reviews, &(&1.state in states))}
+      {:ok, Enum.map(Enum.reject(issues, &("symphony-review" in &1.labels)), &TaskPlan.project/1) ++ Enum.filter(reviews, &(&1.state in states))}
     end
   end
 
@@ -80,7 +80,7 @@ defmodule SymphonyElixir.Tracker do
 
     with {:ok, issues} <- adapter().fetch_issues_by_ids(normal_ids),
          {:ok, reviews} <- review_issues() do
-      {:ok, Enum.reject(issues, &("symphony-review" in &1.labels)) ++ Enum.filter(reviews, &(&1.id in review_ids))}
+      {:ok, Enum.map(Enum.reject(issues, &("symphony-review" in &1.labels)), &TaskPlan.project/1) ++ Enum.filter(reviews, &(&1.id in review_ids))}
     end
   end
 

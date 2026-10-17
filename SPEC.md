@@ -2381,3 +2381,11 @@ Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMP
 ## Repository task workflow extension
 
 The optional GitLab/Codex native Goal extension in [the execution contract](elixir/docs/task-workflow.md) adds five logical states, versioned authorized decisions, independent restrictions, cumulative execution accounting and delivery-bound acceptance. People own the `symphony:ready`, `symphony:rework` and `symphony:accept` labels; the engine owns only the `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels and keeps them consistent with its journal. Native Issue state keeps its existing meaning. A successful execution attempt is not overall completion.
+
+## Repository parent-plan lifecycle extension
+
+The [repository lifecycle contract](elixir/docs/workflow-lifecycle.md) specifies
+versioned parent/child plans and independent PR/MR review. Repository Issues remain
+the sole task source; this is not a general-purpose workflow service or an extra
+tracker. A parent is coordination work, not a coding executor. Native facts,
+versioned human decisions and existing repository permissions remain authoritative.

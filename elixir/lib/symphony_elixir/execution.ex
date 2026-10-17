@@ -35,6 +35,8 @@ defmodule SymphonyElixir.Execution do
   end
 
   @spec prepare(Tracker.Issue.t(), keyword()) :: {:ok, Tracker.Issue.t(), keyword()} | {:error, term()}
+  def prepare(%Tracker.Issue{kind: :plan}, _opts), do: {:error, :parent_plan_has_no_executor}
+
   def prepare(issue, opts) do
     if enabled?() do
       with :ok <- ExecutionBackend.check_record(journal_root(), issue.id),
