@@ -295,9 +295,17 @@ resuming them. A stale execution lock or unknown native allocation remains a
 recovery incident. Do not delete locks to manufacture stop confirmation.
 
 The candidate-binding update also changes note source digests to include native
-creation time and author ID. Deploy it together with the Workspace decision
-publisher, terminal verifier and cleanup integration; the current engine change
-alone is not a supported rollout. Existing labels without candidate bindings
+creation time and author ID. The Workspace scheduling entry publishes an explicit
+versioned execution approval before routing the Issue, avoiding timestamp guesses
+when native actions occur in the same second. The terminal verifier accepts both
+explicit note decisions and the engine-selected label bindings. Deploy the engine
+and these helpers together; an engine-only rollout is unsupported.
+
+`observed_label_refs` fingerprints native label facts independently of consumed
+decisions. Freshness reporting may acknowledge an unbound event without turning
+it into an authorization. A new or changed relevant event fences cleanup until
+the scheduler has observed it. Duplicate or malformed contract blocks never fall
+back to an unstructured agreement. Existing labels without candidate bindings
 cannot be promoted to authorization from the latest description. Retained source
 versions must be reconciled explicitly; do not rewrite historical receipts to
 make old authorization appear current.

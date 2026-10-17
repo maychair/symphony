@@ -265,12 +265,14 @@ defmodule SymphonyElixir.TaskReconciler do
       "type" => type,
       "issue_version" => issue_version,
       "contract" => contract,
+      "contract_invalid" => is_nil(contract) and Regex.match?(~r/<!--\s*symphony-contract\b/, raw["description"] || ""),
       "closed" => raw["state"] == "closed",
       "labels" => raw["labels"],
       "versions" => %{},
       "now" => now,
       "source_refs" => Enum.map(events, & &1["ref"]),
       "decision_bindings" => Map.new(events, &{&1["ref"], &1["binding"]}),
+      "observed_label_refs" => Enum.map(label_events, &TaskDecision.label_observation/1),
       "observed_refs" => notes |> Enum.reject(&(&1["system"] == true)) |> Enum.map(&source_ref/1),
       "owner_valid" => owner == settings.assignee
     }
@@ -287,7 +289,7 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec description_contract(String.t() | nil) :: map() | nil
   def description_contract(description) do
-    with [_, json] <- Regex.run(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
+    with [[_, json]] <- Regex.scan(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
          {:ok, %{"contract_sha" => sha} = block} when is_binary(sha) <- Jason.decode(json),
          data = Map.delete(block, "contract_sha"),
          true <- sha == TaskWorkflow.digest(data) do

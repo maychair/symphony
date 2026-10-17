@@ -86,6 +86,7 @@ defmodule SymphonyElixir.TaskWorkflow do
     |> check_closure(facts)
     |> derive(facts)
     |> Map.put("observed_refs", facts["observed_refs"] || [])
+    |> Map.put("observed_label_refs", facts["observed_label_refs"] || [])
   end
 
   @spec tick(map(), integer()) :: map()
@@ -247,7 +248,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp valid_contract?(data, facts) do
     baseline =
-      data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"] and
+      facts["contract_invalid"] != true and data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"] and
         data["contract_sha"] == digest(Map.drop(data, ["contract_sha", "issue_version"]))
 
     baseline and matches_description?(data, facts["contract"]) and valid_controls?(data) and nonempty_strings?(data["criteria"]) and
@@ -397,7 +398,7 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp check_baseline(flow, facts) do
     contract = flow["contract"]
 
-    valid = is_map(contract) and contract["issue_version"] == facts["issue_version"] and contract["type"] == facts["type"]
+    valid = facts["contract_invalid"] != true and is_map(contract) and contract["issue_version"] == facts["issue_version"] and contract["type"] == facts["type"]
 
     if valid and current_decision?(contract, facts),
       do: clear(flow, "baseline"),

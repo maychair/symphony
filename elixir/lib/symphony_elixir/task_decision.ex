@@ -20,6 +20,18 @@ defmodule SymphonyElixir.TaskDecision do
   @spec source_ref(map()) :: String.t()
   def source_ref(note), do: "note:#{note["id"]}@#{version(note)}"
 
+  @doc "Fingerprint a native label observation without granting it decision authority."
+  @spec label_observation(map()) :: String.t()
+  def label_observation(event) do
+    TaskWorkflow.digest(%{
+      "id" => event["id"],
+      "action" => event["action"],
+      "label" => get_in(event, ["label", "name"]),
+      "actor" => get_in(event, ["user", "id"]),
+      "created_at" => event["created_at"]
+    })
+  end
+
   @spec version(map()) :: String.t()
   def version(note), do: TaskWorkflow.digest(Map.put(Map.take(note, ["body", "created_at", "updated_at"]), "actor", get_in(note, ["author", "id"])))
 

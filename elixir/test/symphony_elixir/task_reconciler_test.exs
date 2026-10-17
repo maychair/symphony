@@ -247,6 +247,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert ready["actor"] == "1"
     assert ready["ref"] == label_ref(11)
     assert TaskDecision.label_events([label_event(11, "symphony:ready")], []) == []
+    assert TaskReconciler.description_contract(description <> "\n" <> contract_block(development_contract())) == nil
   end
 
   test "old ready cannot approve edited scope on first admission", %{server: server, issue: issue} do
@@ -255,9 +256,31 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute Enum.any?(Agent.get(server, & &1.calls), fn {method, _, _, body} -> method == "PUT" and body["state_event"] == "close" end)
   end
 
+  test "an explicit approval cannot bypass duplicate contract blocks", %{server: server, issue: issue} do
+    description = Agent.get(server, & &1.raw["description"])
+    duplicate = description <> "\n" <> contract_block(development_contract())
+    data = TaskReconciler.description_contract(description) |> Map.put("issue_version", TaskWorkflow.digest(duplicate))
+    Agent.update(server, &%{&1 | raw: Map.put(&1.raw, "description", duplicate), notes: [note(1, "authorize", data)]})
+    assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
+  end
+
   test "ready without its actual actor cannot borrow the assignee", %{server: server, issue: issue} do
     Agent.update(server, &%{&1 | label_events: [Map.delete(label_event(11, "symphony:ready"), "user")]})
     assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
+  end
+
+  test "same-second explicit approval works while an unbound label is only recorded as an observation", %{server: server, issue: issue} do
+    raw = Agent.get(server, & &1.raw)
+    data = TaskReconciler.description_contract(raw["description"]) |> Map.put("issue_version", TaskWorkflow.digest(raw["description"]))
+    approval = note(1, "authorize", data)
+    unknown = Map.delete(label_event(11, "symphony:ready"), "user")
+    Agent.update(server, &%{&1 | notes: [approval], label_events: [unknown]})
+    assert {:ok, _, opts} = Execution.prepare(issue, [])
+    flow = opts[:run_record]["workflow"]
+    assert flow["contract"]["ref"] == TaskReconciler.source_ref(approval)
+    assert flow["observed_label_refs"] == [TaskDecision.label_observation(unknown)]
+    assert Map.keys(flow["events"]) == [TaskReconciler.source_ref(approval)]
+    assert flow["state"] == "running"
   end
 
   test "deleting or editing a candidate revokes its projection after journal reload", %{server: server, issue: issue} do
