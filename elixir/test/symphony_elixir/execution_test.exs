@@ -350,6 +350,48 @@ defmodule SymphonyElixir.ExecutionTest do
     end
   end
 
+  test "a confirmed stop at a human decision is not dispatchable", %{issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    flow = SymphonyElixir.TaskWorkflow.new(Execution.run_budget_ms(issue.id), System.system_time(:millisecond))
+
+    refute Execution.awaiting_human?(issue.id)
+
+    for state <- ["waiting", "review", "ended"] do
+      assert {:ok, _} =
+               RunJournal.checkpoint(record, %{
+                 "native_stop_confirmed" => true,
+                 "workflow" => Map.put(flow, "state", state)
+               })
+
+      assert Execution.awaiting_human?(issue.id)
+    end
+
+    assert {:ok, _} =
+             RunJournal.checkpoint(record, %{
+               "native_stop_confirmed" => true,
+               "workflow" => Map.put(flow, "state", "ready")
+             })
+
+    refute Execution.awaiting_human?(issue.id)
+
+    assert {:ok, _} =
+             RunJournal.checkpoint(record, %{
+               "native_stop_confirmed" => false,
+               "workflow" => Map.put(flow, "state", "review")
+             })
+
+    refute Execution.awaiting_human?(issue.id)
+  end
+
+  test "awaiting_human? stays false without a recorded run or goal mode", %{issue: issue} do
+    refute Execution.awaiting_human?(issue.id)
+
+    write_workflow_file!(Workflow.workflow_file_path())
+    assert :ok = WorkflowStore.force_reload()
+    refute Execution.awaiting_human?(issue.id)
+  end
+
   test "handoff marks the native Issue for review without touching the human authorization label", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
 
