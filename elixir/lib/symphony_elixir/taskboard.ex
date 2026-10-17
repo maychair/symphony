@@ -97,10 +97,12 @@ defmodule SymphonyElixir.Taskboard do
 
     with {:ok, project} <- find_project(project_id, settings, opts),
          {:ok, detail} <- fetch_detail(project, identifier, opts) do
+      detail = attach_local_execution(project, detail, identifier)
+
       card =
         if project.local do
           detail.issue
-          |> card_payload(project, local_runtime_entry(detail.issue, opts))
+          |> card_payload(project, local_runtime_entry(detail.issue, opts), detail.execution)
         else
           nil
         end
@@ -175,10 +177,12 @@ defmodule SymphonyElixir.Taskboard do
   def runtime_status(%{status: status}) when is_binary(status), do: status
   def runtime_status(_entry), do: "active"
 
-  @spec card_payload(Issue.t(), map(), map() | nil) :: map()
-  def card_payload(%Issue{} = issue, project, runtime_entry) do
+  @spec card_payload(Issue.t(), map(), map() | nil, map() | nil) :: map()
+  def card_payload(%Issue{} = issue, project, runtime_entry, execution \\ nil) do
     labels = Enum.map(issue.labels, &normalize_label/1)
     column = column_for(issue, labels, runtime_entry)
+    status = agent_status(column, labels, runtime_entry)
+    artifacts = card_artifacts(execution, project)
 
     %{
       issue_id: issue.id,
@@ -195,10 +199,12 @@ defmodule SymphonyElixir.Taskboard do
       repo: project.repo,
       kind: project.kind,
       column: column,
-      agent_status: agent_status(column, labels, runtime_entry),
+      agent_status: status,
       needs_human: column == "Human Review",
       runtime: public_runtime(runtime_entry),
       delivery: delivery_hint(labels),
+      artifacts: artifacts,
+      human_action: human_action(column, labels, status, issue, artifacts, execution),
       updated_at: Provider.iso8601(issue.updated_at),
       created_at: Provider.iso8601(issue.created_at)
     }
@@ -263,8 +269,16 @@ defmodule SymphonyElixir.Taskboard do
       cards =
         issues
         |> Enum.map(fn
-          %Issue{} = issue -> card_payload(issue, project, runtime_entry(issue, runtime))
-          _ -> nil
+          %Issue{} = issue ->
+            card_payload(
+              issue,
+              project,
+              runtime_entry(issue, runtime),
+              local_execution(issue.id, issue.identifier)
+            )
+
+          _ ->
+            nil
         end)
         |> Enum.reject(&is_nil/1)
         |> sort_cards()
@@ -440,13 +454,7 @@ defmodule SymphonyElixir.Taskboard do
 
   defp fetch_detail(%{local: true} = project, identifier, opts) do
     with {:ok, provider} <- Provider.module_for(project.kind) do
-      execution = local_execution(identifier)
-
-      provider.issue_detail(
-        project.settings.tracker,
-        identifier,
-        Keyword.put(opts, :execution, execution)
-      )
+      provider.issue_detail(project.settings.tracker, identifier, opts)
     end
   end
 
@@ -460,6 +468,15 @@ defmodule SymphonyElixir.Taskboard do
       error -> error
     end
   end
+
+  defp attach_local_execution(%{local: true} = _project, detail, identifier) do
+    case local_execution(detail.issue.id, identifier) do
+      nil -> detail
+      execution -> Map.put(detail, :execution, execution)
+    end
+  end
+
+  defp attach_local_execution(_project, detail, _identifier), do: detail
 
   defp normalize_remote_card(card, project) when is_map(card) do
     %{
@@ -481,6 +498,8 @@ defmodule SymphonyElixir.Taskboard do
       needs_human: card["needs_human"] == true,
       runtime: card["runtime"],
       delivery: card["delivery"],
+      artifacts: List.wrap(card["artifacts"]),
+      human_action: card["human_action"],
       updated_at: card["updated_at"],
       created_at: card["created_at"]
     }
@@ -506,6 +525,8 @@ defmodule SymphonyElixir.Taskboard do
       needs_human: false,
       runtime: nil,
       delivery: nil,
+      artifacts: [],
+      human_action: nil,
       updated_at: nil,
       created_at: nil
     }
@@ -577,25 +598,182 @@ defmodule SymphonyElixir.Taskboard do
     }
   end
 
-  defp local_execution(identifier) do
+  defp local_execution(identifier, fallback_identifier) do
     if Execution.enabled?() do
-      case RunJournal.read(RunJournal.directory(Execution.journal_root(), identifier)) do
-        {:ok, record} ->
-          %{
-            phase: record["phase"],
-            attempt_id: record["attempt_id"],
-            attempt_count: record["attempt_count"],
-            thread_id: record["thread_id"],
-            turn_id: record["turn_id"],
-            blocker_reason: record["blocker_reason"],
-            handoff: record["handoff"],
-            updated_at: record["updated_at"],
-            events: record["events"] |> List.wrap() |> Enum.take(-20)
-          }
+      [identifier, fallback_identifier, native_issue_id(identifier), native_issue_id(fallback_identifier)]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.find_value(&read_local_execution/1)
+    end
+  end
 
-        _ ->
-          nil
+  defp read_local_execution(identifier) do
+    case RunJournal.read(RunJournal.directory(Execution.journal_root(), identifier)) do
+      {:ok, %{} = record} ->
+        %{
+          phase: record["phase"],
+          attempt_id: record["attempt_id"],
+          attempt_count: record["attempt_count"],
+          thread_id: record["thread_id"],
+          turn_id: record["turn_id"],
+          blocker_reason: record["blocker_reason"],
+          handoff: record["handoff"],
+          workflow_state: get_in(record, ["workflow", "state"]),
+          acceptance_mode: get_in(record, ["workflow", "contract", "acceptance_mode"]),
+          manifest: get_in(record, ["workflow", "manifest"]),
+          delivery: record["delivery"],
+          intermediate: get_in(record, ["workflow", "intermediate"]),
+          stage_results: record["stage_results"],
+          updated_at: record["updated_at"],
+          events: record["events"] |> List.wrap() |> Enum.take(-20)
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  defp native_issue_id(identifier) when is_binary(identifier) do
+    case Regex.run(~r/^(?:GH|GL)-([1-9][0-9]*)$/, identifier) do
+      [_, number] -> number
+      _ -> nil
+    end
+  end
+
+  defp card_artifacts(nil, _project), do: []
+
+  defp card_artifacts(execution, project) do
+    manifest_items =
+      execution
+      |> Map.get(:manifest)
+      |> case do
+        %{"items" => items} -> List.wrap(items)
+        _ -> []
       end
+
+    [execution[:delivery], execution[:intermediate] | manifest_items]
+    |> Enum.filter(&is_map/1)
+    |> Enum.map(&artifact_payload(&1, project))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(& &1.url)
+  end
+
+  defp artifact_payload(item, project) do
+    kind = item["kind"]
+    url = item["url"]
+
+    if kind in ["mr", "pr", "report"] and http_url?(url) do
+      %{
+        kind: kind,
+        label: artifact_label(kind, url, project.kind),
+        title: item["id"] || item["title"],
+        url: url,
+        state: item["state"]
+      }
+    end
+  end
+
+  defp artifact_label("report", _url, _tracker_kind), do: "Open report"
+
+  defp artifact_label(kind, url, "github") when kind in ["mr", "pr"] do
+    case Regex.run(~r{/pull/([1-9][0-9]*)}, url) do
+      [_, number] -> "Open pull request ##{number}"
+      _ -> "Open pull request"
+    end
+  end
+
+  defp artifact_label(kind, url, _tracker_kind) when kind in ["mr", "pr"] do
+    case Regex.run(~r{/merge_requests/([1-9][0-9]*)}, url) do
+      [_, number] -> "Open merge request !#{number}"
+      _ -> "Open merge request"
+    end
+  end
+
+  defp http_url?(url) when is_binary(url), do: String.match?(url, ~r/^https?:\/\//i)
+  defp http_url?(_url), do: false
+
+  defp human_action("Human Review", labels, status, issue, artifacts, execution) do
+    accepted? = "symphony:accept" in labels
+    acceptance_mode = execution[:acceptance_mode] || "separate"
+
+    cond do
+      accepted? ->
+        %{
+          required: false,
+          summary: "Acceptance is recorded; Symphony is waiting for the tracker to close the Issue.",
+          label: nil
+        }
+
+      status == "failed" ->
+        %{
+          required: true,
+          summary: "Open the Issue and record the next decision; the latest agent run failed.",
+          label: "symphony:rework"
+        }
+
+      status == "blocked" ->
+        %{
+          required: true,
+          summary: "Open the Issue and answer the blocker so execution can continue.",
+          label: nil
+        }
+
+      artifacts != [] ->
+        %{
+          required: true,
+          summary: artifact_action(artifacts, acceptance_mode),
+          label: if(acceptance_mode == "merge", do: nil, else: "symphony:accept"),
+          issue_url: issue.url
+        }
+
+      true ->
+        %{
+          required: true,
+          summary: "Open the Issue and read the latest handoff. Record the requested decision before continuing.",
+          label: nil,
+          issue_url: issue.url
+        }
+    end
+  end
+
+  defp human_action(_column, _labels, _status, _issue, _artifacts, _execution), do: nil
+
+  defp artifact_action(artifacts, acceptance_mode) do
+    reports = Enum.filter(artifacts, &(&1.kind == "report"))
+    requests = Enum.filter(artifacts, &(&1.kind in ["mr", "pr"]))
+
+    review =
+      case {reports, requests} do
+        {[], [request]} -> "Review #{artifact_name(request)}."
+        {[], requests} -> "Review the linked requests: #{join_artifacts(requests)}."
+        {reports, []} -> "Review #{join_artifacts(reports)}."
+        {reports, requests} -> "Review #{join_artifacts(reports)} and #{join_artifacts(requests)}."
+      end
+
+    cond do
+      requests == [] ->
+        review <>
+          " This task has no MR; that is expected for its delivery type. " <>
+          "Add `symphony:accept` to the Issue if it meets the agreed criteria."
+
+      acceptance_mode == "merge" ->
+        review <> " Merge the request when approved; Symphony will verify that delivery."
+
+      true ->
+        review <>
+          " Merge the request if approved, then add `symphony:accept` to the Issue."
+    end
+  end
+
+  defp join_artifacts(artifacts), do: Enum.map_join(artifacts, " and ", &artifact_name/1)
+
+  defp artifact_name(%{url: url, kind: kind}) do
+    case Regex.run(~r{/(?:pull|merge_requests)/([1-9][0-9]*)}, url) do
+      [_, number] when kind in ["mr", "pr"] ->
+        if String.contains?(url, "/pull/"), do: "PR ##{number}", else: "MR !#{number}"
+
+      _ ->
+        if kind == "report", do: "the report", else: "the delivery"
     end
   end
 

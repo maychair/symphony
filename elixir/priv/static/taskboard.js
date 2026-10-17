@@ -68,7 +68,9 @@
       card.project,
       card.repo,
       card.agent_status,
+      card.human_action?.summary,
       ...(card.labels || []),
+      ...(card.artifacts || []).flatMap((artifact) => [artifact.label, artifact.title]),
     ]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(query));
@@ -153,21 +155,27 @@
     return 'idle';
   }
 
+  function externalLink(url, className, text, ariaLabel) {
+    const href = trackerUrl(url);
+    if (!href) return null;
+
+    const node = el('a', className, text);
+    node.href = href;
+    node.target = '_blank';
+    node.rel = 'noopener noreferrer';
+    if (ariaLabel) node.setAttribute('aria-label', ariaLabel);
+    return node;
+  }
+
   function taskCard(card) {
     const url = trackerUrl(card.url);
-    const node = el(url ? 'a' : 'article', `task-card${url ? '' : ' unavailable'}`);
+    const node = el('article', `task-card${url ? '' : ' unavailable'}`);
     node.dataset.project = card.project_id;
     node.dataset.identifier = card.issue_identifier;
     node.dataset.column = card.column;
 
     if (url) {
-      node.href = url;
-      node.target = '_blank';
-      node.rel = 'noopener noreferrer';
-      node.setAttribute(
-        'aria-label',
-        `Open ${card.issue_identifier || 'Issue'} in ${card.kind || 'tracker'}: ${card.title || 'Untitled Issue'}`,
-      );
+      node.dataset.hasIssueLink = 'true';
     } else {
       node.setAttribute('aria-disabled', 'true');
     }
@@ -180,7 +188,20 @@
     }
     node.appendChild(head);
 
-    node.appendChild(el('h3', null, card.title || 'Untitled Issue'));
+    const title = el('h3');
+    const titleLink = externalLink(
+      url,
+      'task-card-title-link',
+      card.title || 'Untitled Issue',
+      `Open ${card.issue_identifier || 'Issue'} in ${card.kind || 'tracker'}: ${card.title || 'Untitled Issue'}`,
+    );
+    if (titleLink) {
+      title.appendChild(titleLink);
+    } else {
+      title.textContent = card.title || 'Untitled Issue';
+    }
+    node.appendChild(title);
+
     if (card.summary) node.appendChild(el('p', 'task-card-summary', card.summary));
 
     const meta = el('div', 'task-card-meta');
@@ -197,13 +218,41 @@
       node.appendChild(labels);
     }
 
+    const action = card.human_action;
+    if (action?.summary) {
+      const actionNode = el('div', `task-card-action${action.required ? ' required' : ''}`);
+      actionNode.appendChild(
+        el('span', 'task-card-action-label', action.required ? 'Needs your action' : 'Status'),
+      );
+      actionNode.appendChild(el('p', null, action.summary));
+      node.appendChild(actionNode);
+    }
+
     const foot = el('div', 'task-card-foot');
     foot.appendChild(el('span', 'agent-status', card.agent_status || 'idle'));
     foot.appendChild(el('span', 'task-card-time', shortTime(card.updated_at)));
     node.appendChild(foot);
 
-    const open = el('div', 'task-card-open', url ? 'Open issue ↗' : 'Tracker link unavailable');
-    node.appendChild(open);
+    const links = el('div', 'task-card-links');
+    const issueLink = externalLink(url, 'task-card-link issue', 'Issue ↗');
+    if (issueLink) links.appendChild(issueLink);
+
+    (card.artifacts || []).forEach((artifact) => {
+      const artifactLink = externalLink(
+        artifact.url,
+        `task-card-link artifact ${safe(artifact.kind).toLowerCase()}`,
+        `${artifact.label || 'Open delivery'} ↗`,
+        artifact.title ? `${artifact.label || 'Open delivery'}: ${artifact.title}` : null,
+      );
+      if (artifactLink) links.appendChild(artifactLink);
+    });
+
+    if (links.childElementCount) {
+      node.appendChild(links);
+    } else {
+      node.appendChild(el('div', 'task-card-links unavailable', 'Tracker link unavailable'));
+    }
+
     return node;
   }
 

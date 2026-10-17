@@ -155,6 +155,13 @@ submission with intermediate continuation. Stopped-run polls recover unfinished
 review requests, including an already merged MR or a notice beyond the first
 comments page, without allocating a replacement executor.
 
+The final handoff includes a `需要你做什么` section. It links the submitted
+artifacts, states when a report-only task correctly has no MR, and names the
+remaining action: merge the approved MR, add `symphony:accept` for separate
+acceptance, or request in-scope rework. The Scheduler generates this section
+from the manifest and acceptance mode so the action does not depend on an
+executor inventing prose.
+
 Publish an overall `manifest` decision using this complete `--decision-file` object:
 
 ```json

@@ -47,10 +47,15 @@ Done. The existing acceptance decision and native Issue closure remain required.
 
 ## Navigation-only dashboard
 
-Each Issue card opens the tracker-provided URL in a new browser tab so the Taskboard remains an
-independent status view. The board has no detail panel, comment composer, drag-and-drop gesture, or
-scheduler action. Issue creation, comments, labels, review, acceptance, and merge decisions happen
-in GitHub or GitLab, where the repository workflow and native history remain visible.
+Each Issue title opens the tracker-provided Issue URL in a new browser tab so the Taskboard remains
+an independent status view. Delivered MRs and reports appear as separate links from the same card,
+using the manifest and verified execution journal. For report-only work, the card states that no MR
+is expected instead of leaving an empty delivery area. Human Review cards also show the concrete
+decision the person must make, such as reviewing the report and adding `symphony:accept`.
+
+The board has no detail panel, comment composer, drag-and-drop gesture, or scheduler action. Issue
+creation, comments, labels, review, acceptance, and merge decisions happen in GitHub or GitLab,
+where the repository workflow and native history remain visible.
 
 The authenticated mutation APIs remain available for integrations that already use them. They
 re-read the current Issue before executing an action, reject invalid transitions, and never write
@@ -115,6 +120,8 @@ the local project projection.
 
 - No Dashi dependency, local Taskboard service, or mirrored task store is introduced.
 - The Taskboard browser page is read-only and cannot write scheduler memory directly.
+- Artifact links come from repository delivery evidence and the execution manifest; report-only work
+  is explicitly different from missing MR evidence.
 - Provider review enrichment is best effort; unsupported unresolved-thread queries are labelled
   unavailable instead of rendered as zero.
 - Closing an Issue without `symphony:accept` remains in Human Review.

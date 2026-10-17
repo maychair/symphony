@@ -23,9 +23,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 The Phoenix service exposes a read-only repository Issue Taskboard at `/` and the lower-level
 runtime observability dashboard at `/runtime`. The Taskboard is a projection over configured
-GitHub, GitLab, or memory-backed Issues; it does not keep a second task database. Its four columns
-are user-facing views over tracker state, labels, and Symphony execution observations. Each card
-opens the native tracker Issue in a new browser tab, where task operations take place. See
+GitHub, GitLab, or memory-backed Issues, execution manifests, and the runtime snapshot; it does not
+keep a second task database. Its four columns are user-facing views over tracker state, labels, and
+Symphony execution observations. Cards open the native Issue in a new tab and expose delivered MRs
+or reports as separate links. Human Review cards state the concrete acceptance or decision action.
+Issue operations take place in the tracker. See
 [Taskboard](docs/taskboard.md) for state mapping, operator authentication, and the JSON API.
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The

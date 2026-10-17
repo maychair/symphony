@@ -566,7 +566,7 @@ defmodule SymphonyElixir.Execution do
     {client, path} = client_path(settings, issue, opts)
     suffix = if kind == "github", do: "/comments", else: "/notes"
 
-    body = handoff_body(args)
+    body = handoff_body(args, record)
 
     with {:ok, posted} <- ensure_handoff_notice(client, path <> suffix, settings, body, record) do
       # The versioned workflow keeps the human authorization label and marks the
@@ -661,7 +661,7 @@ defmodule SymphonyElixir.Execution do
   defp client_path(%{kind: "gitlab"} = settings, issue, opts),
     do: {opts[:gitlab_client] || (&SymphonyElixir.GitLab.Client.request/5), "/projects/#{URI.encode_www_form(settings.provider["project_path"])}/issues/#{issue.id}"}
 
-  defp handoff_body(args) do
+  defp handoff_body(args, record) do
     body =
       ("**#{args["kind"]}**\n\n#{args["reason"]}" <> if(args["url"], do: "\n\n#{args["url"]}", else: ""))
       |> String.replace("<", "&lt;")
@@ -671,17 +671,77 @@ defmodule SymphonyElixir.Execution do
         # A manifest-less handoff asks the human a question, so the notice carries
         # the engine marker: the owner's first later comment answers it, and this
         # notice must never answer itself.
-        body <> "\n\n" <> TaskReconciler.engine_notice_marker()
+        body <>
+          "\n\n" <>
+          handoff_action(args["kind"]) <>
+          "\n\n" <> TaskReconciler.engine_notice_marker()
 
       manifest ->
         decision = %{"action" => "manifest", "contract" => manifest["contract"], "data" => manifest}
         summary = Enum.map_join(manifest["items"], "\n", &"- [#{&1["id"]}](#{&1["url"]})") |> String.replace("<", "&lt;")
 
         body <>
-          "\n\n全部约定成果已提交；请先完成尚未合入 MR 的审查与合并，再按此清单完成整体验收：\n\n" <>
+          "\n\n全部约定成果已提交。请按以下清单和人工动作完成审查与验收：\n\n" <>
           summary <>
+          "\n\n" <>
+          manifest_action(manifest, record) <>
           "\n\n<!-- symphony-workflow\n" <> Jason.encode!(decision) <> "\n-->"
     end
+  end
+
+  defp manifest_action(manifest, record) do
+    items = List.wrap(manifest["items"])
+    report? = Enum.any?(items, &(&1["kind"] == "report"))
+    request? = Enum.any?(items, &(&1["kind"] in ["mr", "pr"]))
+    acceptance_mode = get_in(record, ["workflow", "contract", "acceptance_mode"]) || "separate"
+
+    review_step =
+      case {report?, request?} do
+        {true, true} ->
+          "1. 打开上方报告和 MR，核对验收条件、实际证据、未解决评论及已知限制。"
+
+        {false, true} ->
+          "1. 打开上方 MR，检查改动、验证结果和未解决评论。"
+
+        {true, false} ->
+          "1. 打开上方报告，核对验收条件、实际证据、结果和适用范围。"
+      end
+
+    mr_context =
+      if request?,
+        do: ["2. 如 MR 符合要求，请完成审查和合并；有修改意见时，在本 Issue 添加 `symphony:rework`。"],
+        else: ["2. 本任务没有 MR，这是报告型任务的预期交付。"]
+
+    acceptance_action =
+      if acceptance_mode == "merge",
+        do: "3. 合并 MR 后，Symphony 将核验该交付；不需要额外添加 `symphony:accept`。",
+        else: "3. 如完整交付符合约定，请在本 Issue 添加 `symphony:accept` 完成整体验收。"
+
+    Enum.join(["## 需要你做什么", "", review_step | mr_context ++ [acceptance_action]], "\n")
+  end
+
+  defp handoff_action("review") do
+    """
+    ## 需要你做什么
+
+    请打开上方交付链接并完成审查。如符合约定，请在本 Issue 添加 `symphony:accept`；如需修改，请添加 `symphony:rework` 并说明范围。
+    """
+  end
+
+  defp handoff_action("decision") do
+    """
+    ## 需要你做什么
+
+    请在本 Issue 回复明确决定。Symphony 会按授权人的回复继续执行；调度标签不会代替该决定。
+    """
+  end
+
+  defp handoff_action("blocked") do
+    """
+    ## 需要你做什么
+
+    请在本 Issue 回复解除阻塞所需的具体操作或资源。收到明确答复后，Symphony 才会恢复执行。
+    """
   end
 
   defp response({:ok, %{status: status}}) when status in 200..299, do: :ok

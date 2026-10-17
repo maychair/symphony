@@ -318,8 +318,6 @@
   background: white;
   box-shadow: 0 1px 2px rgba(16, 24, 40, 0.035);
   color: inherit;
-  cursor: pointer;
-  text-decoration: none;
   transition:
     border-color 120ms ease,
     box-shadow 120ms ease,
@@ -420,6 +418,23 @@
   letter-spacing: -0.01em;
 }
 
+.task-card-title-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.task-card-title-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 0.16rem;
+}
+
+.task-card-title-link:focus-visible {
+  border-radius: 0.18rem;
+  outline: 2px solid rgba(16, 163, 127, 0.24);
+  outline-offset: 2px;
+}
+
 .task-card-summary {
   display: -webkit-box;
   margin: 0;
@@ -479,17 +494,83 @@
   font-size: 0.58rem;
 }
 
-.task-card-open {
-  padding-top: 0.36rem;
-  border-top: 1px solid var(--line);
-  color: var(--accent);
-  font-size: 0.64rem;
-  font-weight: 700;
-  text-align: right;
+.task-card-action {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.48rem 0.52rem;
+  border: 1px solid var(--line);
+  border-radius: 0.52rem;
+  background: var(--card-muted);
 }
 
-.task-card.unavailable .task-card-open {
+.task-card-action.required {
+  border-color: #efd39e;
+  background: #fff8eb;
+  color: #704900;
+}
+
+.task-card-action-label {
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.task-card-action p {
+  margin: 0;
+  font-size: 0.66rem;
+  line-height: 1.42;
+}
+
+.task-card-links {
+  display: flex;
+  align-items: center;
+  gap: 0.34rem;
+  flex-wrap: wrap;
+  padding-top: 0.36rem;
+  border-top: 1px solid var(--line);
+}
+
+.task-card-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.55rem;
+  padding: 0.18rem 0.42rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  color: var(--ink);
+  font-size: 0.64rem;
+  font-weight: 700;
+  text-decoration: none;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.task-card-link:hover {
+  border-color: var(--line-strong);
+  background: var(--card-muted);
+}
+
+.task-card-link.artifact {
+  border-color: rgba(16, 163, 127, 0.24);
+  color: var(--accent);
+}
+
+.task-card-link.artifact.report {
+  border-color: rgba(35, 135, 201, 0.28);
+  color: #176b9d;
+}
+
+.task-card-link:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid rgba(16, 163, 127, 0.18);
+  outline-offset: 1px;
+}
+
+.task-card-links.unavailable {
   color: var(--muted);
+  font-size: 0.64rem;
 }
 
 .taskboard-overlay {

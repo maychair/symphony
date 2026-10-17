@@ -3,6 +3,7 @@ defmodule SymphonyElixir.TaskboardTest do
 
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.Taskboard, as: TaskboardSchema
+  alias SymphonyElixir.{Execution, RunJournal}
   alias SymphonyElixir.Taskboard
 
   setup do
@@ -131,6 +132,199 @@ defmodule SymphonyElixir.TaskboardTest do
     assert [%{kind: "mr", number: 9, unresolved_comments: 2}] = detail.deliveries
     assert detail.execution.thread_id == "thread-mock"
     assert detail.capabilities.comment
+  end
+
+  test "cards expose delivered reports, link identity, and the required human action", %{
+    settings: _settings
+  } do
+    journal_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-taskboard-artifacts-#{System.pid()}-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    workflow =
+      Workflow.workflow_file_path()
+      |> File.read!()
+      |> String.replace(
+        "agent:\n",
+        "agent:\n  goal_mode: true\n  run_journal_dir: #{Jason.encode!(journal_root)}\n"
+      )
+
+    File.write!(Workflow.workflow_file_path(), workflow)
+
+    :ok = WorkflowStore.force_reload()
+    on_exit(fn -> File.rm_rf(journal_root) end)
+
+    issue =
+      issue(
+        "29",
+        "GL-29",
+        "Report delivery",
+        "opened",
+        ["symphony:ready", "symphony:review", "type:research"]
+      )
+
+    report_url = issue.url <> "#note_101936"
+    directory = RunJournal.directory(Execution.journal_root(), issue.id)
+    File.mkdir_p!(directory)
+
+    File.write!(
+      Path.join(directory, "run.json"),
+      Jason.encode!(%{
+        "phase" => "completed",
+        "attempt_id" => "report-attempt",
+        "issue_id" => issue.id,
+        "issue_url" => issue.url,
+        "workflow" => %{
+          "state" => "review",
+          "contract" => %{"acceptance_mode" => "separate", "type" => "research"},
+          "manifest" => %{
+            "contract" => "label:1@1@2026-10-17T00:00:00Z",
+            "items" => [
+              %{
+                "id" => "report",
+                "kind" => "report",
+                "url" => report_url,
+                "version" => "v1",
+                "criteria" => ["answer"]
+              }
+            ]
+          }
+        },
+        "stage_results" => %{"mr_publication" => "not_applicable"},
+        "updated_at" => "2026-10-17T01:00:00Z",
+        "events" => []
+      })
+    )
+
+    settings = Config.settings!()
+
+    snapshot =
+      Taskboard.snapshot(
+        settings: settings,
+        issues_fun: fn _states -> [issue] end,
+        runtime_snapshot_fun: fn -> %{} end
+      )
+
+    assert [
+             %{
+               artifacts: [%{kind: "report", label: "Open report", url: ^report_url}],
+               human_action: %{
+                 required: true,
+                 label: "symphony:accept",
+                 summary: summary
+               }
+             }
+           ] = snapshot.cards
+
+    assert summary =~ "This task has no MR; that is expected"
+    assert summary =~ "`symphony:accept`"
+
+    assert {:ok, detail} =
+             Taskboard.issue_detail("memory-project", "GL-29",
+               settings: settings,
+               issues_fun: fn _states -> [issue] end,
+               runtime_snapshot_fun: fn -> %{} end
+             )
+
+    assert detail.execution.manifest["items"] == [
+             %{
+               "criteria" => ["answer"],
+               "id" => "report",
+               "kind" => "report",
+               "url" => report_url,
+               "version" => "v1"
+             }
+           ]
+  end
+
+  test "request cards distinguish GitHub, GitLab, mixed delivery and failure actions" do
+    review_issue =
+      issue(
+        "90",
+        "GH-90",
+        "Review request",
+        "opened",
+        ["symphony:ready", "symphony:review", "type:mixed"]
+      )
+
+    github = %{id: "github", name: "GitHub", repo: "owner/repo", kind: "github"}
+
+    github_card =
+      Taskboard.card_payload(
+        review_issue,
+        github,
+        nil,
+        execution_with_items([
+          %{"id" => "report", "kind" => "report", "url" => "https://github.test/note/1"},
+          %{"id" => "pr", "kind" => "pr", "url" => "https://github.test/owner/repo/pull/7"},
+          %{"id" => "request", "kind" => "mr", "url" => "https://github.test/request/8"},
+          %{"id" => "missing", "kind" => "mr", "url" => nil}
+        ])
+      )
+
+    assert Enum.map(github_card.artifacts, & &1.label) == [
+             "Open report",
+             "Open pull request #7",
+             "Open pull request"
+           ]
+
+    assert github_card.human_action.summary =~
+             "Review the report and PR #7 and the delivery."
+
+    gitlab = %{id: "gitlab", name: "GitLab", repo: "owner/repo", kind: "gitlab"}
+
+    gitlab_multiple =
+      Taskboard.card_payload(
+        review_issue,
+        gitlab,
+        nil,
+        execution_with_items([
+          %{"id" => "mr", "kind" => "mr", "url" => "https://gitlab.test/repo/-/merge_requests/9"},
+          %{"id" => "request", "kind" => "mr", "url" => "https://gitlab.test/request/10"}
+        ])
+      )
+
+    assert Enum.map(gitlab_multiple.artifacts, & &1.label) == [
+             "Open merge request !9",
+             "Open merge request"
+           ]
+
+    assert gitlab_multiple.human_action.summary =~ "Review the linked requests: MR !9 and the delivery."
+
+    gitlab_single =
+      Taskboard.card_payload(
+        review_issue,
+        gitlab,
+        nil,
+        execution_with_items([
+          %{"id" => "mr", "kind" => "mr", "url" => "https://gitlab.test/repo/-/merge_requests/9"}
+        ])
+      )
+
+    assert gitlab_single.human_action.summary =~ "Review MR !9."
+
+    merge_card =
+      Taskboard.card_payload(
+        review_issue,
+        gitlab,
+        nil,
+        execution_with_items(
+          [%{"id" => "mr", "kind" => "mr", "url" => "https://gitlab.test/repo/-/merge_requests/9"}],
+          "merge"
+        )
+      )
+
+    assert merge_card.human_action.label == nil
+    assert merge_card.human_action.summary =~ "Symphony will verify that delivery."
+
+    failed_issue = %{review_issue | labels: ["symphony:ready", "symphony:failed"]}
+    failed_card = Taskboard.card_payload(failed_issue, gitlab, nil)
+    assert failed_card.human_action.label == "symphony:rework"
+    assert failed_card.human_action.summary =~ "the latest agent run failed"
   end
 
   test "an accepted open Issue waits for native closure instead of appearing Done", %{
@@ -941,6 +1135,15 @@ defmodule SymphonyElixir.TaskboardTest do
       dispatchable: true,
       created_at: ~U[2026-10-17 00:00:00Z],
       updated_at: ~U[2026-10-17 01:00:00Z]
+    }
+  end
+
+  defp execution_with_items(items, acceptance_mode \\ "separate") do
+    %{
+      manifest: %{"items" => items},
+      delivery: nil,
+      intermediate: nil,
+      acceptance_mode: acceptance_mode
     }
   end
 

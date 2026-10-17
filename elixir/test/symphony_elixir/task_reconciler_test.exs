@@ -776,6 +776,133 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute Execution.controlled_stop?([])
   end
 
+  test "a final report handoff states that no MR is expected and names the acceptance action", %{
+    issue: issue,
+    server: server,
+    client: client
+  } do
+    contract =
+      development_contract(%{
+        "type" => "research",
+        "criteria" => ["answer"],
+        "deliverables" => [%{"id" => "report", "kind" => "report"}]
+      })
+
+    description = "Deliver the report\n\n" <> contract_block(contract)
+
+    Agent.update(server, fn state ->
+      raw =
+        state.raw
+        |> Map.put("description", description)
+        |> Map.put("labels", ["symphony:ready", "type:research"])
+
+      %{state | raw: raw}
+    end)
+
+    issue = %{issue | labels: ["symphony:ready", "type:research"]}
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+
+    manifest = %{
+      "contract" => record["workflow"]["contract"]["ref"],
+      "items" => [
+        %{
+          "id" => "report",
+          "kind" => "report",
+          "url" => issue.url <> "#note_2",
+          "version" => TaskWorkflow.digest("Report body"),
+          "criteria" => ["answer"]
+        }
+      ]
+    }
+
+    args = %{
+      "kind" => "review",
+      "reason" => "Review the complete report.",
+      "manifest" => manifest
+    }
+
+    assert Execution.handoff(args,
+             issue: issue,
+             tracker_settings: Config.settings!().tracker,
+             gitlab_client: client
+           )["success"]
+
+    body = Agent.get(server, &(&1.notes |> List.last() |> Map.fetch!("body")))
+    assert body =~ "## 需要你做什么"
+    assert body =~ "本任务没有 MR，这是报告型任务的预期交付"
+    assert body =~ "添加 `symphony:accept`"
+  end
+
+  test "a mixed final handoff asks for the report and MR review together", %{
+    issue: issue,
+    server: server,
+    client: client
+  } do
+    contract =
+      development_contract(%{
+        "type" => "mixed",
+        "deliverables" => [
+          %{"id" => "report", "kind" => "report"},
+          %{"id" => "code", "kind" => "mr"}
+        ]
+      })
+
+    description = "Deliver the report and change\n\n" <> contract_block(contract)
+    url = "https://gitlab.test/group/project/-/issues/43"
+
+    Agent.update(server, fn state ->
+      raw =
+        state.raw
+        |> Map.put("description", description)
+        |> Map.put("web_url", url)
+        |> Map.put("labels", ["symphony:ready", "type:mixed"])
+
+      %{state | raw: raw}
+    end)
+
+    issue = %{issue | id: "43", identifier: "GL-43", url: url, labels: ["symphony:ready", "type:mixed"]}
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+
+    manifest = %{
+      "contract" => record["workflow"]["contract"]["ref"],
+      "items" => [
+        %{
+          "id" => "report",
+          "kind" => "report",
+          "url" => url <> "#note_2",
+          "version" => TaskWorkflow.digest("Report body"),
+          "criteria" => ["a", "b"]
+        },
+        %{
+          "id" => "code",
+          "kind" => "mr",
+          "url" => "https://gitlab.test/group/project/-/merge_requests/8",
+          "version" => "v1",
+          "criteria" => ["a", "b"],
+          "checks" => true,
+          "review" => true
+        }
+      ]
+    }
+
+    assert Execution.handoff(
+             %{
+               "kind" => "review",
+               "reason" => "Review the complete mixed delivery.",
+               "manifest" => manifest
+             },
+             issue: issue,
+             tracker_settings: Config.settings!().tracker,
+             gitlab_client: client
+           )["success"]
+
+    body = Agent.get(server, &(&1.notes |> List.last() |> Map.fetch!("body")))
+    assert body =~ "打开上方报告和 MR"
+    assert body =~ "添加 `symphony:accept`"
+  end
+
   test "authorized recovery respects the cumulative failure count across successful handoffs", context do
     %{issue: issue, server: server, contract: contract, client: client} = context
     {:ok, _, opts} = Execution.prepare(issue, [])
