@@ -398,10 +398,69 @@ labels, closure or journal writes.
 
 This coordinator is exercised with owning journals, role-bound tools, real host
 check receipts, and native API fixtures. It does not itself launch Codex, assemble
-role workspaces, authenticate a child acceptance, merge or close an Issue. Polling
+role sessions, authenticate a child acceptance, merge or close an Issue. Polling
 still blocks version 2 automatic dispatch until role workspace/session ownership
 and scheduler continuation are wired to this admission boundary. It must not be
 activated by removing the dispatch guard alone.
+
+## Generation-owned role workspaces
+
+`TaskWorkspace.prepare/3` prepares a locally admitted generation after re-reading
+its native readiness. It rechecks that readiness after preparation, then checkpoints
+the workspace receipt under the owning journal attempt. It does not start Codex
+or enable dispatch. Developer and verifier generations receive separate directories:
+
+```text
+workspace.root/task-<binding-and-generation-digest>/
+  .owner
+  manifest.json
+  source/                   role session cwd
+  inputs/<reference-digest>/ fixed upstream packages
+  candidate/<reference-digest>/ fixed own candidate packages
+```
+
+The host execution registry supplies `repository` (an absolute local Git repository)
+and `base_revision` (an exact initial commit) for a Git-backed developer. These are
+host configuration inputs, never agent-supplied paths. A later candidate supplies
+the source revision; multiple distinct Git revisions require an explicit
+`workspace_artifact` selection. The chosen commit must already exist in the local
+repository and its content must match the retained native artifact. Fetching and
+native base-branch resolution are not yet integrated.
+
+The source is a real detached Git worktree. Checkout uses retained native blobs,
+with hooks and filters bypassed; it does not synthesize a replacement commit.
+Git common-directory and worktree back-link checks prevent borrowing another
+checkout's `.git` pointer. The configured repository's source files stay untouched.
+Report-only roles need no Git repository and receive a scratch source directory.
+
+The manifest records exact binding/generation, input versions, source references,
+verification digests, retained receipts, paths, file hashes, modes and symlink
+contents. Preparation records execution retention owners before materialization.
+Files and inventory are validated without following ancestor symlinks. Path escape,
+extra files, changed bytes, hardlinks and writable input files block reuse. Existing
+unknown directories are not adopted or erased. A matching owned partial preparation
+can resume; conflicting partial content remains an error for recovery.
+
+Resuming a developer generation preserves uncommitted changes and commits in its
+own source worktree. Verifier source must still match the fixed candidate. Rotating
+a generation drops its current workspace receipt and retains that receipt in
+execution history. It never reuses the prior role's mutable source directory.
+
+`TaskWorkspace.environment/1` exposes `SYMPHONY_TASK_INPUTS`,
+`SYMPHONY_TASK_CANDIDATES` and `SYMPHONY_TASK_MANIFEST`. Role context includes these
+paths. Tools revalidate the materialized files before effects and publication.
+Configured command checks bind their identity to the workspace manifest and expose
+the same paths inside their existing Linux filesystem sandbox. Inputs are readable
+but not writable; the supervisor checks their inventory and bytes before and after
+the command. Historical command attestation uses its durable receipt and does not
+require the ephemeral role workspace to survive retention cleanup.
+
+Local verifier Codex sessions use read-only sandbox policy. Remote role workspace
+transport, host registry configuration resolution, automatic session activation and
+scheduler continuation remain pending. Git-backed host command checks still require
+Git; report-only verification uses configured review checks. Native API fixtures,
+real local worktrees and real supervised commands exercise this boundary; this is
+not a live-provider acceptance result.
 
 ## Native evidence publication
 
@@ -656,9 +715,10 @@ does not bypass current parent approval, member scope or native publication read
 It can remain usable when the Git-object endpoint is temporarily unavailable,
 provided those controlling facts are still confirmed.
 
-Each retention owner has `kind` (`candidate`, `dependency` or `manifest`), a full
+Each retention owner has `kind` (`candidate`, `dependency`, `manifest` or `execution`), a full
 Issue `work` reference and an immutable `revision` digest. Candidate owners must
 match their producer; dependency/manifest owners can name another member or parent.
+Execution owners bind retained inputs and source snapshots to one role generation.
 The reference binds the owner to the artifact source and full receipt digest.
 `TaskEvidence` pins selected candidate artifacts automatically; separate consumers
 can pin the same bytes without duplicating storage. Retrying one pin is idempotent.
@@ -671,7 +731,7 @@ not another task tracker, verification verdict or release authorization.
 
 The store currently retains references conservatively. Release, garbage collection
 under current dependency/manifest facts and project retention policy, cross-host
-transfer, and materializing retained bytes for new checks still require integration.
+transfer and automatic retention release still require integration.
 The existing worktree cleaner cannot infer that deleting a worktree releases an
 artifact. Byte snapshots preserve files and modes, not a complete Git history.
 

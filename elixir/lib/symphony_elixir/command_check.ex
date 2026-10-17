@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.CommandCheck do
   @moduledoc "Run a configured verifier command on a fixed Git artifact with durable process and output receipts."
-  alias SymphonyElixir.{ExecutionBinding, RunJournal, TaskWorkflow}
+  alias SymphonyElixir.{ExecutionBinding, RunJournal, TaskWorkflow, TaskWorkspace}
 
   @runner_path Path.expand("../../priv/check_runner.py", __DIR__)
   @external_resource @runner_path
@@ -123,7 +123,8 @@ defmodule SymphonyElixir.CommandCheck do
     binding = record["execution_binding"]
     check = get_in(policy, ["checks", check_id])
 
-    with {:ok, %{"role" => "verifier"} = binding} <- ExecutionBinding.normalize(binding),
+    with :ok <- TaskWorkspace.validate(record),
+         {:ok, %{"role" => "verifier"} = binding} <- ExecutionBinding.normalize(binding),
          {:ok, ^record} <- ExecutionBinding.bind(record, binding),
          true <- is_binary(record["thread_id"]) and is_binary(record["workspace"]),
          true <- is_map(Map.get(record, "check_runs", %{})),
@@ -137,6 +138,7 @@ defmodule SymphonyElixir.CommandCheck do
          {:ok, %{type: :regular}} <- File.lstat(Path.join(record["workspace"], ".git")),
          {git_directory, 0} <- git(record["workspace"], ["rev-parse", "--path-format=absolute", "--git-common-dir"]) do
       data = %{"binding" => binding, "generation" => record["execution_generation"], "check" => check_id, "revision" => revision}
+      data = if record["task_workspace"], do: Map.put(data, "workspace_sha", record["task_workspace"]["manifest_sha"]), else: data
       id = TaskWorkflow.digest(data)
 
       {:ok,
@@ -152,11 +154,21 @@ defmodule SymphonyElixir.CommandCheck do
          "read_roots" => Map.get(check, "read_roots", []),
          "path" => Map.get(check, "path", ["/usr/bin", "/bin"]),
          "workspace" => Path.join(directory(record, id), "worktree")
-       })}
+       })
+       |> workspace_inputs(record)}
     else
       _ -> {:error, :invalid_command_check}
     end
   end
+
+  defp workspace_inputs(spec, %{"task_workspace" => %{"directory" => root}} = record) do
+    spec
+    |> Map.put("environment", TaskWorkspace.environment(record))
+    |> Map.put("input_manifest", Path.join(root, "manifest.json"))
+    |> Map.update!("read_roots", &Enum.uniq([root | &1]))
+  end
+
+  defp workspace_inputs(spec, _), do: spec
 
   defp candidate_matches?(candidate, binding) when is_map(candidate) do
     payload = Map.take(candidate, ~w(work contract_sha inputs artifacts))

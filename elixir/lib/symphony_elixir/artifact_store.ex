@@ -118,7 +118,7 @@ defmodule SymphonyElixir.ArtifactStore do
   defp safe_root?(_), do: false
 
   defp owner?(%{"kind" => kind, "work" => work, "revision" => revision} = owner, producer) do
-    map_size(owner) == 3 and kind in ~w(candidate dependency manifest) and WorkRef.validate(work) == :ok and
+    map_size(owner) == 3 and kind in ~w(candidate dependency manifest execution) and WorkRef.validate(work) == :ok and
       work["kind"] == "issue" and is_binary(revision) and Regex.match?(~r/\A[0-9a-f]{64}\z/, revision) and
       (kind != "candidate" or work == producer)
   end

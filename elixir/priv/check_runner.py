@@ -6,6 +6,7 @@ import os
 import pathlib
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -94,7 +95,57 @@ def stop_children():
     return not children()
 
 
+def input_snapshot(spec):
+    manifest_path = spec.get("input_manifest")
+    if manifest_path is None:
+        return True
+    try:
+        path = pathlib.Path(manifest_path)
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        body = path.read_bytes()
+        if hashlib.sha256(body).hexdigest() != spec["workspace_sha"]:
+            return False
+        manifest = json.loads(body)
+        if manifest["binding"] != spec["binding"] or manifest["generation"] != spec["generation"]:
+            return False
+        expected = {str(pathlib.Path(package["path"]) / item["path"]): item
+                    for package in manifest["packages"] for item in package["files"]}
+        actual = []
+        for directory, directories, names in os.walk(path.parent, followlinks=False):
+            if pathlib.Path(directory) == path.parent:
+                directories[:] = [name for name in directories if name != "source"]
+                names = [name for name in names if name not in (".owner", "manifest.json")]
+            for name in directories[:]:
+                if (pathlib.Path(directory) / name).is_symlink():
+                    names.append(name)
+                    directories.remove(name)
+            actual.extend(str((pathlib.Path(directory) / name).relative_to(path.parent)) for name in names)
+        if sorted(actual) != sorted(expected):
+            return False
+        for name, item in expected.items():
+            entry = path.parent / name
+            info = entry.lstat()
+            if item["mode"] == "120000":
+                if not stat.S_ISLNK(info.st_mode) or os.readlink(entry) != item["target"]:
+                    return False
+                content = os.readlink(entry).encode("utf-8")
+            else:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o222:
+                    return False
+                if bool(info.st_mode & 0o111) != (item["mode"] == "100755"):
+                    return False
+                content = entry.read_bytes()
+            if len(content) != item["size"] or hashlib.sha256(content).hexdigest() != item["sha256"]:
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def snapshot(spec, initial=False):
+    if not input_snapshot(spec):
+        return False
     base = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-C", spec["workspace"]]
     environment = {"PATH": "/usr/bin:/bin"}
     try:
@@ -173,7 +224,7 @@ def run(spec_path):
             process = subprocess.Popen(
                 ["/bin/sh", "-c", spec["command"]],
                 cwd=spec["workspace"],
-                env={"PATH": ":".join(spec["path"]), "LANG": "C.UTF-8", "TMPDIR": str(temporary)},
+                env={"PATH": ":".join(spec["path"]), "LANG": "C.UTF-8", "TMPDIR": str(temporary), **spec.get("environment", {})},
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

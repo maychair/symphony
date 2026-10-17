@@ -12,8 +12,8 @@ defmodule SymphonyElixir.ExecutionBinding do
   @fields ~w(work role plan_revision contract_sha authority inputs candidate policy_sha)
   @input_fields ~w(work artifact version verification)
   @binding_fields ~w(execution_binding execution_binding_sha execution_generation execution_history)
-  @native_fields ~w(thread_id turn_id thread_allocation_intent native_stop_confirmed goal_thread_id goal_status execution_mode recovery native_stop_recovery)
-  @receipt_fields ~w(execution_binding execution_generation attempt_id thread_id turn_id thread_allocation_intent native_stop_confirmed backend worker_host workspace execution_mode goal_status)
+  @native_fields ~w(thread_id turn_id thread_allocation_intent native_stop_confirmed goal_thread_id goal_status execution_mode recovery native_stop_recovery workspace task_workspace)
+  @receipt_fields ~w(execution_binding execution_generation attempt_id thread_id turn_id thread_allocation_intent native_stop_confirmed backend worker_host workspace task_workspace execution_mode goal_status)
 
   @doc "Bind under the journal's admission lock; preserve all cumulative accounting and evidence receipts."
   @spec bind(map(), map() | nil) :: {:ok, map()} | {:error, atom()}
@@ -37,10 +37,19 @@ defmodule SymphonyElixir.ExecutionBinding do
   @doc "A new role cannot reuse a developer thread, and an existing generation cannot switch its native identity."
   @spec check_native_identity(map(), map()) :: :ok | {:error, atom()}
   def check_native_identity(%{"execution_binding" => binding} = record, changes) when is_map(binding) do
+    cond do
+      binding_changed?(record, changes) -> {:error, :execution_binding_changed_outside_admission}
+      workspace_changed?(record, changes) -> {:error, :bound_workspace_changed}
+      true -> check_thread_identity(record, changes)
+    end
+  end
+
+  def check_native_identity(_, _), do: :ok
+
+  defp check_thread_identity(record, changes) do
     thread = changes["thread_id"]
 
     cond do
-      binding_changed?(record, changes) -> {:error, :execution_binding_changed_outside_admission}
       not Map.has_key?(changes, "thread_id") -> :ok
       not text?(thread) -> {:error, :invalid_bound_native_thread}
       is_binary(record["thread_id"]) and record["thread_id"] != thread -> {:error, :bound_native_thread_changed}
@@ -49,7 +58,9 @@ defmodule SymphonyElixir.ExecutionBinding do
     end
   end
 
-  def check_native_identity(_, _), do: :ok
+  defp workspace_changed?(record, changes) do
+    is_map(record["task_workspace"]) and Enum.any?(~w(workspace task_workspace), &(Map.has_key?(changes, &1) and changes[&1] != record[&1]))
+  end
 
   defp binding_changed?(record, changes), do: Enum.any?(@binding_fields, &(Map.has_key?(changes, &1) and changes[&1] != record[&1]))
 

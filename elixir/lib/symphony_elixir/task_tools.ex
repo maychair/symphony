@@ -3,7 +3,7 @@ defmodule SymphonyElixir.TaskTools do
   alias SymphonyElixir.{CommandCheck, Config, ExecutionBinding, GitArtifact, NativeWork, RunJournal}
   alias SymphonyElixir.ReportArtifact
   alias SymphonyElixir.{TaskControl, TaskDelivery, TaskDependencies, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
-  alias SymphonyElixir.{TaskPublication, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{TaskPublication, TaskWorkflow, TaskWorkspace, WorkRef}
 
   @identity ~w(directory attempt_id execution_generation execution_binding)
   @command_fields ~w(candidate command exit_code output_sha reason snapshot_valid)
@@ -12,6 +12,7 @@ defmodule SymphonyElixir.TaskTools do
   def bind(record, policy, opts) do
     with {:ok, binding} <- ExecutionBinding.normalize(record["execution_binding"]),
          {:ok, ^record} <- ExecutionBinding.bind(record, binding),
+         :ok <- TaskWorkspace.validate(record),
          true <- is_map(policy) and TaskWorkflow.digest(policy) == binding["policy_sha"] do
       repositories = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end)
       opts = opts |> Keyword.put(:repositories, repositories) |> Keyword.put(:policy, policy)
@@ -21,7 +22,8 @@ defmodule SymphonyElixir.TaskTools do
       plan_secrets = NativeWork.secret_environment_names(%{provider: %{"plan_repositories" => repositories}})
       secrets = Enum.uniq(tracker.secret_environment_names ++ plan_secrets)
       tools = specs(binding["role"])
-      {:ok, %{task_execution: context, tool_specs: tools, agent_environment: %{}, secret_environment_names: secrets}}
+      tools = %{task_execution: context, tool_specs: tools, agent_environment: TaskWorkspace.environment(record)}
+      {:ok, Map.put(tools, :secret_environment_names, secrets)}
     else
       _ -> {:error, :invalid_task_tool_binding}
     end
@@ -74,7 +76,8 @@ defmodule SymphonyElixir.TaskTools do
   defp scope(record, context) do
     binding = record["execution_binding"]
 
-    with {:ok, plan} <- TaskPlanPreflight.inspect_plan(binding["authority"]["work"], context.opts),
+    with :ok <- TaskWorkspace.validate(record),
+         {:ok, plan} <- TaskPlanPreflight.inspect_plan(binding["authority"]["work"], context.opts),
          true <- plan.authority == binding["authority"] and plan.plan["revision"] == binding["plan_revision"],
          %{} = member <- plan.members[WorkRef.key(binding["work"])],
          true <- member.contract["contract_sha"] == binding["contract_sha"] and member.raw["state"] in ["open", "opened"],
@@ -96,6 +99,7 @@ defmodule SymphonyElixir.TaskTools do
        %{
          "contract" => scope.member.contract,
          "binding" => scope.record["execution_binding"],
+         "workspace" => TaskWorkspace.environment(scope.record),
          "candidate" => evidence.candidate,
          "dependencies" => scope.dependencies.dependencies,
          "delivery" => delivery,
@@ -252,7 +256,8 @@ defmodule SymphonyElixir.TaskTools do
   end
 
   defp publish(scope, context, kind, payload, summary) do
-    with {:ok, record} <- RunJournal.checkpoint(scope.record, %{}),
+    with :ok <- TaskWorkspace.validate(scope.record),
+         {:ok, record} <- RunJournal.checkpoint(scope.record, %{}),
          scope = %{scope | record: record},
          {:ok, scope} <- dependencies(scope, context),
          :ok <- runnable(scope),

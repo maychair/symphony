@@ -5,7 +5,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
   alias SymphonyElixir.{TaskDelivery, TaskDependencies, TaskEvidence, TaskExecution, TaskLifecycle}
-  alias SymphonyElixir.TaskPlanPreflight
+  alias SymphonyElixir.{TaskPlanPreflight, TaskWorkspace}
 
   defp contract(work, parent, kind \\ "report") do
     data = %{
@@ -473,6 +473,272 @@ defmodule SymphonyElixir.TaskPublicationTest do
     assert current(f)["attempt_id"] == "replacement-owner"
     assert File.exists?(Path.join(f.record["directory"], "executor.lock"))
     refute current(f)["thread_id"]
+  end
+
+  defp workspace_options(f), do: Keyword.put(f.opts, :workspace_root, Path.join(Path.dirname(f.record["directory"]), "workspaces"))
+
+  test "owned partial workspace preparation resumes but foreign directories and changed receipts block" do
+    f = report_fixture("github", []) |> fresh_execution()
+    registry = executions([f])
+    opts = workspace_options(f)
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, f.payload["work"], registry, opts)
+    record = admitted.record
+    digest = TaskWorkflow.digest(%{"binding" => record["execution_binding"], "generation" => record["execution_generation"]})
+    root = Path.join(opts[:workspace_root], "task-" <> digest)
+    File.mkdir_p!(root)
+    File.write!(Path.join(root, "foreign"), "preserve this directory")
+    assert {:error, :workspace_path_occupied} = TaskWorkspace.prepare(record, registry, opts)
+    assert File.read!(Path.join(root, "foreign")) == "preserve this directory"
+    File.rename!(root, root <> "-foreign")
+    assert {:error, :invalid_role_workspace_root} = TaskWorkspace.prepare(record, registry, Keyword.put(opts, :workspace_root, "relative"))
+
+    manifest = Path.join(root, "manifest.json")
+
+    request = fn provider, method, target, query, settings ->
+      if File.exists?(manifest), do: {:error, :offline}, else: f.opts[:request].(provider, method, target, query, settings)
+    end
+
+    assert {:error, :native_read_failed} = TaskWorkspace.prepare(record, registry, Keyword.put(opts, :request, request))
+    assert File.exists?(manifest)
+    refute current(f)["task_workspace"]
+    assert {:ok, prepared} = TaskWorkspace.prepare(current(f), registry, opts)
+    assert :ok = TaskWorkspace.validate(prepared)
+    assert {:ok, resumed} = TaskWorkspace.prepare(prepared, registry, opts)
+    assert resumed["task_workspace"] == prepared["task_workspace"]
+    File.rmdir!(Path.join(root, "inputs"))
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(prepared)
+    File.mkdir!(Path.join(root, "inputs"))
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(Map.put(prepared, "task_workspace", nil))
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(put_in(prepared, ["task_workspace", "directory"], nil))
+    altered = put_in(prepared, ["task_workspace", "owner_sha"], String.duplicate("0", 64))
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(altered)
+    File.ln_s!("/missing-git", Path.join(prepared["workspace"], ".git"))
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(prepared)
+    File.rm!(Path.join(prepared["workspace"], ".git"))
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], &1.objects[f.parent_notes] ++ [control(f, :plan, "pause", 70)]))
+    assert {:error, :workspace_execution_not_ready} = TaskWorkspace.prepare(prepared, registry, opts)
+  end
+
+  test "Git source requires a local exact native revision and refuses borrowed worktree administration" do
+    f = fixture("github", [], "pr") |> fresh_execution() |> git_artifact()
+    work = f.payload["work"]
+    registry = executions([f])
+    opts = workspace_options(f)
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, opts)
+    assert {:error, :workspace_revision_unavailable} = TaskWorkspace.prepare(admitted.record, registry, opts)
+    registry = update_in(registry, [WorkRef.key(work)], &Map.put(&1, :base_revision, f.git.revision))
+    assert {:error, :workspace_repository_unavailable} = TaskWorkspace.prepare(admitted.record, registry, opts)
+    registry = update_in(registry, [WorkRef.key(work)], &Map.put(&1, :repository, f.git.path))
+    readonly = opts[:workspace_root] <> "-readonly"
+    File.mkdir_p!(readonly)
+    File.chmod!(readonly, 0o555)
+
+    try do
+      assert {:error, :eacces} = TaskWorkspace.prepare(admitted.record, registry, Keyword.put(opts, :workspace_root, readonly))
+    after
+      File.chmod!(readonly, 0o755)
+    end
+
+    digest = TaskWorkflow.digest(%{"binding" => admitted.record["execution_binding"], "generation" => admitted.record["execution_generation"]})
+    root = Path.join(opts[:workspace_root], "task-" <> digest)
+    manifest = Path.join(root, "manifest.json")
+
+    request = fn provider, method, target, query, settings ->
+      if File.exists?(manifest), do: {:error, :offline}, else: f.opts[:request].(provider, method, target, query, settings)
+    end
+
+    assert {:error, :native_read_failed} = TaskWorkspace.prepare(admitted.record, registry, Keyword.put(opts, :request, request))
+    source = Path.join(root, "source")
+    File.rename!(source, source <> "-moved")
+    File.write!(source, "occupied source")
+    assert {:error, :workspace_path_occupied} = TaskWorkspace.prepare(current(f), registry, opts)
+    File.rm!(source)
+    File.rename!(source <> "-moved", source)
+    File.rm!(manifest)
+    File.chmod!(root, 0o555)
+
+    try do
+      assert {:error, :eacces} = TaskWorkspace.prepare(current(f), registry, opts)
+    after
+      File.chmod!(root, 0o755)
+    end
+
+    File.rename!(f.git.path, f.git.path <> "-offline")
+
+    try do
+      assert {:error, :git_workspace_unavailable} = TaskWorkspace.prepare(current(f), registry, opts)
+    after
+      File.rename!(f.git.path <> "-offline", f.git.path)
+    end
+
+    assert {:ok, prepared} = TaskWorkspace.prepare(current(f), registry, opts)
+    {:ok, owners} = ArtifactStore.references(Path.join(Path.dirname(f.record["directory"]), ".artifacts"), work, f.git.revision, opts)
+    assert Enum.any?(owners, &(&1["kind"] == "execution"))
+    git_file = Path.join(prepared["workspace"], ".git")
+    original = File.read!(git_file)
+    File.write!(git_file, File.read!(Path.join(f.workspace, ".git")))
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(prepared)
+    File.write!(git_file, original)
+    assert :ok = TaskWorkspace.validate(prepared)
+    assert {:error, :workspace_specification_changed} = TaskWorkspace.prepare(prepared, registry, Keyword.put(opts, :workspace_root, opts[:workspace_root] <> "-changed"))
+    registry = update_in(registry, [WorkRef.key(work)], &Map.delete(&1, :base_revision))
+    assert {:error, :workspace_revision_unavailable} = TaskWorkspace.prepare(prepared, registry, opts)
+  end
+
+  test "generation worktrees preserve developer edits and give the verifier exact candidate bytes in a separate directory" do
+    command = """
+    python3 - <<'PY'
+    import json, os, pathlib
+    manifest = pathlib.Path(os.environ['SYMPHONY_TASK_MANIFEST'])
+    data = json.loads(manifest.read_text())
+    package = next(p for p in data['packages'] if p['reference']['category'] == 'candidate')
+    source = manifest.parent / package['path'] / 'result'
+    assert source.read_text() == 'expected\\n'
+    assert pathlib.Path(os.environ['SYMPHONY_TASK_INPUTS']).is_dir()
+    assert source.is_relative_to(os.environ['SYMPHONY_TASK_CANDIDATES'])
+    try:
+        source.write_text('changed')
+    except PermissionError:
+        print('fixed input readable; write denied')
+    else:
+        raise AssertionError('input write was allowed')
+    PY
+    """
+
+    checks = %{
+      "test" => %{"kind" => "command", "command" => command, "artifact" => "output", "timeout_ms" => 2_000},
+      "race" => %{"kind" => "command", "command" => "touch ready; while [ ! -f release ]; do sleep 0.01; done", "artifact" => "output", "timeout_ms" => 5_000}
+    }
+
+    f = fixture("github", [], "report", checks) |> fresh_execution() |> git_artifact()
+    work = f.payload["work"]
+    registry = update_in(executions([f]), [WorkRef.key(work)], &Map.merge(&1, %{repository: f.git.path, base_revision: f.git.revision}))
+    opts = workspace_options(f)
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, opts)
+    assert {:ok, developer} = TaskWorkspace.prepare(admitted.record, registry, opts)
+    assert developer["workspace"] != f.git.path
+    assert File.read!(Path.join(developer["workspace"], "result")) == "expected\n"
+    assert File.regular?(Path.join(developer["workspace"], ".git"))
+    File.write!(Path.join(developer["workspace"], "result"), "uncommitted developer edits\n")
+    assert {:ok, resumed} = TaskWorkspace.prepare(developer, registry, opts)
+    assert resumed["workspace"] == developer["workspace"]
+    assert File.read!(Path.join(resumed["workspace"], "result")) == "uncommitted developer edits\n"
+    assert File.read!(Path.join(f.git.path, "result")) == "expected\n"
+    assert {:error, :bound_workspace_changed} = RunJournal.checkpoint(resumed, %{"workspace" => f.git.path})
+    {developer, tools} = native_tools(f, resumed, "workspace-developer")
+    assert {true, _} = tool(tools, "task_candidate", candidate_args(f))
+    assert {:ok, next} = TaskExecution.refresh(developer, registry, Keyword.put(opts, :active, true))
+    {:ok, stopped} = RunJournal.checkpoint(next.record, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    assert {:ok, verifying} = TaskExecution.admit(f.parent, work, registry, opts)
+    refute verifying.record["task_workspace"]
+    refute verifying.record["workspace"]
+    assert {:ok, verifier} = TaskWorkspace.prepare(verifying.record, registry, opts)
+    assert verifier["workspace"] != developer["workspace"]
+    assert File.read!(Path.join(verifier["workspace"], "result")) == "expected\n"
+    assert :ok = TaskWorkspace.validate(verifier)
+    assert File.exists?(TaskWorkspace.environment(verifier)["SYMPHONY_TASK_MANIFEST"])
+    {verifier, verifier_tools} = native_tools(f, verifier, "workspace-verifier")
+    assert {true, %{"data" => checked}} = tool(verifier_tools, "task_check", %{"check_id" => "test"})
+    assert checked["exit_code"] == 0
+    assert checked["snapshot_valid"]
+    assert checked["output"] =~ "fixed input readable; write denied"
+    assert :ok = TaskWorkspace.validate(verifier)
+    record = current(f)
+    task = Task.async(fn -> CommandCheck.run(record, verifying.evidence["candidate"], "race", f.opts[:policy]) end)
+    check_workspace = await_check_workspace(f, "race")
+    manifest = TaskWorkspace.environment(verifier)["SYMPHONY_TASK_MANIFEST"] |> File.read!() |> Jason.decode!()
+    [package] = manifest["packages"]
+    input = Path.join([verifier["task_workspace"]["directory"], package["path"], "result"])
+    File.chmod!(input, 0o644)
+    File.write!(input, "changed during check")
+    File.write!(Path.join(check_workspace, "release"), "")
+    assert {:ok, _, receipt} = Task.await(task, 10_000)
+    assert receipt["exit_code"] == 0
+    refute receipt["snapshot_valid"]
+    assert receipt["native_stop_confirmed"]
+    File.write!(input, "expected\n")
+    File.chmod!(input, 0o444)
+    File.write!(Path.join(verifier["workspace"], "result"), "tampered reviewer tree")
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(verifier)
+    assert {:error, :invalid_task_tool_binding} = TaskTools.bind(verifier, f.opts[:policy], opts)
+    assert File.read!(Path.join(developer["workspace"], "result")) == "uncommitted developer edits\n"
+  end
+
+  defp await_check_workspace(f, check, remaining \\ 500) do
+    entry = Enum.find_value(current(f)["check_runs"] || %{}, fn {_, entry} -> if entry["spec"]["check"] == check, do: entry end)
+    path = if entry, do: entry["spec"]["workspace"]
+
+    cond do
+      path && File.exists?(Path.join(path, "ready")) ->
+        path
+
+      remaining > 0 ->
+        Process.sleep(10)
+        await_check_workspace(f, check, remaining - 1)
+
+      true ->
+        flunk("supervised check did not reach the input-read barrier")
+    end
+  end
+
+  test "report dependency bytes are materialized without Git and input corruption blocks role tools" do
+    f = report_fixture("gitlab", ["verified"])
+    assert {true, _} = tool(task_tools(f), "task_candidate", candidate_args(f))
+    verifier = verifier_tools(f, current(f))
+    check = %{"id" => "test", "result" => "passed", "rationale" => "Checked report evidence and limitations against the approved criterion."}
+    assert {true, _} = tool(verifier, "task_verification", %{"review_checks" => [check], "findings" => [], "summary" => "Verified"})
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+
+    registry =
+      Map.new(plan.members, fn {key, _} ->
+        {key, %{directory: RunJournal.directory(Path.dirname(f.record["directory"]), key), policy: f.opts[:policy]}}
+      end)
+
+    consumer = %{f.payload["work"] | "number" => 3}
+    opts = workspace_options(f)
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, consumer, registry, opts)
+    binding = admitted.record["execution_binding"]
+    owner = %{"kind" => "execution", "work" => consumer, "revision" => TaskWorkflow.digest(%{"binding" => binding, "generation" => admitted.record["execution_generation"]})}
+    report = hd(f.payload["artifacts"])
+    reference = String.replace_prefix(report["source"], "report:", "report-") <> "." <> TaskWorkflow.digest(owner) <> ".ref"
+    reference = Path.join([Path.dirname(f.record["directory"]), ".artifacts", reference])
+    File.write!(reference, "conflicting execution retention receipt")
+    assert {:error, :artifact_publication_conflict} = TaskWorkspace.prepare(admitted.record, registry, opts)
+    File.rm!(reference)
+    root = Path.join(opts[:workspace_root], "task-" <> owner["revision"])
+
+    request = fn provider, method, target, query, settings ->
+      if File.exists?(Path.join(root, "manifest.json")), do: {:error, :offline}, else: f.opts[:request].(provider, method, target, query, settings)
+    end
+
+    assert {:error, :native_read_failed} = TaskWorkspace.prepare(admitted.record, registry, Keyword.put(opts, :request, request))
+    manifest = Jason.decode!(File.read!(Path.join(root, "manifest.json")))
+    [package] = manifest["packages"]
+    path = Path.join([root, package["path"], "report.md"])
+    File.chmod!(path, 0o644)
+    File.write!(path, "corrupt partial input")
+    assert {:error, :artifact_files_changed} = TaskWorkspace.prepare(admitted.record, registry, opts)
+    assert File.read!(path) == "corrupt partial input"
+    File.write!(path, report["body"])
+    File.chmod!(path, 0o444)
+    assert {:ok, record} = TaskWorkspace.prepare(admitted.record, registry, opts)
+    refute File.exists?(Path.join(record["workspace"], ".git"))
+    assert File.read!(path) == hd(f.payload["artifacts"])["body"]
+    assert package["reference"]["verification"] == hd(record["execution_binding"]["inputs"])["verification"]
+    assert :ok = TaskWorkspace.validate(record)
+    File.rmdir!(record["workspace"])
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(record)
+    File.mkdir!(record["workspace"])
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "report-consumer", "native_stop_confirmed" => false})
+    assert {:ok, tools} = TaskTools.bind(record, f.opts[:policy], Keyword.put(opts, :dependency_executions, registry))
+    assert {true, %{"data" => %{"workspace" => environment}}} = tool(tools, "task_context", %{})
+    assert environment["SYMPHONY_TASK_INPUTS"] == Path.join(root, "inputs")
+    File.chmod!(path, 0o644)
+    File.write!(path, "changed input")
+    assert {:error, :role_workspace_changed} = TaskWorkspace.validate(record)
+    assert {false, %{"error" => ":role_workspace_changed"}} = tool(tools, "task_context", %{})
+    assert {:error, :role_workspace_changed} = TaskWorkspace.prepare(record, registry, opts)
   end
 
   test "native Markdown reports publish visibly and unlock verified delivery only after independent review" do

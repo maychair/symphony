@@ -515,7 +515,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp session_policies(workspace, nil, opts) do
-    if Keyword.get(opts, :review_only, false) do
+    if Keyword.get(opts, :review_only, false) or get_in(opts[:run_record] || %{}, ["execution_binding", "role"]) == "verifier" do
       {:ok, %{approval_policy: "never", thread_sandbox: "read-only", turn_sandbox_policy: %{"type" => "readOnly"}}}
     else
       Config.codex_runtime_settings(workspace)

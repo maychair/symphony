@@ -72,6 +72,13 @@ defmodule SymphonyElixir.ExecutionRoleSessionTest do
   defp complete_role(context, record, thread) do
     File.write!(context.mode, thread)
     assert {:ok, session} = AppServer.start_session(context.workspace, session_options(record))
+
+    if record["execution_binding"]["role"] == "verifier" do
+      assert session.thread_sandbox == "read-only"
+      assert session.turn_sandbox_policy == %{"type" => "readOnly"}
+      assert session.approval_policy == "never"
+    end
+
     tools = Enum.map(session.dynamic_tool_binding.tool_specs, & &1["name"])
     assert "task_candidate" in tools == (record["execution_binding"]["role"] == "developer")
     assert "task_verification" in tools == (record["execution_binding"]["role"] == "verifier")
