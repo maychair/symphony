@@ -97,12 +97,18 @@ defmodule SymphonyElixir.TaskLifecycle do
   def validate_policy(policy, contract) when is_map(policy) do
     valid =
       nonnegative?(policy["max_retries"]) and nonnegative?(policy["max_repairs"]) and text?(policy["engine_actor"]) and
+        role_instructions?(Map.get(policy, "role_instructions", %{})) and
         check_assignments?(policy["checks"], contract["verification_checks"], contract["criteria"])
 
     if valid, do: :ok, else: {:error, :incomplete_verification_policy}
   end
 
   def validate_policy(_, _), do: {:error, :incomplete_verification_policy}
+
+  defp role_instructions?(instructions) when is_map(instructions),
+    do: Enum.all?(instructions, fn {role, text} -> role in ["developer", "verifier"] and text?(text) end)
+
+  defp role_instructions?(_), do: false
 
   defp check_assignments?(checks, assignments, criteria) when is_map(checks) and is_map(assignments) do
     map_size(checks) > 0 and Enum.all?(checks, &check_policy?/1) and
@@ -402,9 +408,15 @@ defmodule SymphonyElixir.TaskLifecycle do
     signature = findings |> Enum.map(&Map.take(&1, ~w(criterion problem_sha repair_basis_sha))) |> Enum.uniq() |> Enum.sort() |> TaskWorkflow.digest()
     flow = Map.merge(flow, %{"phase" => "ready", "action" => "repair", "repair_signature" => signature})
     prior = flow["repair_history"][signature]
-    retrying = prior == context.runtime["execution_generation"] and context.runtime["last_result"] == "retryable_error"
+    retrying = prior == context.runtime["execution_generation"] and context.runtime["last_result"] in ["retryable_error", "interrupted"]
     active = prior == context.runtime["execution_generation"] and context.evidence["active"] == true
-    if is_nil(prior) or retrying or active, do: flow, else: restrict(flow, "repair_without_progress", "decision")
+    preparing = prior == context.runtime["execution_generation"] and preparing_repair?(context.runtime)
+    if is_nil(prior) or retrying or active or preparing, do: flow, else: restrict(flow, "repair_without_progress", "decision")
+  end
+
+  defp preparing_repair?(record) do
+    record["phase"] in ~w(admitted thread_start_intent thread_ready goal_start_intent turn_start_intent) and
+      is_nil(get_in(record, ["task_attempt_results", record["attempt_id"]]))
   end
 
   defp select_delivery(%{"phase" => "verified"} = flow, context) do

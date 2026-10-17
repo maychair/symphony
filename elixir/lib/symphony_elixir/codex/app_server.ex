@@ -46,44 +46,54 @@ defmodule SymphonyElixir.Codex.AppServer do
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
 
-    on_thread_intent = Keyword.get(opts, :on_thread_intent, fn -> :ok end)
-    on_thread_started = Keyword.get(opts, :on_thread_started, fn _id -> :ok end)
-
     with {:ok, dynamic_tool_binding} <- DynamicTool.bind_session(opts),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
-
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
-           {:ok, thread_id} <-
-             do_start_session(
-               port,
-               expanded_workspace,
-               session_policies,
-               dynamic_tool_binding,
-               opts,
-               on_thread_intent
-             ),
-           :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(opts[:run_record] || %{}, %{"thread_id" => thread_id}),
-           :ok <- on_thread_started.(thread_id) do
-        {:ok,
-         %{
-           port: port,
-           metadata: metadata,
-           approval_policy: session_policies.approval_policy,
-           auto_approve_requests: auto_approve?(session_policies, dynamic_tool_binding),
-           thread_sandbox: session_policies.thread_sandbox,
-           turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
-           workspace: expanded_workspace,
-           worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
-         }}
-      else
-        {:error, reason} ->
+      try do
+        initialize_session(port, expanded_workspace, worker_host, dynamic_tool_binding, opts)
+      catch
+        kind, reason ->
           stop_port(port)
-          {:error, reason}
+          {:error, {:native_session_start_failed, kind, inspect(reason)}}
       end
+    end
+  end
+
+  defp initialize_session(port, expanded_workspace, worker_host, dynamic_tool_binding, opts) do
+    on_thread_intent = Keyword.get(opts, :on_thread_intent, fn -> :ok end)
+    on_thread_started = Keyword.get(opts, :on_thread_started, fn _id -> :ok end)
+
+    metadata = port_metadata(port, worker_host)
+
+    with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
+         {:ok, thread_id} <-
+           do_start_session(
+             port,
+             expanded_workspace,
+             session_policies,
+             dynamic_tool_binding,
+             opts,
+             on_thread_intent
+           ),
+         :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(opts[:run_record] || %{}, %{"thread_id" => thread_id}),
+         :ok <- on_thread_started.(thread_id) do
+      {:ok,
+       %{
+         port: port,
+         metadata: metadata,
+         approval_policy: session_policies.approval_policy,
+         auto_approve_requests: auto_approve?(session_policies, dynamic_tool_binding),
+         thread_sandbox: session_policies.thread_sandbox,
+         turn_sandbox_policy: session_policies.turn_sandbox_policy,
+         thread_id: thread_id,
+         workspace: expanded_workspace,
+         worker_host: worker_host,
+         dynamic_tool_binding: dynamic_tool_binding
+       }}
+    else
+      {:error, reason} ->
+        stop_port(port)
+        {:error, reason}
     end
   end
 

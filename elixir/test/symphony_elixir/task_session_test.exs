@@ -26,7 +26,7 @@ defmodule SymphonyElixir.TaskSessionTest do
   defp block(name, value), do: "<!-- symphony-#{name} " <> Jason.encode!(value) <> " -->"
   defp note(body, id), do: %{"id" => id, "body" => body, "user" => %{"id" => 1}, "created_at" => "2026-10-18T00:00:00Z", "updated_at" => "2026-10-18T00:00:00Z"}
 
-  setup do
+  setup tags do
     root = Path.dirname(Workflow.workflow_file_path())
     work = %{"provider" => "github", "host" => "github.test", "repository_id" => "10", "kind" => "issue", "number" => 2}
     parent = %{work | "number" => 1}
@@ -85,9 +85,9 @@ defmodule SymphonyElixir.TaskSessionTest do
 
     File.write!(binary, """
     #!/usr/bin/env python3
-    import json,sys,pathlib
+    import json,sys,pathlib,hashlib
     path=pathlib.Path(#{Jason.encode!(native)})
-    state=json.loads(path.read_text()) if path.exists() else {'id':'owned-thread','goal':None,'turns':[]}
+    state=json.loads(path.read_text()) if path.exists() else {'id':'owned-thread','goal':None,'turns':[],'allocations':0}
     def emit(q,result):print(json.dumps({'id':q['id'],'result':result}),flush=True)
     for line in sys.stdin:
       q=json.loads(line);m=q.get('method');p=q.get('params',{})
@@ -99,7 +99,12 @@ defmodule SymphonyElixir.TaskSessionTest do
           print(json.dumps({'id':q['id'],'error':{'message':'allocation response lost'}}),flush=True)
         elif m=='thread/read' and pathlib.Path(#{Jason.encode!(failure)}).exists():
           emit(q,{'thread':{'id':'foreign','status':{'type':'idle'},'turns':[]}})
-        else:emit(q,{'thread':{'id':state['id'],'status':{'type':'idle'},'turns':state['turns']}})
+        else:
+          if m=='thread/start':
+            state['allocations']+=1
+            state['id']='owned-thread' if state['allocations']==1 else 'owned-thread-'+str(state['allocations'])
+            state['goal']=None;state['turns']=[]
+          emit(q,{'thread':{'id':state['id'],'status':{'type':'idle'},'turns':state['turns']}})
       elif m=='thread/goal/get':emit(q,{'goal':state['goal']})
       elif m=='turn/start':
         state['turns']=[{'id':'owned-turn','status':'completed'}]
@@ -120,10 +125,24 @@ defmodule SymphonyElixir.TaskSessionTest do
           elif mode=='candidate':
             args={'artifacts':[{'id':'report','body':'# Result\\n\\nThe approved result is reproducible.'}],'summary':'Candidate ready'}
             print(json.dumps({'id':'candidate-call','method':'item/tool/call','params':{'tool':'task_candidate','arguments':args,'callId':'candidate-call','threadId':state['id'],'turnId':'owned-turn'}}),flush=True)
+          elif mode in ['develop','verify','reject']:
+            print(json.dumps({'id':'context-call','method':'item/tool/call','params':{'tool':'task_context','arguments':{},'callId':'context-call','threadId':state['id'],'turnId':'owned-turn'}}),flush=True)
       elif m=='turn/interrupt':
         state['turns'][0]['status']='interrupted';emit(q,{})
         print(json.dumps({'method':'turn/completed','params':{'threadId':state['id'],'turn':state['turns'][0]}}),flush=True)
-      elif q.get('id')=='candidate-call':assert q['result']['success'] is True
+      elif q.get('id')=='context-call':
+        assert q['result']['success'] is True
+        context=json.loads(q['result']['contentItems'][0]['text'])['data']
+        mode=pathlib.Path(#{Jason.encode!(mode)}).read_text()
+        if mode=='develop':
+          tool='task_candidate';args={'artifacts':[{'id':'report','body':'# Result\\n\\nVerified scope result '+str(state['allocations'])+'.'}],'summary':'Candidate ready'}
+        else:
+          findings=[]
+          if mode=='reject':
+            findings=[{'id':'missing-detail','criterion':'result','status':'valid','required':True,'rationale':'Add the missing report detail','problem_sha':hashlib.sha256(b'missing detail').hexdigest(),'repair_basis_sha':hashlib.sha256(context['candidate']['digest'].encode()).hexdigest(),'evidence':[context['candidate']['source']]}]
+          tool='task_verification';args={'review_checks':[{'id':'review','result':'failed' if mode=='reject' else 'passed','rationale':'Fixed report independently inspected'}],'findings':findings,'summary':'Independent verification'}
+        print(json.dumps({'id':'result-call','method':'item/tool/call','params':{'tool':tool,'arguments':args,'callId':'result-call','threadId':state['id'],'turnId':'owned-turn'}}),flush=True)
+      elif q.get('id') in ['candidate-call','result-call']:assert q['result']['success'] is True
       else:raise AssertionError('unexpected method: '+str(m))
       path.write_text(json.dumps(state))
     """)
@@ -131,8 +150,17 @@ defmodule SymphonyElixir.TaskSessionTest do
     File.chmod!(binary, 0o755)
     settings = [tracker_kind: "memory", workspace_root: opts[:workspace_root], codex_command: binary]
     write_workflow_file!(Workflow.workflow_file_path(), settings)
-    {:ok, admitted} = TaskExecution.admit(parent, work, registry, opts)
-    {:ok, root: root, work: work, parent: parent, plan: plan, state: state, registry: registry, opts: opts, record: admitted.record, trace: trace, failure: failure, mode: mode}
+
+    record =
+      if tags[:unadmitted] do
+        %{"directory" => directory, "issue_id" => WorkRef.key(work)}
+      else
+        {:ok, admitted} = TaskExecution.admit(parent, work, registry, opts)
+        admitted.record
+      end
+
+    scope = [root: root, work: work, parent: parent, plan: plan, state: state, registry: registry]
+    {:ok, scope ++ [opts: opts, record: record, trace: trace, failure: failure, mode: mode]}
   end
 
   defp current(c), do: elem(SymphonyElixir.RunJournal.read(c.record["directory"]), 1)
@@ -734,5 +762,273 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert reason =~ "plan_execution_finalizer_required"
     assert File.read!(Path.join(c.record["directory"], "run.json")) == before
     assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+  end
+
+  @tag :unadmitted
+  test "the member worker runs independent report development, verification, repair and re-verification", c do
+    key = WorkRef.key(c.work)
+    instructions = %{"developer" => "Keep the report reproducible.", "verifier" => "Review the report independently."}
+    registry = update_in(c.registry, [key, :policy], &Map.put(&1, "role_instructions", instructions))
+
+    results =
+      Enum.map(["develop", "reject", "develop", "verify"], fn mode ->
+        File.write!(c.mode, mode)
+        assert {:ok, result} = AgentRunner.run_member(c.parent, c.work, registry, self(), c.opts)
+        assert result.record["native_stop_confirmed"]
+        refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
+        assert_receive {:worker_runtime_info, ^key, %{worker_host: nil, workspace_path: workspace}}
+        assert workspace == result.record["workspace"]
+        assert_receive {:codex_worker_update, ^key, %{event: :session_started}}
+        result
+      end)
+
+    assert Enum.map(results, & &1.record["execution_binding"]["role"]) == ~w(developer verifier developer verifier)
+    assert length(Enum.uniq_by(results, & &1.record["thread_id"])) == 4
+    assert Enum.map(results, & &1.record["execution_generation"]) == [1, 2, 3, 4]
+    final = List.last(results)
+    assert final.record["retry_count"] == 0
+    assert final.flow["repair_count"] == 1
+    assert final.flow["closeable"]
+    assert final.flow["outcome"] == "delivered"
+    assert {:waiting, _} = AgentRunner.run_member(c.parent, c.work, registry, nil, c.opts)
+    assert Agent.get(c.state, & &1["/repos/team/repo/issues/2"]["state"]) == "open"
+    goals = requests(c) |> Enum.filter(&(get_in(&1, ["params", "status"]) == "active")) |> Enum.map(& &1["params"]["objective"])
+    assert Enum.at(goals, 0) =~ "Keep the report reproducible."
+    assert Enum.at(goals, 1) =~ "Review the report independently."
+    assert Enum.at(goals, 2) =~ "Add the missing report detail"
+    contexts = requests(c) |> Enum.filter(&(&1["id"] == "context-call")) |> Enum.map(&Jason.decode!(&1["result"]["contentItems"] |> hd() |> Map.fetch!("text")))
+    assert get_in(Enum.at(contexts, 2), ["data", "verification", "findings"]) != []
+  end
+
+  test "a managed worker derives its Goal from sealed scope and stops an idle session if readiness notification fails", c do
+    Agent.update(c.state, &update_in(&1, ["/repos/team/repo/issues/2", "body"], fn body -> body <> "\nUNAPPROVED EXTRA TARGET" end))
+    assert {:ok, result} = TaskSession.run(c.record, c.registry, c.opts)
+    goal = Enum.find(requests(c), &(get_in(&1, ["params", "status"]) == "active"))["params"]["objective"]
+    assert goal =~ "Produce the approved report"
+    refute goal =~ "UNAPPROVED EXTRA TARGET"
+    assert result.reason == ":task_execution_no_progress"
+    assert {:error, :task_attempt_not_admitted} = TaskSession.run(result.record, c.registry, c.opts)
+    {:ok, admitted} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    failed = Keyword.put(c.opts, :on_ready, fn _ -> throw(:ready_consumer_failed) end)
+    assert {:ok, stopped} = TaskSession.run(admitted.record, c.registry, failed)
+    assert stopped.record["native_stop_confirmed"]
+    assert stopped.reason =~ "ready_consumer_failed"
+    assert length(Enum.filter(requests(c), &(get_in(&1, ["params", "status"]) == "active"))) == 1
+  end
+
+  test "startup failures finalize only their own preparation and native allocation", c do
+    opts = Keyword.put(c.opts, :workspace_root, 12)
+    assert {:ok, failed} = TaskSession.run(c.record, c.registry, opts)
+    assert failed.outcome == "retry"
+    refute failed.record["thread_allocation_intent"]
+    refute File.exists?(c.trace)
+    {:ok, admitted} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    File.write!(c.failure, "")
+    assert {:ok, uncertain} = TaskSession.run(admitted.record, c.registry, c.opts)
+    assert uncertain.outcome == "incident"
+    refute uncertain.record["native_stop_confirmed"]
+    refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
+  end
+
+  @tag :unadmitted
+  test "unsupported worker transport and native waiting do not allocate execution", c do
+    assert {:error, :unsupported_task_session_transport} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, Keyword.put(c.opts, :worker_host, "remote"))
+    refute File.exists?(c.record["directory"])
+    pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+    assert {:waiting, _} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    refute File.exists?(c.trace)
+  end
+
+  test "role prompt generation rejects changed or incomplete authority and invalid role instructions", c do
+    {:ok, observation} = TaskExecution.observe(c.parent, c.work, c.registry, c.opts)
+    assert {:ok, prompt} = PromptBuilder.build_role_prompt(observation)
+    assert prompt =~ "task_candidate"
+    assert {:error, :invalid_role_prompt_context} = PromptBuilder.build_role_prompt(%{})
+    changed = Map.update!(observation.policy, "max_retries", &(&1 + 1))
+    assert {:error, :role_prompt_not_ready} = PromptBuilder.build_role_prompt(%{observation | policy: changed})
+
+    for instructions <- [nil, [], %{"unknown" => "instruction"}, %{"developer" => ""}] do
+      policy = Map.put(observation.policy, "role_instructions", instructions)
+      invalid = %{observation | policy: policy}
+      assert {:error, :incomplete_verification_policy} = PromptBuilder.build_role_prompt(invalid)
+    end
+  end
+
+  defp owned_ports, do: Enum.filter(Port.list(), &(Port.info(&1, :connected) == {:connected, self()}))
+  defp provider_failure(:raise), do: raise("provider unavailable")
+  defp provider_failure(:throw), do: throw(:provider_unavailable)
+
+  test "a failing native activation callback closes its transport and finalizes without claiming allocation", c do
+    once = start_supervised!({Agent, fn -> false end}, id: :start_fault)
+
+    request = fn provider, method, path, query, settings ->
+      if File.exists?(c.trace) and Agent.get_and_update(once, &{not &1, true}), do: raise("startup callback failed")
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    ports = owned_ports()
+    assert {:ok, result} = TaskSession.run(c.record, c.registry, Keyword.put(c.opts, :request, request))
+    assert {:error, {:native_session_start_failed, :error, _}} = result.native_result
+    assert result.outcome == "retry"
+    refute result.record["thread_allocation_intent"]
+    assert owned_ports() == ports
+    refute Enum.any?(requests(c), &(&1["method"] == "thread/start"))
+  end
+
+  test "a second worker cannot adopt a session claim while its owner initializes the native transport", c do
+    once = start_supervised!({Agent, fn -> false end}, id: :competing_start)
+
+    request = fn provider, method, path, query, settings ->
+      if File.exists?(c.trace) and Agent.get_and_update(once, &{not &1, true}) do
+        record = current(c)
+        assert record["task_session_phase"] == "opening"
+        other = Task.async(fn -> TaskSession.run(record, c.registry, c.opts) end)
+        assert {:error, :task_attempt_not_admitted} = Task.await(other)
+        assert current(c) == record
+      end
+
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    assert {:ok, result} = TaskSession.run(c.record, c.registry, Keyword.put(c.opts, :request, request))
+    assert result.record["native_stop_confirmed"]
+    assert result.record["retry_count"] == 1
+    assert Enum.count(requests(c), &(&1["method"] == "initialize")) == 1
+  end
+
+  for failure <- [:raise, :throw] do
+    @failure failure
+    test "a #{@failure} from preparation and final observation keeps evidence unknown without orphaning ownership", c do
+      request = fn _, _, _, _, _ -> provider_failure(@failure) end
+      assert {:ok, result} = TaskSession.run(c.record, c.registry, Keyword.put(c.opts, :request, request))
+      assert result.flow["evidence"] == "unknown"
+      assert result.reason =~ "finalization_observation_failed"
+      assert inspect(result.native_result) =~ "task_start_failed"
+      refute result.flow["dispatchable"]
+      refute File.exists?(c.trace)
+      refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    end
+  end
+
+  test "a worker that loses its admission during preparation cannot finalize the replacement", c do
+    once = start_supervised!({Agent, fn -> false end}, id: :replace_preparation)
+
+    request = fn provider, method, path, query, settings ->
+      if Agent.get_and_update(once, &{not &1, true}) do
+        replacement = Map.put(current(c), "attempt_id", "replacement")
+        File.write!(Path.join(c.record["directory"], "run.json"), Jason.encode!(replacement))
+      end
+
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    assert {:error, :task_session_no_longer_owned} = TaskSession.run(c.record, c.registry, Keyword.put(c.opts, :request, request))
+    assert current(c)["attempt_id"] == "replacement"
+    refute current(c)["task_attempt_results"]
+    refute File.exists?(c.trace)
+  end
+
+  @tag :unadmitted
+  test "native pause after the approved prompt is built still prevents Goal activation", c do
+    on_ready = fn _ ->
+      pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+      Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+    end
+
+    assert {:ok, result} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, Keyword.put(c.opts, :on_ready, on_ready))
+    assert result.outcome == "waiting"
+    assert result.record["native_stop_confirmed"]
+    assert result.record["retry_count"] == 0
+    refute Enum.any?(requests(c), &(&1["method"] == "thread/goal/set"))
+  end
+
+  defp ready_for_repair(c) do
+    for mode <- ["develop", "reject"] do
+      File.write!(c.mode, mode)
+      assert {:ok, _} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    end
+  end
+
+  @tag :unadmitted
+  test "a repair Goal without new evidence stops further repair of the same finding", c do
+    ready_for_repair(c)
+    File.write!(c.mode, "complete")
+    assert {:ok, result} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert result.flow["restrictions"]["repair_without_progress"]
+    assert result.flow["repair_count"] == 1
+    assert result.outcome == "waiting"
+    assert result.record["last_result"] == "completed"
+    before = requests(c)
+    assert {:waiting, _} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert requests(c) == before
+  end
+
+  @tag :unadmitted
+  test "scheduler interruption and technical retry preserve the admitted repair generation and allowance", c do
+    ready_for_repair(c)
+    File.write!(c.mode, "hold")
+
+    on_ready = fn _ ->
+      send(self(), :symphony_stop)
+      :ok
+    end
+
+    assert {:ok, stopped} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, Keyword.put(c.opts, :on_ready, on_ready))
+    assert stopped.outcome == "continue"
+    assert stopped.record["last_result"] == "interrupted"
+    assert stopped.record["retry_count"] == 0
+    assert stopped.flow["repair_count"] == 1
+
+    handler = fn
+      %{event: :session_started} -> throw(:transient_failure)
+      _ -> :ok
+    end
+
+    assert {:ok, failed} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, Keyword.put(c.opts, :on_message, handler))
+    assert failed.outcome == "retry"
+    assert failed.record["retry_count"] == 1
+    assert failed.record["last_result"] == "retryable_error"
+    File.write!(c.mode, "develop")
+    assert {:ok, repaired} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert repaired.flow["next_binding"]["role"] == "verifier"
+    assert repaired.record["execution_generation"] == stopped.record["execution_generation"]
+    assert repaired.record["thread_id"] == stopped.record["thread_id"]
+    assert repaired.flow["repair_count"] == 1
+    assert repaired.record["retry_count"] == 1
+  end
+
+  @tag :unadmitted
+  test "human pause and explicit native resume preserve a repair interrupted by a blocked Goal", c do
+    ready_for_repair(c)
+    File.write!(c.mode, "hold")
+
+    handler = fn
+      %{event: :session_started} ->
+        pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+        Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+
+      _ ->
+        :ok
+    end
+
+    assert {:ok, paused} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, Keyword.put(c.opts, :on_message, handler))
+    assert {:ok, %{goal_status: "blocked"}} = paused.native_result
+    assert paused.record["last_result"] == "interrupted"
+    assert paused.record["retry_count"] == 0
+    assert paused.flow["repair_count"] == 1
+    assert {:waiting, _} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    source = paused.flow["restrictions"] |> Map.values() |> Enum.find(&(&1["kind"] == "pause")) |> Map.fetch!("source")
+    decision = %{"action" => "resume", "revision" => c.plan["revision"], "restriction" => source}
+    resume = note(block("plan-decision", decision), 3)
+    resume = Map.merge(resume, %{"created_at" => "2026-10-18T00:00:01Z", "updated_at" => "2026-10-18T00:00:01Z"})
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [resume] end))
+    File.write!(c.mode, "develop")
+    assert {:ok, resumed} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert resumed.flow["next_binding"]["role"] == "verifier"
+    assert resumed.record["execution_generation"] == paused.record["execution_generation"]
+    assert resumed.record["thread_id"] == paused.record["thread_id"]
+    assert resumed.record["retry_count"] == 0
+    assert resumed.flow["repair_count"] == 1
   end
 end

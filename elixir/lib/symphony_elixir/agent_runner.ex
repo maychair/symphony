@@ -7,6 +7,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
   alias SymphonyElixir.ReviewLane.Runner
+  alias SymphonyElixir.{TaskExecution, TaskSession}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -27,6 +28,28 @@ defmodule SymphonyElixir.AgentRunner do
     if SymphonyElixir.ReviewLane.job?(issue),
       do: Runner.run(issue, codex_update_recipient, opts),
       else: do_run(issue, codex_update_recipient, opts)
+  end
+
+  @doc "Execute one plan-member role from native admission to owned finalization; the scheduler owns continuation."
+  @spec run_member(map(), map(), map(), pid() | nil, keyword()) :: {:ok, map()} | {:waiting, map()} | {:error, term()}
+  def run_member(parent, work, executions, recipient \\ nil, opts \\ []) do
+    with true <- (ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])) or {:error, :unsupported_task_session_transport},
+         {:ok, admitted} <- TaskExecution.admit(parent, work, executions, opts) do
+      issue = %Issue{id: admitted.record["issue_id"], identifier: admitted.record["issue_id"], title: "Plan member", state: "open"}
+
+      callbacks = [
+        on_ready: fn record ->
+          send_worker_runtime_info(recipient, issue, nil, record["workspace"])
+          Keyword.get(opts, :on_ready, fn _ -> :ok end).(record)
+        end,
+        on_message: fn event ->
+          send_codex_update(recipient, issue, event)
+          Keyword.get(opts, :on_message, fn _ -> :ok end).(event)
+        end
+      ]
+
+      TaskSession.run(admitted.record, executions, Keyword.merge(opts, callbacks))
+    end
   end
 
   defp do_run(issue, codex_update_recipient, opts) do

@@ -279,16 +279,27 @@ defmodule SymphonyElixir.TaskExecution do
 
   defp prepare_finish(record, result, executions, opts) do
     if stopped?(record) do
-      case observe_stopped(record, executions, opts) do
-        {:ok, observation} ->
-          finish_observed(record, result, observation)
-
-        {:error, reason} ->
-          flow = unknown_flow(record, "finalization_evidence")
-          persist_finish(record, result, "waiting", {:finalization_evidence_unconfirmed, reason}, flow)
+      with {:ok, record} <- RunJournal.checkpoint(record, %{"phase" => "attempt_stopped", "last_result" => result_class(result)}) do
+        finish_stopped(record, result, executions, opts)
       end
     else
       persist_finish(record, result, "incident", :task_execution_stop_unconfirmed, unknown_flow(record, "native_stop"))
+    end
+  end
+
+  defp result_class({:ok, %{goal_status: status}}) when status != "complete", do: "interrupted"
+  defp result_class({:ok, _}), do: "completed"
+  defp result_class({:error, :scheduler_stop}), do: "interrupted"
+  defp result_class(_), do: "retryable_error"
+
+  defp finish_stopped(record, result, executions, opts) do
+    case observe_stopped(record, executions, opts) do
+      {:ok, observation} ->
+        finish_observed(record, result, observation)
+
+      {:error, reason} ->
+        flow = unknown_flow(record, "finalization_evidence")
+        persist_finish(record, result, "waiting", {:finalization_evidence_unconfirmed, reason}, flow)
     end
   end
 
@@ -302,6 +313,10 @@ defmodule SymphonyElixir.TaskExecution do
       false -> {:error, :execution_observation_superseded}
       error -> error
     end
+  rescue
+    error -> {:error, {:finalization_observation_failed, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {:finalization_observation_failed, kind, inspect(reason)}}
   end
 
   defp finish_observed(record, result, observation) do

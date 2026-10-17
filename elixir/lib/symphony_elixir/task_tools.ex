@@ -93,7 +93,7 @@ defmodule SymphonyElixir.TaskTools do
   end
 
   defp invoke("task_context", _, scope, context) do
-    with {:ok, scope, evidence} <- observe_candidate(scope, context),
+    with {:ok, scope, evidence} <- observe_candidate(scope, context, scope.record["execution_binding"]["role"] == "verifier"),
          {:ok, delivery} <- TaskDelivery.read_candidate(scope.member.work, evidence.candidate, Keyword.put(context.opts, :runtime, scope.record)) do
       {:ok,
        %{
@@ -101,6 +101,7 @@ defmodule SymphonyElixir.TaskTools do
          "binding" => scope.record["execution_binding"],
          "workspace" => TaskWorkspace.environment(scope.record),
          "candidate" => evidence.candidate,
+         "verification" => evidence.verification,
          "dependencies" => scope.dependencies.dependencies,
          "delivery" => delivery,
          "controls" => evidence.controls.restrictions,
@@ -171,8 +172,11 @@ defmodule SymphonyElixir.TaskTools do
     end
   end
 
-  defp observe_candidate(scope, context) do
-    with {:ok, evidence} <- TaskEvidence.read_candidate(scope.plan, scope.member.work, scope.record, context.policy, context.opts),
+  defp observe_candidate(scope, context, candidate_only \\ true) do
+    reader = if candidate_only, do: &TaskEvidence.read_candidate/5, else: &TaskEvidence.read_member/5
+    opts = Keyword.delete(context.opts, :candidate_only)
+
+    with {:ok, evidence} <- reader.(scope.plan, scope.member.work, scope.record, context.policy, opts),
          {:ok, record} <- RunJournal.checkpoint(scope.record, %{"control_receipts" => evidence.controls.receipts}),
          {:ok, scope} <- dependencies(%{scope | record: record, controls: evidence.controls}, context) do
       {:ok, scope, %{evidence | sources: Enum.uniq(evidence.sources ++ scope.dependencies.sources)}}

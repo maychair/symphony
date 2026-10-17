@@ -1,23 +1,101 @@
 defmodule SymphonyElixir.TaskSession do
   @moduledoc "Owned local Codex sessions and final activation fences for admitted plan-member generations."
   alias SymphonyElixir.{Codex.AppServer, Config, NativeStop, RunJournal, TaskExecution, TaskObserver, TaskWorkspace}
+  alias SymphonyElixir.PromptBuilder
   alias SymphonyElixir.Tracker.Issue
 
   @identity ~w(directory issue_id attempt_id execution_binding execution_generation workspace task_workspace task_session_id)
+  @preparation_identity (@identity -- ~w(workspace task_workspace)) ++ ~w(thread_id)
   @type t :: %{native: AppServer.session(), task_session: map()}
 
   @doc "Prepare the role workspace and allocate or resume only its own native thread. Admission belongs to TaskExecution."
   @spec start(map(), map(), keyword()) :: {:ok, t()} | {:error, term()}
   def start(record, executions, opts) do
-    with true <- local?(record, opts) or {:error, :unsupported_task_session_transport},
-         {:ok, record} <- TaskWorkspace.prepare(record, executions, opts),
-         context = %{owner: self(), record: record, executions: executions, opts: opts},
-         {:ok, observation, _deadline} <- activation(context),
-         {:ok, context} <- claim(context) do
-      case AppServer.start_session(record["workspace"], session_options(context, observation.policy)) do
-        {:ok, session} -> {:ok, %{native: session, task_session: context}}
-        error -> failed_start(context, error)
+    case prepare_start(%{owner: self(), record: record, executions: executions, opts: opts}) do
+      {:error, reason, _context} -> {:error, reason}
+      result -> result
+    end
+  end
+
+  @doc "Execute one freshly admitted role using approved native scope, including owned startup-failure finalization."
+  @spec run(map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def run(record, executions, opts) do
+    context = %{owner: self(), record: record, executions: executions, opts: opts}
+
+    with {:ok, current} <- current(context),
+         true <- unclaimed_attempt?(current) or {:error, :task_attempt_not_admitted} do
+      case prepare_start(context) do
+        {:ok, session} -> run_prepared(session, opts)
+        {:error, reason, failed} -> finalize(failed, {:error, reason})
       end
+    end
+  end
+
+  defp unclaimed_attempt?(record), do: record["phase"] == "admitted" and record["task_session_phase"] in [nil, "stopped"]
+
+  defp prepare_start(context) do
+    result =
+      capture_start(fn ->
+        if local?(context.record, context.opts),
+          do: TaskWorkspace.prepare(context.record, context.executions, context.opts),
+          else: {:error, :unsupported_task_session_transport}
+      end)
+
+    case result do
+      {:ok, record} -> open_session(%{context | record: record})
+      {:error, reason} -> preparation_failed(context, reason)
+    end
+  end
+
+  defp preparation_failed(context, reason) do
+    with {:ok, %{} = record} <- RunJournal.read(context.record["directory"]),
+         true <- Map.take(record, @preparation_identity) == Map.take(context.record, @preparation_identity) do
+      {:error, reason, %{context | record: record}}
+    else
+      _ -> {:error, :task_session_no_longer_owned, context}
+    end
+  end
+
+  defp open_session(context) do
+    with {:ok, observation, _deadline} <- capture_start(fn -> activation(context) end),
+         {:ok, context} <- claim(context) do
+      start_native(context, observation.policy)
+    else
+      {:error, reason} -> {:error, reason, context}
+    end
+  end
+
+  defp start_native(context, policy) do
+    case capture_start(fn -> AppServer.start_session(context.record["workspace"], session_options(context, policy)) end) do
+      {:ok, session} ->
+        {:ok, %{native: session, task_session: context}}
+
+      error ->
+        {:error, reason} = failed_start(context, error)
+        {:error, reason, context}
+    end
+  end
+
+  defp capture_start(fun) do
+    fun.()
+  rescue
+    error -> {:error, {:task_start_failed, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {:task_start_failed, kind, inspect(reason)}}
+  end
+
+  defp run_prepared(%{task_session: context} = session, opts) do
+    objective =
+      capture_start(fn ->
+        with {:ok, observation, _} <- activation(context),
+             {:ok, prompt} <- PromptBuilder.build_role_prompt(observation),
+             :ok <- Keyword.get(opts, :on_ready, fn _ -> :ok end).(observation.record),
+             do: {:ok, prompt}
+      end)
+
+    case objective do
+      {:ok, prompt} -> run_goal(session, prompt, opts)
+      {:error, _} = error -> finish_goal(context, error, stop(session))
     end
   end
 

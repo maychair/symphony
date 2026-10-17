@@ -540,9 +540,10 @@ app-server protocol process, including Goal activation, same-thread resume,
 late callbacks, controls arriving before and during execution, candidate publication,
 healthy repeated observations, workspace corruption, reader timeout/crash/owner
 exit, budget expiration and failed stop readback. They are not yet the polling
-worker entry point. The role-specific Goal prompt, startup-failure and abrupt-worker
-recovery, configuration resolution and scheduler continuation still need integration before
-version 2 automatic dispatch can be enabled.
+worker entry point. `AgentRunner.run_member/5` now provides the explicit member
+worker path described below. Abrupt-worker recovery, configuration resolution and
+scheduler discovery/continuation still need integration before version 2 automatic
+dispatch can be enabled.
 
 ## Owned attempt finalization
 
@@ -553,7 +554,8 @@ invokes it after native stop; host startup failures may also use it before any
 allocation. The finalizer checks both native and supervised command stop. Closing
 a port, a normal worker exit or a successful Goal response is not stop evidence.
 
-A stopped attempt re-reads current native facts. A required role change returns
+A stopped attempt records `attempt_stopped` and its `last_result` classification
+before re-reading current native facts. A required role change returns
 `continue`; an observed pause or other restriction returns `waiting`. Scheduler
 shutdown does not consume a retry. If the same role remains runnable, native
 failure or a completed Goal without task progress increments the cumulative retry
@@ -585,6 +587,63 @@ a dead worker's ownership, recovering native allocations after VM loss and wirin
 scheduler continuation remain separate integration work. Tests use real native
 protocol processes and filesystem lock boundaries; replay of `finalizing` and
 `completed` checkpoints is a local interruption fixture, not live-provider recovery.
+
+## Approved role worker entry
+
+`AgentRunner.run_member/5` takes a parent WorkRef, member WorkRef, host execution
+registry, optional event recipient and native request options. It admits one role
+through `TaskExecution`, then invokes `TaskSession.run/3` for the freshly admitted
+attempt. Waiting is returned without allocating a native thread. This is a worker
+entry in the existing AgentRunner, not another scheduler; it does not loop through
+successor roles or create child Issues. Local Codex is required. Runtime workspace
+and native events use the existing worker message format.
+
+`TaskSession.run/3` prepares the generation workspace, allocates or resumes the
+owned transport, derives a current approved Goal and runs it through managed stop
+and finalization. A fresh journal read cannot adopt another worker's opening,
+ready or uncertain session claim, even before its first native thread is allocated.
+Preparation failures can adopt only that attempt's workspace
+receipt, never a different attempt, generation, thread or transport claim. Startup
+errors before allocation use bounded retry accounting. Uncertain allocation keeps
+an incident. An exception during native initialization closes its local port while
+preserving allocation uncertainty; port closure itself is not stop proof. A failed
+readiness callback stops the idle session before finalization. Provider exceptions
+during final observation produce unknown evidence and retain their failure reason.
+
+`PromptBuilder.build_role_prompt/1` reassesses the native observation and accepts
+only the selected binding. It includes the sealed member goal, non-goals, criteria,
+allowed criteria, fixed binding, materialized input paths, candidate, current
+verification, dependencies and configured checks. Unsealed Issue prose does not
+supply the objective. Developers publish candidates and use verification findings
+for repairs. Verifiers inspect the fixed candidate, run configured command checks
+through `task_check`, and publish independent verification. `task_context` exposes
+current verification to developers; verifiers can read their candidate while their
+own verification publication is incomplete. Every effect still has its native
+control and ownership checks; the prompt is not an authorization boundary.
+
+The host execution policy may add literal per-role instructions using
+`role_instructions`, an optional object whose only keys are `developer` and
+`verifier`, each with non-empty text. These are additional host instructions, not
+Liquid templates or task-authored permission. They participate in the existing
+policy digest, so changing them changes the binding. Workspace deployment
+configuration owns their content; the registry resolver is still pending. No
+credentials or provider configuration are embedded in the generated Goal.
+
+An admitted repair is distinct from a completed repair without progress. Its
+preparation phases may activate the already charged repair generation. Once the
+attempt stops, finalization classifies normal completion, native Goal blocking,
+scheduler interruption or a retryable error before reassessment. Interruption and bounded technical
+retry retain the same repair generation and allowance. A completed repair that
+publishes no progress cannot repeat the same finding indefinitely.
+
+Tests drive development, failed independent verification, repair and successful
+re-verification through four real local app-server protocol threads and native
+Issue fixtures. They check current findings in the developer context, separate
+read-only verifier sessions, unchanged retry/repair budgets, startup fault cleanup
+explicit native pause/resume and stopping after no-progress repair. A verified report can become closeable, but
+the worker does not close its Issue or accept the parent. This is local protocol
+integration, not a live-provider acceptance result. Polling projection, cross-host
+recovery and configured registry discovery remain separate integration work.
 
 ## Native evidence publication
 
