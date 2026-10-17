@@ -109,7 +109,7 @@ defmodule SymphonyElixir.ExecutionBinding do
     WorkRef.validate(binding["work"]) == :ok and binding["work"]["kind"] == "issue" and
       Enum.all?(~w(plan_revision contract_sha policy_sha), &digest?(binding[&1])) and
       case binding["role"] do
-        "developer" -> is_nil(binding["candidate"])
+        "developer" -> is_nil(binding["candidate"]) or digest?(binding["candidate"])
         "verifier" -> digest?(binding["candidate"])
         _ -> false
       end

@@ -352,4 +352,4 @@ lifecycle integration are still under development.
 
 Configured parent plans now receive [native preflight](docs/workflow-lifecycle.md#native-plan-preflight) on tracker reads. This verifies complete cross-repository scope and approval without granting child dispatch or treating Issue closure as dependency evidence.
 
-[Native execution generations](docs/workflow-lifecycle.md#native-execution-generations) bind roles and fixed inputs, preserve cumulative accounting, and require native stop before replacing a thread. Automatic role selection remains under development.
+[Native execution generations](docs/workflow-lifecycle.md#native-execution-generations) bind roles and fixed inputs, preserve cumulative accounting, and require native stop before replacing a thread. The member lifecycle reducer derives developer/verifier selection from resolved evidence, with finite repair accounting and version-bound delivery checks; native evidence production and dispatch integration remain under development.

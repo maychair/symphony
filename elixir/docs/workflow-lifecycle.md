@@ -11,6 +11,8 @@ decisions to unchanged native candidate notes and rejects unversioned acceptance
 Configured parents now receive complete native scope/approval preflight on
 tracker reads, including GitHub/GitLab repository identity and member contracts.
 Native execution generation fencing is available for role separation and recovery.
+The member lifecycle reducer now selects roles from resolved evidence and applies
+candidate, verification, delivery, control and cumulative accounting constraints.
 Child dispatch, artifact verification and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
@@ -191,13 +193,15 @@ and [GitLab Issue notes](https://docs.gitlab.com/api/notes/#list-all-issue-notes
 verified native facts. It binds the full work identity, developer/verifier role,
 plan revision, child contract checksum, parent approval reference, fixed input
 versions and verification references, candidate digest and runtime policy digest.
-A verifier must name a candidate. Input ordering is canonicalized; reordering
+A verifier must name a candidate; a developer also binds the candidate being
+repaired or delivered. Initial development has no candidate. Input ordering is canonicalized; reordering
 unchanged inputs resumes the same generation rather than allocating another.
 
 This binding is an execution boundary, not proof that its inputs are verified or
 that the work is authorized. The lifecycle must still check those native facts,
 all restrictions, remaining budget and finite retry/repair limits before calling
-admission. Automatic role selection and candidate verification are still pending.
+admission. The member reducer derives role selection, but native evidence producers
+and automatic dispatch integration are still pending.
 
 Changing role or fixed inputs requires a confirmed stop of the recorded native
 thread. Allocation without a known thread remains uncertain even if a local
@@ -213,6 +217,76 @@ attempt or stale callback cannot overwrite a newer generation, clear its binding
 or release its lock. Damaged binding/history records fail closed on recovery.
 These guards do not imply child completion, independent verification success or
 permission to publish, merge or close an Issue.
+
+## Member lifecycle reducer
+
+`TaskLifecycle.assess/2` consumes the complete `TaskPlanPreflight` result, one
+member WorkRef, its execution journal, current adapter-resolved evidence and a
+finite verification policy. It returns phase, outcome, action, restrictions,
+desired binding, dispatchability, stop requirement and closure eligibility.
+It performs no native writes and does not enable version 2 dispatch by itself.
+
+The policy names `engine_actor`, finite nonnegative `max_retries` and
+`max_repairs`, and a `checks` map. Each check is a `command` with its exact
+command, or a `review`. The sealed child contract adds `verification_checks`,
+an exact map from every criterion to nonempty check IDs. Missing assignments
+prevent eligibility; successful graph preflight alone does not satisfy this.
+
+Resolved evidence has lists of current `sources`, `restrictions`, `releases`,
+`dependencies` and `deliveries`, an `active` execution fact, and nullable
+`candidate`, `verification` and `acceptance` records. These are trusted adapter
+outputs, not a wire format that agents may self-certify:
+
+- Dependencies name producer, artifact, version, verification, retrieval,
+  criteria and stage. Exactly one matching proof must meet each sealed edge.
+- A candidate binds work, contract checksum, fixed inputs and exact artifact
+  IDs/kinds/versions/sources. Its digest covers that payload. Publication binds
+  the engine actor and current source; its generation/thread must occur in the
+  journal as development under the same authority, scope and inputs.
+- Verification binds that candidate, inputs and policy, with a separate recorded
+  verifier thread. Every required command has its exact command, integer exit
+  code and output checksum; every review has a result and rationale. Check
+  success is derived by check kind. Missing checks or failed commands cannot be
+  overridden by an otherwise clean review.
+- Findings bind original criteria, status, required/advisory classification,
+  rationale, current evidence, a stable `problem_sha` for the normalized
+  problem and `repair_basis_sha` for the substantive reproduction/repair basis.
+  Producers must exclude publication IDs, head-only changes and wording from
+  these identities; a new basis requires evidence of actual progress. Invalid or undecidable findings wait for
+  a decision; valid required findings select in-scope development.
+- Delivery maps each candidate artifact to its delivered version and current
+  native source. A transformed version requires mapping and delivered-check
+  evidence. Technical children need no human acceptance; an explicitly gated
+  child requires its designated actor's exact-candidate acceptance.
+
+Old candidate/input/policy verification remains historical and selects current
+verification. A current-target record with invalid provenance blocks. A missing
+previous candidate does not silently restart initial implementation.
+
+`TaskLifecycle.start/3` records the admitted execution generation before charging
+or counting repair. `repair_history` and elapsed budget remain journal accounting.
+Only an actual repair admission increments the repair count; infrastructure
+retries retain their separate count. Republishing an unchanged problem cannot
+create another automatic repair. A materially new repair basis can permit
+another bounded repair of the same problem. Exhausted budgets, finite limits and clock
+regression block new execution. Waiting for a human stops charging only after
+native stop; resource/dependency waiting retains existing accounting semantics.
+
+Native restrictions survive disappearance of their source. A resolved release
+must name that restriction's exact source; releasing one does not clear others.
+The adapter must authenticate and order restrictions/releases before supplying
+them. The reducer cannot infer a resume from a missing pause comment.
+
+A complete proof cannot yield a completed outcome while execution is active or
+uncertain. Changed completed conclusions require a decision instead of silently
+reopening work. `closeable` is a derived eligibility flag, not a close receipt:
+the effect owner must re-read native sources and stop facts, record its intent,
+perform the authorized close and read back the result.
+
+Native evidence authentication/publication, parent rework, fine-grained execution
+under criterion restrictions, shared board projection and effect integration
+remain pending. In particular, supplying a `sources` list is not itself proof
+that an external artifact was retrieved or a real command was executed.
 
 ## Execution and evidence
 
