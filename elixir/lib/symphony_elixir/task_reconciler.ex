@@ -50,7 +50,8 @@ defmodule SymphonyElixir.TaskReconciler do
 
   defp poll_record(path, active_ids) do
     with {:ok, record} when is_map(record) <- RunJournal.read(Path.dirname(path)),
-         false <- MapSet.member?(active_ids, record["issue_id"]) do
+         false <- MapSet.member?(active_ids, record["issue_id"]),
+         true <- legacy_record?(record) do
       locked_refresh(record)
     end
   end
@@ -113,6 +114,14 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec observe(map(), keyword()) :: {:ok, map()} | {:error, term()}
   def observe(record, opts \\ []) do
+    if legacy_record?(record) do
+      observe_legacy(record, opts)
+    else
+      {:error, :plan_execution_requires_native_coordinator}
+    end
+  end
+
+  defp observe_legacy(record, opts) do
     settings = Keyword.get(opts, :settings, Config.settings!().tracker)
     default_client = Application.get_env(:symphony_elixir, :task_workflow_client, &Client.request/5)
     client = Keyword.get(opts, :client, default_client)
@@ -133,6 +142,14 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec apply_observation(map(), map(), boolean(), keyword()) :: {:ok, map()} | {:error, term()}
   def apply_observation(record, observation, active, opts \\ []) do
+    if legacy_record?(record),
+      do: apply_legacy_observation(record, observation, active, opts),
+      else: {:error, :plan_execution_requires_native_coordinator}
+  end
+
+  defp legacy_record?(record), do: not Map.has_key?(record, "execution_binding") and get_in(record, ["workflow", "schema_version"]) != 2
+
+  defp apply_legacy_observation(record, observation, active, opts) do
     %{facts: facts, events: events, raw: raw, path: path, settings: settings, client: client} = observation
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
 

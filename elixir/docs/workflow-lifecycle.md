@@ -355,6 +355,54 @@ fine-grained criterion restrictions, shared board projection and effect integrat
 remain pending. Supplying an arbitrary `sources` list is not proof of retrieval
 or command execution.
 
+## Native member admission
+
+`TaskExecution.observe/4` assembles the `TaskLifecycle` input from the complete
+native preflight, native candidate/verification publications, recursively verified
+dependencies, delivery observations and persisted control receipts. The host
+supplies a registry of full WorkRef keys to owning journal directories and finite
+verification policies. Every sealed member must have valid configuration; the
+registry cannot add membership or substitute for native scope. Journal directories
+must match the existing `RunJournal.directory/2` identity convention.
+
+Observation does not allocate an executor. It rechecks the complete native plan,
+member/comment versions, delivery snapshots and the owning journal after the
+read. An existing binding keeps its fixed dependency versions. Missing evidence,
+foreign or malformed journals and changing sources return errors rather than a
+runnable projection. The host alone supplies the `active` fact; it must come from
+the owning live executor, never an agent payload or a stale process identifier.
+Human acceptance is not yet acquired here, so separately gated children remain
+ineligible for completion.
+
+`TaskExecution.admit/4` ignores any supplied active hint and admits only the role
+selected by current evidence. It acquires the existing exclusive journal lock,
+then reads the evidence again before starting lifecycle accounting. A native
+candidate selects the independent verifier; passed verification plus a confirmed
+report publication can select completion. No input `role` or binding argument can
+force that transition. A stopped prior generation and stopped host checks are
+required before rotation, and prior accounting/history survive it. Failure after
+acquiring the lock releases only this unstarted attempt; changed ownership remains
+an explicit recovery error and the replacement lock is untouched.
+
+Observed control sources are retained under the lock before the second native
+read. This also applies to a pause received before the first execution: a small
+execution journal records its receipt without creating a native thread or starting
+budget charging. Removing that native comment cannot grant execution. Conflicting
+source versions preserve the first receipt and fail subsequent validation. An
+actual active owner uses `TaskExecution.refresh/3` to persist the latest projection
+and stop requirement; the coordinator never claims that projecting `stopping`
+proves native stop. Stale attempt/generation callbacks cannot refresh a replacement.
+Legacy label reconciliation skips bound or version 2 journals. Both fresh reads
+and delayed legacy observations reject these records before native requests,
+labels, closure or journal writes.
+
+This coordinator is exercised with owning journals, role-bound tools, real host
+check receipts, and native API fixtures. It does not itself launch Codex, assemble
+role workspaces, authenticate a child acceptance, merge or close an Issue. Polling
+still blocks version 2 automatic dispatch until role workspace/session ownership
+and scheduler continuation are wired to this admission boundary. It must not be
+activated by removing the dispatch guard alone.
+
 ## Native evidence publication
 
 `TaskPublication.publish/5` appends an engine-owned candidate or verification

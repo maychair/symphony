@@ -217,8 +217,16 @@ defmodule SymphonyElixir.RunJournal do
   @spec read(Path.t()) :: {:ok, map() | nil} | {:error, term()}
   def read(directory) do
     case File.read(Path.join(directory, "run.json")) do
-      {:ok, data} -> Jason.decode(data)
+      {:ok, data} -> decode_record(data)
       {:error, :enoent} -> {:ok, nil}
+      error -> error
+    end
+  end
+
+  defp decode_record(data) do
+    case Jason.decode(data) do
+      {:ok, %{} = record} -> {:ok, record}
+      {:ok, _} -> {:error, :invalid_run_journal}
       error -> error
     end
   end

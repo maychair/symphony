@@ -170,6 +170,26 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     File.write!(path, Jason.encode!(Map.take(record, ["attempt_id", "host", "executor_os_pid"])))
   end
 
+  test "legacy polling and late observations cannot take over a native plan journal", %{server: server, issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    {:ok, legacy_observation} = TaskReconciler.observe(record)
+    flow = Map.put(record["workflow"], "schema_version", 2)
+    {:ok, record} = RunJournal.checkpoint(record, %{"workflow" => flow})
+    :ok = RunJournal.complete(record, "completed")
+    record = current(record)
+    before = File.read!(Path.join(record["directory"], "run.json"))
+    calls = Agent.get(server, & &1.calls)
+    assert :ok = TaskReconciler.poll(MapSet.new())
+    assert {:error, :plan_execution_requires_native_coordinator} = TaskReconciler.refresh(record, false)
+    result = TaskReconciler.apply_observation(record, legacy_observation, false)
+    assert {:error, :plan_execution_requires_native_coordinator} = result
+    bound = record |> Map.delete("workflow") |> Map.put("execution_binding", %{})
+    assert {:error, :plan_execution_requires_native_coordinator} = TaskReconciler.observe(bound)
+    assert File.read!(Path.join(record["directory"], "run.json")) == before
+    assert Agent.get(server, & &1.calls) == calls
+  end
+
   test "pause, separately satisfied dependency and explicit resume survive unlabelled polling and restart", %{server: server, issue: issue, contract: contract} do
     assert TaskReconciler.enabled?()
     assert {:ok, _, opts} = Execution.prepare(issue, [])

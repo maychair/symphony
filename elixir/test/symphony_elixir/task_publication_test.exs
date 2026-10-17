@@ -4,7 +4,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{TaskDelivery, TaskDependencies, TaskEvidence, TaskLifecycle}
+  alias SymphonyElixir.{TaskDelivery, TaskDependencies, TaskEvidence, TaskExecution, TaskLifecycle}
   alias SymphonyElixir.TaskPlanPreflight
 
   defp contract(work, parent, kind \\ "report") do
@@ -237,6 +237,242 @@ defmodule SymphonyElixir.TaskPublicationTest do
     body = "# Findings\n\nThe cited experiment supports the conclusion.\n\nLimit: only the approved input was examined.\n<!-- reader note -->"
     {:ok, report} = ReportArtifact.build(f.payload["work"], "output", body)
     %{f | payload: Map.put(f.payload, "artifacts", [report])} |> Map.put(:workspace, nil)
+  end
+
+  defp fresh_execution(f) do
+    File.rm_rf!(f.record["directory"])
+    f
+  end
+
+  defp native_tools(f, record, thread) do
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => thread, "thread_allocation_intent" => true, "native_stop_confirmed" => false})
+    {:ok, tools} = TaskTools.bind(record, f.opts[:policy], f.opts)
+    {record, tools}
+  end
+
+  test "native evidence derives and admits developer then independent verifier, retaining budget and stop fences" do
+    for provider <- ["github", "gitlab"] do
+      f = report_fixture(provider, []) |> fresh_execution()
+      registry = executions([f])
+      work = f.payload["work"]
+      assert {:ok, initial} = TaskExecution.observe(f.parent, work, registry, f.opts)
+      assert initial.flow["next_binding"]["role"] == "developer"
+      refute initial.flow["started"]
+      refute File.exists?(Path.join(f.record["directory"], "run.json"))
+      assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, f.opts)
+      assert admitted.flow["charging"]
+      assert admitted.record["execution_generation"] == 1
+      assert {:error, {:run_admission_blocked, _, :eexist}} = TaskExecution.admit(f.parent, work, registry, f.opts)
+      {developer, tools} = native_tools(f, admitted.record, "native-developer")
+      assert {true, _} = tool(tools, "task_candidate", candidate_args(f))
+      assert {:ok, next} = TaskExecution.refresh(developer, registry, Keyword.put(f.opts, :active, true))
+      assert next.flow["next_binding"]["role"] == "verifier"
+      assert next.flow["stop_required"]
+      refute next.flow["dispatchable"]
+      assert {:waiting, uncertain} = TaskExecution.admit(f.parent, work, registry, f.opts)
+      assert uncertain.flow["restrictions"]["native_stop"]
+      {:ok, stopped} = RunJournal.checkpoint(next.record, %{"native_stop_confirmed" => true})
+      :ok = RunJournal.complete(stopped, "completed")
+      assert {:ok, verifying} = TaskExecution.admit(f.parent, work, registry, f.opts)
+      assert verifying.record["execution_generation"] == 2
+      assert verifying.flow["used_ms"] >= next.flow["used_ms"]
+      assert verifying.record["execution_binding"]["candidate"] == TaskWorkflow.digest(f.payload)
+      assert verifying.record["execution_binding"]["role"] == "verifier"
+      assert {:error, :native_thread_reused_across_generations} = RunJournal.checkpoint(verifying.record, %{"thread_id" => "native-developer"})
+      assert {:error, :execution_attempt_changed} = TaskExecution.refresh(developer, registry, f.opts)
+      assert {false, _} = tool(tools, "task_candidate", candidate_args(f))
+      {verifier, review_tools} = native_tools(f, verifying.record, "native-verifier")
+      review = %{"id" => "test", "result" => "passed", "rationale" => "Checked the exact report and its cited evidence against every approved criterion."}
+      assert {true, _} = tool(review_tools, "task_verification", %{"review_checks" => [review], "findings" => [], "summary" => "Verified"})
+      assert {:ok, pending_stop} = TaskExecution.refresh(verifier, registry, Keyword.put(f.opts, :active, true))
+      assert pending_stop.flow["stop_required"]
+      refute pending_stop.flow["closeable"]
+      {:ok, stopped} = RunJournal.checkpoint(pending_stop.record, %{"native_stop_confirmed" => true})
+      assert {:ok, completed} = TaskExecution.refresh(stopped, registry, f.opts)
+      assert completed.flow["closeable"]
+      refute completed.flow["charging"]
+      :ok = RunJournal.complete(completed.record, "completed")
+      assert {:waiting, observation} = TaskExecution.admit(f.parent, work, registry, f.opts)
+      assert observation.flow["outcome"] == "delivered"
+      assert length(posts(f)) == 2
+      assert Agent.get(f.state, & &1.objects[f.child]["state"]) == "open"
+    end
+  end
+
+  test "a pause observed before the first execution remains binding if its native comment disappears" do
+    f = report_fixture("github", []) |> fresh_execution()
+    pause = control(f, :parent, "pause", 20)
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [pause] end))
+    assert {:waiting, waiting} = TaskExecution.admit(f.parent, f.payload["work"], executions([f]), f.opts)
+    refute waiting.flow["started"]
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], [hd(&1.objects[f.parent_notes])]))
+    result = TaskExecution.admit(f.parent, f.payload["work"], executions([f]), f.opts)
+    assert {:error, :control_source_unconfirmed} = result
+    source = hd(Map.values(current(f)["control_receipts"]))
+    resume = control(f, :parent, "resume", 21, %{"restriction" => source})
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [pause, resume] end))
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, f.payload["work"], executions([f]), f.opts)
+    assert admitted.record["execution_generation"] == 1
+    assert admitted.record["execution_binding"]["role"] == "developer"
+  end
+
+  test "admission rechecks pause after locking and retains it without starting or leaving a stale lock" do
+    f = report_fixture("gitlab", []) |> fresh_execution()
+    registry = executions([f])
+    work = f.payload["work"]
+    pause = control(f, :parent, "pause", 20)
+
+    request = fn provider, method, path, query, settings ->
+      if File.exists?(Path.join(f.record["directory"], "executor.lock")) do
+        Agent.update(f.state, &put_in(&1.objects[f.parent_notes], [hd(&1.objects[f.parent_notes]), pause]))
+      end
+
+      f.opts[:request].(provider, method, path, query, settings)
+    end
+
+    opts = Keyword.put(f.opts, :request, request)
+    assert {:error, :lifecycle_start_not_admitted} = TaskExecution.admit(f.parent, work, registry, opts)
+    record = current(f)
+    refute record["thread_id"]
+    refute record["workflow"]["started"]
+    assert record["workflow"]["used_ms"] == 0
+    refute File.exists?(Path.join(record["directory"], "executor.lock"))
+    assert {:waiting, _} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], [hd(&1.objects[f.parent_notes])]))
+    assert {:error, :control_source_unconfirmed} = TaskExecution.admit(f.parent, work, registry, f.opts)
+  end
+
+  test "admission refuses missing configuration, foreign journals, unknown allocation and changing source evidence" do
+    f = report_fixture("github", []) |> fresh_execution()
+    work = f.payload["work"]
+    registry = executions([f])
+    key = WorkRef.key(work)
+    assert {:error, :incomplete_plan_execution_configuration} = TaskExecution.observe(f.parent, work, nil, f.opts)
+    assert {:error, :incomplete_plan_execution_configuration} = TaskExecution.observe(f.parent, work, %{}, f.opts)
+    invalid = put_in(registry, [key, :directory], "/tmp/foreign")
+    assert {:error, :incomplete_plan_execution_configuration} = TaskExecution.observe(f.parent, work, invalid, f.opts)
+    assert {:error, :invalid_work_ref} = TaskExecution.observe(f.parent, %{}, registry, f.opts)
+    foreign_work = %{work | "number" => 99}
+    assert {:error, :member_execution_unavailable} = TaskExecution.observe(f.parent, foreign_work, registry, f.opts)
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    {:ok, unknown} = RunJournal.checkpoint(admitted.record, %{"thread_allocation_intent" => true})
+    assert {:waiting, _} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    assert {:error, :invalid_execution_binding} = TaskExecution.refresh(%{}, registry, f.opts)
+    assert {:error, :control_source_unconfirmed} = TaskExecution.refresh(Map.put(unknown, "control_receipts", %{"foreign" => "missing"}), registry, f.opts)
+    path = Path.join(f.record["directory"], "run.json")
+    File.write!(path, Jason.encode!(%{unknown | "issue_id" => "foreign"}))
+    assert {:error, :member_execution_identity_changed} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    File.write!(path, Jason.encode!(Map.put(unknown, "execution_binding", "malformed")))
+    assert {:error, :member_execution_identity_changed} = TaskExecution.observe(f.parent, work, registry, f.opts)
+
+    for json <- ["[]", "null", "42", Jason.encode!("invalid record")] do
+      File.write!(path, json)
+      assert {:error, :invalid_run_journal} = TaskExecution.observe(f.parent, work, registry, f.opts)
+      assert {:error, :invalid_run_journal} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    end
+
+    File.write!(path, "{")
+    assert {:error, %Jason.DecodeError{}} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    File.write!(path, Jason.encode!(unknown))
+    counter = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
+
+    request = fn provider, method, target, query, settings ->
+      result = f.opts[:request].(provider, method, target, query, settings)
+
+      if target == f.child do
+        count = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+        if count == 3, do: File.write!(path, Jason.encode!(Map.put(unknown, "retry_count", 1)))
+      end
+
+      result
+    end
+
+    assert {:error, :execution_evidence_changed_during_read} = TaskExecution.observe(f.parent, work, registry, Keyword.put(f.opts, :request, request))
+  end
+
+  test "member admission resolves whole-plan configuration and pins independently verified upstream inputs" do
+    f = fixture("github", ["verified"]) |> git_artifact()
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+
+    registry =
+      Map.new(plan.members, fn {key, _} ->
+        {key, %{directory: RunJournal.directory(Path.dirname(f.record["directory"]), key), policy: f.opts[:policy]}}
+      end)
+
+    consumer = %{f.payload["work"] | "number" => 3}
+    assert {:error, :incomplete_plan_execution_configuration} = TaskExecution.admit(f.parent, consumer, executions([f]), f.opts)
+    assert {:error, :dependency_not_verified} = TaskExecution.admit(f.parent, consumer, registry, f.opts)
+    refute File.exists?(registry[WorkRef.key(consumer)].directory)
+    f = verified_tools(f)
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, consumer, registry, f.opts)
+    [input] = admitted.record["execution_binding"]["inputs"]
+    assert input["work"] == f.payload["work"]
+    assert input["version"] == f.git.revision
+    assert input["verification"] == hd(admitted.evidence["dependencies"])["verification"]
+    assert admitted.flow["dispatchable"]
+    assert {:ok, again} = TaskExecution.observe(f.parent, consumer, registry, f.opts)
+    assert again.flow["inputs"] == [input]
+  end
+
+  test "native unavailability at the final fence or after lock acquisition never starts an executor" do
+    f = report_fixture("github", []) |> fresh_execution()
+    registry = executions([f])
+    work = f.payload["work"]
+    parent_path = String.replace_suffix(f.parent_notes, "/comments", "")
+    reads = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
+
+    request = fn provider, method, target, query, settings ->
+      count = if target == parent_path, do: Agent.get_and_update(reads, &{&1 + 1, &1 + 1}), else: 0
+      # The final preflight follows the initial plan and member evidence reads.
+      if count == 11 do
+        {:error, :temporarily_unavailable}
+      else
+        f.opts[:request].(provider, method, target, query, settings)
+      end
+    end
+
+    result = TaskExecution.observe(f.parent, work, registry, Keyword.put(f.opts, :request, request))
+    assert {:error, :native_read_failed} = result
+    refute File.exists?(f.record["directory"])
+
+    request = fn provider, method, target, query, settings ->
+      if File.exists?(Path.join(f.record["directory"], "executor.lock")),
+        do: {:error, :temporarily_unavailable},
+        else: f.opts[:request].(provider, method, target, query, settings)
+    end
+
+    result = TaskExecution.admit(f.parent, work, registry, Keyword.put(f.opts, :request, request))
+    assert {:error, :native_read_failed} = result
+    refute current(f)["thread_id"]
+    refute current(f)["workflow"]
+    refute File.exists?(Path.join(f.record["directory"], "executor.lock"))
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    assert admitted.record["attempt_count"] == 2
+    assert admitted.record["execution_generation"] == 1
+    assert admitted.flow["started"]
+    assert admitted.flow["budget_ms"] == 100_000
+  end
+
+  test "admission never releases a replacement attempt when ownership changes during native readback" do
+    f = report_fixture("github", []) |> fresh_execution()
+    changed = start_supervised!({Agent, fn -> false end}, id: make_ref())
+
+    request = fn provider, method, target, query, settings ->
+      if File.exists?(Path.join(f.record["directory"], "executor.lock")) and not Agent.get(changed, & &1) do
+        Agent.update(changed, fn _ -> true end)
+        path = Path.join(f.record["directory"], "run.json")
+        File.write!(path, Jason.encode!(Map.put(current(f), "attempt_id", "replacement-owner")))
+      end
+
+      f.opts[:request].(provider, method, target, query, settings)
+    end
+
+    opts = Keyword.put(f.opts, :request, request)
+    result = TaskExecution.admit(f.parent, f.payload["work"], executions([f]), opts)
+    assert {:error, :execution_admission_recovery_required} = result
+    assert current(f)["attempt_id"] == "replacement-owner"
+    assert File.exists?(Path.join(f.record["directory"], "executor.lock"))
+    refute current(f)["thread_id"]
   end
 
   test "native Markdown reports publish visibly and unlock verified delivery only after independent review" do
