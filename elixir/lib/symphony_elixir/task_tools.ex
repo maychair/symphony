@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskTools do
   @moduledoc "Role-bound native tools for an admitted plan-member execution."
   alias SymphonyElixir.{CommandCheck, Config, ExecutionBinding, GitArtifact, NativeWork, RunJournal}
-  alias SymphonyElixir.{TaskControl, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
+  alias SymphonyElixir.{TaskControl, TaskDependencies, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
   alias SymphonyElixir.{TaskPublication, TaskWorkflow, WorkRef}
 
   @identity ~w(directory attempt_id execution_generation execution_binding)
@@ -81,7 +81,7 @@ defmodule SymphonyElixir.TaskTools do
          :ok <- TaskLifecycle.validate_policy(context.policy, member.contract),
          {:ok, controls} <- TaskControl.observe(plan, binding["work"], TaskControl.recorded(record)),
          {:ok, record} <- RunJournal.checkpoint(record, %{"control_receipts" => controls.receipts}) do
-      {:ok, %{record: record, plan: plan, member: member, controls: controls}}
+      dependencies(%{record: record, plan: plan, member: member, controls: controls}, context)
     else
       {:error, _} = error -> error
       _ -> {:error, :task_tool_scope_changed}
@@ -95,8 +95,9 @@ defmodule SymphonyElixir.TaskTools do
          "contract" => scope.member.contract,
          "binding" => scope.record["execution_binding"],
          "candidate" => evidence.candidate,
+         "dependencies" => scope.dependencies.dependencies,
          "controls" => evidence.controls.restrictions,
-         "sources" => evidence.sources,
+         "sources" => Enum.uniq(evidence.sources ++ scope.dependencies.sources),
          "checks" => context.policy["checks"]
        }}
     end
@@ -164,8 +165,17 @@ defmodule SymphonyElixir.TaskTools do
 
   defp observe_candidate(scope, context) do
     with {:ok, evidence} <- TaskEvidence.read_candidate(scope.plan, scope.member.work, scope.record, context.policy, context.opts),
-         {:ok, record} <- RunJournal.checkpoint(scope.record, %{"control_receipts" => evidence.controls.receipts}) do
-      {:ok, %{scope | record: record, controls: evidence.controls}, evidence}
+         {:ok, record} <- RunJournal.checkpoint(scope.record, %{"control_receipts" => evidence.controls.receipts}),
+         {:ok, scope} <- dependencies(%{scope | record: record, controls: evidence.controls}, context) do
+      {:ok, scope, %{evidence | sources: Enum.uniq(evidence.sources ++ scope.dependencies.sources)}}
+    end
+  end
+
+  defp dependencies(scope, context) do
+    binding = scope.record["execution_binding"]
+
+    with {:ok, facts} <- TaskDependencies.read(scope.plan, scope.member.work, binding["inputs"], context.opts[:dependency_executions] || %{}, context.opts) do
+      {:ok, Map.put(scope, :dependencies, facts)}
     end
   end
 
@@ -222,6 +232,7 @@ defmodule SymphonyElixir.TaskTools do
   defp publish(scope, context, kind, payload, summary) do
     with {:ok, record} <- RunJournal.checkpoint(scope.record, %{}),
          scope = %{scope | record: record},
+         {:ok, scope} <- dependencies(scope, context),
          :ok <- runnable(scope),
          {:ok, results} <- TaskPublication.observe(scope.record, scope.member, context.policy["engine_actor"]),
          true <- Enum.all?(results, &same_result?(&1.envelope, scope.record, payload)) or {:error, :execution_result_already_submitted},

@@ -627,6 +627,46 @@ transfer, and materializing retained bytes for new checks still require integrat
 The existing worktree cleaner cannot infer that deleting a worktree releases an
 artifact. Byte snapshots preserve files and modes, not a complete Git history.
 
+## Native dependency evidence
+
+`TaskDependencies.read/5` resolves the approved incoming edges of one member.
+The host supplies owning journal directories and verification policies, keyed by
+full `WorkRef`; agent arguments cannot replace that registry. The reader loads
+the current journals and native publications, resolves each producer's own pinned
+inputs recursively, re-attests actual command receipts, and applies the same
+candidate/check/finding rules used by `TaskLifecycle`.
+
+A `nil` input selection requests current candidate evidence. An existing input
+list requests its exact artifact version and native verification source through
+`TaskEvidence.read_input/5`. A new candidate does not replace an older pinned
+candidate. A newer verification of that *same* candidate supersedes its earlier
+verdict; a missing, edited, unconfirmed or conflicting source cannot fall back
+to an earlier success. Changed policy, scope or approval also invalidates reuse.
+This reader does not decide which versions a parent manifest will select.
+
+A successful `verified` proof names the producer, artifact, immutable version,
+verification source, retrieval source and approved criteria. Retained bytes get
+a separate dependency owner naming the consumer and a digest of the plan/input
+selection. Native snapshots and journal versions are checked again after the
+whole acquisition. These sequential fences do not create a cross-provider
+transaction. Failed reads may leave conservative retention references; they do
+not authorize execution or release existing references.
+
+Role tools use host-only `dependency_executions` options and compare their fixed
+binding inputs with the approved edges. They revalidate before context, checks
+and result publication, including after candidate acquisition. A failure blocks
+the call rather than emitting a result based on unavailable upstream evidence.
+The context includes dependency references and their source evidence.
+
+Technical verification is independent of upstream Issue closure, execution
+activity, delivery and human acceptance. It neither proves those facts nor
+permits replacing an active executor. Edges requiring `delivered` or `published`
+currently report `dependency_delivery_evidence_unavailable`; verified bytes are
+never promoted to a native merge or publication receipt. Native delivery
+acquisition, automatic dispatch/stop reconciliation, input materialization and
+parent manifest selection still require integration. Version 2 automatic
+dispatch remains fenced until those lifecycle boundaries are connected.
+
 ## Execution and evidence
 
 ```text

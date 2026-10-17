@@ -35,6 +35,48 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   def assess(_, _), do: {:error, :incomplete_observation}
 
+  @doc "Validate technical results for dependency consumption; this grants no delivery, execution or closure authority."
+  @spec verified_artifacts(map()) :: {:ok, [map()]} | {:error, term()}
+  def verified_artifacts(context) do
+    with :ok <- TaskPlan.validate(context.plan.plan),
+         :ok <- WorkRef.validate(context.work),
+         %{} = member <- context.plan.members[WorkRef.key(context.work)],
+         {:ok, _} <- TaskPlan.member(context.plan.plan, context.work, member.contract["contract_sha"]),
+         true <- native_scope?(context, member),
+         :ok <- validate_policy(context.policy, member.contract),
+         {:ok, _} <- ExecutionBinding.bind(context.runtime, context.runtime["execution_binding"]),
+         context = Map.put(context, :member, member),
+         %{} = candidate <- context.evidence["candidate"],
+         %{} = verification <- context.evidence["verification"] do
+      flow = %{
+        "contract_sha" => member.contract["contract_sha"],
+        "authority" => context.plan.authority,
+        "plan_revision" => context.plan.plan["revision"],
+        "candidate" => candidate["digest"],
+        "restrictions" => %{}
+      }
+
+      flow = select_inputs(flow, context)
+
+      if verified_result?(candidate, verification, flow, context) do
+        {:ok, candidate["artifacts"]}
+      else
+        {:error, :dependency_not_verified}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :dependency_not_verified}
+    end
+  end
+
+  defp verified_result?(candidate, verification, flow, context) do
+    map_size(flow["restrictions"]) == 0 and candidate?(candidate, flow, context) and
+      verification_target?(verification, flow, context) and verification?(verification, flow, context) and
+      validate_findings(verification["findings"], context.member.contract["criteria"], context.evidence["sources"]) == :ok and
+      not Enum.any?(verification["findings"], &(&1["status"] == "unknown" or (&1["required"] and &1["status"] == "valid"))) and
+      Enum.all?(verification["checks"], &passed?(&1, context.policy["checks"][&1["id"]]))
+  end
+
   defp native_scope?(context, member) do
     plan = context.plan.plan
     authority = context.plan.authority
@@ -253,7 +295,7 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   defp receipt_binding?(binding, role, candidate, flow, context) when is_map(binding) do
     binding["work"] == context.work and binding["role"] == role and binding["contract_sha"] == flow["contract_sha"] and
-      binding["authority"] == flow["authority"] and binding["inputs"] == flow["inputs"] and
+      binding["authority"] == flow["authority"] and binding["plan_revision"] == flow["plan_revision"] and binding["inputs"] == flow["inputs"] and
       (is_nil(candidate) or binding["candidate"] == candidate) and current_policy?(binding, role, context)
   end
 

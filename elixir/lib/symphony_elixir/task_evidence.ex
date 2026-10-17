@@ -2,8 +2,9 @@ defmodule SymphonyElixir.TaskEvidence do
   @moduledoc """
   Resolve candidate and verification evidence from native publications and actual artifacts.
 
-  This supplies result and native control facts. Dependencies, delivery, acceptance and
-  native execution activity must still be resolved before lifecycle assessment.
+  This supplies result and native control facts, including pinned historical inputs.
+  TaskDependencies composes technical dependency proofs; delivery, acceptance and
+  native execution activity still need their own facts before lifecycle assessment.
   """
   alias SymphonyElixir.ArtifactStore
   alias SymphonyElixir.{CommandCheck, ExecutionBinding, GitArtifact, NativeWork, TaskPublication, TaskWorkflow, WorkRef}
@@ -24,7 +25,7 @@ defmodule SymphonyElixir.TaskEvidence do
          {:ok, controls} <- TaskControl.observe(current_plan, work, TaskControl.recorded(runtime)),
          {:ok, results} <- TaskPublication.observe(runtime, snapshot, policy["engine_actor"]),
          current = Enum.filter(results, &scope?(&1.envelope, plan, member, policy)),
-         {:ok, selected} <- latest(current, "candidate"),
+         {:ok, selected} <- select_candidate(current, opts),
          {:ok, candidate, artifacts} <- candidate(selected, runtime, work, opts),
          {:ok, selected} <- select_verification(current, candidate, policy, opts),
          {:ok, verification} <- verification(selected, runtime, policy),
@@ -44,6 +45,43 @@ defmodule SymphonyElixir.TaskEvidence do
   @spec read_candidate(map(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def read_candidate(plan, work, runtime, policy, opts),
     do: read_member(plan, work, runtime, policy, Keyword.put(opts, :candidate_only, true))
+
+  @doc "Revalidate a consumer's pinned input against its original native verification, without selecting a newer candidate."
+  @spec read_input(map(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_input(plan, reference, runtime, policy, opts) do
+    opts = opts |> Keyword.delete(:candidate_only) |> Keyword.put(:input_reference, reference)
+
+    with {:ok, facts} <- read_member(plan, reference["work"], runtime, policy, opts),
+         %{candidate: %{} = candidate, verification: %{} = verification} <- facts,
+         true <-
+           verification["source"] == reference["verification"] and
+             Enum.any?(candidate["artifacts"], &(&1["id"] == reference["artifact"] and &1["version"] == reference["version"])) do
+      {:ok, facts}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :pinned_input_unconfirmed}
+    end
+  end
+
+  defp select_candidate(current, opts) do
+    case opts[:input_reference] do
+      nil ->
+        latest(current, "candidate")
+
+      reference ->
+        case Enum.filter(pinned_results(current, reference), &(&1.envelope["kind"] == "verification")) do
+          [%{envelope: envelope}] ->
+            current
+            |> Enum.filter(&(&1.envelope["kind"] == "candidate" and TaskWorkflow.digest(&1.envelope["payload"]) == envelope["payload"]["candidate"]))
+            |> latest("candidate")
+
+          _ ->
+            {:error, :pinned_input_unconfirmed}
+        end
+    end
+  end
+
+  defp pinned_results(current, reference), do: Enum.filter(current, &(&1.receipt && &1.receipt["source"] == reference["verification"]))
 
   defp select_verification(current, candidate, policy, opts) do
     if opts[:candidate_only], do: {:ok, nil}, else: latest_verification(current, candidate, policy)

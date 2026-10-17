@@ -64,6 +64,23 @@ defmodule SymphonyElixir.TaskLifecycleTest do
     flow
   end
 
+  test "dependency verification uses technical evidence independently of delivery and runtime activity" do
+    context = fixture() |> candidate() |> verified()
+    assert {:ok, artifacts} = TaskLifecycle.verified_artifacts(context)
+    assert artifacts == context.evidence["candidate"]["artifacts"]
+    narrow = Map.update!(context, :evidence, &Map.take(&1, ~w(sources candidate verification dependencies)))
+    assert {:ok, ^artifacts} = TaskLifecycle.verified_artifacts(narrow)
+    assert {:error, :dependency_not_verified} = TaskLifecycle.verified_artifacts(fixture())
+    assert {:error, :dependency_not_verified} = TaskLifecycle.verified_artifacts(put_in(context.evidence["verification"]["checks"], []))
+    failed = put_in(context.evidence["verification"]["findings"], [finding()])
+    assert {:error, :dependency_not_verified} = TaskLifecycle.verified_artifacts(failed)
+    unknown = put_in(context.evidence["verification"]["findings"], [Map.put(finding(), "status", "unknown")])
+    assert {:error, :dependency_not_verified} = TaskLifecycle.verified_artifacts(unknown)
+    changed = update_in(context.runtime["execution_history"], &Enum.map(&1, fn r -> put_in(r["execution_binding"]["plan_revision"], TaskWorkflow.digest("old")) end))
+    assert {:error, :invalid_persisted_execution_binding} = TaskLifecycle.verified_artifacts(changed)
+    assert {:error, :incomplete_verification_policy} = TaskLifecycle.verified_artifacts(%{context | policy: %{}})
+  end
+
   defp candidate(context) do
     flow = assess(context)
     assert {:ok, record} = ExecutionBinding.bind(context.runtime, flow["next_binding"])

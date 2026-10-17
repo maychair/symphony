@@ -4,7 +4,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{TaskEvidence, TaskLifecycle}
+  alias SymphonyElixir.{TaskDependencies, TaskEvidence, TaskLifecycle}
   alias SymphonyElixir.TaskPlanPreflight
 
   defp contract(work, parent) do
@@ -27,12 +27,26 @@ defmodule SymphonyElixir.TaskPublicationTest do
     Map.put(data, "contract_sha", TaskWorkflow.digest(data))
   end
 
-  defp fixture(provider) do
+  defp fixture(provider, stages \\ []) do
     work = %{"provider" => provider, "host" => provider <> ".test", "repository_id" => "10", "kind" => "issue", "number" => 2}
     parent = %{work | "number" => 1}
     child_scope = contract(work, parent)
-    root_scope = contract(parent, nil)
+    root_scope = contract(parent, nil) |> Map.delete("contract_sha") |> Map.put("budget_ms", 100_000 * (1 + length(stages)))
+    root_scope = Map.put(root_scope, "contract_sha", TaskWorkflow.digest(root_scope))
     member = %{"work" => work, "contract_sha" => child_scope["contract_sha"], "criteria" => ["result"], "budget_ms" => 100_000, "human_gate" => false}
+
+    extra =
+      Enum.with_index(stages, 3)
+      |> Enum.map(fn {_, number} ->
+        child = %{work | "number" => number}
+        %{member | "work" => child, "contract_sha" => contract(child, parent)["contract_sha"]}
+      end)
+
+    edges =
+      Enum.with_index(stages, 3)
+      |> Enum.map(fn {stage, number} ->
+        %{"from" => %{work | "number" => number - 1}, "to" => %{work | "number" => number}, "artifact" => "output", "criteria" => ["result"], "stage" => stage}
+      end)
 
     {:ok, plan} =
       TaskPlan.seal(%{
@@ -40,10 +54,10 @@ defmodule SymphonyElixir.TaskPublicationTest do
         "contract_sha" => root_scope["contract_sha"],
         "authorizer" => "1",
         "criteria" => ["result"],
-        "members" => [member],
-        "dependencies" => [],
-        "integration" => work,
-        "budget_ms" => 100_000
+        "members" => [member | extra],
+        "dependencies" => edges,
+        "integration" => %{work | "number" => 2 + length(stages)},
+        "budget_ms" => root_scope["budget_ms"]
       })
 
     approval = note(1, 1, "<!-- symphony-plan-decision " <> Jason.encode!(%{"action" => "authorize", "revision" => plan["revision"]}) <> " -->")
@@ -71,6 +85,13 @@ defmodule SymphonyElixir.TaskPublicationTest do
       (prefix <> "/issues/2" <> suffix) => []
     }
 
+    objects =
+      Enum.reduce(extra, objects, fn member, objects ->
+        child = member["work"]
+        path = prefix <> "/issues/#{child["number"]}"
+        objects |> Map.put(path, raw.(child["number"], block(contract(child, parent)))) |> Map.put(path <> suffix, [])
+      end)
+
     state = start_supervised!({Agent, fn -> %{objects: objects, posts: [], mode: :success} end}, id: make_ref())
 
     request = fn ^provider, "GET", path, _, _ ->
@@ -80,7 +101,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
     writer = fn ^provider, "POST", path, query, %{"body" => body}, _ ->
       assert query == %{}
 
-      assert path == prefix <> "/issues/2" <> suffix
+      assert path in Enum.map(2..(2 + length(stages)), &(prefix <> "/issues/#{&1}" <> suffix))
       Agent.get_and_update(state, &store_post(&1, path, body))
     end
 
@@ -197,6 +218,182 @@ defmodule SymphonyElixir.TaskPublicationTest do
     {:ok, verifier} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
     {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "tool-verifier", "workspace" => fixture.workspace})
     task_tools(fixture, verifier)
+  end
+
+  defp verified_tools(f) do
+    assert {true, _} = tool(task_tools(f), "task_candidate", candidate_args(f))
+    verifier = verifier_tools(f, current(f))
+    assert {true, %{"data" => %{"exit_code" => 0}}} = tool(verifier, "task_check", %{"check_id" => "test"})
+    assert {true, _} = tool(verifier, "task_verification", %{"review_checks" => [], "findings" => [], "summary" => "Verified fixed output"})
+    f
+  end
+
+  defp executions(fixtures), do: Map.new(fixtures, &{WorkRef.key(&1.payload["work"]), %{directory: &1.record["directory"], policy: &1.opts[:policy]}})
+
+  defp dependencies(f, number, inputs, fixtures, opts \\ nil) do
+    opts = opts || f.opts
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(f.parent, opts)
+    TaskDependencies.read(plan, %{f.payload["work"] | "number" => number}, inputs, executions(fixtures), opts)
+  end
+
+  defp inputs(facts), do: Enum.map(facts.dependencies, &Map.take(&1, ~w(work artifact version verification)))
+
+  defp consumer(f, number, inputs, producers) do
+    work = %{f.payload["work"] | "number" => number}
+    binding = %{f.record["execution_binding"] | "work" => work, "contract_sha" => contract(work, f.parent)["contract_sha"], "inputs" => inputs}
+    {:ok, record} = RunJournal.admit(Path.dirname(f.record["directory"]), WorkRef.key(work), execution_binding: binding)
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "developer-#{number}"})
+    payload = Map.take(binding, ~w(work contract_sha inputs)) |> Map.put("artifacts", Enum.map(f.payload["artifacts"], &Map.put(&1, "source", GitArtifact.source_ref(work, f.git.revision))))
+
+    %{
+      f
+      | record: record,
+        payload: payload,
+        opts: Keyword.put(f.opts, :dependency_executions, executions(producers)),
+        child: String.replace(f.child, "/issues/2", "/issues/#{number}"),
+        notes: String.replace(f.notes, "/issues/2", "/issues/#{number}")
+    }
+  end
+
+  test "native verified dependencies are transitive, retained and consumed by role tools on both providers" do
+    for provider <- ["github", "gitlab"] do
+      f = fixture(provider, ["verified", "verified"]) |> git_artifact()
+      assert {:error, :dependency_not_verified} = dependencies(f, 3, nil, [f])
+      f = verified_tools(f)
+      assert {:ok, facts} = dependencies(f, 3, nil, [f])
+      assert [%{"stage" => "verified", "version" => revision}] = facts.dependencies
+      assert revision == f.git.revision
+      assert {:ok, ^facts} = dependencies(f, 3, inputs(facts), [f])
+      root = Path.join(Path.dirname(f.record["directory"]), ".artifacts")
+      assert {:ok, owners} = ArtifactStore.references(root, f.payload["work"], revision, f.opts)
+      assert Enum.any?(owners, &(&1["kind"] == "dependency" and &1["work"]["number"] == 3))
+
+      second = consumer(f, 3, inputs(facts), [f]) |> verified_tools()
+      assert {:ok, downstream} = dependencies(f, 4, nil, [f, second])
+      assert hd(downstream.dependencies)["work"] == second.payload["work"]
+      third = consumer(f, 4, inputs(downstream), [f, second])
+      tools = task_tools(third)
+      assert {true, %{"data" => %{"dependencies" => proofs}}} = tool(tools, "task_context", %{})
+      assert proofs == downstream.dependencies
+
+      # A missing upstream publication blocks effects even when the intermediate result is intact.
+      Agent.update(f.state, &put_in(&1.objects[f.notes], []))
+      before = posts(f)
+      assert {false, _} = tool(tools, "task_candidate", candidate_args(third))
+      assert posts(f) == before
+      assert {:error, :pinned_input_unconfirmed} = dependencies(f, 4, inputs(downstream), [f, second])
+    end
+  end
+
+  test "dependency observation refuses missing journals, mismatched inputs and delivery-stage shortcuts" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    assert {:error, :dependency_execution_unavailable} = dependencies(f, 3, nil, [])
+    assert {:error, :dependency_inputs_do_not_match_plan} = dependencies(f, 3, [], [f])
+    assert {:error, :dependency_inputs_do_not_match_plan} = dependencies(f, 3, "invalid", [f])
+    assert {:error, :not_plan_member} = dependencies(f, 42, nil, [f])
+    {:ok, facts} = dependencies(f, 3, nil, [f])
+    [input] = inputs(facts)
+    assert {:error, :pinned_input_unconfirmed} = dependencies(f, 3, [Map.put(input, "version", String.duplicate("0", 40))], [f])
+    assert {:error, :pinned_input_unconfirmed} = dependencies(f, 3, [Map.put(input, "verification", "missing")], [f])
+    changed_policy = Keyword.put(f.opts, :policy, Map.put(f.opts[:policy], "max_repairs", 1))
+    assert {:error, :pinned_input_unconfirmed} = dependencies(f, 3, [input], [%{f | opts: changed_policy}])
+
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    invalid = put_in(plan.plan["revision"], "invalid")
+    assert {:error, :plan_revision_changed} = TaskDependencies.read(invalid, f.payload["work"], nil, executions([f]), f.opts)
+    root = Path.join(Path.dirname(f.record["directory"]), ".artifacts")
+    reference = Path.wildcard(Path.join(root, "*.ref")) |> Enum.find(&(Jason.decode!(File.read!(&1))["owner"]["kind"] == "dependency"))
+    File.write!(reference, "damaged consumer ownership")
+    assert {:error, :artifact_publication_conflict} = dependencies(f, 3, [input], [f])
+
+    for stage <- ["delivered", "published"] do
+      staged = fixture("gitlab", [stage]) |> git_artifact() |> verified_tools()
+      Agent.update(staged.state, &put_in(&1.objects[staged.child]["state"], "closed"))
+      assert {:error, :dependency_delivery_evidence_unavailable} = dependencies(staged, 3, nil, [staged])
+    end
+  end
+
+  test "new candidates do not silently replace a pinned valid input" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    {:ok, facts} = dependencies(f, 3, nil, [f])
+    original = inputs(facts)
+    {:ok, stopped} = RunJournal.checkpoint(current(f), %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    binding = %{stopped["execution_binding"] | "role" => "developer"}
+    {:ok, record} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "next-developer"})
+    changed = put_in(f.payload["artifacts"], Enum.map(f.payload["artifacts"], &Map.put(&1, "version", String.duplicate("a", 40))))
+    # An unverified new candidate has no usable bytes; the older pinned input remains independently provable.
+    {:ok, _, _} = TaskPublication.publish(record, "candidate", changed.payload, "New candidate", f.opts)
+    assert {:ok, ^facts} = dependencies(f, 3, original, [f])
+    assert {:error, _} = dependencies(f, 3, nil, [f])
+    Agent.update(f.state, &update_in(&1.objects[f.notes], fn [_candidate, verification, newer] -> [verification, newer] end))
+    assert {:error, :current_result_unconfirmed} = dependencies(f, 3, original, [f])
+  end
+
+  test "a newer verification of the same candidate invalidates the old pinned verdict" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    {:ok, facts} = dependencies(f, 3, nil, [f])
+    original = inputs(facts)
+    {:ok, stopped} = RunJournal.checkpoint(current(f), %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    binding = %{stopped["execution_binding"] | "role" => "developer"}
+    {:ok, developer} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
+    {:ok, developer} = RunJournal.checkpoint(developer, %{"thread_id" => "recheck-developer", "native_stop_confirmed" => true})
+    :ok = RunJournal.complete(developer, "completed")
+    {:ok, verifier} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: stopped["execution_binding"])
+    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "recheck-verifier", "workspace" => f.workspace})
+    tools = task_tools(f, verifier)
+    assert {true, _} = tool(tools, "task_check", %{"check_id" => "test"})
+
+    finding = %{
+      "id" => "F1",
+      "criterion" => "result",
+      "status" => "unknown",
+      "required" => true,
+      "rationale" => "Contradictory source needs resolution",
+      "problem_sha" => TaskWorkflow.digest("problem"),
+      "repair_basis_sha" => TaskWorkflow.digest("basis"),
+      "evidence" => [hd(f.payload["artifacts"])["source"]]
+    }
+
+    assert {true, _} = tool(tools, "task_verification", %{"review_checks" => [], "findings" => [finding], "summary" => "Unresolved evidence"})
+    assert {:error, :pinned_input_unconfirmed} = dependencies(f, 3, original, [f])
+    assert {:error, :dependency_not_verified} = dependencies(f, 3, nil, [f])
+  end
+
+  test "dependency evidence is fenced against native and journal changes during the read" do
+    for mutation <- [:parent, :consumer, :journal, :journal_missing, :native_error] do
+      f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+      root = Path.join(Path.dirname(f.record["directory"]), ".artifacts")
+      original = f.opts[:request]
+
+      request = fn provider, method, path, query, settings ->
+        {:ok, owners} = ArtifactStore.references(root, f.payload["work"], f.git.revision, f.opts)
+        pinned = Enum.any?(owners, &(&1["kind"] == "dependency"))
+        trigger = pinned and path == String.replace_suffix(f.parent_notes, "/comments", "") and not Agent.get(f.state, &Map.get(&1, :dependency_mutated, false))
+
+        if trigger do
+          Agent.update(f.state, &Map.put(&1, :dependency_mutated, true))
+
+          case mutation do
+            :parent -> Agent.update(f.state, &put_in(&1.objects[f.parent_notes], &1.objects[f.parent_notes] ++ [control(f, :parent, "pause", 50)]))
+            :consumer -> Agent.update(f.state, &put_in(&1.objects[String.replace(f.notes, "/issues/2", "/issues/3")], [note(50, 1, "Consumer changed")]))
+            :journal -> assert {:ok, _} = RunJournal.checkpoint(current(f), %{"phase" => "changed"})
+            :journal_missing -> File.rm!(Path.join(f.record["directory"], "run.json"))
+            :native_error -> :ok
+          end
+        end
+
+        if trigger and mutation == :native_error do
+          {:error, :offline}
+        else
+          original.(provider, method, path, query, settings)
+        end
+      end
+
+      assert {:error, _} = dependencies(f, 3, nil, [f], Keyword.put(f.opts, :request, request))
+    end
   end
 
   test "role tools publish retained candidates and actual command results through both native providers" do
