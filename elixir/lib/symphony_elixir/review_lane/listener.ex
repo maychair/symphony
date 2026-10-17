@@ -6,7 +6,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   """
   use GenServer
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitLab, Owner, Policy, Publication}
+  alias SymphonyElixir.ReviewLane.{GitLab, Journal, Owner, Policy, Publication}
 
   @worker_fields ~w(thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
@@ -41,6 +41,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       records: %{},
       hints: %{},
       owners: %{},
+      journal: nil,
       last_event_at: nil,
       error: nil,
       initial_config: opts[:config]
@@ -51,6 +52,17 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   @impl true
   def handle_call(message, from, state) do
+    if message == :health or is_nil(state.config) do
+      handle_current_call(message, from, state)
+    else
+      case Journal.check(state.journal) do
+        :ok -> handle_current_call(message, from, state)
+        {:error, reason} -> {:stop, {:review_journal_lost, reason}, {:error, reason}, state}
+      end
+    end
+  end
+
+  defp handle_current_call(message, from, state) do
     bypass = message == :health or match?({:checkpoint, _, _, _}, message) or is_nil(state.config)
 
     if bypass or current_config?(state),
@@ -243,6 +255,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   @impl true
+  def handle_info(:configure, %{journal: %{} = _journal} = state), do: {:noreply, state}
+
   def handle_info(:configure, state) do
     settings = initial_settings(state.initial_config)
 
@@ -284,14 +298,28 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
+  def handle_info({port, {:exit_status, status}}, %{journal: %{port: owned}} = state) when port == owned do
+    {:stop, {:review_journal_lost, status}, state}
+  end
+
   def handle_info(_message, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state), do: Journal.close(state.journal)
 
   defp initial_settings(nil), do: Config.settings()
   defp initial_settings(config), do: {:ok, %{tracker: %{provider: %{"review_lane" => config}}}}
 
-  defp current_config?(%{initial_config: config}) when is_map(config), do: true
-
   defp current_config?(state) do
+    case Journal.check(state.journal) do
+      :ok -> config_current?(state)
+      {:error, reason} -> exit({:review_journal_lost, reason})
+    end
+  end
+
+  defp config_current?(%{initial_config: config}) when is_map(config), do: true
+
+  defp config_current?(state) do
     with :ok <- Config.validate!(),
          {:ok, %{tracker: %{provider: %{"review_lane" => %{"enabled" => true} = config}}}} <- Config.settings() do
       SymphonyElixir.ReviewLane.resolve(config) == state.config
@@ -314,19 +342,19 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp load(state, raw_config) do
     config = SymphonyElixir.ReviewLane.resolve(raw_config)
-    path = Path.join(config["state_dir"], "review-lane.json")
 
     with :ok <- SymphonyElixir.ReviewLane.validate_config(%{provider: %{"review_lane" => config}}),
          true <- not File.exists?(Path.join(config["state_dir"], "mail-review.json")) or {:error, :legacy_review_journal_requires_migration},
-         :ok <- File.mkdir_p(config["state_dir"]) do
-      case File.read(path) do
-        {:ok, content} ->
-          restore(state, config, content)
+         {:ok, journal, content} <- Journal.open(config["state_dir"]) do
+      owned = %{state | journal: journal}
+      result = if is_nil(content), do: {:ok, %{owned | config: config}}, else: restore(owned, config, content)
 
-        {:error, :enoent} ->
-          {:ok, %{state | config: config}}
+      case result do
+        {:ok, _} ->
+          result
 
         error ->
+          Journal.close(journal)
           error
       end
     end
@@ -674,20 +702,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp scope(config), do: Map.take(config, ["provider", "host", "reviewer_id", "publisher_id", "projects", "allow_insecure_http"])
 
   defp persist(state) do
-    path = Path.join(state.config["state_dir"], "review-lane.json")
-    File.write!(path <> ".pending", Jason.encode!(%{"schema_version" => 2, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints}), [:sync])
-    File.rename!(path <> ".pending", path)
-    sync_directory!(Path.dirname(path))
+    body = Jason.encode!(%{"schema_version" => 2, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints})
+    :ok = Journal.write!(state.journal, body)
     state
-  end
-
-  defp sync_directory!(path) do
-    {:ok, directory} = :file.open(String.to_charlist(path), [:read, :raw, :directory])
-
-    try do
-      :ok = :file.sync(directory)
-    after
-      :file.close(directory)
-    end
   end
 end

@@ -6,7 +6,12 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   setup do
     root = Path.dirname(Workflow.workflow_file_path())
     Supervisor.terminate_child(SymphonyElixir.Supervisor, Listener)
-    on_exit(fn -> Supervisor.restart_child(SymphonyElixir.Supervisor, Listener) end)
+
+    on_exit(fn ->
+      write_workflow_file!(Path.join(root, "WORKFLOW.md"), tracker_kind: "memory")
+      Supervisor.restart_child(SymphonyElixir.Supervisor, Listener)
+    end)
+
     fixture = Path.join(root, "fixture")
     File.mkdir_p!(Path.join(root, "source"))
     File.write!(Path.join(root, "instructions"), "Review only; no subagents.")
@@ -92,6 +97,52 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     start_supervised!({Listener, config: config})
     await_listener()
     {:ok, root: root, config: config}
+  end
+
+  test "a second Listener cannot discover or write through an already owned journal", c do
+    {:ok, [_]} = Listener.issues()
+    path = Path.join(c.config["state_dir"], "review-lane.json")
+    before = File.read!(path)
+    options = [config: c.config, name: :review_contender]
+    contender = start_supervised!(Supervisor.child_spec({Listener, options}, id: :review_contender))
+    send(contender, :configure)
+    assert %{health: :failed, error: error} = GenServer.call(contender, :health)
+    assert error =~ "review_journal_locked"
+    assert {:ok, []} = GenServer.call(contender, :issues)
+    assert File.read!(path) == before
+    copied = :sys.get_state(Listener)
+
+    assert {:stop, {:review_journal_lost, :review_journal_not_owned}, {:error, :review_journal_not_owned}, ^copied} =
+             Listener.handle_call(:issues, self(), copied)
+
+    assert catch_exit(Listener.handle_info(:poll, copied)) == {:review_journal_lost, :review_journal_not_owned}
+    assert :ok = Listener.request_review("team/repo", 1)
+    assert Listener.health().health == :listening
+    send(Listener, :configure)
+    assert Listener.health().health == :listening
+  end
+
+  @tag capture_log: true
+  test "broker death terminates its Listener and a confirmed dead controller can restart", c do
+    config = Map.put(c.config, "state_dir", Path.join(c.root, "separate-state"))
+    {:ok, pid} = GenServer.start(Listener, config: config)
+    send(pid, :configure)
+    assert %{health: :listening} = GenServer.call(pid, :health)
+    assert {:ok, [_]} = GenServer.call(pid, :issues)
+    state = :sys.get_state(pid)
+    {:os_pid, broker_pid} = Port.info(state.journal.port, :os_pid)
+    ref = Process.monitor(pid)
+    :ok = :sys.suspend(pid)
+    port = state.journal.port
+    port_ref = Port.monitor(port)
+    assert {_, 0} = System.cmd("kill", ["-KILL", to_string(broker_pid)])
+    assert_receive {:DOWN, ^port_ref, :port, ^port, _}, 2_000
+    :ok = :sys.resume(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:review_journal_lost, _}}, 2_000
+    {:ok, replacement} = GenServer.start(Listener, config: config)
+    send(replacement, :configure)
+    assert %{health: :listening} = GenServer.call(replacement, :health)
+    GenServer.stop(replacement)
   end
 
   test "queued and running review survives repeated routing polls; completion stays durable and deduplicated", c do
@@ -611,21 +662,27 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
              Listener.handle_call({:request_review, "team/repo", 1}, self(), disabled)
 
     assert {:noreply, ^disabled} = Listener.handle_info(:poll, disabled)
-    state = :sys.get_state(Listener)
-    changed = %{state | initial_config: nil}
-
-    assert {:reply, {:error, :review_lane_configuration_changed_restart_required}, suspended} =
-             Listener.handle_call(:issues, self(), changed)
-
-    assert suspended.health == :failed
-    assert {:noreply, %{health: :failed}} = Listener.handle_info(:check_config, changed)
-    assert {:noreply, %{health: :failed}} = Listener.handle_info(:poll, changed)
-    assert {:noreply, ^state} = Listener.handle_info(:unknown, state)
+    :sys.replace_state(Listener, &%{&1 | initial_config: nil})
+    assert {:error, :review_lane_configuration_changed_restart_required} = Listener.issues()
+    assert Listener.health().health == :failed
+    send(Listener, :check_config)
+    assert Listener.health().health == :failed
+    send(Listener, :poll)
+    assert Listener.health().health == :failed
+    before_unknown = :sys.get_state(Listener)
+    send(Listener, :unknown)
+    assert :sys.get_state(Listener) == before_unknown
+    stop_supervised!(Listener)
     File.write!(Path.join(c.config["state_dir"], "review-lane.json"), "{}")
-    {:ok, initial} = Listener.init(config: c.config)
-    assert {:noreply, %{health: :failed}} = Listener.handle_info(:configure, initial)
+    start_supervised!({Listener, config: c.config})
+    send(Listener, :configure)
+    assert %{health: :failed, error: error} = Listener.health()
+    assert error =~ "invalid_review_journal"
+    stop_supervised!(Listener)
     File.write!(Path.join(c.config["state_dir"], "mail-review.json"), "legacy execution receipts")
-    assert {:noreply, %{health: :failed, error: error}} = Listener.handle_info(:configure, initial)
+    start_supervised!({Listener, config: c.config})
+    send(Listener, :configure)
+    assert %{health: :failed, error: error} = Listener.health()
     assert error =~ "legacy_review_journal_requires_migration"
   end
 
@@ -643,9 +700,12 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
           %{"hints" => %{"bad" => nil}},
           %{"records" => %{id => Map.put(original["records"][id], "head", "invalid")}}
         ] do
+      stop_supervised!(Listener)
       File.write!(path, Jason.encode!(Map.merge(original, change)))
-      {:ok, initial} = Listener.init(config: c.config)
-      assert {:noreply, %{health: :failed}} = Listener.handle_info(:configure, initial)
+      start_supervised!({Listener, config: c.config})
+      send(Listener, :configure)
+      assert %{health: :failed, error: error} = Listener.health()
+      assert error =~ "invalid_review_journal"
     end
 
     File.write!(path, Jason.encode!(original))
@@ -943,8 +1003,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
 
     :ok = WorkflowStore.force_reload()
     assert SymphonyElixir.ReviewLane.config() == config
-    state = :sys.get_state(Listener)
-    assert {:reply, {:ok, _}, _} = Listener.handle_call(:issues, self(), %{state | initial_config: nil, config: config})
+    :sys.replace_state(Listener, &%{&1 | initial_config: nil, config: config})
+    assert {:ok, _} = Listener.issues()
     {:ok, reviews} = SymphonyElixir.Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states)
     review = Enum.find(reviews, &(&1.kind == :review))
     assert review
@@ -979,10 +1039,13 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     end
 
     path = Path.join(c.config["state_dir"], "review-lane.json")
+    stop_supervised!(Listener)
     File.rm!(path)
     File.mkdir!(path)
-    {:ok, initial} = Listener.init(config: c.config)
-    assert {:noreply, %{health: :failed}} = Listener.handle_info(:configure, initial)
+    start_supervised!({Listener, config: c.config})
+    send(Listener, :configure)
+    assert %{health: :failed, error: error} = Listener.health()
+    assert error =~ "Is a directory"
   end
 
   test "malformed native work and missing discussion evidence stop eligibility without inventing another review", c do

@@ -745,8 +745,46 @@ stop request through their existing native connection. The round remains fenced
 against new allocation and submission, but its authentic owner can still report
 native identities observed in flight and the eventual stop result. Other VM
 incarnations and legacy ownerless active records do not gain callback authority
-or inferred stop confirmation. Exclusive journal ownership across scheduler
-processes and native orphan recovery after VM loss remain under development.
+or inferred stop confirmation. Journal exclusion is described below; native
+orphan recovery after VM loss remains under development.
+
+## Exclusive review journal ownership
+
+The opt-in review lane requires Linux, Python 3, a local filesystem with working
+`flock`/atomic rename/fsync semantics, and `/proc` visibility of the service's
+processes. All controllers for one review lane must share the same durable
+`state_dir`; separate journal copies do not coordinate with each other. One
+journal broker owns both the kernel lock and every journal read and write. A separate lock-holder beside ordinary Listener file writes would
+allow an old Listener to keep writing after the lock-holder died.
+
+`review-journal.lock` is permanent and must not be deleted to recover a service.
+The broker checks the held inode against that path before each operation.
+`review-journal-owner.json` records the Listener's VM/process ticket, BEAM OS PID
+and process start time, machine, boot and PID namespace, and clean-release fact.
+The Listener passes its BEAM PID explicitly: a spawned port's parent may instead
+be `erl_child_setup`. Writes replace the journal atomically after file fsync and
+sync the containing directory before acknowledging persistence.
+
+Acquiring the kernel lock is necessary but insufficient. A successor also needs
+a clean predecessor release, a dead Listener in the same live VM, or a foreign
+VM's OS process proven absent/replaced in the same machine, boot and namespace.
+A living predecessor, unreadable/malformed receipt or unknown process context
+fences admission. EOF, broker death and timeout do not manufacture clean release.
+A failed transport cannot be reused for further writes. A second Listener fails
+before discovery or publication; copied transport handles do not confer ownership.
+
+Journal ownership proves only controller exclusion. It does not prove that a
+previous native app-server, thread or turn has stopped. Existing record-level
+native-stop and worker-owner gates still apply, including after a real OS
+controller exits. Retained native execution remains uncertain until its separate
+stop evidence can be established.
+
+An existing `review-lane.json` without an ownership receipt fails with
+`review_journal_owner_missing_migration_required`; it is not silently claimed.
+Older binaries do not honor this lock, so rollout must stop and verify all old
+controllers before explicit migration. Cross-host/boot/namespace recovery and
+native orphan takeover are not automated. Retain the journal and snapshots for
+operator recovery; deleting receipts to bypass exclusion is not a migration.
 
 ## Live review cancellation
 
