@@ -765,15 +765,34 @@ defmodule SymphonyElixir.TaskSessionTest do
   end
 
   @tag :unadmitted
-  test "the member worker runs independent report development, verification, repair and re-verification", c do
+  test "the configured member worker runs independent report development, verification, repair and re-verification", c do
     key = WorkRef.key(c.work)
     instructions = %{"developer" => "Keep the report reproducible.", "verifier" => "Review the report independently."}
     registry = update_in(c.registry, [key, :policy], &Map.put(&1, "role_instructions", instructions))
+    repositories = Enum.map(c.opts[:repositories], &Map.put(&1, "execution", %{"policy" => registry[key].policy}))
+    env = "SYMPHONY_CONFIGURED_ROOT_FIXTURE"
+    previous = System.get_env(env)
+    System.put_env(env, Path.dirname(c.record["directory"]))
+    on_exit(fn -> restore_env(env, previous) end)
+    workflow = File.read!(Workflow.workflow_file_path())
+    workflow = String.replace(workflow, "tracker:\n", "tracker:\n  provider: " <> Jason.encode!(%{"plan_repositories" => repositories}) <> "\n")
+    workflow = String.replace(workflow, "agent:\n", "agent:\n  run_journal_dir: $#{env}\n")
+    File.write!(Workflow.workflow_file_path(), workflow)
+    WorkflowStore.force_reload()
+    opts = Keyword.delete(c.opts, :repositories)
+    assert {:ok, configured} = SymphonyElixir.TaskExecutionConfig.prepare(c.parent, Keyword.put(opts, :journal_root, "$#{env}"))
+    assert configured.executions[key].directory == c.record["directory"]
+    assert {:error, :unsupported_task_session_transport} = AgentRunner.run_configured_member(c.parent, c.work, nil, Keyword.put(opts, :worker_host, "remote"))
+
+    assert {:error, {:member_execution_configuration, _, :missing_repository_execution_policy}} =
+             AgentRunner.run_configured_member(c.parent, c.work, nil, c.opts)
+
+    refute File.exists?(c.trace)
 
     results =
       Enum.map(["develop", "reject", "develop", "verify"], fn mode ->
         File.write!(c.mode, mode)
-        assert {:ok, result} = AgentRunner.run_member(c.parent, c.work, registry, self(), c.opts)
+        assert {:ok, result} = AgentRunner.run_configured_member(c.parent, c.work, self(), opts)
         assert result.record["native_stop_confirmed"]
         refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
         assert_receive {:worker_runtime_info, ^key, %{worker_host: nil, workspace_path: workspace}}
@@ -790,7 +809,7 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert final.flow["repair_count"] == 1
     assert final.flow["closeable"]
     assert final.flow["outcome"] == "delivered"
-    assert {:waiting, _} = AgentRunner.run_member(c.parent, c.work, registry, nil, c.opts)
+    assert {:waiting, _} = AgentRunner.run_configured_member(c.parent, c.work, nil, opts)
     assert Agent.get(c.state, & &1["/repos/team/repo/issues/2"]["state"]) == "open"
     goals = requests(c) |> Enum.filter(&(get_in(&1, ["params", "status"]) == "active")) |> Enum.map(& &1["params"]["objective"])
     assert Enum.at(goals, 0) =~ "Keep the report reproducible."

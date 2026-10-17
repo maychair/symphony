@@ -20,6 +20,7 @@ defmodule SymphonyElixir.TaskPlanPreflightTest do
       "non_goals" => ["No extra scope"],
       "criteria" => ["result"],
       "criteria_details" => %{"result" => "The result reproduces the approved behavior"},
+      "verification_checks" => %{"result" => ["review"]},
       "authorizer" => "1",
       "acceptance_mode" => if(is_nil(parent), do: "separate", else: "technical"),
       "acceptor" => if(is_nil(parent), do: "2", else: nil),
@@ -125,6 +126,26 @@ defmodule SymphonyElixir.TaskPlanPreflightTest do
     assert copy.native_ref["plan_preflight"]["reason"] == "parent_projection_changed"
     [unconfigured] = TaskPlanPreflight.project([TaskPlan.project(issue)], Keyword.put(options(fixture), :roots, []))
     assert unconfigured.native_ref["plan_preflight"]["status"] == "unconfigured"
+  end
+
+  test "the execution registry follows native cross-provider membership and requires the member repository policy" do
+    f = fixture()
+    root = Path.join(System.tmp_dir!(), "configured-plan-#{System.unique_integer([:positive])}")
+    policy = %{"engine_actor" => "99", "max_retries" => 2, "max_repairs" => 1, "checks" => %{"review" => %{"kind" => "review"}}}
+    [parent, child] = f.repositories
+    catalog = [parent, Map.put(child, "execution", %{"policy" => policy})]
+    opts = options(f) |> Keyword.put(:journal_root, root) |> Keyword.put(:repositories, catalog)
+    assert {:ok, configured} = SymphonyElixir.TaskExecutionConfig.prepare(f.parent, opts)
+    assert Map.keys(configured.executions) == [WorkRef.key(f.child)]
+    assert configured.executions[WorkRef.key(f.child)].policy == policy
+    assert configured.plan.authority["work"] == f.parent
+    refute File.exists?(root)
+
+    invalid = Keyword.put(opts, :repositories, [Map.put(parent, "execution", %{"policy" => policy}), child])
+    result = SymphonyElixir.TaskExecutionConfig.prepare(f.parent, invalid)
+    assert {:error, {:member_execution_configuration, work, :missing_repository_execution_policy}} = result
+    assert work == f.child
+    refute File.exists?(root)
   end
 
   test "unregistered, duplicate and foreign endpoints fail before any HTTP call" do

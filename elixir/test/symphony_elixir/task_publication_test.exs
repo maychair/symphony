@@ -5,7 +5,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
   alias SymphonyElixir.{TaskDelivery, TaskDependencies, TaskEvidence, TaskExecution, TaskLifecycle}
-  alias SymphonyElixir.{TaskPlanPreflight, TaskWorkspace}
+  alias SymphonyElixir.{TaskExecutionConfig, TaskPlanPreflight, TaskWorkspace}
 
   defp contract(work, parent, kind \\ "report") do
     data = %{
@@ -539,6 +539,118 @@ defmodule SymphonyElixir.TaskPublicationTest do
 
   defp workspace_options(f), do: Keyword.put(f.opts, :workspace_root, Path.join(Path.dirname(f.record["directory"]), "workspaces"))
 
+  defp configured_options(f, config \\ %{}) do
+    execution = Map.merge(%{"policy" => f.opts[:policy]}, config)
+    repositories = Enum.map(f.opts[:repositories], &Map.put(&1, "execution", execution))
+    workspace_options(f) |> Keyword.put(:repositories, repositories) |> Keyword.put(:journal_root, Path.dirname(f.record["directory"]))
+  end
+
+  test "host configuration resolves every sealed member without allocating journals or accepting scope from configuration" do
+    f = report_fixture("github", ["verified"]) |> fresh_execution()
+    opts = configured_options(f)
+    assert {:ok, configured} = TaskExecutionConfig.prepare(f.parent, opts)
+    assert configured.plan.plan["parent"] == f.parent
+    assert map_size(configured.executions) == 2
+    assert configured.executions[WorkRef.key(f.payload["work"])] == executions([f])[WorkRef.key(f.payload["work"])]
+    refute File.exists?(f.record["directory"])
+
+    for {_key, entry} <- configured.executions do
+      assert entry.policy == f.opts[:policy]
+      refute File.exists?(entry.directory)
+    end
+
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, f.payload["work"], configured.executions, configured.opts)
+    assert admitted.record["execution_binding"]["policy_sha"] == TaskWorkflow.digest(f.opts[:policy])
+    assert Agent.get(f.state, & &1.posts) == []
+  end
+
+  test "incomplete host policy and unsafe journal roots fail before allocation" do
+    f = report_fixture("gitlab", []) |> fresh_execution()
+    opts = configured_options(f)
+
+    for root <- [nil, "relative", "/", Path.dirname(f.record["directory"]) <> "/../escaped"] do
+      assert {:error, :invalid_plan_journal_root} = TaskExecutionConfig.prepare(f.parent, Keyword.put(opts, :journal_root, root))
+    end
+
+    assert {:error, {:member_execution_configuration, _, :missing_repository_execution_policy}} =
+             TaskExecutionConfig.prepare(f.parent, Keyword.put(opts, :repositories, f.opts[:repositories]))
+
+    for policy <- [nil, Map.delete(f.opts[:policy], "max_retries"), Map.put(f.opts[:policy], "checks", %{})] do
+      assert {:error, {:member_execution_configuration, _, :incomplete_verification_policy}} =
+               TaskExecutionConfig.prepare(f.parent, configured_options(f, %{"policy" => policy}))
+    end
+
+    assert {:error, {:member_execution_configuration, _, :workspace_source_ambiguous}} =
+             TaskExecutionConfig.prepare(f.parent, configured_options(f, %{"workspace_artifact" => "missing"}))
+
+    failed = Keyword.put(opts, :request, fn _, _, _, _, _ -> raise "native unavailable" end)
+    assert {:error, {:execution_configuration_failed, :error, _}} = TaskExecutionConfig.prepare(f.parent, failed)
+    refute File.exists?(f.record["directory"])
+  end
+
+  test "configured code sources pin a native branch and preserve the developer base and edits when that branch advances" do
+    for provider <- ["github", "gitlab"] do
+      kind = if provider == "github", do: "pr", else: "mr"
+      f = fixture(provider, [], kind) |> fresh_execution()
+      root = Path.dirname(f.record["directory"])
+      git = GitArtifactFixture.create(Path.join(root, "source"), provider)
+      prefix = if provider == "github", do: "/repos/team/repo", else: "/projects/team%2Frepo"
+      branch_path = prefix <> if(provider == "github", do: "/branches/main", else: "/repository/branches/main")
+      key = if provider == "github", do: "sha", else: "id"
+      native = Map.new(git.objects, fn {path, body} -> {prefix <> path, body} end)
+      native = Map.put(native, branch_path, %{"name" => "main", "commit" => %{key => git.revision}})
+      Agent.update(f.state, &update_in(&1.objects, fn objects -> Map.merge(objects, native) end))
+      opts = configured_options(f, %{"repository" => git.path, "workspace_artifact" => "output"})
+      assert {:ok, configured} = TaskExecutionConfig.prepare(f.parent, opts)
+      entry = configured.executions[WorkRef.key(f.payload["work"])]
+      assert entry.base_revision == git.revision
+      assert entry.base_source["branch"] == "main"
+      assert {:ok, admitted} = TaskExecution.admit(f.parent, f.payload["work"], configured.executions, configured.opts)
+      digest = TaskWorkflow.digest(%{"binding" => admitted.record["execution_binding"], "generation" => admitted.record["execution_generation"]})
+      partial_manifest = Path.join([opts[:workspace_root], "task-" <> digest, "manifest.json"])
+
+      request = fn p, method, target, query, settings ->
+        if File.exists?(partial_manifest), do: {:error, :offline}, else: opts[:request].(p, method, target, query, settings)
+      end
+
+      assert {:error, :native_read_failed} = TaskWorkspace.prepare(admitted.record, configured.executions, Keyword.put(configured.opts, :request, request))
+      partial = current(f)
+      assert partial["task_source"]["revision"] == git.revision
+      refute partial["task_workspace"]
+      assert {:error, :bound_workspace_changed} = RunJournal.checkpoint(partial, %{"task_source" => nil})
+      assert {:error, :role_workspace_changed} = TaskWorkspace.validate(Map.put(partial, "task_source", nil))
+      assert {:error, :role_workspace_changed} = TaskWorkspace.validate(put_in(partial, ["task_source", "generation"], 999))
+      Agent.update(f.state, &put_in(&1.objects[branch_path]["commit"][key], String.duplicate("a", 40)))
+      assert {:ok, after_failure} = TaskExecutionConfig.prepare(f.parent, opts)
+      assert {:ok, prepared} = TaskWorkspace.prepare(partial, after_failure.executions, after_failure.opts)
+      # Journals written before source intents already have a complete bound manifest.
+      legacy = Map.delete(prepared, "task_source")
+      File.write!(Path.join(prepared["directory"], "run.json"), Jason.encode!(legacy))
+      assert {:ok, prepared} = TaskWorkspace.prepare(legacy, after_failure.executions, after_failure.opts)
+      assert prepared["task_source"]["revision"] == git.revision
+      manifest = Path.join(prepared["task_workspace"]["directory"], "manifest.json") |> File.read!() |> Jason.decode!()
+      assert manifest["source"]["base_source"] == entry.base_source
+      File.write!(Path.join(prepared["workspace"], "result"), "work in progress\n")
+      Agent.update(f.state, &put_in(&1.objects[branch_path]["commit"][key], String.duplicate("b", 40)))
+      assert {:ok, refreshed} = TaskExecutionConfig.prepare(f.parent, opts)
+      assert refreshed.executions[WorkRef.key(f.payload["work"])].base_revision != entry.base_revision
+      assert {:ok, resumed} = TaskWorkspace.prepare(prepared, refreshed.executions, refreshed.opts)
+      assert resumed["task_workspace"] == prepared["task_workspace"]
+      assert File.read!(Path.join(resumed["workspace"], "result")) == "work in progress\n"
+      assert GitArtifactFixture.git(git.path, ["status", "--porcelain"]) == ""
+
+      for repository <- ["relative", "$UNSET_SOURCE_#{System.unique_integer([:positive])}"] do
+        invalid = configured_options(f, %{"repository" => repository})
+        result = TaskExecutionConfig.prepare(f.parent, invalid)
+        assert {:error, {:member_execution_configuration, _, :workspace_repository_unavailable}} = result
+      end
+
+      invalid = configured_options(f, %{"repository" => git.path, "workspace_artifact" => "other"})
+      result = TaskExecutionConfig.prepare(f.parent, invalid)
+      assert {:error, {:member_execution_configuration, _, :workspace_source_ambiguous}} = result
+    end
+  end
+
   test "owned partial workspace preparation resumes but foreign directories and changed receipts block" do
     f = report_fixture("github", []) |> fresh_execution()
     registry = executions([f])
@@ -644,7 +756,8 @@ defmodule SymphonyElixir.TaskPublicationTest do
     assert :ok = TaskWorkspace.validate(prepared)
     assert {:error, :workspace_specification_changed} = TaskWorkspace.prepare(prepared, registry, Keyword.put(opts, :workspace_root, opts[:workspace_root] <> "-changed"))
     registry = update_in(registry, [WorkRef.key(work)], &Map.delete(&1, :base_revision))
-    assert {:error, :workspace_revision_unavailable} = TaskWorkspace.prepare(prepared, registry, opts)
+    assert {:ok, resumed} = TaskWorkspace.prepare(prepared, registry, opts)
+    assert resumed["task_workspace"] == prepared["task_workspace"]
   end
 
   test "generation worktrees preserve developer edits and give the verifier exact candidate bytes in a separate directory" do
@@ -694,8 +807,11 @@ defmodule SymphonyElixir.TaskPublicationTest do
     :ok = RunJournal.complete(stopped, "completed")
     assert {:ok, verifying} = TaskExecution.admit(f.parent, work, registry, opts)
     refute verifying.record["task_workspace"]
+    refute verifying.record["task_source"]
+    assert List.last(verifying.record["execution_history"])["task_source"] == developer["task_source"]
     refute verifying.record["workspace"]
     assert {:ok, verifier} = TaskWorkspace.prepare(verifying.record, registry, opts)
+    refute verifier["task_source"]
     assert verifier["workspace"] != developer["workspace"]
     assert File.read!(Path.join(verifier["workspace"], "result")) == "expected\n"
     assert :ok = TaskWorkspace.validate(verifier)

@@ -7,10 +7,11 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
   alias SymphonyElixir.ReviewLane.Runner
-  alias SymphonyElixir.{TaskExecution, TaskSession}
+  alias SymphonyElixir.{TaskExecution, TaskExecutionConfig, TaskSession}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
+  @type member_result :: {:ok, map()} | {:waiting, map()} | {:error, term()}
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
@@ -31,7 +32,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   @doc "Execute one plan-member role from native admission to owned finalization; the scheduler owns continuation."
-  @spec run_member(map(), map(), map(), pid() | nil, keyword()) :: {:ok, map()} | {:waiting, map()} | {:error, term()}
+  @spec run_member(map(), map(), map(), pid() | nil, keyword()) :: member_result()
   def run_member(parent, work, executions, recipient \\ nil, opts \\ []) do
     with true <- (ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])) or {:error, :unsupported_task_session_transport},
          {:ok, admitted} <- TaskExecution.admit(parent, work, executions, opts) do
@@ -49,6 +50,17 @@ defmodule SymphonyElixir.AgentRunner do
       ]
 
       TaskSession.run(admitted.record, executions, Keyword.merge(opts, callbacks))
+    end
+  end
+
+  @doc "Resolve every approved member's host configuration before entering the existing role worker."
+  @spec run_configured_member(map(), map(), pid() | nil, keyword()) :: member_result()
+  def run_configured_member(parent, work, recipient \\ nil, opts \\ []) do
+    local = ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])
+
+    with true <- local or {:error, :unsupported_task_session_transport},
+         {:ok, configured} <- TaskExecutionConfig.prepare(parent, opts) do
+      run_member(parent, work, configured.executions, recipient, configured.opts)
     end
   end
 

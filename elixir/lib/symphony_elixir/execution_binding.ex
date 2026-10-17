@@ -12,8 +12,8 @@ defmodule SymphonyElixir.ExecutionBinding do
   @fields ~w(work role plan_revision contract_sha authority inputs candidate policy_sha)
   @input_fields ~w(work artifact version verification)
   @binding_fields ~w(execution_binding execution_binding_sha execution_generation execution_history)
-  @native_fields ~w(thread_id turn_id thread_allocation_intent native_stop_confirmed goal_thread_id goal_status execution_mode recovery native_stop_recovery workspace task_workspace task_session_id task_session_phase task_observation_error)
-  @receipt_fields ~w(execution_binding execution_generation attempt_id thread_id turn_id thread_allocation_intent native_stop_confirmed backend worker_host workspace task_workspace execution_mode goal_status task_session_id task_session_phase task_observation_error)
+  @native_fields ~w(thread_id turn_id thread_allocation_intent native_stop_confirmed goal_thread_id goal_status execution_mode recovery native_stop_recovery workspace task_workspace task_source task_session_id task_session_phase task_observation_error)
+  @receipt_fields ~w(execution_binding execution_generation attempt_id thread_id turn_id thread_allocation_intent native_stop_confirmed backend worker_host workspace task_workspace task_source execution_mode goal_status task_session_id task_session_phase task_observation_error)
 
   @doc "Bind under the journal's admission lock; preserve all cumulative accounting and evidence receipts."
   @spec bind(map(), map() | nil) :: {:ok, map()} | {:error, atom()}
@@ -59,7 +59,10 @@ defmodule SymphonyElixir.ExecutionBinding do
   end
 
   defp workspace_changed?(record, changes) do
-    is_map(record["task_workspace"]) and Enum.any?(~w(workspace task_workspace), &(Map.has_key?(changes, &1) and changes[&1] != record[&1]))
+    source_changed = Map.has_key?(record, "task_source") and Map.has_key?(changes, "task_source") and changes["task_source"] != record["task_source"]
+
+    source_changed or
+      (is_map(record["task_workspace"]) and Enum.any?(~w(workspace task_workspace), &(Map.has_key?(changes, &1) and changes[&1] != record[&1])))
   end
 
   defp binding_changed?(record, changes), do: Enum.any?(@binding_fields, &(Map.has_key?(changes, &1) and changes[&1] != record[&1]))

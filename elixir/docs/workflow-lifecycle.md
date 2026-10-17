@@ -429,8 +429,9 @@ and `base_revision` (an exact initial commit) for a Git-backed developer. These 
 host configuration inputs, never agent-supplied paths. A later candidate supplies
 the source revision; multiple distinct Git revisions require an explicit
 `workspace_artifact` selection. The chosen commit must already exist in the local
-repository and its content must match the retained native artifact. Fetching and
-native base-branch resolution are not yet integrated.
+repository and its content must match the retained native artifact. The configured
+worker resolves the initial branch through the native API; automatic acquisition
+of missing local Git objects remains to be integrated.
 
 The source is a real detached Git worktree. Checkout uses retained native blobs,
 with hooks and filters bypassed; it does not synthesize a replacement commit.
@@ -446,10 +447,16 @@ extra files, changed bytes, hardlinks and writable input files block reuse. Exis
 unknown directories are not adopted or erased. A matching owned partial preparation
 can resume; conflicting partial content remains an error for recovery.
 
+Before materializing an initial Git source, the journal stores `task_source` with
+the binding digest, generation, exact revision and available native branch receipt.
+This intent is immutable within that generation. Both partial preparation and
+completed workspaces resume the recorded source even if the remote branch has
+advanced. Older completed workspaces can recover the source intent from their
+existing bound manifest. A malformed or foreign-generation intent blocks reuse.
 Resuming a developer generation preserves uncommitted changes and commits in its
 own source worktree. Verifier source must still match the fixed candidate. Rotating
-a generation drops its current workspace receipt and retains that receipt in
-execution history. It never reuses the prior role's mutable source directory.
+a generation drops its current workspace and initial-source receipts and retains
+them in execution history. It never reuses the prior role's mutable source directory.
 
 `TaskWorkspace.environment/1` exposes `SYMPHONY_TASK_INPUTS`,
 `SYMPHONY_TASK_CANDIDATES` and `SYMPHONY_TASK_MANIFEST`. Role context includes these
@@ -461,7 +468,7 @@ the command. Historical command attestation uses its durable receipt and does no
 require the ephemeral role workspace to survive retention cleanup.
 
 Local verifier Codex sessions use read-only sandbox policy. Remote role workspace
-transport, host registry configuration resolution, automatic dispatch and scheduler
+transport, automatic dispatch and scheduler
 continuation remain pending. Git-backed host command checks still require
 Git; report-only verification uses configured review checks. Native API fixtures,
 real local worktrees and real supervised commands exercise this boundary; this is
@@ -546,7 +553,7 @@ late callbacks, controls arriving before and during execution, candidate publica
 healthy repeated observations, workspace corruption, reader timeout/crash/owner
 exit, budget expiration and failed stop readback. They are not yet the polling
 worker entry point. `AgentRunner.run_member/5` now provides the explicit member
-worker path described below. Abrupt-worker recovery, configuration resolution and
+worker path described below. Abrupt-worker recovery and
 scheduler discovery/continuation still need integration before version 2 automatic
 dispatch can be enabled.
 
@@ -631,7 +638,7 @@ The host execution policy may add literal per-role instructions using
 `verifier`, each with non-empty text. These are additional host instructions, not
 Liquid templates or task-authored permission. They participate in the existing
 policy digest, so changing them changes the binding. Workspace deployment
-configuration owns their content; the registry resolver is still pending. No
+configuration owns their content through the repository execution policy. No
 credentials or provider configuration are embedded in the generated Goal.
 
 An admitted repair is distinct from a completed repair without progress. Its
@@ -647,8 +654,74 @@ Issue fixtures. They check current findings in the developer context, separate
 read-only verifier sessions, unchanged retry/repair budgets, startup fault cleanup
 explicit native pause/resume and stopping after no-progress repair. A verified report can become closeable, but
 the worker does not close its Issue or accept the parent. This is local protocol
-integration, not a live-provider acceptance result. Polling projection, cross-host
-recovery and configured registry discovery remain separate integration work.
+integration, not a live-provider acceptance result. Polling projection and crash
+recovery remain separate integration work.
+
+## Configured member execution
+
+`TaskExecutionConfig.prepare/2` reads the complete native approved plan and maps
+every member to its owning repository's host `execution` configuration under
+`tracker.provider.plan_repositories`. It returns an ephemeral registry for the
+existing worker, not a task database or a scheduler. The whole resolution fails
+if any member lacks its policy or required source configuration. A parent-only
+repository needs no execution policy. Native membership and approval cannot be
+added by configuration. Errors identify the affected WorkRef; preparation creates
+no execution journal, worktree, native comment or Codex thread.
+
+Each repository's `execution.policy` supplies `engine_actor`, finite
+`max_retries`/`max_repairs`, configured `checks`, and optional literal
+`role_instructions`. The existing lifecycle validates these against each member's
+sealed criterion/check assignments and includes the policy in its binding digest.
+The journal directory is derived from the full WorkRef below the existing
+`agent.run_journal_dir`; callers may explicitly supply `journal_root`. Absolute
+normalized paths with no symlink ancestors are required. Path values can use a
+whole-value `$ENV_NAME` reference. Policy instructions are not environment-expanded.
+
+For PR/MR deliverables, `execution.repository` names the local Git repository
+used to create isolated worktrees. The source branch comes from the sealed
+deliverable's `target_branch`. Multiple distinct branches require an explicit
+`execution.workspace_artifact` naming one of those approved deliverables. A
+report-only member needs no repository or branch. For example, this block extends
+an already identity-checked `plan_repositories` entry:
+
+```yaml
+execution:
+  repository: $PROJECT_CHECKOUT
+  workspace_artifact: output
+  policy:
+    engine_actor: "99"
+    max_retries: 2
+    max_repairs: 2
+    checks:
+      tests:
+        kind: command
+        command: make test
+        artifact: output
+        timeout_ms: 600000
+      review:
+        kind: review
+```
+
+`NativeWork.read_branch/3` verifies the configured host/provider/native repository
+ID and path before requesting the exact encoded branch name. Both branch reads
+must return that name and the same full commit ID; final repository readback rejects
+path reassignment during those reads. The receipt binds repository,
+branch and revision. GitHub supplies `commit.sha`; GitLab supplies `commit.id`.
+See the [GitHub branch API](https://docs.github.com/en/rest/branches/branches#get-a-branch)
+and [GitLab branch API](https://docs.gitlab.com/api/branches/#get-single-repository-branch).
+The local commit must still exist and the workspace uses independently retained
+native contents; a local HEAD or remote URL alone never supplies source evidence.
+
+`AgentRunner.run_configured_member/4` captures the repository catalog and resolves
+the complete plan before calling `run_member/5`. Admission and native activation
+still recheck current authority. A new attempt resolves current configuration;
+an existing generation preserves its pinned workspace source. Unsupported remote
+transports fail before resolution. Tests load real workflow configuration, run
+the four-role report/repair protocol, resolve cross-provider membership, and
+exercise native branch changes during reads, partial preparation and resume.
+Automatic plan discovery, scheduler continuation, abrupt-worker/VM recovery and
+missing local Git object acquisition are still pending; the v2 dispatch guard
+remains in place until those boundaries are integrated.
 
 ## Native evidence publication
 

@@ -69,6 +69,90 @@ defmodule SymphonyElixir.NativeChangeTest do
     end)
   end
 
+  test "branch resolution binds the registered repository, exact encoded name and matching native commit reads" do
+    for provider <- ["github", "gitlab"] do
+      f = fixture(provider)
+      prefix = if provider == "github", do: "/repos/team/repo/branches/", else: "/projects/team%2Frepo/repository/branches/"
+      key = if provider == "github", do: "sha", else: "id"
+      branch = "release/next"
+      path = prefix <> "release%2Fnext"
+      body = %{"name" => branch, "commit" => %{key => f.head}}
+      reads = start_supervised!({Agent, fn -> [] end}, id: make_ref())
+
+      request = fn p, method, target, query, settings ->
+        Agent.update(reads, &(&1 ++ [target]))
+
+        if target == path do
+          {:ok, %{status: 200, body: body}}
+        else
+          f.opts[:request].(p, method, target, query, settings)
+        end
+      end
+
+      assert {:ok, snapshot} = NativeWork.read_branch(f.work, branch, Keyword.put(f.opts, :request, request))
+      assert snapshot["repository"] == Map.take(f.work, ~w(provider host repository_id))
+      assert snapshot["branch"] == branch
+      assert snapshot["revision"] == f.head
+      assert snapshot["source"] == "branch:" <> SymphonyElixir.TaskWorkflow.digest(Map.delete(snapshot, "source"))
+      assert Enum.count(Agent.get(reads, & &1), &(&1 == path)) == 2
+
+      for invalid <- [nil, "", <<0>>] do
+        assert {:error, :invalid_native_branch} = NativeWork.read_branch(f.work, invalid, f.opts)
+      end
+
+      assert {:error, :invalid_work_ref} = NativeWork.read_branch(%{}, branch, f.opts)
+      assert {:error, :unregistered_plan_repository} = NativeWork.read_branch(%{f.work | "repository_id" => "99"}, branch, f.opts)
+
+      invalid = [nil, %{}, %{body | "name" => "other"}, %{body | "commit" => %{key => "main"}}, %{body | "commit" => nil}]
+
+      for malformed <- invalid do
+        request = fn p, method, target, query, settings ->
+          if target == path do
+            {:ok, %{status: 200, body: malformed}}
+          else
+            f.opts[:request].(p, method, target, query, settings)
+          end
+        end
+
+        assert {:error, :native_branch_incomplete} = NativeWork.read_branch(f.work, branch, Keyword.put(f.opts, :request, request))
+      end
+
+      Agent.update(reads, fn _ -> [] end)
+
+      request = fn p, method, target, query, settings ->
+        if target == path do
+          revision =
+            Agent.get_and_update(reads, fn list ->
+              {if(list == [], do: f.head, else: f.final), [target | list]}
+            end)
+
+          {:ok, %{status: 200, body: put_in(body, ["commit", key], revision)}}
+        else
+          f.opts[:request].(p, method, target, query, settings)
+        end
+      end
+
+      assert {:error, :native_branch_changed} = NativeWork.read_branch(f.work, branch, Keyword.put(f.opts, :request, request))
+      Agent.update(reads, fn _ -> [] end)
+
+      request = fn p, method, target, query, settings ->
+        if target == path do
+          Agent.update(reads, &[target | &1])
+          {:ok, %{status: 200, body: body}}
+        else
+          {:ok, response} = f.opts[:request].(p, method, target, query, settings)
+
+          if length(Agent.get(reads, & &1)) == 2,
+            do: {:ok, %{response | body: Map.put(response.body, "id", 999)}},
+            else: {:ok, response}
+        end
+      end
+
+      result = NativeWork.read_branch(f.work, branch, Keyword.put(f.opts, :request, request))
+      assert {:error, :native_repository_mismatch} = result
+    end
+  end
+
   test "native merge facts distinguish test SHAs, unmerged closure, transformed versions and verified final targets" do
     for provider <- ["github", "gitlab"] do
       f = fixture(provider)

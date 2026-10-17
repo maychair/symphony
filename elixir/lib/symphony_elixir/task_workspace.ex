@@ -9,9 +9,10 @@ defmodule SymphonyElixir.TaskWorkspace do
     with :ok <- validate(record),
          {:ok, observation} <- ready(record, executions, opts),
          {:ok, spec, packages, source} <- specification(observation, executions, opts),
+         {:ok, record} <- pin_source(observation.record, source),
          :ok <- own(spec),
-         :ok <- populate(observation.record, spec, packages, source),
-         {:ok, current} <- ready(observation.record, executions, opts),
+         :ok <- populate(record, spec, packages, source),
+         {:ok, current} <- ready(record, executions, opts),
          receipt = receipt(spec),
          {:ok, saved} <- RunJournal.checkpoint(current.record, %{"workspace" => receipt["workspace"], "task_workspace" => receipt}),
          :ok <- validate(saved) do
@@ -86,6 +87,38 @@ defmodule SymphonyElixir.TaskWorkspace do
   end
 
   defp source(observation, entry, owner, opts) do
+    with {:ok, entry} <- initial_source_entry(observation, entry) do
+      select_source(observation, entry, owner, opts)
+    end
+  end
+
+  defp initial_source_entry(%{evidence: %{"candidate" => %{}}}, entry), do: {:ok, Map.delete(entry, :base_source)}
+
+  defp initial_source_entry(%{record: %{"task_source" => source}}, entry),
+    do: {:ok, Map.merge(entry, %{base_revision: source["revision"], base_source: source["base_source"]})}
+
+  defp initial_source_entry(%{record: %{"task_workspace" => %{"directory" => directory}}}, entry) do
+    with {:ok, body} <- read_file(Path.join(directory, "manifest.json")),
+         {:ok, %{"source" => source}} <- Jason.decode(body) do
+      if source,
+        do: {:ok, Map.merge(entry, %{base_revision: source["revision"], base_source: source["base_source"]})},
+        else: {:ok, entry}
+    end
+  end
+
+  defp initial_source_entry(_, entry), do: {:ok, entry}
+
+  defp pin_source(record, nil), do: {:ok, record}
+
+  defp pin_source(%{"execution_binding" => %{"candidate" => candidate}} = record, _source) when is_binary(candidate),
+    do: {:ok, record}
+
+  defp pin_source(record, source) do
+    intent = %{"generation" => record["execution_generation"], "binding_sha" => record["execution_binding_sha"], "revision" => source.revision, "base_source" => source.base_source}
+    if record["task_source"] == intent, do: {:ok, record}, else: RunJournal.checkpoint(record, %{"task_source" => intent})
+  end
+
+  defp select_source(observation, entry, owner, opts) do
     candidate = observation.evidence["candidate"]
     artifacts = if candidate, do: Enum.filter(candidate["artifacts"], &String.starts_with?(&1["source"], "git:")), else: []
     artifacts = if entry[:workspace_artifact], do: Enum.filter(artifacts, &(&1["id"] == entry[:workspace_artifact])), else: artifacts
@@ -105,14 +138,19 @@ defmodule SymphonyElixir.TaskWorkspace do
          {:ok, artifact} <- ArtifactStore.retain(store_root(entry, opts), owner["work"], revision, owner, opts),
          {:ok, _} <- git(entry.repository, ["cat-file", "-e", revision <> "^{commit}"]),
          {:ok, common} <- git(entry.repository, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) do
-      {:ok, %{repository: entry.repository, common: common, revision: revision, artifact: artifact}}
+      source = %{repository: entry.repository, common: common, revision: revision, artifact: artifact}
+      {:ok, Map.put(source, :base_source, entry[:base_source])}
     end
   end
 
   defp store_root(entry, opts), do: Keyword.get(opts, :artifact_store_root, Path.join(Path.dirname(entry.directory), ".artifacts"))
   defp package_manifest(package), do: %{"path" => package.path, "reference" => package.reference, "receipt" => package.artifact.receipt["digest"], "files" => metadata(package.artifact.files)}
   defp source_manifest(nil), do: nil
-  defp source_manifest(source), do: %{"revision" => source.revision, "repository" => source.repository, "common" => source.common, "files" => metadata(source.artifact.files)}
+
+  defp source_manifest(source) do
+    manifest = %{"revision" => source.revision, "repository" => source.repository, "common" => source.common, "files" => metadata(source.artifact.files)}
+    if source.base_source, do: Map.put(manifest, "base_source", source.base_source), else: manifest
+  end
 
   defp metadata(files) do
     Enum.map(files, fn file ->
@@ -204,7 +242,7 @@ defmodule SymphonyElixir.TaskWorkspace do
   @doc "Recheck materialized inputs before role tools. Developer edits survive resume; verifier source bytes remain fixed."
   @spec validate(map()) :: :ok | {:error, term()}
   def validate(%{"task_workspace" => receipt} = record) when is_map(receipt) do
-    with true <- receipt?(receipt),
+    with true <- source_intent?(record) and receipt?(receipt),
          true <- receipt["generation"] == record["execution_generation"] and receipt["binding_sha"] == record["execution_binding_sha"],
          true <- record["workspace"] == receipt["workspace"] and receipt["workspace"] == Path.join(receipt["directory"], "source"),
          true <- ArtifactFiles.safe_root?(receipt["directory"]) and ArtifactFiles.safe_root?(receipt["workspace"]),
@@ -225,7 +263,23 @@ defmodule SymphonyElixir.TaskWorkspace do
     end
   end
 
-  def validate(record), do: if(Map.has_key?(record, "task_workspace"), do: {:error, :role_workspace_changed}, else: :ok)
+  def validate(record), do: if(Map.has_key?(record, "task_workspace") or not source_intent?(record), do: {:error, :role_workspace_changed}, else: :ok)
+
+  defp source_intent?(record) do
+    case Map.fetch(record, "task_source") do
+      :error ->
+        true
+
+      {:ok, %{"generation" => generation, "binding_sha" => sha, "revision" => revision}} ->
+        is_integer(generation) and generation > 0 and generation == record["execution_generation"] and
+          is_binary(sha) and sha == record["execution_binding_sha"] and revision?(revision)
+
+      _ ->
+        false
+    end
+  end
+
+  defp revision?(revision), do: is_binary(revision) and Regex.match?(~r/\A(?:[a-f0-9]{40}|[a-f0-9]{64})\z/, revision)
 
   defp package_files(package) do
     Enum.map(package["files"], &Map.update!(&1, "path", fn path -> Path.join(package["path"], path) end))

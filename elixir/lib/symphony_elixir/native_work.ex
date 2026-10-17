@@ -99,6 +99,41 @@ defmodule SymphonyElixir.NativeWork do
   defp change_state?(_), do: false
   defp git_revision?(value), do: is_binary(value) and Regex.match?(~r/\A(?:[a-f0-9]{40}|[a-f0-9]{64})\z/, value)
 
+  @doc "Resolve an exact branch in the configured native repository; two matching reads pin its initial commit."
+  @spec read_branch(WorkRef.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_branch(work, branch, opts) do
+    catalog = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end)
+    request = Keyword.get(opts, :request, &request/5)
+
+    with :ok <- WorkRef.validate(work),
+         true <- branch_name?(branch) or {:error, :invalid_native_branch},
+         {:ok, repository} <- resolve(work, catalog),
+         prefix = repository_path(repository),
+         {:ok, native} <- get(request, repository, prefix),
+         :ok <- verify_repository(repository, native),
+         suffix = if(repository["provider"] == "github", do: "/branches/", else: "/repository/branches/"),
+         path = prefix <> suffix <> URI.encode_www_form(branch),
+         {:ok, before} <- get(request, repository, path),
+         {:ok, revision} <- branch_revision(before, repository["provider"], branch),
+         {:ok, after_read} <- get(request, repository, path),
+         {:ok, current} <- branch_revision(after_read, repository["provider"], branch),
+         true <- current == revision or {:error, :native_branch_changed},
+         {:ok, after_repository} <- get(request, repository, prefix),
+         :ok <- verify_repository(repository, after_repository) do
+      facts = %{"repository" => Map.take(work, @identity), "branch" => branch, "revision" => revision}
+      {:ok, Map.put(facts, "source", "branch:" <> TaskWorkflow.digest(facts))}
+    end
+  end
+
+  defp branch_name?(branch), do: is_binary(branch) and branch != "" and not String.contains?(branch, <<0>>)
+
+  defp branch_revision(%{"name" => name, "commit" => %{} = commit}, provider, name) do
+    revision = commit[if(provider == "github", do: "sha", else: "id")]
+    if git_revision?(revision), do: {:ok, revision}, else: {:error, :native_branch_incomplete}
+  end
+
+  defp branch_revision(_, _, _), do: {:error, :native_branch_incomplete}
+
   @doc "Retrieve a complete fixed Git snapshot after checking the configured native repository identity."
   @spec read_git(WorkRef.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def read_git(work, revision, opts) do
