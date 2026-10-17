@@ -3,6 +3,31 @@ defmodule SymphonyElixir.ReviewLane.GitLab do
 
   @spec request(map(), String.t(), String.t(), map()) :: {:ok, term()} | {:error, term()}
   def request(config, method, path, fields \\ %{}) do
+    if permitted?(config, method, path, fields),
+      do: native_request(config, method, path, fields),
+      else: {:error, :review_write_not_permitted}
+  end
+
+  @doc "Reject slash-command lines, including in code examples; GitLab comments can otherwise execute native actions."
+  @spec comment_body?(term()) :: boolean()
+  def comment_body?(body), do: SymphonyElixir.NativeWork.comment_body?("gitlab", body)
+
+  defp permitted?(_config, "GET", _path, fields), do: fields == %{}
+
+  defp permitted?(config, "POST", path, %{"body" => body} = fields) do
+    Map.keys(fields) == ["body"] and comment_body?(body) and discussion_path?(config, path)
+  end
+
+  defp permitted?(_, _, _, _), do: false
+
+  defp discussion_path?(config, path) do
+    case Regex.run(~r{\Aprojects/([^/]+)/merge_requests/([1-9][0-9]*)/discussions\z}, path) do
+      [_, project, _iid] -> Enum.any?(Map.keys(config["projects"]), &(URI.encode_www_form(&1) == project))
+      _ -> false
+    end
+  end
+
+  defp native_request(config, method, path, fields) do
     args = ["api", "--hostname", config["host"], "--method", method, path]
     args = args ++ Enum.flat_map(fields, fn {key, value} -> ["--raw-field", "#{key}=#{value}"] end)
 

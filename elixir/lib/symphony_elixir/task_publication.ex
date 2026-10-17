@@ -86,6 +86,7 @@ defmodule SymphonyElixir.TaskPublication do
          true <- is_binary(record["thread_id"]) and record["thread_id"] != "",
          true <- is_map(policy) and TaskWorkflow.digest(policy) == binding["policy_sha"],
          true <- text?(policy["engine_actor"]) and summary?(summary) and is_map(payload),
+         true <- NativeWork.comment_body?(binding["work"]["provider"], summary),
          true <- role_payload?(kind, payload, binding),
          :ok <- attest(kind, record, payload, policy) do
       envelope = %{

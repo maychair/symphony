@@ -83,7 +83,8 @@ defmodule SymphonyElixir.ReviewLane do
     [
       %{
         "name" => "review_submit",
-        "description" => "Submit substantiated Chinese findings; the scheduler validates the fixed MR head and posts discussions. An empty list explicitly completes a no-findings review.",
+        "description" =>
+          "Submit substantiated Chinese findings; the scheduler validates the fixed MR head and posts discussions. An empty list explicitly completes a no-findings review. Do not include slash-command lines, even in examples.",
         "inputSchema" => %{
           "type" => "object",
           "additionalProperties" => false,

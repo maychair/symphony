@@ -23,13 +23,34 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       if key in responses:
         if responses[key]=='EXIT':sys.exit(3)
         print(json.dumps(responses[key]));sys.exit(0)
+    if method=='GET' and '/discussions' in path and (r/'fail-read').exists():
+      (r/'fail-read').unlink();sys.exit(3)
     ds=json.loads((r/'discussions.json').read_text())
     if path=='user':out={'id':20,'username':'reviewer'}
     elif '/discussions' in path:
       if method=='POST':
         body=a[a.index('--raw-field')+1].split('=',1)[1];n=len(ds)+1
         out={'id':str(n),'notes':[{'id':n,'body':body,'resolved':False,'created_at':'2026-01-01T00:00:00Z','author':{'id':20,'username':'reviewer'}}]}
-        ds.append(out);(r/'discussions.json').write_text(json.dumps(ds))
+        journal=json.loads((r/'state'/'review-lane.json').read_text())
+        entries=[e for v in journal['records'].values() for e in v.get('publication',{}).get('entries',[])]
+        assert any(e['body']==body and e['status']=='sending' for e in entries)
+        posts=json.loads((r/'posts.json').read_text()) if (r/'posts.json').exists() else []
+        posts.append(body);(r/'posts.json').write_text(json.dumps(posts))
+        faults=json.loads((r/'faults.json').read_text()) if (r/'faults.json').exists() else {}
+        mode=faults.get(str(len(posts)))
+        if mode=='edited':out['notes'][0]['body']='edited '+body
+        if mode=='wrong_actor':out['notes'][0]['author']['id']=99
+        if mode=='reply':out['notes'].append({'id':900,'body':'请核对新增的边界条件','author':{'id':30},'created_at':'2026-01-02T00:00:00Z'})
+        if mode!='drop':ds.append(out)
+        if mode=='duplicate':ds.append({'id':'duplicate','notes':[dict(out['notes'][0],id=1000)]})
+        if mode=='preempt_next':
+          entry=next(e for e in entries if e['body']==body)
+          next_entry=next(e for e in entries if e['index']==entry['index']+1)
+          ds.append({'id':'preempted','notes':[dict(out['notes'][0],id=1001,body=next_entry['body'])]})
+        (r/'discussions.json').write_text(json.dumps(ds))
+        if mode=='head':(r/'changed-head').write_text('new head')
+        if mode=='interrupt_read':(r/'fail-read').write_text('once')
+        if mode in ['lost','interrupt_read']:sys.exit(3)
       else:out=ds
     else:out={'id':1001,'project_id':10,'iid':1,'state':'opened','sha':('c' if (r/'changed-head').exists() else 'a')*40,'diff_refs':{'base_sha':'b'*40},'author':{'id':30},'reviewers':[{'id':20,'username':'reviewer'}],'web_url':'https://review.invalid/team/repo/-/merge_requests/1'}
     if path=='projects/team%2Frepo':out={'id':10,'path_with_namespace':'team/repo','web_url':'https://review.invalid/team/repo'}
@@ -192,6 +213,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{"findings" => []})
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{"findings" => ["English only"]})
+    assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{"findings" => ["请核对空输入。\n/approve"]})
+    refute File.exists?(Path.join(c.root, "posts.json"))
     assert {:error, :invalid_review_submission} = Listener.submit("missing", %{"findings" => []})
     responses(c, %{"GET user" => %{"username" => "someone-else"}})
     assert {:error, :gitlab_identity_mismatch} = Listener.submit(issue.id, %{"findings" => []})
@@ -228,9 +251,9 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
     assert {:ok, [_]} = Listener.issues()
     path = Path.join(c.root, "discussions.json")
-    [discussion] = Jason.decode!(File.read!(path))
+    [discussion, conclusion] = Jason.decode!(File.read!(path))
     reply = %{"id" => 99, "body" => "已修复空输入处理", "author" => %{"id" => 30}, "created_at" => "2026-01-02T00:00:00Z"}
-    File.write!(path, Jason.encode!([Map.update!(discussion, "notes", &(&1 ++ [reply]))]))
+    File.write!(path, Jason.encode!([Map.update!(discussion, "notes", &(&1 ++ [reply])), conclusion]))
     {:ok, rounds} = Listener.issues()
     assert length(rounds) == 2
     assert Enum.any?(rounds, &(&1.native_ref["round"] == 2 and &1.native_ref["phase"] == "queued"))
@@ -243,17 +266,17 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     :ok = Listener.submit(issue.id, %{"findings" => ["空输入导致越界，见 source.cpp:10，请检查输入长度。"]})
     :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
     path = Path.join(c.root, "discussions.json")
-    [discussion] = Jason.decode!(File.read!(path))
+    [discussion, conclusion] = Jason.decode!(File.read!(path))
     reply = %{"id" => 99, "body" => "已修复输入检查", "author" => %{"id" => 30}, "created_at" => "2026-01-02T00:00:00Z"}
     discussion = Map.update!(discussion, "notes", &(&1 ++ [reply]))
-    File.write!(path, Jason.encode!([discussion]))
+    File.write!(path, Jason.encode!([discussion, conclusion]))
     {:ok, rounds} = Listener.issues()
     next = Enum.find(rounds, & &1.dispatchable)
     {:ok, _, _} = Listener.begin_run(next.id)
     changed = update_in(discussion["notes"], fn [own, reply] -> [own, Map.put(reply, "body", "还有另一个边界条件")] end)
-    File.write!(path, Jason.encode!([changed]))
+    File.write!(path, Jason.encode!([changed, conclusion]))
     assert {:error, :review_responses_changed} = Listener.submit(next.id, %{"findings" => []})
-    assert length(Jason.decode!(File.read!(path))) == 1
+    assert length(Jason.decode!(File.read!(path))) == 2
   end
 
   test "a new push after a no-findings result starts one round and retires the previous dispatch", c do
@@ -349,20 +372,16 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:ok, ^rounds} = Listener.issues()
   end
 
-  test "publication receipts must belong to the configured reviewer", c do
+  test "POST response data alone never proves a comment was delivered", c do
     path = "projects/team%2Frepo/merge_requests/1/discussions"
 
-    for {reply, reason} <- [
-          {%{"id" => "d", "notes" => []}, :invalid_owned_note_receipt},
-          {%{}, :invalid_discussion_receipt},
-          {"EXIT", {:command_failed, c.config["glab_bin"], 3}}
-        ] do
+    for reply <- [%{"id" => "d", "notes" => []}, %{}, "EXIT"] do
       :sys.replace_state(Listener, &%{&1 | records: %{}})
       assert :ok = Listener.request_review("team/repo", 1)
       {:ok, [issue]} = Listener.issues()
       {:ok, _, _} = Listener.begin_run(issue.id)
       responses(c, %{("POST " <> path) => reply})
-      assert {:error, ^reason} = Listener.submit(issue.id, %{"findings" => []})
+      assert {:error, :review_publication_uncertain} = Listener.submit(issue.id, %{"findings" => []})
       File.rm!(Path.join(c.root, "responses.json"))
     end
   end
@@ -381,6 +400,198 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     start_supervised!({Listener, config: c.config})
     await_listener()
     assert Listener.health().pending_hints == 1
+  end
+
+  test "lost POST responses recover from exact native comments without repeating sends", c do
+    faults(c, %{"1" => "lost"})
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    assert :ok = Listener.submit(issue.id, %{"findings" => []})
+    record = saved_review(c, issue)
+    assert record["phase"] == "completed"
+    assert [%{"status" => "published", "receipt" => receipt}] = record["publication"]["entries"]
+    assert receipt["actor"] == 20
+    assert receipt["work"] == record["work"]
+    assert [body] = posts(c)
+    assert :ok = Listener.submit(issue.id, %{"findings" => []})
+    assert {:error, :changed_submission} = Listener.submit(issue.id, %{"findings" => ["后来改变的结论。"]})
+    assert posts(c) == [body]
+    assert body =~ record["head"]
+    assert body =~ record["base"]
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert {:ok, [_]} = Listener.issues()
+    assert posts(c) == [body]
+  end
+
+  test "partial publication resumes unsent findings only after native stop and recovers the lost receipt", c do
+    faults(c, %{"2" => "interrupt_read"})
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    :ok = Listener.checkpoint(issue.id, %{"thread_id" => "native-review", "thread_allocation_intent" => true})
+    findings = ["第一条：空输入越界。", "第二条：输出缺少终止符。", "第三条：错误路径泄漏句柄。"]
+    assert {:error, {:command_failed, _, 3}} = Listener.submit(issue.id, %{"findings" => findings})
+    record = saved_review(c, issue)
+    assert Enum.map(record["publication"]["entries"], & &1["status"]) == ["published", "sending", "prepared", "prepared"]
+    assert length(record["findings"]) == 1
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    {:ok, [fenced]} = Listener.issues()
+    assert fenced.native_ref["phase"] == "fenced"
+    assert length(fenced.native_ref["findings"]) == 2
+    assert length(posts(c)) == 2
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    responses(c, %{"GET user" => %{"id" => 99}})
+    {:ok, [wrong_identity]} = Listener.issues()
+    assert wrong_identity.native_ref["publication_error"] =~ "gitlab_identity_mismatch"
+    assert length(posts(c)) == 2
+    responses(c, %{})
+    {:ok, [complete]} = Listener.issues()
+    assert complete.native_ref["phase"] == "completed"
+    assert length(complete.native_ref["findings"]) == 3
+    assert length(complete.native_ref["receipts"]) == 4
+    assert [_, _, third, conclusion] = posts(c)
+    assert third =~ "第三条"
+    assert conclusion =~ "本轮评审完成"
+    assert Enum.all?(posts(c), &String.contains?(&1, issue.native_ref["head"]))
+    assert {:ok, [^complete]} = Listener.issues()
+    assert length(posts(c)) == 4
+  end
+
+  test "an absent uncertain send remains fenced across restart even when native execution stopped", c do
+    faults(c, %{"1" => "drop"})
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    assert {:error, :review_publication_uncertain} = Listener.submit(issue.id, %{"findings" => []})
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    {:ok, [fenced]} = Listener.issues()
+    assert fenced.native_ref["publication_error"] =~ "review_publication_uncertain"
+    assert fenced.native_ref["phase"] == "fenced"
+    refute fenced.dispatchable
+    assert length(posts(c)) == 1
+    assert Jason.decode!(File.read!(Path.join(c.root, "discussions.json"))) == []
+  end
+
+  for {mode, reason} <- [
+        {"edited", :review_publication_conflict},
+        {"wrong_actor", :review_publication_conflict},
+        {"duplicate", :review_publication_conflict},
+        {"preempt_next", :unexpected_review_publication}
+      ] do
+    @tag publication_fault: {mode, reason}
+    test "native readback rejects #{mode} and does not publish a conclusion", c do
+      {mode, reason} = c.publication_fault
+      faults(c, %{"1" => mode})
+      {:ok, [issue]} = Listener.issues()
+      {:ok, _, _} = Listener.begin_run(issue.id)
+      assert {:error, ^reason} = Listener.submit(issue.id, %{"findings" => ["空输入导致越界，请检查长度。"]})
+      assert length(posts(c)) == 1
+      assert saved_review(c, issue)["phase"] == "fenced"
+    end
+  end
+
+  test "head changes preserve old receipts without publishing the remainder on the new version", c do
+    faults(c, %{"1" => "head"})
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    assert {:error, :mr_head_changed} = Listener.submit(issue.id, %{"findings" => ["旧版本存在空输入越界。", "旧版本存在资源泄漏。"]})
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    {:ok, rounds} = Listener.issues()
+    assert length(rounds) == 2
+    old = Enum.find(rounds, &(&1.id == issue.id))
+    assert old.native_ref["phase"] == "superseded"
+    assert length(old.native_ref["findings"]) == 1
+    assert length(posts(c)) == 1
+    assert [next] = Enum.filter(rounds, & &1.dispatchable)
+    assert next.native_ref["round"] == 2
+  end
+
+  test "editing or deleting a confirmed publication invalidates its current delivery evidence", c do
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    :ok = Listener.submit(issue.id, %{"findings" => []})
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    path = Path.join(c.root, "discussions.json")
+    [discussion] = Jason.decode!(File.read!(path))
+    changed = update_in(discussion["notes"], fn [note] -> [Map.put(note, "id", 999)] end)
+    File.write!(path, Jason.encode!([changed]))
+    {:ok, [conflict]} = Listener.issues()
+    assert conflict.native_ref["phase"] == "fenced"
+    assert conflict.native_ref["publication_error"] =~ "review_publication_conflict"
+    File.write!(path, "[]")
+    {:ok, [missing]} = Listener.issues()
+    assert missing.native_ref["publication_error"] =~ "review_publication_missing"
+    assert length(posts(c)) == 1
+    File.write!(Path.join(c.root, "changed-head"), "new head cannot erase a receipt conflict")
+    {:ok, [unknown]} = Listener.issues()
+    assert unknown.native_ref["eligibility"] == "unknown"
+    assert unknown.native_ref["error"] =~ "review_publication_unverified"
+    File.write!(path, Jason.encode!([discussion]))
+    {:ok, rounds} = Listener.issues()
+    assert [next] = Enum.filter(rounds, & &1.dispatchable)
+    assert next.native_ref["round"] == 2
+    assert length(posts(c)) == 1
+  end
+
+  test "an author reply during the batch invalidates the remaining publication", c do
+    faults(c, %{"1" => "reply"})
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    assert {:error, :review_responses_changed} = Listener.submit(issue.id, %{"findings" => ["空输入触发越界。"]})
+    assert length(posts(c)) == 1
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    {:ok, rounds} = Listener.issues()
+    assert [next] = Enum.filter(rounds, & &1.dispatchable)
+    assert next.native_ref["round"] == 2
+    assert next.native_ref["response_sha"] != issue.native_ref["response_sha"]
+  end
+
+  test "journal corruption cannot change a publication's context, body, status or native receipt", c do
+    {:ok, [issue]} = Listener.issues()
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    :ok = Listener.submit(issue.id, %{"findings" => []})
+    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    path = Path.join(c.root, "state/review-lane.json")
+    original = Jason.decode!(File.read!(path))
+    record = saved_review(c, issue)
+    [entry] = record["publication"]["entries"]
+    stop_supervised!(Listener)
+
+    corruptions = [
+      put_in(record["publication"]["context"]["head"], String.duplicate("f", 40)),
+      put_in(record["publication"]["actor"], 99),
+      put_in(record["publication"]["entries"], [nil]),
+      put_in(record["publication"]["entries"], [Map.put(entry, "body", "different body")]),
+      put_in(record["publication"]["entries"], [Map.put(entry, "status", "unknown")]),
+      put_in(record["publication"]["entries"], [Map.put(entry, "receipt", nil)]),
+      Map.delete(record, "publication")
+    ]
+
+    for corrupted <- corruptions do
+      File.write!(path, Jason.encode!(put_in(original["records"][record["id"]], corrupted)))
+      pid = start_supervised!({Listener, config: c.config})
+      send(pid, :configure)
+      assert %{health: :failed, error: error} = Listener.health()
+      assert error =~ "invalid_review_journal"
+      stop_supervised!(Listener)
+    end
+
+    File.write!(path, Jason.encode!(original))
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    {:ok, [restored]} = Listener.issues()
+    assert restored.native_ref["phase"] == "completed"
+    assert length(posts(c)) == 1
+  end
+
+  defp faults(c, values), do: File.write!(Path.join(c.root, "faults.json"), Jason.encode!(values))
+  defp posts(c), do: Jason.decode!(File.read!(Path.join(c.root, "posts.json")))
+
+  defp saved_review(c, issue) do
+    Jason.decode!(File.read!(Path.join(c.root, "state/review-lane.json")))["records"][String.replace_prefix(issue.id, "review:", "")]
   end
 
   test "disabled, changed and legacy configurations cannot start native discovery", c do

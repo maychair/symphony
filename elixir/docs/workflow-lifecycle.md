@@ -626,7 +626,7 @@ review_lane:
       checkout: /absolute/registered/source
 ```
 
-The reviewer and publisher use distinct, explicit stable native user IDs. Project
+The reviewer and publisher use separately configured stable native user IDs. Project
 IDs, paths and URLs must match the configured host. Discovery reads each configured
 project's paginated open MRs with `scope=all` and `reviewer_id`, then re-reads each
 candidate. This discovers requests even if the first event was lost. Duplicate or
@@ -667,8 +667,48 @@ execution authority. Migration still requires reconciling old native executions
 and publication receipts before activating the new deployment. This change does
 not itself restart an existing service. GitHub review discovery, complete native
 assignment history, target-branch refresh, automatic uncertain-stop recovery,
-partial publication reconciliation and task-owned review deduplication remain
+task-owned review deduplication remain
 necessary for the full lifecycle described below.
+
+## Review publication receipts
+
+`ReviewLane.Publication` owns a versioned batch of finding comments followed by
+one round conclusion. Each body includes the fixed base/head, round and a digest
+of the native work, response and instruction context. An empty finding set still
+publishes an explicit conclusion. All batch bodies are sealed before the first
+send. A repeated identical submission reads back the original batch; changing a
+sealed submission is rejected.
+
+Each entry advances from `prepared` to `sending` to `published`. The listener
+syncs the journal and its directory before issuing a POST, and checkpoints each
+read-back receipt separately. POST responses alone never prove delivery. Recovery
+matches the exact native repository, discussion/note IDs, stable publisher ID,
+full body and creation timestamp. Missing confirmed notes, changed content or
+identity, duplicate markers and unexpected comments for never-sent entries are
+conflicts. An absent `sending` entry stays uncertain; it is never blindly resent.
+
+On restart, reads recover partial receipts even for old rounds. Continuing an
+unsent entry requires confirmed native execution stop and the current head,
+base, reviewer, publisher, policy and response context. The same checks run before
+every new send and after the final readback. Replies to findings published during
+the batch also invalidate its remaining conclusion. A changed version preserves
+old receipts and permits a new round only after native stop; it never moves an
+unfinished old batch onto the new revision. The round is delivered only after
+all findings and its conclusion have native receipts.
+
+Published entries are re-read during reconciliation. Edited, deleted or replaced
+comments no longer count as current delivery evidence. A new push does not bypass
+an unresolved publication conflict for the same MR. Existing journals that
+contain submissions without the complete publication intent are rejected for
+migration, rather than inventing send history. Automatic recovery of uncertain
+native executions and operator resolution of permanently uncertain sends still
+require the execution recovery work described below. No approval or merge API
+is exposed by this publisher. Its GitLab write adapter accepts only a new
+MR discussion in a configured repository. Comment bodies reject standalone
+slash-command lines, including in examples: [GitLab quick actions](https://docs.gitlab.com/user/project/quick_actions/)
+can otherwise approve, merge or close native work through a comment. The same
+body check protects native Issue evidence publication; rejected submissions do
+not acquire a send intent.
 
 ## Review and recovery
 

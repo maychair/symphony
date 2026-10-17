@@ -2,6 +2,29 @@ defmodule SymphonyElixir.ReviewLaneGitLabTest do
   use SymphonyElixir.TestSupport
   alias SymphonyElixir.ReviewLane.GitLab
 
+  test "the review adapter cannot invoke native actions, foreign writes or quick actions inside comments" do
+    config = %{"host" => "review.invalid", "projects" => %{"team/repo" => %{"id" => 10}}, "glab_bin" => "must-not-be-called"}
+    path = GitLab.mr_path("team/repo", 1) <> "/discussions"
+    assert GitLab.comment_body?("请核对 `/approve` 的字面含义，以及 `source.cpp:10`。")
+    refute GitLab.comment_body?(nil)
+
+    for body <- ["/approve\n审查通过", "说明\n /merge", "说明\r\n\t/close", "示例\n```\n/rebase\n```", "说明\r/approve"] do
+      refute GitLab.comment_body?(body)
+      assert {:error, :review_write_not_permitted} = GitLab.request(config, "POST", path, %{"body" => body})
+    end
+
+    for {method, target, fields} <- [
+          {"POST", GitLab.mr_path("team/repo", 1) <> "/approve", %{}},
+          {"PUT", GitLab.mr_path("team/repo", 1) <> "/merge", %{}},
+          {"DELETE", path <> "/existing", %{}},
+          {"POST", GitLab.mr_path("other/repo", 1) <> "/discussions", %{"body" => "foreign"}},
+          {"POST", path <> "?redirect=other", %{"body" => "changed endpoint"}},
+          {"POST", path, %{"body" => "text", "resolved" => "true"}}
+        ] do
+      assert {:error, :review_write_not_permitted} = GitLab.request(config, method, target, fields)
+    end
+  end
+
   test "private HTTP scope is explicit and cannot redirect metadata to another native path" do
     config = %{"host" => "review.invalid", "projects" => %{"team/repo" => %{"id" => 10}}}
     repository = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "http://review.invalid/team/repo"}

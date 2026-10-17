@@ -6,7 +6,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   """
   use GenServer
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitLab, Policy}
+  alias SymphonyElixir.ReviewLane.{GitLab, Policy, Publication}
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]) |> Keyword.put_new(:name, __MODULE__))
@@ -214,7 +214,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp records?(_, _), do: false
 
   defp record?(id, %{} = record, config) do
-    valid_subject?(record, config) and record_shape?(record) and
+    valid_subject?(record, config) and record_shape?(record) and Publication.valid?(record, config["publisher_id"]) and
       record["work"] == work(config, record["project"], record["iid"]) and
       id == record["id"] and id == round_id(record["work"], record["round"], config)
   end
@@ -333,11 +333,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp round_id(work, round, config), do: TaskWorkflow.digest(%{"work" => work, "round" => round, "reviewer" => config["reviewer_id"]})
 
   defp reconcile(state) do
+    state = recover_publications(state)
+
     state.records
     |> Map.values()
     |> Enum.group_by(&{&1["project"], &1["iid"]})
     |> Enum.map(fn {_, rounds} -> Enum.max_by(rounds, & &1["round"]) end)
     |> Enum.reduce(state, &reconcile_record(&2, &1))
+    |> continue_publications()
   end
 
   defp reconcile_record(state, record) do
@@ -362,7 +365,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp reconcile_assigned(state, record, mr, path) do
     with {:ok, discussions} <- GitLab.discussions(state.config, path),
-         {:ok, responses} <- Policy.response_digest(findings_for(state, record), discussions, record["author_id"]) do
+         {:ok, responses} <- Policy.response_digest(findings_for(state, record), discussions, record["author_id"]),
+         true <- publications_verified?(state, record) or {:error, :review_publication_unverified} do
       changed = changed_inputs?(state.config, record, mr, responses)
 
       cond do
@@ -383,6 +387,10 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp findings_for(state, record) do
     state.records |> Map.values() |> Enum.filter(&(&1["project"] == record["project"] and &1["iid"] == record["iid"])) |> Enum.flat_map(& &1["findings"])
+  end
+
+  defp publications_verified?(state, record) do
+    state.records |> Map.values() |> Enum.filter(&(&1["project"] == record["project"] and &1["iid"] == record["iid"])) |> Enum.all?(&is_nil(&1["publication_error"]))
   end
 
   defp changed_inputs?(config, record, mr, responses) do
@@ -418,24 +426,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     record = state.records[record_key(id)]
 
     if publishable?(record, findings) do
-      record = Map.put_new(record, "submission", findings) |> Map.put("phase", "publishing")
-      state = put_record(state, record)
-      path = GitLab.mr_path(record["project"], record["iid"])
+      case Publication.prepare(record, findings, state.config["publisher_id"]) do
+        {:ok, record} ->
+          record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")
+          state = put_record(state, record)
+          finish_publication(state, record)
 
-      with true <- record["submission"] == findings || {:error, :changed_submission},
-           {:ok, mr} <- GitLab.request(state.config, "GET", path),
-           true <- same_review?(mr, record, state.config) || {:error, :mr_head_changed},
-           {:ok, user} <- GitLab.request(state.config, "GET", "user"),
-           true <- user["id"] == state.config["publisher_id"] || {:error, :gitlab_identity_mismatch},
-           {:ok, discussions} <- GitLab.discussions(state.config, path),
-           record = Map.put(record, "response_findings", findings_for(state, record)),
-           :ok <- same_responses(record, discussions),
-           {:ok, receipts} <- post_findings(state.config, path, record, discussions) do
-        {:ok, put_record(state, record |> Map.put("phase", "completed") |> Map.put("receipts", receipts) |> Map.put("findings", if(findings == [], do: [], else: receipts)))}
-      else
         {:error, reason} ->
-          next = put_record(state, record |> Map.put("phase", "fenced") |> Map.put("error", inspect(reason)))
-          {:error, reason, next}
+          {:error, reason, state}
       end
     else
       {:error, :invalid_review_submission, state}
@@ -443,51 +441,56 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp publish(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
-
   defp publishable?(nil, _findings), do: false
-
-  defp publishable?(record, findings) do
-    record["phase"] in ["running", "publishing"] and Enum.all?(findings, &valid_finding?/1)
-  end
+  defp publishable?(record, findings), do: record["phase"] in ["running", "publishing", "completed"] and Enum.all?(findings, &valid_finding?/1)
 
   defp valid_finding?(finding) do
     is_binary(finding) and byte_size(finding) in 1..16_384 and
-      Regex.match?(~r/[\x{4e00}-\x{9fff}]/u, finding) and not String.contains?(finding, "<!-- symphony-review:")
+      Regex.match?(~r/[\x{4e00}-\x{9fff}]/u, finding) and not String.contains?(finding, "<!-- symphony-review:") and GitLab.comment_body?(finding)
   end
 
-  defp post_findings(config, path, record, discussions) do
-    entries = if record["submission"] == [], do: ["本轮评审未发现有充分证据支持的问题。评审范围：`#{record["base"]}` → `#{record["head"]}`。"], else: record["submission"]
+  defp finish_publication(state, record) do
+    case Publication.publish(record, state.config, &put_record(state, &1), &publication_scope(&1, state)) do
+      {:ok, current} ->
+        current = current |> Map.put("phase", "completed") |> Map.delete("publication_error")
+        {:ok, put_record(state, current)}
 
-    entries
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {body, index}, {:ok, receipts} ->
-      marker = Policy.marker(record["id"], index)
-      existing = Enum.find(discussions, &owned_note(&1["notes"] || [], marker, config))
-      result = if existing, do: {:ok, existing}, else: post_at_head(config, path, record, body <> "\n\n" <> marker)
-      collect_receipt(result, marker, config, receipts)
-    end)
-  end
-
-  defp owned_note(notes, marker, config) do
-    Enum.find(
-      notes,
-      &(String.contains?(&1["body"] || "", marker) and
-          get_in(&1, ["author", "id"]) == config["publisher_id"])
-    )
-  end
-
-  defp collect_receipt({:ok, %{"id" => discussion_id, "notes" => notes}}, marker, config, receipts) do
-    case owned_note(notes, marker, config) do
-      %{"id" => id} when is_integer(id) ->
-        {:cont, {:ok, receipts ++ [%{"discussion_id" => discussion_id, "note_id" => id}]}}
-
-      _ ->
-        {:halt, {:error, :invalid_owned_note_receipt}}
+      {:error, reason, current} ->
+        current = current |> Map.put("phase", "fenced") |> Map.put("publication_error", inspect(reason))
+        {:error, reason, put_record(state, current)}
     end
   end
 
-  defp collect_receipt({:error, reason}, _marker, _config, _receipts), do: {:halt, {:error, reason}}
-  defp collect_receipt(_result, _marker, _config, _receipts), do: {:halt, {:error, :invalid_discussion_receipt}}
+  defp recover_publications(state) do
+    Enum.reduce(state.records, state, fn {_id, record}, current ->
+      if is_map(record["publication"]), do: recover_publication(current, record), else: current
+    end)
+  end
+
+  defp recover_publication(state, record) do
+    case Publication.recover(record, state.config, &put_record(state, &1)) do
+      {:ok, record} ->
+        put_record(state, Map.delete(record, "publication_error"))
+
+      {:error, reason, record} ->
+        phase = if record["phase"] in ["ended", "superseded"], do: record["phase"], else: "fenced"
+        put_record(state, record |> Map.put("phase", phase) |> Map.put("publication_error", inspect(reason)))
+    end
+  end
+
+  defp continue_publications(state), do: Enum.reduce(state.records, state, fn {_id, record}, current -> continue_publication(current, record) end)
+
+  defp continue_publication(state, record) do
+    if record["phase"] in ["publishing", "fenced", "failed"] and record["eligibility"] == "current" and
+         record["native_stop_confirmed"] == true and is_map(record["publication"]) and is_nil(record["publication_error"]) do
+      case finish_publication(state, record) do
+        {:ok, next} -> next
+        {:error, _, next} -> next
+      end
+    else
+      state
+    end
+  end
 
   defp same_review?(mr, record, config) do
     valid_mr?(mr, record["project"], record["iid"], config) and
@@ -495,19 +498,24 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       policy_sha(config) == record["policy_sha"] and Policy.requested_reviewer?(mr, config["reviewer_id"])
   end
 
-  defp post_at_head(config, path, record, body) do
-    with {:ok, mr} <- GitLab.request(config, "GET", path),
-         true <- same_review?(mr, record, config) || {:error, :mr_head_or_reviewer_changed},
-         {:ok, discussions} <- GitLab.discussions(config, path),
-         :ok <- same_responses(record, discussions) do
-      GitLab.request(config, "POST", path <> "/discussions", %{"body" => body})
+  defp publication_scope(record, state) do
+    config = state.config
+    path = GitLab.mr_path(record["project"], record["iid"])
+
+    with true <- current_config?(state) || {:error, :review_lane_configuration_changed_restart_required},
+         {:ok, mr} <- GitLab.request(config, "GET", path),
+         true <- same_review?(mr, record, config) || {:error, :mr_head_changed},
+         {:ok, user} <- GitLab.request(config, "GET", "user"),
+         true <- user["id"] == config["publisher_id"] || {:error, :gitlab_identity_mismatch},
+         {:ok, discussions} <- GitLab.discussions(config, path) do
+      same_responses(record, discussions)
     end
   end
 
   defp same_responses(record, discussions) do
     expected = record["response_sha"]
 
-    case Policy.response_digest(record["response_findings"], discussions, record["author_id"]) do
+    case Policy.response_digest(record["response_findings"] ++ record["findings"], discussions, record["author_id"]) do
       {:ok, ^expected} -> :ok
       _ -> {:error, :review_responses_changed}
     end
@@ -526,6 +534,17 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     path = Path.join(state.config["state_dir"], "review-lane.json")
     File.write!(path <> ".pending", Jason.encode!(%{"schema_version" => 2, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints}), [:sync])
     File.rename!(path <> ".pending", path)
+    sync_directory!(Path.dirname(path))
     state
+  end
+
+  defp sync_directory!(path) do
+    {:ok, directory} = :file.open(String.to_charlist(path), [:read, :raw, :directory])
+
+    try do
+      :ok = :file.sync(directory)
+    after
+      :file.close(directory)
+    end
   end
 end

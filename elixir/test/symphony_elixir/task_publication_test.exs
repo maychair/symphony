@@ -374,6 +374,17 @@ defmodule SymphonyElixir.TaskPublicationTest do
     end
   end
 
+  test "GitLab Issue evidence cannot execute quick actions through comment text" do
+    fixture = fixture("gitlab")
+    work = fixture.record["execution_binding"]["work"]
+    {:ok, snapshot} = NativeWork.read(work, fixture.opts)
+    body = "Result\n/close"
+    assert {:not_sent, :native_comment_action_not_allowed} = NativeWork.comment(snapshot, body, "99", fixture.opts)
+    assert {:error, :invalid_publication_context} = TaskPublication.publish(fixture.record, "candidate", fixture.payload, body, fixture.opts)
+    assert posts(fixture) == []
+    refute NativeWork.comment_body?("unknown", body)
+  end
+
   test "a verifier publication stays bound to its separate journal generation and fixed candidate" do
     fixture = fixture("github")
     {:ok, developer, _} = publish(fixture)

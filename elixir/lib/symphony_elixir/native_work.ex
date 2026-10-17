@@ -73,6 +73,7 @@ defmodule SymphonyElixir.NativeWork do
     request = Keyword.get(opts, :request, &request/5)
 
     with true <- is_binary(body) and String.trim(body) != "" and is_binary(actor),
+         true <- comment_body?(snapshot.work["provider"], body) or {:error, :native_comment_action_not_allowed},
          catalog = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end),
          {:ok, repository} <- resolve(snapshot.work, catalog),
          {:ok, %{"id" => id}} when is_integer(id) and id > 0 <- get(request, repository, "/user"),
@@ -86,6 +87,12 @@ defmodule SymphonyElixir.NativeWork do
       _ -> {:not_sent, :invalid_native_publication}
     end
   end
+
+  @doc "Keep native comment creation from executing GitLab quick actions, even when credentials have broader permissions."
+  @spec comment_body?(String.t(), term()) :: boolean()
+  def comment_body?("gitlab", body) when is_binary(body), do: not Regex.match?(~r{(?:\A|[\r\n])[\s]*\/}u, body)
+  def comment_body?("github", body) when is_binary(body), do: true
+  def comment_body?(_provider, _body), do: false
 
   defp write_comment(repository, work, body, opts) do
     path = issue_path(repository, work["number"]) <> if(repository["provider"] == "github", do: "/comments", else: "/notes")
