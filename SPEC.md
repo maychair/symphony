@@ -1497,8 +1497,8 @@ Enablement (extension):
 - The Taskboard SHOULD depict repository Issues in exactly four user-facing columns: `Todo`,
   `In Progress`, `Human Review`, and `Done`.
 - The Taskboard SHOULD remain a navigation and status surface. Issue cards SHOULD open the native
-  tracker page, and task creation, comments, labels, review decisions, and merge actions SHOULD be
-  performed there rather than duplicated in the dashboard.
+  tracker page in a new browser tab, and task creation, comments, labels, review decisions, and
+  merge actions SHOULD be performed there rather than duplicated in the dashboard.
 - These columns are projections over tracker state, scheduler labels, execution observations, and
   the agreed acceptance protocol. They MUST NOT introduce a second task source or replace the
   internal scheduler state machine.

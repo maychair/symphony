@@ -47,10 +47,10 @@ Done. The existing acceptance decision and native Issue closure remain required.
 
 ## Navigation-only dashboard
 
-Each Issue card links directly to the tracker-provided URL. The board has no detail panel, comment
-composer, drag-and-drop gesture, or scheduler action. Issue creation, comments, labels, review,
-acceptance, and merge decisions happen in GitHub or GitLab, where the repository workflow and native
-history remain visible.
+Each Issue card opens the tracker-provided URL in a new browser tab so the Taskboard remains an
+independent status view. The board has no detail panel, comment composer, drag-and-drop gesture, or
+scheduler action. Issue creation, comments, labels, review, acceptance, and merge decisions happen
+in GitHub or GitLab, where the repository workflow and native history remain visible.
 
 The authenticated mutation APIs remain available for integrations that already use them. They
 re-read the current Issue before executing an action, reject invalid transitions, and never write

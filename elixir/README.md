@@ -25,7 +25,7 @@ The Phoenix service exposes a read-only repository Issue Taskboard at `/` and th
 runtime observability dashboard at `/runtime`. The Taskboard is a projection over configured
 GitHub, GitLab, or memory-backed Issues; it does not keep a second task database. Its four columns
 are user-facing views over tracker state, labels, and Symphony execution observations. Each card
-links to the native tracker Issue, where task operations take place. See
+opens the native tracker Issue in a new browser tab, where task operations take place. See
 [Taskboard](docs/taskboard.md) for state mapping, operator authentication, and the JSON API.
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The

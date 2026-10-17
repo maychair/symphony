@@ -80,6 +80,8 @@ defmodule SymphonyElixirWeb.TaskboardApiTest do
     assert taskboard_js =~ "/api/v1/taskboard"
     assert taskboard_js =~ "card.url"
     assert taskboard_js =~ "Open issue"
+    assert taskboard_js =~ "node.target = '_blank'"
+    assert taskboard_js =~ "node.rel = 'noopener noreferrer'"
     refute taskboard_js =~ "operatorRequest"
     refute taskboard_js =~ "/comments"
     refute taskboard_js =~ "/actions/"

@@ -162,6 +162,8 @@
 
     if (url) {
       node.href = url;
+      node.target = '_blank';
+      node.rel = 'noopener noreferrer';
       node.setAttribute(
         'aria-label',
         `Open ${card.issue_identifier || 'Issue'} in ${card.kind || 'tracker'}: ${card.title || 'Untitled Issue'}`,
