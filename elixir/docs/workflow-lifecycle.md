@@ -13,6 +13,8 @@ tracker reads, including GitHub/GitLab repository identity and member contracts.
 Native execution generation fencing is available for role separation and recovery.
 The member lifecycle reducer now selects roles from resolved evidence and applies
 candidate, verification, delivery, control and cumulative accounting constraints.
+Role-bound Issue evidence publication now has durable intent and native readback
+for GitHub and GitLab, including recovery after an uncertain send.
 Child dispatch, artifact verification and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
@@ -283,10 +285,58 @@ reopening work. `closeable` is a derived eligibility flag, not a close receipt:
 the effect owner must re-read native sources and stop facts, record its intent,
 perform the authorized close and read back the result.
 
-Native evidence authentication/publication, parent rework, fine-grained execution
+Native evidence attestation/selection, parent rework, fine-grained execution
 under criterion restrictions, shared board projection and effect integration
 remain pending. In particular, supplying a `sources` list is not itself proof
 that an external artifact was retrieved or a real command was executed.
+
+## Native evidence publication
+
+`TaskPublication.publish/5` appends an engine-owned candidate or verification
+report to the execution binding's owning Issue. It requires a recorded native
+thread, the matching generation/role, fixed input references and policy digest.
+Candidates belong to developers; verification reports belong to verifiers and
+name their bound candidate. This API never approves, requests changes, merges,
+creates or closes native work.
+
+Before a new send, the publisher resolves the entire current native plan again
+and checks the exact parent approval, revision, member contract and open state.
+`NativeWork.comment/4` then resolves the configured credential's native
+`/user` identity and re-reads the target Issue plus all comments. Its snapshot
+fence includes comment versions, so a concurrent comment edit can block a write
+even if the Issue's own version did not change. These are sequential read fences,
+not a cross-provider transaction.
+
+The body contains a readable summary, one canonical `symphony-evidence`
+envelope and the engine-notice marker. The envelope includes the payload,
+execution binding, native generation/thread, publishing actor and an intent
+digest of those fixed result/execution fields. Presentation text is frozen within
+that intent; rewording it cannot create a second publication for the same result. It cannot be consumed as a human decision.
+The journal preserves publication intents and native receipts; it does not copy
+the Issue's goals or maintain another task tracker.
+
+Publication proceeds through `prepared -> sending -> published`. The journal
+records `sending` before the HTTP write. HTTP 201 alone never proves
+publication: complete native readback must find exactly one matching intent,
+the expected actual author, exact body and unchanged source timestamps. The
+receipt names the WorkRef, native note ID and full source version.
+
+Retries and restarts recover a sending intent by reading the provider. A lost
+response followed by a matching note produces the original receipt. An absent,
+altered, foreign or ambiguous note remains unconfirmed and cannot cause another
+POST. A failure proven to occur before the write preserves a prepared intent.
+The journal's version/owner fence prevents late callbacks from overwriting a
+concurrent recovery or a newer role.
+
+Reusing the same completed intent revalidates its receipt. Recovering an old
+send may preserve a historical receipt after authority changes, but does not
+grant new execution or make that result current. Every consumer must reconcile
+its own current authority, candidate, inputs and check policy.
+
+This is a publication boundary, not evidence attestation: an engine-authored
+comment does not prove that a command ran or an artifact was retrieved. Actual
+candidate/check producers, authenticated evidence selection, child controls and
+automatic execution wiring remain pending. Version 2 dispatch stays fenced.
 
 ## Execution and evidence
 

@@ -36,6 +36,52 @@ defmodule SymphonyElixir.NativeWork do
     end
   end
 
+  @doc "Fingerprint both Issue content and all comment versions for a later write fence."
+  @spec snapshot_ref(map()) :: String.t()
+  def snapshot_ref(snapshot) do
+    TaskWorkflow.digest(%{
+      "work" => snapshot.work,
+      "issue" => snapshot.version,
+      "notes" => Enum.map(snapshot.notes, &SymphonyElixir.TaskDecision.source_ref/1) |> Enum.sort()
+    })
+  end
+
+  @doc """
+  Append one comment after a fresh scope and credential-actor check.
+
+  The caller must persist its send intent first and reconcile native readback
+  even after success. A write response is never a publication receipt.
+  """
+  @spec comment(map(), String.t(), String.t(), keyword()) :: :sent | {:not_sent, term()} | {:uncertain, term()}
+  def comment(snapshot, body, actor, opts \\ []) do
+    request = Keyword.get(opts, :request, &request/5)
+
+    with true <- is_binary(body) and String.trim(body) != "" and is_binary(actor),
+         catalog = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end),
+         {:ok, repository} <- resolve(snapshot.work, catalog),
+         {:ok, %{"id" => id}} when is_integer(id) and id > 0 <- get(request, repository, "/user"),
+         true <- to_string(id) == actor or {:error, :native_publication_actor_mismatch},
+         {:ok, current} <- read(snapshot.work, opts),
+         true <- snapshot_ref(current) == snapshot_ref(snapshot) or {:error, :native_snapshot_changed},
+         true <- current.raw["state"] in ["open", "opened"] or {:error, :native_issue_not_open} do
+      write_comment(repository, current.work, body, opts)
+    else
+      {:error, reason} -> {:not_sent, reason}
+      _ -> {:not_sent, :invalid_native_publication}
+    end
+  end
+
+  defp write_comment(repository, work, body, opts) do
+    path = issue_path(repository, work["number"]) <> if(repository["provider"] == "github", do: "/comments", else: "/notes")
+    writer = Keyword.get(opts, :write_request, &write_request/6)
+
+    case writer.(repository["provider"], "POST", path, %{}, %{"body" => body}, settings(repository)) do
+      {:ok, %{status: 201}} -> :sent
+      {:ok, %{status: status}} when is_integer(status) -> {:uncertain, {:native_write_status, status}}
+      _ -> {:uncertain, :native_write_failed}
+    end
+  end
+
   @doc "Resolve exact host/provider/native-ID membership before making any request."
   @spec resolve(WorkRef.t(), term()) :: {:ok, map()} | {:error, atom()}
   def resolve(work, catalog) when is_list(catalog) do
@@ -200,4 +246,6 @@ defmodule SymphonyElixir.NativeWork do
 
   defp request("github", method, path, query, settings), do: GitHub.request(method, path, query, nil, tracker_settings: settings)
   defp request("gitlab", method, path, query, settings), do: GitLab.request(method, path, query, nil, tracker_settings: settings)
+  defp write_request("github", method, path, query, body, settings), do: GitHub.request(method, path, query, body, tracker_settings: settings)
+  defp write_request("gitlab", method, path, query, body, settings), do: GitLab.request(method, path, query, body, tracker_settings: settings)
 end
