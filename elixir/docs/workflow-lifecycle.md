@@ -500,9 +500,8 @@ replacement attempt merely because that record exists at the same path.
 halts and reads the thread through its owning transport. Only validated native
 readback records a stop receipt. Failure keeps stop unconfirmed. A stale callback
 closes its old transport without issuing native halt requests against a thread
-that may now be owned by a replacement. The session API never releases the
-execution admission lock, closes an Issue or treats native Goal completion as
-technical verification or business acceptance.
+that may now be owned by a replacement. The low-level stop API does not release the execution admission lock or close an
+Issue. Native Goal completion is never technical verification or business acceptance.
 
 `TaskSession.run_goal/3` runs the managed Goal with owned native event checkpoints
 and an asynchronous `TaskObserver`. The observer starts reading only after the
@@ -530,18 +529,62 @@ a provider read is pending. Stop effects, including implicit error cleanup and
 late turn interruption, first recheck the owning session. The observer is stopped
 when the Goal returns; native stop is then explicitly confirmed and the stopped
 lifecycle is refreshed. The result retains `native_result` separately from the
-current record and flow: an outer `{:ok, result}` does not mean the Goal succeeded,
-a candidate passed verification or the task completed. The admission lock remains
-with the caller for finalization.
+current record, flow, finalization outcome and reason: an outer `{:ok, result}`
+does not mean the Goal succeeded, a candidate passed verification or the task
+completed. Managed Goals finalize the attempt before returning, including failed
+activation of an already allocated session. Callers must not perform legacy
+finalization or complete the journal again.
 
 These APIs are exercised together with native Issue fixtures and a real local
 app-server protocol process, including Goal activation, same-thread resume,
 late callbacks, controls arriving before and during execution, candidate publication,
 healthy repeated observations, workspace corruption, reader timeout/crash/owner
 exit, budget expiration and failed stop readback. They are not yet the polling
-worker entry point. The role-specific Goal prompt, worker finalization/recovery,
-configuration resolution and scheduler continuation still need integration before
+worker entry point. The role-specific Goal prompt, startup-failure and abrupt-worker
+recovery, configuration resolution and scheduler continuation still need integration before
 version 2 automatic dispatch can be enabled.
+
+## Owned attempt finalization
+
+`TaskExecution.finish/4` finalizes an admitted member attempt using the same
+execution journal and lock. It matches the attempt, binding, generation, workspace,
+thread and transport session before effects. A managed `TaskSession.run_goal/3`
+invokes it after native stop; host startup failures may also use it before any
+allocation. The finalizer checks both native and supervised command stop. Closing
+a port, a normal worker exit or a successful Goal response is not stop evidence.
+
+A stopped attempt re-reads current native facts. A required role change returns
+`continue`; an observed pause or other restriction returns `waiting`. Scheduler
+shutdown does not consume a retry. If the same role remains runnable, native
+failure or a completed Goal without task progress increments the cumulative retry
+count. The lifecycle applies the configured finite retry limit again before the
+result can request another attempt. A retry never resets consumed time or the
+execution generation; only admission can change the role or fixed inputs.
+
+`task_attempt_results` retains a receipt keyed by attempt ID, including the native
+result, reason, generation, session ID, outcome and final journal phase. The result,
+retry count, latest controls and lifecycle projection are checkpointed together at
+`finalizing`, then the final phase is saved and the exact executor lock is released.
+Repeated finalization resumes those steps without counting again or replacing the
+recorded result. A foreign cleanup owner or changed journal prevents cleanup.
+The returned snapshot belongs to the finished attempt; the finalizer does not read
+back and adopt a successor after releasing the lock.
+
+If final native facts are unreadable, the projection becomes `unknown`, with
+execution, closure and next-role eligibility blocked. Confirmed history remains
+intact, and a later native observation can recompute the projection. If native or
+command stop is unconfirmed, the final phase is `incident`, not `completed`.
+Releasing a failed worker's lock does not prove its native execution stopped:
+admission still rejects that incident or derives an uncertainty restriction.
+No finalizer closes an Issue, publishes acceptance or creates another native thread.
+
+Legacy `Execution.finish/3` and interrupted-worker finalization reject plan-member
+journals. They cannot apply label-based decisions, count a second retry or erase
+role evidence. Replaying finalization with its existing owner is covered; acquiring
+a dead worker's ownership, recovering native allocations after VM loss and wiring
+scheduler continuation remain separate integration work. Tests use real native
+protocol processes and filesystem lock boundaries; replay of `finalizing` and
+`completed` checkpoints is a local interruption fixture, not live-provider recovery.
 
 ## Native evidence publication
 

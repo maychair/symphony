@@ -186,7 +186,8 @@ defmodule SymphonyElixir.Execution do
 
   defp finish_record(issue, initial, result) do
     with {:ok, record} <- RunJournal.read(initial["directory"]),
-         true <- record["attempt_id"] == initial["attempt_id"] do
+         true <- record["attempt_id"] == initial["attempt_id"],
+         :ok <- legacy_finalizer(record) do
       record =
         case refresh_workflow(record, false) do
           {:ok, refreshed} -> refreshed
@@ -201,6 +202,12 @@ defmodule SymphonyElixir.Execution do
         RunJournal.complete(updated, phase)
       end
     end
+  end
+
+  defp legacy_finalizer(record) do
+    if is_map(record["execution_binding"]) or get_in(record, ["workflow", "schema_version"]) == 2,
+      do: {:error, :plan_execution_finalizer_required},
+      else: :ok
   end
 
   defp clear_resume_requested(%{"workflow" => flow} = record),
@@ -362,7 +369,8 @@ defmodule SymphonyElixir.Execution do
   defp finish_interrupted(record, message) do
     record = clear_resume_requested(record)
 
-    with {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => message}),
+    with :ok <- legacy_finalizer(record),
+         {:ok, updated} <- RunJournal.checkpoint(record, %{"blocker_reason" => message}),
          :ok <- RunJournal.complete(updated, "incident") do
       {:blocked, message}
     else

@@ -309,7 +309,10 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert result.record["turn_count"] == 1
     assert result.record["native_stop_confirmed"]
     refute result.flow["closeable"]
-    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    assert result.outcome == "retry"
+    assert result.record["retry_count"] == 1
+    assert result.reason == ":task_execution_no_progress"
     assert {:error, :task_session_not_ready} = TaskSession.run_goal(session, "Do not reuse a closed transport")
   end
 
@@ -332,6 +335,7 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert result.flow["state"] == "waiting"
     refute result.flow["charging"]
     assert map_size(result.record["control_receipts"]) > 0
+    assert result.record["retry_count"] == 0
     assert Enum.any?(requests(c), &(&1["method"] == "turn/interrupt"))
   end
 
@@ -342,7 +346,8 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert result.flow["next_binding"]["role"] == "verifier"
     assert result.record["native_stop_confirmed"]
     assert Enum.any?(requests(c), &(&1["id"] == "candidate-call" and &1["result"]["success"]))
-    assert :ok = RunJournal.complete(result.record, "completed")
+    assert result.outcome == "continue"
+    assert result.record["retry_count"] == 0
     assert {:ok, verifying} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
     assert verifying.record["execution_generation"] == 2
     refute verifying.record["task_session_id"]
@@ -567,5 +572,167 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert {:ok, result} = TaskSession.run_goal(session, "Fail the consumer", on_message: handler)
     assert {:error, {:task_goal_failed, :throw, ":consumer_failed"}} = result.native_result
     assert result.record["native_stop_confirmed"]
+  end
+
+  test "repeated Goals without task progress exhaust retries without resetting generation or budget", c do
+    final =
+      Enum.reduce(1..3, c.record, fn attempt, record ->
+        {:ok, session} = TaskSession.start(record, c.registry, c.opts)
+        {:ok, result} = TaskSession.run_goal(session, "Return without publishing")
+        assert result.record["retry_count"] == attempt
+        assert result.record["execution_generation"] == 1
+        assert result.record["workflow"]["used_ms"] >= record["workflow"]["used_ms"]
+        assert map_size(result.record["task_attempt_results"]) == attempt
+        unchanged = File.read!(Path.join(record["directory"], "run.json"))
+        assert {:ok, duplicate} = TaskExecution.finish(result.record, {:error, :different_result}, c.registry, [])
+        assert duplicate.record == result.record
+        assert File.read!(Path.join(record["directory"], "run.json")) == unchanged
+
+        if attempt < 3 do
+          assert result.outcome == "retry"
+          assert {:ok, next} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+          assert next.record["thread_id"] == result.record["thread_id"]
+          assert {:error, :execution_attempt_changed} = TaskExecution.finish(result.record, :ok, c.registry, c.opts)
+          next.record
+        else
+          assert result.outcome == "waiting"
+          result.record
+        end
+      end)
+
+    assert final["workflow"]["restrictions"]["retry_limit"]
+    assert {:waiting, _} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    refute File.exists?(Path.join(final["directory"], "executor.lock"))
+  end
+
+  test "scheduler stop before Goal activation finalizes without consuming retries", c do
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    send(self(), :symphony_stop)
+    assert {:ok, result} = TaskSession.run_goal(session, "Respect scheduler stop")
+    assert result.native_result == {:error, :scheduler_stop}
+    assert result.outcome == "continue"
+    assert result.record["retry_count"] == 0
+    assert result.record["native_stop_confirmed"]
+    refute Enum.any?(requests(c), &(&1["method"] == "thread/goal/set"))
+  end
+
+  test "a pause before managed activation still finalizes the allocated idle session", c do
+    {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+    pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+    assert {:ok, result} = TaskSession.run_goal(session, "Do not activate")
+    assert result.native_result == {:error, :task_activation_not_ready}
+    assert result.record["native_stop_confirmed"]
+    assert result.record["retry_count"] == 0
+    assert result.outcome == "waiting"
+    refute File.exists?(Path.join(result.record["directory"], "executor.lock"))
+  end
+
+  test "unreadable native facts after stop preserve unknown evidence and release only execution ownership", c do
+    request = fn provider, method, path, query, settings ->
+      if current(c)["task_session_phase"] == "stopped",
+        do: {:error, :source_unavailable},
+        else: c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    {:ok, session} = TaskSession.start(c.record, c.registry, Keyword.put(c.opts, :request, request))
+    assert {:ok, result} = TaskSession.run_goal(session, "Stop before provider failure")
+    assert result.flow["evidence"] == "unknown"
+    refute result.flow["dispatchable"]
+    refute result.flow["closeable"]
+    assert result.reason =~ "finalization_evidence_unconfirmed"
+    assert result.record["native_stop_confirmed"]
+    assert {:ok, resumed} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    refute resumed.flow["restrictions"]["finalization_evidence"]
+  end
+
+  for boundary <- ["finalizing", "completed"] do
+    @boundary boundary
+    test "finalization recovers the #{@boundary} boundary without counting the failure twice", c do
+      {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
+      marker = Path.join([c.record["directory"], "executor.lock", "cleanup-owner.json"])
+      File.write!(marker, "protect cleanup")
+      assert {:error, {:execution_lock_owner_changed, _}} = TaskSession.run_goal(session, "Finalize once")
+      record = current(c)
+      assert record["retry_count"] == 1
+      assert record["native_stop_confirmed"]
+      assert record["phase"] == "completed"
+      assert File.read!(marker) == "protect cleanup"
+      # Replay the durable boundary left by interruption before/after the final
+      # phase checkpoint. Keep the real lock, receipt and native stop proof.
+      record = Map.put(record, "phase", @boundary)
+      File.write!(Path.join(record["directory"], "run.json"), Jason.encode!(record))
+      File.rm!(marker)
+      assert {:ok, recovered} = TaskExecution.finish(record, {:error, :replayed}, c.registry, [])
+      assert recovered.record["retry_count"] == 1
+      assert recovered.record["task_attempt_results"] == record["task_attempt_results"]
+      refute File.exists?(Path.dirname(marker))
+    end
+  end
+
+  test "uncertain native allocation finalizes as an incident and cannot admit a replacement", c do
+    File.write!(c.failure, "")
+    assert {:error, _} = TaskSession.start(c.record, c.registry, c.opts)
+    assert {:ok, finished} = TaskExecution.finish(current(c), {:error, :allocation_response_lost}, c.registry, [])
+    assert finished.outcome == "incident"
+    assert finished.record["phase"] == "incident"
+    assert finished.flow["execution"] == "uncertain"
+    refute finished.flow["dispatchable"]
+    refute finished.record["native_stop_confirmed"]
+    File.rm!(c.failure)
+    assert {:waiting, _} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+  end
+
+  test "failure before native allocation consumes a bounded retry and preserves the same admitted scope", c do
+    assert {:ok, finished} = TaskExecution.finish(c.record, {:error, :workspace_prepare_failed}, c.registry, c.opts)
+    assert finished.outcome == "retry"
+    assert finished.record["retry_count"] == 1
+    refute finished.record["thread_allocation_intent"]
+    assert {:ok, next} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+    assert next.record["execution_binding"] == c.record["execution_binding"]
+  end
+
+  test "a changed journal during final observation cannot be overwritten or released", c do
+    once = start_supervised!({Agent, fn -> false end}, id: :finalization_update)
+
+    request = fn provider, method, path, query, settings ->
+      if Agent.get_and_update(once, &{not &1, true}), do: RunJournal.checkpoint(current(c), %{"new_fact" => "preserve"})
+      c.opts[:request].(provider, method, path, query, settings)
+    end
+
+    assert {:error, :stale_or_unowned_execution_checkpoint} = TaskExecution.finish(c.record, {:error, :failed}, c.registry, Keyword.put(c.opts, :request, request))
+    assert current(c)["new_fact"] == "preserve"
+    refute current(c)["task_attempt_results"]
+    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    assert {:ok, _} = TaskExecution.finish(current(c), {:error, :failed}, c.registry, c.opts)
+  end
+
+  test "malformed finalization receipts and missing or foreign records do not authorize cleanup", c do
+    assert {:ok, finished} = TaskExecution.finish(c.record, {:error, :failed}, c.registry, c.opts)
+    journal = Path.join(c.record["directory"], "run.json")
+    corrupted = put_in(finished.record, ["task_attempt_results", c.record["attempt_id"]], %{"phase" => "completed"})
+    File.write!(journal, Jason.encode!(corrupted))
+    assert {:error, :invalid_attempt_result} = TaskExecution.finish(finished.record, :ok, c.registry, c.opts)
+    foreign = Map.put(finished.record, "task_session_id", "other")
+    assert {:error, :execution_attempt_changed} = TaskExecution.finish(foreign, :ok, c.registry, c.opts)
+    File.rm!(journal)
+    assert {:error, :execution_attempt_changed} = TaskExecution.finish(finished.record, :ok, c.registry, c.opts)
+    File.write!(journal, "null")
+    assert {:error, :invalid_run_journal} = TaskExecution.finish(finished.record, :ok, c.registry, c.opts)
+  end
+
+  test "legacy finalization and worker-down handling cannot rewrite a plan member", c do
+    issue = %Issue{id: c.record["issue_id"], identifier: "ROLE", title: "Owned member", state: "open"}
+    before = File.read!(Path.join(c.record["directory"], "run.json"))
+    assert {:error, :plan_execution_finalizer_required} = SymphonyElixir.Execution.finish(issue, [run_record: c.record], :ok)
+    path = Workflow.workflow_file_path()
+    agent = "agent:\n  goal_mode: true\n  run_journal_dir: " <> Jason.encode!(Path.dirname(c.record["directory"])) <> "\n"
+    File.write!(path, String.replace(File.read!(path), "agent:\n", agent))
+    WorkflowStore.force_reload()
+    assert {:blocked, reason} = SymphonyElixir.Execution.worker_down(issue.id, :killed)
+    assert reason =~ "plan_execution_finalizer_required"
+    assert File.read!(Path.join(c.record["directory"], "run.json")) == before
+    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
   end
 end

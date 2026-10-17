@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.TaskExecution do
   @moduledoc "Resolve native member evidence and admit the derived role under its owning execution journal lock."
+  alias SymphonyElixir.CommandCheck
   alias SymphonyElixir.{ExecutionBinding, NativeWork, RunJournal, TaskControl, TaskDelivery, TaskDependencies}
   alias SymphonyElixir.{TaskEvidence, TaskLifecycle, TaskPlanPreflight, WorkRef}
 
@@ -240,5 +241,137 @@ defmodule SymphonyElixir.TaskExecution do
     prior = TaskControl.recorded(record)
     known = TaskControl.recorded(current)
     if is_map(prior) and is_map(known) and Enum.all?(prior, fn {id, source} -> known[id] == source end), do: :ok, else: {:error, :control_source_unconfirmed}
+  end
+
+  @doc "Finalize one owned attempt exactly once. Native stop, task evidence and retry accounting remain separate facts."
+  @spec finish(map(), term(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def finish(record, result, executions, opts) do
+    with {:ok, %{} = current} <- RunJournal.read(record["directory"]),
+         true <- Map.take(current, @running_identity) == Map.take(record, @running_identity) and current["executor_os_pid"] == System.pid(),
+         {:ok, _} <- ExecutionBinding.normalize(current["execution_binding"]),
+         true <- is_map(current["workflow"]) and is_map(current["workflow"]["restrictions"]),
+         {:ok, ^current} <- ExecutionBinding.bind(current, current["execution_binding"]),
+         {:ok, current} <- finish_intent(current, result, executions, opts),
+         {:ok, current} <- release_finished(current) do
+      receipt = current["task_attempt_results"][current["attempt_id"]]
+      {:ok, %{record: current, flow: current["workflow"], outcome: receipt["outcome"], reason: receipt["reason"]}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :execution_attempt_changed}
+    end
+  end
+
+  defp finish_intent(record, result, executions, opts) do
+    case get_in(record, ["task_attempt_results", record["attempt_id"]]) do
+      nil -> prepare_finish(record, result, executions, opts)
+      receipt -> if valid_finish?(receipt, record), do: {:ok, record}, else: {:error, :invalid_attempt_result}
+    end
+  end
+
+  defp valid_finish?(receipt, record) do
+    is_map(receipt) and receipt["generation"] == record["execution_generation"] and receipt["session_id"] == record["task_session_id"] and
+      receipt["phase"] in ["completed", "incident"] and receipt["outcome"] in ["continue", "waiting", "retry", "incident"] and
+      record["phase"] in ["finalizing", receipt["phase"]] and (receipt["phase"] == "incident" or stopped?(record))
+  end
+
+  defp stopped?(record),
+    do: CommandCheck.stopped?(record) and (record["native_stop_confirmed"] == true or (is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true))
+
+  defp prepare_finish(record, result, executions, opts) do
+    if stopped?(record) do
+      case observe_stopped(record, executions, opts) do
+        {:ok, observation} ->
+          finish_observed(record, result, observation)
+
+        {:error, reason} ->
+          flow = unknown_flow(record, "finalization_evidence")
+          persist_finish(record, result, "waiting", {:finalization_evidence_unconfirmed, reason}, flow)
+      end
+    else
+      persist_finish(record, result, "incident", :task_execution_stop_unconfirmed, unknown_flow(record, "native_stop"))
+    end
+  end
+
+  defp observe_stopped(record, executions, opts) do
+    binding = record["execution_binding"]
+
+    with {:ok, observation} <- observe(binding["authority"]["work"], binding["work"], executions, Keyword.put(opts, :active, false)),
+         true <- observation.record == record do
+      {:ok, observation}
+    else
+      false -> {:error, :execution_observation_superseded}
+      error -> error
+    end
+  end
+
+  defp finish_observed(record, result, observation) do
+    {outcome, reason} = finish_outcome(record, result, observation.flow)
+    record = if outcome == "retry", do: Map.update(record, "retry_count", 1, &(&1 + 1)), else: record
+    binding = record["execution_binding"]
+    context = %{plan: observation.plan, work: binding["work"], runtime: record, policy: observation.policy, evidence: observation.evidence}
+
+    with {:ok, flow} <- TaskLifecycle.assess(context, System.system_time(:millisecond)) do
+      record = Map.put(record, "control_receipts", observation.evidence["control_receipts"])
+      outcome = if outcome == "retry" and not flow["dispatchable"], do: "waiting", else: outcome
+      persist_finish(record, result, outcome, reason, flow)
+    end
+  end
+
+  defp finish_outcome(record, result, flow) do
+    cond do
+      not flow["dispatchable"] -> {"waiting", nil}
+      flow["next_binding"] != record["execution_binding"] -> {"continue", nil}
+      result == {:error, :scheduler_stop} -> {"continue", nil}
+      match?({:ok, _}, result) -> {"retry", :task_execution_no_progress}
+      true -> {"retry", result}
+    end
+  end
+
+  defp unknown_flow(record, id) do
+    flow = record["workflow"]
+    restriction = %{"kind" => "evidence", "scope" => "task", "source" => "finalization"}
+    flow = put_in(flow, ["restrictions", id], restriction)
+    execution = if id == "native_stop", do: "uncertain", else: if(record["thread_id"], do: "stopped", else: "idle")
+    Map.merge(flow, %{"state" => "waiting", "execution" => execution, "evidence" => "unknown", "dispatchable" => false, "stop_required" => false, "closeable" => false, "next_binding" => nil})
+  end
+
+  defp persist_finish(record, result, outcome, reason, flow) do
+    phase = if outcome == "incident", do: "incident", else: "completed"
+
+    receipt = %{
+      "generation" => record["execution_generation"],
+      "session_id" => record["task_session_id"],
+      "phase" => phase,
+      "outcome" => outcome,
+      "reason" => if(reason, do: inspect(reason)),
+      "native_result" => inspect(result)
+    }
+
+    receipts = Map.put(record["task_attempt_results"] || %{}, record["attempt_id"], receipt)
+
+    changes = %{
+      "phase" => "finalizing",
+      "workflow" => flow,
+      "retry_count" => record["retry_count"] || 0,
+      "control_receipts" => record["control_receipts"],
+      "task_attempt_results" => receipts,
+      "blocker_reason" => receipt["reason"]
+    }
+
+    RunJournal.checkpoint(record, changes)
+  end
+
+  defp release_finished(%{"phase" => "finalizing"} = record) do
+    phase = record["task_attempt_results"][record["attempt_id"]]["phase"]
+
+    with {:ok, record} <- RunJournal.checkpoint(record, %{"phase" => phase}),
+         :ok <- RunJournal.release_lock(record) do
+      {:ok, record}
+    end
+  end
+
+  defp release_finished(record) do
+    result = if File.exists?(Path.join(record["directory"], "executor.lock")), do: RunJournal.release_lock(record), else: :ok
+    with :ok <- result, do: {:ok, record}
   end
 end

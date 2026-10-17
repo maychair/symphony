@@ -110,19 +110,33 @@ defmodule SymphonyElixir.TaskSession do
   @doc "Run this role's native Goal with bounded asynchronous control reads, owned event checkpoints and explicit stop proof."
   @spec run_goal(t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_goal(%{task_session: context} = session, objective, opts \\ []) do
+    with {:ok, record} <- current(context),
+         true <- record["task_session_phase"] == "ready" or {:error, :task_session_not_ready} do
+      result = activated_goal(session, objective, opts)
+      finish_goal(context, result, stop(session))
+    end
+  end
+
+  defp finish_goal(context, result, :ok), do: finalize(context, result)
+
+  defp finish_goal(context, result, {:error, reason} = error) do
+    with {:ok, _} <- finalize(context, {:error, {:native_stop_failed, reason, result}}), do: error
+  end
+
+  defp activated_goal(%{task_session: context} = session, objective, opts) do
     with {:ok, activation} <- activation_options(session),
          {:ok, record} <- current(context),
-         true <- record["task_session_phase"] == "ready" or {:error, :task_session_not_ready},
          {:ok, observer} <- TaskObserver.start_link(record, context.executions, context.opts) do
-      result =
-        try do
-          native_goal(session, objective, observer, activation, opts)
-        after
-          TaskObserver.stop(observer)
-        end
-
-      with :ok <- stop(session), do: reconcile_stopped(context, result)
+      try do
+        native_goal(session, objective, observer, activation, opts)
+      after
+        TaskObserver.stop(observer)
+      end
     end
+  rescue
+    error -> {:error, {:task_goal_failed, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {:task_goal_failed, kind, inspect(reason)}}
   end
 
   defp native_goal(%{task_session: context} = session, objective, observer, activation, opts) do
@@ -140,10 +154,6 @@ defmodule SymphonyElixir.TaskSession do
     ]
 
     AppServer.run_goal(session.native, objective, issue, Keyword.merge(activation, owned))
-  rescue
-    error -> {:error, {:task_goal_failed, Exception.message(error)}}
-  catch
-    kind, reason -> {:error, {:task_goal_failed, kind, inspect(reason)}}
   end
 
   defp current!(context) do
@@ -198,10 +208,10 @@ defmodule SymphonyElixir.TaskSession do
   defp native_event(_, _), do: :ok
   defp save_event(context, changes), do: :ok = save(context, changes)
 
-  defp reconcile_stopped(context, result) do
+  defp finalize(context, result) do
     with {:ok, record} <- current(context),
-         {:ok, observation} <- TaskExecution.refresh(record, context.executions, Keyword.put(context.opts, :active, false)) do
-      {:ok, %{native_result: result, record: observation.record, flow: observation.flow}}
+         {:ok, finished} <- TaskExecution.finish(record, result, context.executions, context.opts) do
+      {:ok, Map.put(finished, :native_result, result)}
     end
   end
 
