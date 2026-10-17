@@ -54,7 +54,7 @@ defmodule SymphonyElixir.TaskDependencies do
 
   defp input_set?(_, _), do: false
 
-  defp dependency(context, %{"stage" => stage} = edge, reference, observed) when stage in ["verified", "delivered"] do
+  defp dependency(context, edge, reference, observed) do
     with {:ok, facts, runtime, policy} <- member(context, edge["from"], reference),
          %{} = candidate <- facts.candidate,
          {:ok, upstream} <- dependencies(context, edge["from"], candidate["inputs"], observed),
@@ -62,8 +62,9 @@ defmodule SymphonyElixir.TaskDependencies do
          assessment = %{plan: context.plan, work: edge["from"], runtime: runtime, policy: policy, evidence: evidence},
          {:ok, artifacts} <- TaskLifecycle.verified_artifacts(assessment),
          %{} = artifact <- Enum.find(artifacts, &(&1["id"] == edge["artifact"])),
-         {:ok, proof, changes} <- delivery_proof(context, edge, artifact, facts.verification),
-         :ok <- retain(context, edge, proof, runtime),
+         delivery_context = %{context | opts: Keyword.merge(context.opts, candidate: candidate, runtime: runtime)},
+         {:ok, proof, changes} <- delivery_proof(delivery_context, edge, artifact, facts.verification),
+         :ok <- retain(context, edge, proof, runtime, artifact),
          {:ok, observed} <- observe(upstream.observed, runtime, facts.snapshot, changes) do
       {:ok, proof, Enum.uniq(evidence["sources"] ++ Enum.map(changes, & &1.source)), observed}
     else
@@ -72,14 +73,15 @@ defmodule SymphonyElixir.TaskDependencies do
     end
   end
 
-  defp dependency(_, _, _, _), do: {:error, :dependency_delivery_evidence_unavailable}
-
   defp delivery_proof(_context, %{"stage" => "verified"} = edge, artifact, verification), do: {:ok, proof(edge, artifact, verification), []}
+
+  defp delivery_proof(_, %{"stage" => "published"}, %{"kind" => kind}, _) when kind != "report",
+    do: {:error, :dependency_delivery_evidence_unavailable}
 
   defp delivery_proof(context, edge, artifact, verification) do
     case TaskDelivery.read(edge["from"], artifact, context.opts) do
       {:ok, %{status: "delivered", snapshot: snapshot}} ->
-        {:ok, proof(edge, artifact, verification) |> Map.put("stage", "delivered") |> Map.put("delivery", snapshot.source), [snapshot]}
+        {:ok, proof(edge, artifact, verification) |> Map.put("stage", edge["stage"]) |> Map.put("delivery", snapshot.source), [snapshot]}
 
       {:ok, %{status: "verification_required"}} ->
         {:error, :dependency_delivery_verification_required}
@@ -125,12 +127,17 @@ defmodule SymphonyElixir.TaskDependencies do
     }
   end
 
-  defp retain(context, edge, proof, runtime) do
+  defp retain(context, edge, proof, runtime, artifact) do
     revision = TaskWorkflow.digest(%{"plan_revision" => context.plan.plan["revision"], "input" => proof})
     owner = %{"kind" => "dependency", "work" => edge["to"], "revision" => revision}
     root = Keyword.get(context.opts, :artifact_store_root, Path.join(Path.dirname(runtime["directory"]), ".artifacts"))
 
-    case ArtifactStore.retain(root, edge["from"], proof["version"], owner, context.opts) do
+    result =
+      if Map.has_key?(artifact, "body"),
+        do: ArtifactStore.retain_report(root, edge["from"], artifact, owner, context.opts),
+        else: ArtifactStore.retain(root, edge["from"], proof["version"], owner, context.opts)
+
+    case result do
       {:ok, _} -> :ok
       {:error, _} = error -> error
     end
@@ -164,7 +171,7 @@ defmodule SymphonyElixir.TaskDependencies do
   end
 
   defp unchanged_member?(snapshot, value, opts) do
-    changes_current = Enum.all?(value.changes, &(NativeWork.read_change(&1.work, opts) == {:ok, &1}))
+    changes_current = Enum.all?(value.changes, &TaskDelivery.current?(&1, opts))
 
     case RunJournal.read(value.directory) do
       {:ok, %{} = runtime} ->

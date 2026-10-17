@@ -1,11 +1,11 @@
 defmodule SymphonyElixir.ArtifactStore do
   @moduledoc """
-  Retain verified immutable Git snapshots independently of executor worktrees.
+  Retain immutable Git snapshots and native report bytes independently of executor worktrees.
 
   Stored bytes and retention references are receipts, not task state or execution
   authority. This boundary never deletes artifacts or releases live references.
   """
-  alias SymphonyElixir.{Config, GitArtifact, NativeWork, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{Config, GitArtifact, NativeWork, ReportArtifact, TaskWorkflow, WorkRef}
 
   @owner "symphony-artifact-store:1\n"
   @metadata_limit 16_777_216
@@ -20,6 +20,41 @@ defmodule SymphonyElixir.ArtifactStore do
          :ok <- reference(root, artifact.receipt, owner) do
       {:ok, artifact}
     end
+  end
+
+  @doc "Persist exact report bytes and a consumer reference; this does not prove native publication or technical verification."
+  @spec retain_report(Path.t(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def retain_report(root, work, report, owner, opts) do
+    with :ok <- context(root, work, report["version"], opts),
+         true <- owner?(owner, work) or {:error, :invalid_artifact_reference},
+         {:ok, artifact} <- ReportArtifact.snapshot(work, report),
+         true <- artifact.receipt["bytes"] <= Keyword.get(opts, :artifact_max_bytes, 104_857_600) or {:error, :artifact_storage_limit},
+         :ok <- prepare_root(root),
+         :ok <- publish(root, report_path(root, report), encode(artifact)),
+         {:ok, saved} <- read_report(root, work, report, opts),
+         :ok <- reference(root, saved.receipt, owner) do
+      {:ok, saved}
+    end
+  end
+
+  @doc "Read a fixed retained report without native requests or trusting its filename as proof."
+  @spec read_report(Path.t(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_report(root, work, report, opts) do
+    with :ok <- context(root, work, report["version"], opts),
+         expected_source = ReportArtifact.source_ref(work, report["id"], report["version"]),
+         true <- report["source"] == expected_source or {:error, :invalid_report_artifact},
+         :ok <- owned_root(root),
+         {:ok, data} <- read_json(report_path(root, report), file_limit(opts)),
+         {:ok, artifact} <- decode(data),
+         :ok <- ReportArtifact.validate(work, report, artifact),
+         true <- artifact.receipt["bytes"] <= Keyword.get(opts, :artifact_max_bytes, 104_857_600) or {:error, :artifact_storage_limit} do
+      {:ok, artifact}
+    end
+  end
+
+  @spec report_references(Path.t(), map(), map(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def report_references(root, work, report, opts) do
+    with {:ok, artifact} <- read_report(root, work, report, opts), do: stored_references(root, artifact.receipt, work)
   end
 
   @doc "Read retained bytes with full integrity checks, without contacting the provider or creating a reference."
@@ -37,14 +72,17 @@ defmodule SymphonyElixir.ArtifactStore do
   @doc "List durable retention owners; damaged references remain a gap, never an empty reference set."
   @spec references(Path.t(), map(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def references(root, work, revision, opts) do
-    with {:ok, artifact} <- read(root, work, revision, opts),
-         {:ok, names} <- File.ls(root) do
-      prefix = key(work, revision) <> "."
+    with {:ok, artifact} <- read(root, work, revision, opts), do: stored_references(root, artifact.receipt, work)
+  end
+
+  defp stored_references(root, receipt, work) do
+    with {:ok, names} <- File.ls(root) do
+      prefix = source_key(receipt["source"]) <> "."
 
       names
       |> Enum.filter(&(String.starts_with?(&1, prefix) and String.ends_with?(&1, ".ref")))
       |> Enum.sort()
-      |> read_references(root, artifact.receipt, work)
+      |> read_references(root, receipt, work)
     end
   end
 
@@ -167,7 +205,7 @@ defmodule SymphonyElixir.ArtifactStore do
 
   defp reference(root, receipt, owner) do
     ref = %{"schema_version" => 1, "artifact" => receipt["source"], "digest" => receipt["digest"], "owner" => owner}
-    path = Path.join(root, String.replace_prefix(receipt["source"], "git:", "") <> "." <> TaskWorkflow.digest(owner) <> ".ref")
+    path = Path.join(root, source_key(receipt["source"]) <> "." <> TaskWorkflow.digest(owner) <> ".ref")
     body = TaskWorkflow.canonical_json(ref)
 
     with :ok <- publish(root, path, body),
@@ -181,7 +219,7 @@ defmodule SymphonyElixir.ArtifactStore do
     Enum.reduce_while(names, {:ok, []}, fn name, {:ok, acc} ->
       with {:ok, %{"schema_version" => 1, "artifact" => source, "digest" => digest, "owner" => owner} = ref} <- read_json(Path.join(root, name), @metadata_limit),
            true <- map_size(ref) == 4 and source == receipt["source"] and digest == receipt["digest"] and owner?(owner, work),
-           true <- name == String.replace_prefix(source, "git:", "") <> "." <> TaskWorkflow.digest(owner) <> ".ref" do
+           true <- name == source_key(source) <> "." <> TaskWorkflow.digest(owner) <> ".ref" do
         {:cont, {:ok, [owner | acc]}}
       else
         _ -> {:halt, {:error, :unconfirmed_artifact_reference}}
@@ -250,6 +288,8 @@ defmodule SymphonyElixir.ArtifactStore do
   end
 
   defp key(work, revision), do: String.replace_prefix(GitArtifact.source_ref(work, revision), "git:", "")
+  defp source_key(source), do: source |> String.replace_prefix("git:", "") |> String.replace_prefix("report:", "report-")
+  defp report_path(root, report), do: Path.join(root, source_key(report["source"]) <> ".json")
   defp snapshot_path(root, work, revision), do: Path.join(root, key(work, revision) <> ".json")
   defp file_limit(opts), do: div(Keyword.get(opts, :artifact_max_bytes, 104_857_600) + 2, 3) * 4 + @metadata_limit
 end

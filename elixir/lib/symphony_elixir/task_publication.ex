@@ -7,7 +7,7 @@ defmodule SymphonyElixir.TaskPublication do
   approval, merge, Issue creation or closure operation is exposed here.
   """
   alias SymphonyElixir.{ExecutionBinding, NativeWork, RunJournal, TaskDecision, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{TaskControl, TaskPlanPreflight}
+  alias SymphonyElixir.{ReportArtifact, TaskControl, TaskPlanPreflight}
 
   @marker "<!-- symphony-evidence "
 
@@ -103,7 +103,12 @@ defmodule SymphonyElixir.TaskPublication do
       id = TaskWorkflow.digest(Map.delete(envelope, "summary"))
       envelope = Map.put(envelope, "id", id)
       body = render(envelope)
-      {:ok, %{"id" => id, "work" => binding["work"], "actor" => policy["engine_actor"], "body" => body, "status" => "prepared", "binding" => binding}}
+
+      if byte_size(body) <= 64_000 do
+        {:ok, %{"id" => id, "work" => binding["work"], "actor" => policy["engine_actor"], "body" => body, "status" => "prepared", "binding" => binding}}
+      else
+        {:error, :publication_body_too_large}
+      end
     else
       _ -> {:error, :invalid_publication_context}
     end
@@ -112,11 +117,25 @@ defmodule SymphonyElixir.TaskPublication do
   defp attest("verification", record, payload, policy), do: SymphonyElixir.CommandCheck.attest(record, payload, policy)
   defp attest(_, _, _, _), do: :ok
 
-  defp render(envelope), do: envelope["summary"] <> "\n\n" <> @marker <> TaskWorkflow.canonical_json(envelope) <> " -->\n<!-- symphony-engine-notice -->"
+  defp render(envelope) do
+    report = report_text(envelope)
+    json = TaskWorkflow.canonical_json(envelope)
+    json = if report == "", do: json, else: json |> String.replace("<", "\\u003c") |> String.replace(">", "\\u003e")
+    envelope["summary"] <> report <> "\n\n" <> @marker <> json <> " -->\n<!-- symphony-engine-notice -->"
+  end
+
+  defp report_text(%{"kind" => "candidate", "payload" => %{"artifacts" => artifacts}}) do
+    Enum.map_join(artifacts, "", fn
+      %{"kind" => "report", "body" => body, "id" => id} -> "\n\n### Report " <> Jason.encode!(id) <> "\n\n" <> body
+      _ -> ""
+    end)
+  end
+
+  defp report_text(_), do: ""
   defp summary?(summary), do: text?(summary) and not String.contains?(summary, "<!-- symphony-")
 
   defp valid_entry?(id, %{"id" => id, "body" => body, "binding" => binding, "status" => status} = entry) when is_binary(body) do
-    with true <- status in ["prepared", "sending", "published"] and receipt_shape?(entry),
+    with true <- status in ["prepared", "sending", "published"] and receipt_shape?(entry) and byte_size(body) <= 64_000,
          {:ok, ^binding} <- ExecutionBinding.normalize(binding),
          [json] <- Regex.run(~r/\n\n<!-- symphony-evidence (\{[^\n]*\}) -->\n<!-- symphony-engine-notice -->\z/, body, capture: :all_but_first),
          {:ok, %{"id" => ^id, "binding" => ^binding, "actor" => actor} = envelope} <- Jason.decode(json) do
@@ -145,7 +164,9 @@ defmodule SymphonyElixir.TaskPublication do
 
   defp role_payload?("candidate", payload, %{"role" => "developer"} = binding) do
     expected = Map.take(binding, ~w(work contract_sha inputs))
-    Enum.all?(expected, fn {key, value} -> payload[key] == value end) and is_list(payload["artifacts"]) and payload["artifacts"] != []
+
+    Enum.all?(expected, fn {key, value} -> payload[key] == value end) and is_list(payload["artifacts"]) and payload["artifacts"] != [] and
+      Enum.all?(payload["artifacts"], &valid_report?(&1, binding["work"]))
   end
 
   defp role_payload?("verification", payload, %{"role" => "verifier"} = binding) do
@@ -153,6 +174,11 @@ defmodule SymphonyElixir.TaskPublication do
   end
 
   defp role_payload?(_, _, _), do: false
+
+  defp valid_report?(artifact, work) when is_map(artifact),
+    do: not Map.has_key?(artifact, "body") or match?({:ok, _}, ReportArtifact.snapshot(work, artifact))
+
+  defp valid_report?(_, _), do: false
 
   defp intent(record, %{"body" => body} = entry) do
     case (record["publications"] || %{})[entry["id"]] do

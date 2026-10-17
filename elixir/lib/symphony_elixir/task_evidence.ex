@@ -136,7 +136,7 @@ defmodule SymphonyElixir.TaskEvidence do
     end
   end
 
-  @doc "Retain candidate Git outputs before publishing or consuming their immutable references."
+  @doc "Retain candidate Git outputs and exact report bytes before publishing or consuming immutable references."
   @spec retain_candidate(map(), map(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def retain_candidate(runtime, payload, opts) do
     digest = TaskWorkflow.digest(Map.take(payload, ~w(work contract_sha inputs artifacts)))
@@ -154,6 +154,9 @@ defmodule SymphonyElixir.TaskEvidence do
       end
     end)
   end
+
+  defp acquire_one(%{"kind" => "report", "body" => _} = report, root, work, owner, opts),
+    do: ArtifactStore.retain_report(root, work, report, owner, opts)
 
   defp acquire_one(%{"version" => version, "source" => source}, root, work, owner, opts) when is_binary(version) do
     if source == GitArtifact.source_ref(work, version),

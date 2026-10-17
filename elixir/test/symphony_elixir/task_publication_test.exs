@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskPublicationTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.{ArtifactStore, CommandCheck, TaskTools}
+  alias SymphonyElixir.{ArtifactStore, CommandCheck, ReportArtifact, TaskTools}
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
@@ -28,7 +28,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
     Map.put(data, "contract_sha", TaskWorkflow.digest(data))
   end
 
-  defp fixture(provider, stages \\ [], kind \\ "report") do
+  defp fixture(provider, stages \\ [], kind \\ "report", checks \\ nil) do
     work = %{"provider" => provider, "host" => provider <> ".test", "repository_id" => "10", "kind" => "issue", "number" => 2}
     parent = %{work | "number" => 1}
     child_scope = contract(work, parent, kind)
@@ -114,7 +114,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
       "engine_actor" => "99",
       "max_repairs" => 2,
       "max_retries" => 2,
-      "checks" => %{"test" => %{"kind" => "command", "command" => "grep -x expected result", "artifact" => "output", "timeout_ms" => 2_000}}
+      "checks" => checks || %{"test" => %{"kind" => "command", "command" => "grep -x expected result", "artifact" => "output", "timeout_ms" => 2_000}}
     }
 
     opts = [repositories: [repository], request: request, write_request: writer, policy: policy]
@@ -210,7 +210,10 @@ defmodule SymphonyElixir.TaskPublicationTest do
   end
 
   defp candidate_args(fixture),
-    do: %{"artifacts" => Enum.map(fixture.payload["artifacts"], &Map.take(&1, ~w(id version target))), "summary" => "Fixed candidate ready"}
+    do: %{
+      "artifacts" => Enum.map(fixture.payload["artifacts"], fn artifact -> Map.take(artifact, if(Map.has_key?(artifact, "body"), do: ~w(id body), else: ~w(id version target))) end),
+      "summary" => "Fixed candidate ready"
+    }
 
   defp verifier_tools(fixture, developer) do
     {:ok, stopped} = RunJournal.checkpoint(developer, %{"native_stop_confirmed" => true})
@@ -227,6 +230,81 @@ defmodule SymphonyElixir.TaskPublicationTest do
     assert {true, %{"data" => %{"exit_code" => 0}}} = tool(verifier, "task_check", %{"check_id" => "test"})
     assert {true, _} = tool(verifier, "task_verification", %{"review_checks" => [], "findings" => [], "summary" => "Verified fixed output"})
     f
+  end
+
+  defp report_fixture(provider, stages) do
+    f = fixture(provider, stages, "report", %{"test" => %{"kind" => "review"}})
+    body = "# Findings\n\nThe cited experiment supports the conclusion.\n\nLimit: only the approved input was examined.\n<!-- reader note -->"
+    {:ok, report} = ReportArtifact.build(f.payload["work"], "output", body)
+    %{f | payload: Map.put(f.payload, "artifacts", [report])} |> Map.put(:workspace, nil)
+  end
+
+  test "native Markdown reports publish visibly and unlock verified delivery only after independent review" do
+    for provider <- ["github", "gitlab"], stage <- ["verified", "delivered", "published"] do
+      f = report_fixture(provider, [stage])
+      developer = task_tools(f)
+      assert {true, %{"data" => receipt}} = tool(developer, "task_candidate", candidate_args(f))
+      [body] = posts(f)
+      assert body =~ hd(f.payload["artifacts"])["body"]
+      assert body =~ "### Report"
+      assert {:ok, facts} = evidence(f, current(f))
+      assert facts.candidate["artifacts"] == f.payload["artifacts"]
+      assert hd(facts.artifacts).files |> hd() |> Map.fetch!("content") == hd(f.payload["artifacts"])["body"]
+      refute File.exists?(Path.join(f.record["directory"], ".git"))
+      assert {:error, :dependency_not_verified} = dependencies(f, 3, nil, [f])
+      assert {true, %{"data" => %{"delivery" => [%{"status" => "delivered", "receipt" => delivery}]}}} = tool(developer, "task_context", %{})
+      assert delivery["source"] == receipt["source"]
+      verifier = verifier_tools(f, current(f))
+
+      review = %{
+        "review_checks" => [%{"id" => "test", "result" => "passed", "rationale" => "Checked cited evidence, scope and stated limitations against the approved criteria."}],
+        "findings" => [],
+        "summary" => "Report independently verified"
+      }
+
+      assert {true, _} = tool(verifier, "task_verification", review)
+      assert {:ok, dependencies} = dependencies(f, 3, nil, [f])
+      [proof] = dependencies.dependencies
+      assert proof["stage"] == stage
+      assert proof["version"] == hd(f.payload["artifacts"])["version"]
+      root = Path.join(Path.dirname(f.record["directory"]), ".artifacts")
+      assert {:ok, owners} = ArtifactStore.report_references(root, f.payload["work"], hd(f.payload["artifacts"]), f.opts)
+      assert Enum.any?(owners, &(&1["kind"] == "dependency" and &1["work"]["number"] == 3))
+      Agent.update(f.state, &update_in(&1.objects[f.notes], fn [candidate, verification] -> [%{candidate | "body" => candidate["body"] <> "edited"}, verification] end))
+      assert {:error, _} = dependencies(f, 3, inputs(dependencies), [f])
+    end
+  end
+
+  test "report publication recovers a lost response and rejects mismatched bodies or native command injection" do
+    f = report_fixture("gitlab", [])
+    tools = task_tools(f)
+    bad = candidate_args(f) |> Map.put("artifacts", [%{"id" => "output", "body" => "Report\n/close"}])
+    assert {false, %{"error" => ":invalid_report_artifact"}} = tool(tools, "task_candidate", bad)
+    Agent.update(f.state, &%{&1 | mode: :lost})
+    assert {true, %{"data" => receipt}} = tool(tools, "task_candidate", candidate_args(f))
+    assert {true, %{"data" => ^receipt}} = tool(tools, "task_candidate", candidate_args(f))
+    assert length(posts(f)) == 1
+    forged = Map.update!(f.payload, "artifacts", &Enum.map(&1, fn artifact -> Map.put(artifact, "body", "Changed without updating version") end))
+    assert {:error, :invalid_publication_context} = TaskPublication.publish(current(f), "candidate", forged, "Changed", f.opts)
+    oversized_summary = String.duplicate("x", 64_001)
+    oversized_result = TaskPublication.publish(current(f), "candidate", f.payload, oversized_summary, f.opts)
+    assert {:error, :publication_body_too_large} = oversized_result
+    invalid_payload = Map.put(f.payload, "artifacts", [nil])
+    assert {:error, :invalid_publication_context} = TaskPublication.publish(current(f), "candidate", invalid_payload, "Invalid", f.opts)
+    assert {:ok, evidence} = evidence(f, current(f))
+    artifact = hd(f.payload["artifacts"])
+    opts = f.opts |> Keyword.put(:candidate, evidence.candidate) |> Keyword.put(:runtime, current(f))
+    assert {:ok, delivery} = TaskDelivery.read(f.payload["work"], artifact, opts)
+    assert TaskDelivery.current?(delivery.snapshot, opts)
+    invalid = Keyword.put(opts, :candidate, Map.put(evidence.candidate, "digest", "invented"))
+    assert {:error, :report_delivery_unconfirmed} = TaskDelivery.read(f.payload["work"], artifact, invalid)
+    missing = Keyword.put(opts, :runtime, %{})
+    assert {:error, :unrecorded_native_result} = TaskDelivery.read(f.payload["work"], artifact, missing)
+    offline = Keyword.put(opts, :request, fn _, _, _, _, _ -> {:error, :offline} end)
+    refute TaskDelivery.current?(delivery.snapshot, offline)
+    Agent.update(f.state, &put_in(&1.objects[f.notes], []))
+    refute TaskDelivery.current?(delivery.snapshot, opts)
+    assert {:error, :report_delivery_unconfirmed} = TaskDelivery.read(f.payload["work"], artifact, opts)
   end
 
   defp executions(fixtures), do: Map.new(fixtures, &{WorkRef.key(&1.payload["work"]), %{directory: &1.record["directory"], policy: &1.opts[:policy]}})
@@ -359,6 +437,13 @@ defmodule SymphonyElixir.TaskPublicationTest do
       assert {:error, :dependency_changed_during_read} = dependencies(final, 3, inputs(facts), [final], Keyword.put(final.opts, :request, request))
       assert {:error, :delivery_candidate_changed} = dependencies(final, 3, inputs(facts), [final])
     end
+  end
+
+  test "a verified merged change is not release publication evidence" do
+    f = fixture("github", ["published"], "pr") |> git_artifact() |> change_target() |> merged_candidate() |> verified_tools()
+    assert {:ok, [observation]} = TaskDelivery.read_candidate(f.payload["work"], f.payload, f.opts)
+    assert observation.status == "delivered"
+    assert {:error, :dependency_delivery_evidence_unavailable} = dependencies(f, 3, nil, [f])
   end
 
   test "candidate tools require native targets only for PR/MR outputs and do not publish target assertions blindly" do

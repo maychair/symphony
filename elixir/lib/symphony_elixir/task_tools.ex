@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskTools do
   @moduledoc "Role-bound native tools for an admitted plan-member execution."
   alias SymphonyElixir.{CommandCheck, Config, ExecutionBinding, GitArtifact, NativeWork, RunJournal}
+  alias SymphonyElixir.ReportArtifact
   alias SymphonyElixir.{TaskControl, TaskDelivery, TaskDependencies, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
   alias SymphonyElixir.{TaskPublication, TaskWorkflow, WorkRef}
 
@@ -90,7 +91,7 @@ defmodule SymphonyElixir.TaskTools do
 
   defp invoke("task_context", _, scope, context) do
     with {:ok, scope, evidence} <- observe_candidate(scope, context),
-         {:ok, delivery} <- TaskDelivery.read_candidate(scope.member.work, evidence.candidate, context.opts) do
+         {:ok, delivery} <- TaskDelivery.read_candidate(scope.member.work, evidence.candidate, Keyword.put(context.opts, :runtime, scope.record)) do
       {:ok,
        %{
          "contract" => scope.member.contract,
@@ -183,18 +184,29 @@ defmodule SymphonyElixir.TaskTools do
   end
 
   defp artifacts(items, outputs, work) do
-    valid = Enum.all?(items, &(is_map(&1) and keys?(Map.delete(&1, "target"), ~w(id version)) and text?(&1["version"])))
+    valid = Enum.all?(items, &is_map/1)
 
     if valid and Enum.sort(Enum.map(items, & &1["id"])) == Enum.sort(Enum.map(outputs, & &1["id"])) do
-      artifacts =
-        Enum.map(outputs, fn output ->
-          item = Enum.find(items, &(&1["id"] == output["id"]))
+      Enum.reduce_while(outputs, {:ok, []}, &collect_artifact(work, &1, items, &2))
+    else
+      {:error, :candidate_outputs_do_not_match_contract}
+    end
+  end
 
-          Map.merge(item, %{"kind" => output["kind"], "source" => GitArtifact.source_ref(work, item["version"])})
-          |> Map.merge(Map.take(output, ["target_branch"]))
-        end)
+  defp collect_artifact(work, output, items, {:ok, artifacts}) do
+    case artifact(work, output, Enum.find(items, &(&1["id"] == output["id"]))) do
+      {:ok, artifact} -> {:cont, {:ok, artifacts ++ [artifact]}}
+      {:error, _} = error -> {:halt, error}
+    end
+  end
 
-      if Enum.all?(artifacts, &artifact_target?(work, &1)), do: {:ok, artifacts}, else: {:error, :candidate_delivery_target_invalid}
+  defp artifact(work, %{"kind" => "report"}, %{"id" => id, "body" => body} = item) when map_size(item) == 2,
+    do: ReportArtifact.build(work, id, body)
+
+  defp artifact(work, output, item) do
+    if keys?(Map.delete(item, "target"), ~w(id version)) and text?(item["version"]) do
+      artifact = Map.merge(item, %{"kind" => output["kind"], "source" => GitArtifact.source_ref(work, item["version"])}) |> Map.merge(Map.take(output, ["target_branch"]))
+      if artifact_target?(work, artifact), do: {:ok, artifact}, else: {:error, :candidate_delivery_target_invalid}
     else
       {:error, :candidate_outputs_do_not_match_contract}
     end
@@ -273,7 +285,7 @@ defmodule SymphonyElixir.TaskTools do
         context,
         spec(
           "task_candidate",
-          "Publish the complete candidate for independent verification. Supply each declared output ID and fixed Git revision; the host retrieves and retains it. This does not complete the task.",
+          "Publish the complete candidate for independent verification. Supply each output ID with a fixed Git revision, or an exact Markdown body for a report. The host retains the bytes. This does not complete the task.",
           %{
             "artifacts" => array(artifact_schema()),
             "summary" => string()
@@ -305,7 +317,9 @@ defmodule SymphonyElixir.TaskTools do
 
   defp artifact_schema do
     properties = %{"id" => string(), "version" => string(), "target" => target_schema()}
-    %{"type" => "object", "additionalProperties" => false, "required" => ~w(id version), "properties" => properties}
+    git = %{"type" => "object", "additionalProperties" => false, "required" => ~w(id version), "properties" => properties}
+    report = %{"type" => "object", "additionalProperties" => false, "required" => ~w(id body), "properties" => %{"id" => string(), "body" => string()}}
+    %{"oneOf" => [git, report]}
   end
 
   defp target_schema do

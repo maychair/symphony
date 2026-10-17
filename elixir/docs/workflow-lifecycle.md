@@ -662,7 +662,8 @@ Technical verification is independent of upstream Issue closure, execution
 activity, delivery and human acceptance. It neither proves those facts nor
 permits replacing an active executor. For `delivered` PR/MR edges, native merge evidence must match the independently
 verified candidate version and the approved target branch. Edges requiring
-`published`, and non-PR/MR delivery, still report an explicit evidence gap.
+`published` report edges use the owning Issue publication described below. Other
+publication kinds still report an explicit evidence gap.
 Verified bytes are never promoted to a native merge or publication receipt.
 Automatic dispatch/stop reconciliation, input materialization and parent
 manifest selection still require integration. Version 2 automatic
@@ -708,8 +709,50 @@ its independent verification support a `delivered` dependency. The reader checks
 native delivery again after resolving the full upstream chain. Target-branch
 changes, changed native results, missing native access and stale source evidence
 block the proof. Direct native observations never close an Issue or select a
-parent manifest. Report/publication delivery, merge execution policy and full
+parent manifest. General release publication, merge execution policy and full
 automatic lifecycle wiring remain pending.
+
+## Native report artifacts and delivery
+
+A sealed `report` output accepts `{id, body}` through `task_candidate`. The host
+hashes the exact UTF-8 Markdown bytes with SHA-256 and binds its retrieval source
+to the full owning Issue, output ID and content version. A report does not need a
+Git commit, branch, change request or working checkout. Reports are bounded to
+16 KiB each; the complete publication, including its evidence envelope, is bounded
+to 64,000 bytes. Invalid UTF-8, empty content, NUL bytes, reserved engine markers
+and native GitLab quick-action lines are rejected before publication.
+
+`ReportArtifact` validates both the inline candidate and retained `report.md`
+bytes. `ArtifactStore` uses its existing owned root, atomic snapshot writes,
+readback checks and durable consumer references for reports. The record is a
+report content receipt, not a Git revision or proof of quality. Altered bytes,
+wrong Issue/output scope, corrupt references and inconsistent metadata fail
+validation. Report retention follows the same conservative ownership rules as
+Git snapshots; release and garbage collection remain pending.
+
+`TaskPublication` puts the readable report text in the owning GitHub/GitLab Issue
+comment alongside the versioned candidate envelope. Envelope HTML delimiters are
+escaped without changing the report bytes. Existing persisted send intent,
+exact-body native readback and uncertain-response recovery apply. Retrying the
+same candidate cannot publish a changed report under its old content version.
+
+`TaskDelivery` confirms the exact candidate against its owning journal and native
+comment. Its `delivered` observation means only that the readable content was
+published; it never asserts independent validity or human acceptance. Before
+publication, context reports `publication_unconfirmed`. Missing access, edited or
+deleted comments, absent journal provenance and conflicting evidence cannot be
+replaced with retained local text.
+
+After a separate verifier validates the selected candidate under the host policy,
+`TaskDependencies` can resolve a report edge at `verified`, `delivered` or
+`published` stage. Delivered/published edges additionally require current native
+publication and recheck it after acquiring the upstream chain. Every stage pins
+the exact content and verification source, retaining a consumer reference.
+Review-only policies work without Git. Configured command checks still require
+their existing isolated Git workspace; report-specific command materialization
+is not implemented and those checks are not silently skipped. General release
+artifacts, role input materialization and automatic dispatch remain separate
+integration work.
 
 ## Execution and evidence
 
