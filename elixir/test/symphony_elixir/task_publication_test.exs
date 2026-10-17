@@ -453,6 +453,68 @@ defmodule SymphonyElixir.TaskPublicationTest do
     assert admitted.flow["budget_ms"] == 100_000
   end
 
+  test "provider exceptions before and after admission locking leave no native allocation or stranded owner" do
+    for provider <- ["github", "gitlab"], failure <- [:raise, :throw, :exit], locked <- [false, true] do
+      f = report_fixture(provider, []) |> fresh_execution()
+      registry = executions([f])
+      work = f.payload["work"]
+      lock = Path.join(f.record["directory"], "executor.lock")
+
+      request = fn p, method, target, query, settings ->
+        if File.exists?(lock) == locked,
+          do: admission_provider_failure(failure),
+          else: f.opts[:request].(p, method, target, query, settings)
+      end
+
+      assert {:error, {:admission_observation_failed, _, _}} =
+               TaskExecution.admit(f.parent, work, registry, Keyword.put(f.opts, :request, request))
+
+      refute File.exists?(lock)
+
+      if locked do
+        assert current(f)["phase"] == "completed"
+        refute current(f)["thread_id"]
+        refute current(f)["workflow"]
+      else
+        refute File.exists?(f.record["directory"])
+      end
+
+      assert {:ok, resumed} = TaskExecution.admit(f.parent, work, registry, f.opts)
+      assert resumed.record["attempt_count"] == if(locked, do: 2, else: 1)
+      assert resumed.record["execution_generation"] == 1
+      assert resumed.flow["repair_count"] == 0
+      assert (resumed.record["retry_count"] || 0) == 0
+      assert resumed.flow["budget_ms"] == 100_000
+      assert Agent.get(f.state, & &1.posts) == []
+    end
+  end
+
+  defp admission_provider_failure(:raise), do: raise("admission provider unavailable")
+  defp admission_provider_failure(:throw), do: throw(:admission_provider_unavailable)
+  defp admission_provider_failure(:exit), do: exit(:admission_provider_unavailable)
+
+  test "provider exceptions after ownership changes preserve the replacement execution lock" do
+    f = report_fixture("github", []) |> fresh_execution()
+    lock = Path.join(f.record["directory"], "executor.lock")
+
+    request = fn provider, method, target, query, settings ->
+      if File.exists?(lock) do
+        path = Path.join(f.record["directory"], "run.json")
+        File.write!(path, Jason.encode!(Map.put(current(f), "attempt_id", "replacement-owner")))
+        raise "provider failed after ownership changed"
+      end
+
+      f.opts[:request].(provider, method, target, query, settings)
+    end
+
+    opts = Keyword.put(f.opts, :request, request)
+    assert {:error, :execution_admission_recovery_required} = TaskExecution.admit(f.parent, f.payload["work"], executions([f]), opts)
+    assert current(f)["attempt_id"] == "replacement-owner"
+    assert current(f)["phase"] == "admitted"
+    assert File.exists?(lock)
+    refute current(f)["thread_id"]
+  end
+
   test "admission never releases a replacement attempt when ownership changes during native readback" do
     f = report_fixture("github", []) |> fresh_execution()
     changed = start_supervised!({Agent, fn -> false end}, id: make_ref())

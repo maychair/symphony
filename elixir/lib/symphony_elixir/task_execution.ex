@@ -142,7 +142,7 @@ defmodule SymphonyElixir.TaskExecution do
   def admit(parent, work, executions, opts) do
     opts = Keyword.put(opts, :active, false)
 
-    with {:ok, observation} <- observe(parent, work, executions, opts) do
+    with {:ok, observation} <- admission_observation(parent, work, executions, opts) do
       cond do
         observation.flow["dispatchable"] ->
           admit_locked(observation, executions, opts, observation.flow["next_binding"], :start)
@@ -154,6 +154,12 @@ defmodule SymphonyElixir.TaskExecution do
           {:waiting, observation}
       end
     end
+  end
+
+  defp admission_observation(parent, work, executions, opts) do
+    observe(parent, work, executions, opts)
+  catch
+    kind, reason -> {:error, {:admission_observation_failed, kind, inspect(reason)}}
   end
 
   defp admit_locked(observation, executions, opts, binding, action) do
@@ -185,7 +191,7 @@ defmodule SymphonyElixir.TaskExecution do
     parent = observation.plan.plan["parent"]
     work = observation.flow["work"]
 
-    with {:ok, current} <- observe(parent, work, executions, opts),
+    with {:ok, current} <- admission_observation(parent, work, executions, opts),
          true <- Map.take(current.record, @identity) == Map.take(record, @identity),
          changes = %{"workflow" => current.flow, "control_receipts" => current.evidence["control_receipts"], "issue_url" => current.plan.members[WorkRef.key(work)].url},
          {:ok, record} <- RunJournal.checkpoint(current.record, changes) do

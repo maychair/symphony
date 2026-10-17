@@ -383,6 +383,11 @@ force that transition. A stopped prior generation and stopped host checks are
 required before rotation, and prior accounting/history survive it. Failure after
 acquiring the lock releases only this unstarted attempt; changed ownership remains
 an explicit recovery error and the replacement lock is untouched.
+Synchronous provider exceptions, throws and exits during either admission read
+return `admission_observation_failed`. Before locking they create no execution;
+after locking they pass through the same owned cleanup. A subsequent admission
+re-reads native authority without charging a retry or repair for a role that
+never started. This does not recover an abruptly killed worker or a lost VM.
 
 Observed control sources are retained under the lock before the second native
 read. This also applies to a pause received before the first execution: a small
