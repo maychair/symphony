@@ -710,6 +710,44 @@ can otherwise approve, merge or close native work through a comment. The same
 body check protects native Issue evidence publication; rejected submissions do
 not acquire a send intent.
 
+## Review execution ownership
+
+Each admission persists an `execution_owner` with an independent attempt token,
+the BEAM VM incarnation and the actual worker PID. Checkpoint and submission
+calls must present that exact owner and originate from that worker process.
+Copying the token to another process is insufficient. A new admission replaces
+the token and clears the earlier stop receipt, so delayed callbacks cannot
+modify a later attempt even when a process is reused.
+
+Worker checkpoints are limited to execution facts. They cannot edit the native
+work identity, fixed inputs, policy, publication batch or owner, or set a round
+back to queued. Thread identity and recorded workspace/host/backend cannot
+change. Allocation intents cannot be erased, and a confirmed stop cannot be
+reset through a worker callback. The Listener owns business phase transitions.
+
+Thread and turn allocation each require one durable intent per attempt and a
+fresh native scope check. Turn admission additionally requires the recorded
+thread identity. A repeated intent, revoked assignment, changed head or policy,
+or suspended configuration denies allocation. The app-server client honors
+failed thread-observation and pre-turn callbacks rather than continuing native
+execution after the journal rejects them.
+
+The Listener monitors admitted workers itself; scheduler cleanup no longer
+writes failure checkpoints using only a round ID. Worker exit proves that no
+native work remains only when neither allocation intent nor any thread identity
+was recorded. Allocated native work stays uncertain until native stop is proven.
+While a submission is publishing, each subsequent write rechecks owner liveness
+after native scope validation. Confirmed earlier comments remain recoverable;
+owner exit cannot send the rest of the batch.
+
+After a Listener restart in the same VM, surviving recorded workers receive a
+stop request through their existing native connection. The round remains fenced
+against new allocation and submission, but its authentic owner can still report
+native identities observed in flight and the eventual stop result. Other VM
+incarnations and legacy ownerless active records do not gain callback authority
+or inferred stop confirmation. Exclusive journal ownership across scheduler
+processes and native orphan recovery after VM loss remain under development.
+
 ## Live review cancellation
 
 The scheduler requests graceful stop when an active review loses eligibility,

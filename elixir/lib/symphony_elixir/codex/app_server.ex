@@ -64,9 +64,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                opts,
                on_thread_intent
              ),
-           :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(opts[:run_record] || %{}, %{"thread_id" => thread_id}) do
-        on_thread_started.(thread_id)
-
+           :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(opts[:run_record] || %{}, %{"thread_id" => thread_id}),
+           :ok <- on_thread_started.(thread_id) do
         {:ok,
          %{
            port: port,
@@ -120,10 +119,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    Keyword.get(opts, :before_turn, fn -> :ok end).()
-
     started =
-      with :ok <- turn_admission(opts) do
+      with :ok <- Keyword.get(opts, :before_turn, fn -> :ok end).(),
+           :ok <- turn_admission(opts) do
         start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy)
       end
 

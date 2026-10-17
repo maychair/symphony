@@ -8,8 +8,12 @@ defmodule SymphonyElixir.ReviewLane.Runner do
   @spec run(SymphonyElixir.Tracker.Issue.t(), pid() | nil, keyword()) :: :ok
   def run(issue, recipient, opts \\ []) do
     case Listener.begin_run(issue.id) do
-      {:ok, record, config} -> run_admitted(issue, record, config, recipient, opts)
-      error -> raise "Review execution fenced: #{inspect(error)}"
+      {:ok, record, config} ->
+        owned_issue = %{issue | native_ref: Map.put(issue.native_ref, "execution_owner", record["execution_owner"])}
+        run_admitted(owned_issue, record, config, recipient, opts)
+
+      error ->
+        raise "Review execution fenced: #{inspect(error)}"
     end
   end
 
@@ -28,19 +32,20 @@ defmodule SymphonyElixir.ReviewLane.Runner do
              suspend_goal: true,
              dynamic_tool_binding: SymphonyElixir.ReviewLane.binding(),
              on_thread_intent: fn -> before_thread(issue, repository) end,
-             on_thread_started: fn thread -> Listener.checkpoint(issue.id, %{"thread_id" => thread}) end
+             on_thread_started: fn thread -> checkpoint(issue, %{"thread_id" => thread}) end
            ) do
       if is_pid(recipient), do: send(recipient, {:worker_runtime_info, issue.id, %{worker_host: nil, workspace_path: repository}})
 
       try do
         handler = fn message ->
-          if message[:event] == :session_started, do: Listener.checkpoint(issue.id, %{"turn_id" => message[:turn_id]})
+          if message[:event] == :session_started, do: checkpoint(issue, %{"turn_id" => message[:turn_id]})
           if is_pid(recipient), do: send(recipient, {:codex_worker_update, issue.id, message})
         end
 
         instructions = prompt(record, config, mr, discussions)
-        turn_opts = [deadline: opts[:deadline], on_message: handler, interruptible: true]
-        result = AppServer.run_turn(session, instructions, issue, turn_opts)
+        admission = fn -> checkpoint(issue, %{"turn_allocation_intent" => true}) end
+        turn_opts = [on_message: handler, interruptible: true, before_turn: admission]
+        result = AppServer.run_turn(session, instructions, issue, Keyword.put(turn_opts, :deadline, opts[:deadline]))
         finish_turn(result, session, issue)
       after
         AppServer.stop_session(session)
@@ -51,28 +56,30 @@ defmodule SymphonyElixir.ReviewLane.Runner do
     end
   rescue
     error ->
-      Listener.checkpoint(issue.id, %{"phase" => "failed", "error" => Exception.message(error)})
+      checkpoint(issue, %{"phase" => "failed", "error" => Exception.message(error)})
       reraise error, __STACKTRACE__
   end
+
+  defp checkpoint(issue, changes), do: Listener.checkpoint(issue.id, issue.native_ref["execution_owner"], changes)
 
   defp before_thread(issue, repository) do
     receive do
       :symphony_stop -> {:error, :scheduler_stop}
     after
-      0 -> Listener.checkpoint(issue.id, %{"thread_allocation_intent" => true, "native_stop_confirmed" => false, "workspace" => repository, "worker_host" => nil, "backend" => "codex"})
+      0 -> checkpoint(issue, %{"thread_allocation_intent" => true, "native_stop_confirmed" => false, "workspace" => repository, "worker_host" => nil, "backend" => "codex"})
     end
   end
 
   defp stopped_before_thread(issue, record) do
     if is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true and is_nil(record["resume_thread_id"]) do
-      Listener.checkpoint(issue.id, %{"phase" => "fenced", "native_stop_confirmed" => true, "native_stop_recovery" => "scheduler stopped admission before native allocation"})
+      checkpoint(issue, %{"phase" => "fenced", "native_stop_confirmed" => true, "native_stop_recovery" => "scheduler stopped admission before native allocation"})
     else
       record_stop(issue, NativeStop.confirm(record, stop_options()))
     end
   end
 
   defp finish_turn({:ok, _}, _session, issue) do
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = checkpoint(issue, %{"native_stop_confirmed" => true})
     {:ok, issues} = Listener.issues()
     unless Enum.any?(issues, &(&1.id == issue.id and &1.native_ref["phase"] == "completed")), do: raise("Review did not complete through review_submit")
     :ok
@@ -86,11 +93,11 @@ defmodule SymphonyElixir.ReviewLane.Runner do
   end
 
   defp record_stop(issue, {:ok, evidence}) do
-    Listener.checkpoint(issue.id, Map.merge(evidence, %{"phase" => "fenced", "native_stop_recovery" => "recorded native thread halted and idle verified"}))
+    checkpoint(issue, Map.merge(evidence, %{"phase" => "fenced", "native_stop_recovery" => "recorded native thread halted and idle verified"}))
   end
 
   defp record_stop(issue, {:error, reason}) do
-    Listener.checkpoint(issue.id, %{"phase" => "fenced", "native_stop_confirmed" => false, "native_stop_recovery" => inspect(reason)})
+    checkpoint(issue, %{"phase" => "fenced", "native_stop_confirmed" => false, "native_stop_recovery" => inspect(reason)})
   end
 
   defp stop_options, do: [review_only: true, dynamic_tool_binding: SymphonyElixir.ReviewLane.binding()]

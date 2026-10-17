@@ -6,7 +6,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   """
   use GenServer
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitLab, Policy, Publication}
+  alias SymphonyElixir.ReviewLane.{GitLab, Owner, Policy, Publication}
+
+  @worker_fields ~w(thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]) |> Keyword.put_new(:name, __MODULE__))
@@ -20,11 +22,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   @spec begin_run(String.t()) :: {:ok, map(), map()} | {:error, term()}
   def begin_run(id), do: GenServer.call(__MODULE__, {:begin, id}, 60_000)
 
-  @spec checkpoint(String.t(), map()) :: :ok
-  def checkpoint(id, changes), do: GenServer.call(__MODULE__, {:checkpoint, id, changes}, 60_000)
+  @spec checkpoint(String.t(), map() | nil, map()) :: :ok | {:error, term()}
+  def checkpoint(id, owner, changes), do: GenServer.call(__MODULE__, {:checkpoint, id, owner, changes}, 60_000)
 
-  @spec submit(String.t(), map()) :: :ok | {:error, term()}
-  def submit(id, arguments), do: GenServer.call(__MODULE__, {:submit, id, arguments}, 120_000)
+  @spec submit(String.t(), map() | nil, map()) :: :ok | {:error, term()}
+  def submit(id, owner, arguments), do: GenServer.call(__MODULE__, {:submit, id, owner, arguments}, 120_000)
 
   @spec request_review(String.t(), pos_integer()) :: :ok | {:error, term()}
   def request_review(project, iid), do: GenServer.call(__MODULE__, {:request_review, project, iid}, 120_000)
@@ -38,6 +40,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       health: :disabled,
       records: %{},
       hints: %{},
+      owners: %{},
       last_event_at: nil,
       error: nil,
       initial_config: opts[:config]
@@ -48,7 +51,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   @impl true
   def handle_call(message, from, state) do
-    bypass = message == :health or match?({:checkpoint, _, _}, message) or is_nil(state.config)
+    bypass = message == :health or match?({:checkpoint, _, _, _}, message) or is_nil(state.config)
 
     if bypass or current_config?(state),
       do: handle_request(message, from, state),
@@ -85,35 +88,157 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
-  defp handle_request({:checkpoint, id, changes}, _from, state) do
-    record = Map.fetch!(state.records, record_key(id))
+  defp handle_request({:checkpoint, id, owner, changes}, {caller, _}, state) do
+    record = state.records[record_key(id)]
 
-    if record["phase"] in ["completed", "ended"] and changes["phase"] == "failed" and stopped?(record) do
-      {:reply, :ok, state}
+    with true <- owned?(record, owner, caller) or {:error, :review_execution_owner_mismatch},
+         true <- worker_changes?(record, changes) or {:error, :invalid_review_checkpoint} do
+      checkpoint_owned(state, record, changes)
     else
-      next = put_record(state, Map.merge(record, changes))
-      {:reply, :ok, next}
+      error -> {:reply, error, state}
     end
   end
 
-  defp handle_request({:begin, id}, _from, state) do
+  defp handle_request({:begin, id}, {caller, _}, state) do
     state = reconcile(state)
 
     case Map.get(state.records, record_key(id)) do
       %{"phase" => "queued", "eligibility" => "current"} = record ->
-        record = record |> Map.put("phase", "running") |> Map.put("native_stop_confirmed", false)
-        next = put_record(state, record)
-        {:reply, {:ok, record, state.config}, next}
+        if stopped?(record) do
+          record =
+            Map.merge(record, %{
+              "phase" => "running",
+              "native_stop_confirmed" => false,
+              "native_stop_receipt" => nil,
+              "thread_allocation_intent" => false,
+              "turn_allocation_intent" => false,
+              "execution_owner" => Owner.new(caller)
+            })
+
+          next = state |> put_record(record) |> monitor_owner(record, caller)
+          {:reply, {:ok, record, state.config}, next}
+        else
+          {:reply, {:error, :review_execution_fenced}, state}
+        end
 
       _ ->
         {:reply, {:error, :review_execution_fenced}, state}
     end
   end
 
-  defp handle_request({:submit, id, arguments}, _from, state) do
-    case publish(state, id, arguments) do
-      {:ok, next} -> {:reply, :ok, next}
-      {:error, reason, next} -> {:reply, {:error, reason}, next}
+  defp handle_request({:submit, id, owner, arguments}, {caller, _}, state) do
+    if owned?(state.records[record_key(id)], owner, caller) do
+      case publish(state, id, arguments) do
+        {:ok, next} -> {:reply, :ok, next}
+        {:error, reason, next} -> {:reply, {:error, reason}, next}
+      end
+    else
+      {:reply, {:error, :review_execution_owner_mismatch}, state}
+    end
+  end
+
+  defp owned?(%{"execution_owner" => recorded}, supplied, caller), do: Owner.authorized?(recorded, supplied, caller)
+  defp owned?(_, _, _), do: false
+
+  defp worker_changes?(record, changes) when is_map(changes) do
+    Enum.all?(Map.keys(changes), &(&1 in @worker_fields)) and
+      changes["phase"] in [nil, "failed", "fenced"] and stop_changes?(record, changes) and
+      Enum.all?(~w(thread_allocation_intent turn_allocation_intent), &(not Map.has_key?(changes, &1) or changes[&1] == true)) and
+      same_thread?(record, changes) and same_runtime?(record, changes)
+  end
+
+  defp worker_changes?(_, _), do: false
+
+  defp stop_changes?(record, changes) do
+    not (stopped?(record) and (allocation?(changes) or changes["native_stop_confirmed"] == false)) and
+      not (changes["native_stop_confirmed"] == true and allocation?(changes)) and
+      (not Map.has_key?(changes, "native_stop_confirmed") or is_boolean(changes["native_stop_confirmed"]))
+  end
+
+  defp same_runtime?(record, changes) do
+    Enum.all?(~w(workspace worker_host backend), &(not Map.has_key?(changes, &1) or not Map.has_key?(record, &1) or record[&1] == changes[&1]))
+  end
+
+  defp same_thread?(record, %{"thread_id" => thread}) do
+    is_binary(thread) and thread != "" and (is_nil(record["thread_id"]) or record["thread_id"] == thread)
+  end
+
+  defp same_thread?(_, _), do: true
+  defp allocation?(changes), do: changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true
+
+  defp checkpoint_owned(state, record, changes) do
+    if allocation?(changes) do
+      next = if current_config?(state), do: reconcile(state), else: suspend(state)
+      current = next.records[record["id"]]
+
+      if allocation_allowed?(next, current, changes) do
+        {:reply, :ok, put_record(next, Map.merge(current, changes))}
+      else
+        {:reply, {:error, :review_execution_fenced}, next}
+      end
+    else
+      changes = if stopped?(record) and record["phase"] in ["completed", "ended"], do: Map.delete(changes, "phase"), else: changes
+      {:reply, :ok, put_record(state, Map.merge(record, changes))}
+    end
+  end
+
+  defp allocation_allowed?(state, record, changes) do
+    state.health != :failed and record["phase"] == "running" and record["eligibility"] == "current" and
+      turn_ready?(record, changes) and
+      Enum.all?(~w(thread_allocation_intent turn_allocation_intent), &(changes[&1] != true or record[&1] != true))
+  end
+
+  defp turn_ready?(record, changes) do
+    changes["turn_allocation_intent"] != true or (is_binary(record["thread_id"]) and record["thread_allocation_intent"] == true)
+  end
+
+  defp monitor_owner(state, record, pid) do
+    owners =
+      Enum.reduce(state.owners, state.owners, fn {ref, {id, _}}, owners ->
+        if id == record["id"] do
+          Process.demonitor(ref, [:flush])
+          Map.delete(owners, ref)
+        else
+          owners
+        end
+      end)
+
+    %{state | owners: Map.put(owners, Process.monitor(pid), {record["id"], record["execution_owner"]})}
+  end
+
+  defp recover_owners(state) do
+    Enum.reduce(state.records, state, fn {_id, record}, current -> recover_owner(current, record) end)
+  end
+
+  defp recover_owner(state, record) do
+    case Owner.local_pid(record["execution_owner"]) do
+      pid when is_pid(pid) ->
+        cond do
+          stopped?(record) ->
+            state
+
+          Process.alive?(pid) ->
+            send(pid, :symphony_stop)
+            monitor_owner(state, record, pid)
+
+          true ->
+            owner_down(state, record["id"], record["execution_owner"], :listener_restart)
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp owner_down(state, id, owner, reason) do
+    record = state.records[id]
+
+    if record && record["execution_owner"] == owner && not stopped?(record) do
+      no_allocation = not allocation?(record) and is_nil(record["thread_id"]) and is_nil(record["resume_thread_id"])
+      phase = if record["phase"] in ["ended", "superseded"], do: record["phase"], else: "fenced"
+      put_record(state, Map.merge(record, %{"phase" => phase, "native_stop_confirmed" => no_allocation, "error" => "Review worker exited: #{inspect(reason)}"}))
+    else
+      state
     end
   end
 
@@ -127,7 +252,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
           {:ok, next} ->
             Process.send_after(self(), :check_config, 1_000)
             Process.send_after(self(), :poll, 0)
-            {:noreply, %{recover(next) | health: :listening}}
+            {:noreply, %{(next |> recover() |> recover_owners()) | health: :listening}}
 
           {:error, reason} ->
             {:noreply, %{state | health: :failed, error: inspect(reason)}}
@@ -150,6 +275,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   def handle_info(:check_config, state) do
     Process.send_after(self(), :check_config, 1_000)
     {:noreply, if(current_config?(state), do: state, else: suspend(state))}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case Map.pop(state.owners, ref) do
+      {nil, _} -> {:noreply, state}
+      {{id, owner}, owners} -> {:noreply, owner_down(%{state | owners: owners}, id, owner, reason)}
+    end
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -225,7 +357,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     is_integer(record["round"]) and record["round"] > 0 and
       record["phase"] in ~w(queued running publishing completed failed fenced ended superseded) and
       is_list(record["findings"]) and Enum.all?(record["findings"], &is_map/1) and
-      Enum.all?(~w(head base), &valid_sha?(record[&1])) and Enum.all?(~w(policy_sha response_sha), &digest?(record[&1]))
+      Enum.all?(~w(head base), &valid_sha?(record[&1])) and Enum.all?(~w(policy_sha response_sha), &digest?(record[&1])) and
+      (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"]))
   end
 
   defp digest?(value), do: is_binary(value) and Regex.match?(~r/^[a-f0-9]{64}$/, value)
@@ -430,7 +563,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
         {:ok, record} ->
           record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")
           state = put_record(state, record)
-          finish_publication(state, record)
+          finish_publication(state, record, :worker)
 
         {:error, reason} ->
           {:error, reason, state}
@@ -441,7 +574,6 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp publish(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
-  defp publishable?(nil, _findings), do: false
   defp publishable?(record, findings), do: record["phase"] in ["running", "publishing", "completed"] and Enum.all?(findings, &valid_finding?/1)
 
   defp valid_finding?(finding) do
@@ -449,8 +581,12 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       Regex.match?(~r/[\x{4e00}-\x{9fff}]/u, finding) and not String.contains?(finding, "<!-- symphony-review:") and GitLab.comment_body?(finding)
   end
 
-  defp finish_publication(state, record) do
-    case Publication.publish(record, state.config, &put_record(state, &1), &publication_scope(&1, state)) do
+  defp finish_publication(state, record, mode \\ :recovery) do
+    guard = fn current ->
+      with :ok <- publication_scope(current, state), do: publication_owner(current, mode)
+    end
+
+    case Publication.publish(record, state.config, &put_record(state, &1), guard) do
       {:ok, current} ->
         current = current |> Map.put("phase", "completed") |> Map.delete("publication_error")
         {:ok, put_record(state, current)}
@@ -459,6 +595,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
         current = current |> Map.put("phase", "fenced") |> Map.put("publication_error", inspect(reason))
         {:error, reason, put_record(state, current)}
     end
+  end
+
+  defp publication_owner(_record, :recovery), do: :ok
+
+  defp publication_owner(record, :worker) do
+    pid = Owner.local_pid(record["execution_owner"])
+    if is_pid(pid) and Process.alive?(pid), do: :ok, else: {:error, :review_execution_owner_exited}
   end
 
   defp recover_publications(state) do

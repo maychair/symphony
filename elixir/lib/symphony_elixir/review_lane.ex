@@ -97,7 +97,7 @@ defmodule SymphonyElixir.ReviewLane do
 
   @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
   def execute_agent_tool("review_submit", arguments, opts) do
-    result = Listener.submit(opts[:issue].id, arguments)
+    result = Listener.submit(opts[:issue].id, opts[:issue].native_ref["execution_owner"], arguments)
     output = Jason.encode!(%{"result" => inspect(result)})
     %{"success" => result == :ok, "output" => output, "contentItems" => [%{"type" => "inputText", "text" => output}]}
   end

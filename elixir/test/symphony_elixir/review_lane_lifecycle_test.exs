@@ -50,6 +50,10 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
         (r/'discussions.json').write_text(json.dumps(ds))
         if mode=='head':(r/'changed-head').write_text('new head')
         if mode=='interrupt_read':(r/'fail-read').write_text('once')
+        if mode=='hold':
+          (r/'post-held').write_text('ready');deadline=time.monotonic()+5
+          while not (r/'release-post').exists() and time.monotonic()<deadline:time.sleep(0.01)
+          assert (r/'release-post').exists()
         if mode in ['lost','interrupt_read']:sys.exit(3)
       else:out=ds
     else:out={'id':1001,'project_id':10,'iid':1,'state':'opened','sha':('c' if (r/'changed-head').exists() else 'a')*40,'diff_refs':{'base_sha':'b'*40},'author':{'id':30},'reviewers':[{'id':20,'username':'reviewer'}],'web_url':'https://review.invalid/team/repo/-/merge_requests/1'}
@@ -123,8 +127,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
 
     send(worker.pid, :stop)
     Task.await(worker)
-    assert :ok = Listener.submit(issue.id, %{"findings" => []})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     {:ok, [done]} = Listener.issues()
     assert done.native_ref["phase"] == "completed"
     refute Issue.routable?(done, ["symphony"])
@@ -135,7 +139,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     {:ok, [restored]} = Listener.issues()
     assert restored.native_ref["phase"] == "completed"
     assert length(Jason.decode!(File.read!(Path.join(c.root, "discussions.json")))) == 1
-    assert :ok = Listener.checkpoint(issue.id, %{"phase" => "failed", "error" => "late worker DOWN"})
+    assert :ok = owned_checkpoint(issue.id, %{"phase" => "failed", "error" => "late worker DOWN"})
     {:ok, [still_done]} = Listener.issues()
     assert still_done.native_ref["phase"] == "completed"
   end
@@ -144,7 +148,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert :ok = Listener.request_review("team/repo", 1)
     {:ok, [issue]} = Listener.issues()
     assert {:ok, _, _} = Listener.begin_run(issue.id)
-    assert :ok = Listener.checkpoint(issue.id, %{"thread_id" => "native-thread", "turn_id" => "native-turn", "phase" => "publishing"})
+    assert :ok = fixture_checkpoint(issue.id, %{"thread_id" => "native-thread", "turn_id" => "native-turn", "phase" => "publishing"})
     stop_supervised!(Listener)
     start_supervised!({Listener, config: c.config})
     await_listener()
@@ -152,6 +156,10 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert fenced.native_ref["phase"] == "fenced"
     assert fenced.native_ref["previous_phase"] == "publishing"
     assert fenced.native_ref["thread_id"] == "native-thread"
+    assert_receive :symphony_stop
+    assert {:error, :review_execution_fenced} = owned_checkpoint(issue.id, %{"thread_allocation_intent" => true})
+    assert {:error, :review_execution_fenced} = owned_checkpoint(issue.id, %{"turn_allocation_intent" => true})
+    assert {:error, :invalid_review_submission} = owned_submit(issue.id, %{"findings" => []})
     refute Issue.routable?(fenced, ["symphony"])
     assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
     assert :ok = Listener.request_review("team/repo", 1)
@@ -162,8 +170,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   test "published findings keep their existing worker alive until the native turn stops, and restart cannot redispatch it", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.checkpoint(issue.id, %{"thread_id" => "still-finishing", "thread_allocation_intent" => true})
-    :ok = Listener.submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"thread_id" => "still-finishing", "thread_allocation_intent" => true})
+    :ok = owned_submit(issue.id, %{"findings" => []})
     {:ok, [finishing]} = Listener.issues()
     assert finishing.native_ref["phase"] == "completed"
     assert finishing.dispatchable
@@ -201,7 +209,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
     File.write!(Path.join(c.root, "changed-head"), "changed")
-    assert {:error, :mr_head_changed} = Listener.submit(issue.id, %{"findings" => ["空输入导致越界，见 source.cpp:10，请检查长度。"]})
+    assert {:error, :mr_head_changed} = owned_submit(issue.id, %{"findings" => ["空输入导致越界，见 source.cpp:10，请检查长度。"]})
     assert Jason.decode!(File.read!(Path.join(c.root, "discussions.json"))) == []
   end
 
@@ -209,15 +217,16 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:error, :invalid_review_scope} = Listener.request_review("other/repo", 1)
     assert :ok = Listener.request_review("team/repo", 1)
     {:ok, [issue]} = Listener.issues()
-    assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{})
-    assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{"findings" => []})
+    assert {:error, :review_execution_owner_mismatch} = owned_submit(issue.id, %{})
+    assert {:error, :review_execution_owner_mismatch} = owned_submit(issue.id, %{"findings" => []})
     assert {:ok, _, _} = Listener.begin_run(issue.id)
-    assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{"findings" => ["English only"]})
-    assert {:error, :invalid_review_submission} = Listener.submit(issue.id, %{"findings" => ["请核对空输入。\n/approve"]})
+    assert {:error, :invalid_review_submission} = owned_submit(issue.id, %{})
+    assert {:error, :invalid_review_submission} = owned_submit(issue.id, %{"findings" => ["English only"]})
+    assert {:error, :invalid_review_submission} = owned_submit(issue.id, %{"findings" => ["请核对空输入。\n/approve"]})
     refute File.exists?(Path.join(c.root, "posts.json"))
-    assert {:error, :invalid_review_submission} = Listener.submit("missing", %{"findings" => []})
+    assert {:error, :review_execution_owner_mismatch} = owned_submit("missing", %{"findings" => []})
     responses(c, %{"GET user" => %{"username" => "someone-else"}})
-    assert {:error, :gitlab_identity_mismatch} = Listener.submit(issue.id, %{"findings" => []})
+    assert {:error, :gitlab_identity_mismatch} = owned_submit(issue.id, %{"findings" => []})
     responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => "EXIT"})
     assert :ok = Listener.request_review("team/repo", 1)
     {:ok, [unknown]} = Listener.issues()
@@ -232,7 +241,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
     responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => %{"iid" => 1, "project_id" => 99}})
-    assert {:error, :mr_head_changed} = Listener.submit(issue.id, %{"findings" => []})
+    assert {:error, :mr_head_changed} = owned_submit(issue.id, %{"findings" => []})
     assert Jason.decode!(File.read!(Path.join(c.root, "discussions.json"))) == []
   end
 
@@ -245,10 +254,10 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
              SymphonyElixir.ReviewLane.execute_agent_tool(
                "review_submit",
                %{"findings" => ["空输入导致越界，见 source.cpp:10，请检查长度。"]},
-               issue: issue
+               issue: %{issue | native_ref: Map.put(issue.native_ref, "execution_owner", owner_for(issue.id))}
              )
 
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     assert {:ok, [_]} = Listener.issues()
     path = Path.join(c.root, "discussions.json")
     [discussion, conclusion] = Jason.decode!(File.read!(path))
@@ -263,8 +272,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   test "a reply edited during review cannot publish a conclusion for the prior response version", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.submit(issue.id, %{"findings" => ["空输入导致越界，见 source.cpp:10，请检查输入长度。"]})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_submit(issue.id, %{"findings" => ["空输入导致越界，见 source.cpp:10，请检查输入长度。"]})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     path = Path.join(c.root, "discussions.json")
     [discussion, conclusion] = Jason.decode!(File.read!(path))
     reply = %{"id" => 99, "body" => "已修复输入检查", "author" => %{"id" => 30}, "created_at" => "2026-01-02T00:00:00Z"}
@@ -275,15 +284,15 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     {:ok, _, _} = Listener.begin_run(next.id)
     changed = update_in(discussion["notes"], fn [own, reply] -> [own, Map.put(reply, "body", "还有另一个边界条件")] end)
     File.write!(path, Jason.encode!([changed, conclusion]))
-    assert {:error, :review_responses_changed} = Listener.submit(next.id, %{"findings" => []})
+    assert {:error, :review_responses_changed} = owned_submit(next.id, %{"findings" => []})
     assert length(Jason.decode!(File.read!(path))) == 2
   end
 
   test "a new push after a no-findings result starts one round and retires the previous dispatch", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    assert :ok = Listener.submit(issue.id, %{"findings" => []})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     File.write!(Path.join(c.root, "changed-head"), "new commit")
     {:ok, rounds} = Listener.issues()
     assert length(rounds) == 2
@@ -297,12 +306,12 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   test "changed input cannot replace an unconfirmed native executor", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.checkpoint(issue.id, %{"thread_allocation_intent" => true, "thread_id" => "native-running"})
+    :ok = owned_checkpoint(issue.id, %{"thread_allocation_intent" => true, "thread_id" => "native-running"})
     File.write!(Path.join(c.root, "changed-head"), "new commit")
     {:ok, [stopping]} = Listener.issues()
     refute stopping.dispatchable
     assert stopping.native_ref["eligibility"] == "superseded"
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "failed"})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "failed"})
     {:ok, rounds} = Listener.issues()
     assert length(Enum.filter(rounds, & &1.dispatchable)) == 1
     assert length(rounds) == 2
@@ -333,7 +342,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     refute waiting.dispatchable
     assert waiting.id == issue.id
     assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     {:ok, rounds} = Listener.issues()
     assert length(rounds) == 2
     assert [next] = Enum.filter(rounds, & &1.dispatchable)
@@ -381,7 +390,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       {:ok, [issue]} = Listener.issues()
       {:ok, _, _} = Listener.begin_run(issue.id)
       responses(c, %{("POST " <> path) => reply})
-      assert {:error, :review_publication_uncertain} = Listener.submit(issue.id, %{"findings" => []})
+      assert {:error, :review_publication_uncertain} = owned_submit(issue.id, %{"findings" => []})
       File.rm!(Path.join(c.root, "responses.json"))
     end
   end
@@ -406,19 +415,19 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     faults(c, %{"1" => "lost"})
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    assert :ok = Listener.submit(issue.id, %{"findings" => []})
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
     record = saved_review(c, issue)
     assert record["phase"] == "completed"
     assert [%{"status" => "published", "receipt" => receipt}] = record["publication"]["entries"]
     assert receipt["actor"] == 20
     assert receipt["work"] == record["work"]
     assert [body] = posts(c)
-    assert :ok = Listener.submit(issue.id, %{"findings" => []})
-    assert {:error, :changed_submission} = Listener.submit(issue.id, %{"findings" => ["后来改变的结论。"]})
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
+    assert {:error, :changed_submission} = owned_submit(issue.id, %{"findings" => ["后来改变的结论。"]})
     assert posts(c) == [body]
     assert body =~ record["head"]
     assert body =~ record["base"]
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     assert {:ok, [_]} = Listener.issues()
     assert posts(c) == [body]
   end
@@ -427,9 +436,9 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     faults(c, %{"2" => "interrupt_read"})
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.checkpoint(issue.id, %{"thread_id" => "native-review", "thread_allocation_intent" => true})
+    :ok = owned_checkpoint(issue.id, %{"thread_id" => "native-review", "thread_allocation_intent" => true})
     findings = ["第一条：空输入越界。", "第二条：输出缺少终止符。", "第三条：错误路径泄漏句柄。"]
-    assert {:error, {:command_failed, _, 3}} = Listener.submit(issue.id, %{"findings" => findings})
+    assert {:error, {:command_failed, _, 3}} = owned_submit(issue.id, %{"findings" => findings})
     record = saved_review(c, issue)
     assert Enum.map(record["publication"]["entries"], & &1["status"]) == ["published", "sending", "prepared", "prepared"]
     assert length(record["findings"]) == 1
@@ -440,7 +449,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert fenced.native_ref["phase"] == "fenced"
     assert length(fenced.native_ref["findings"]) == 2
     assert length(posts(c)) == 2
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     responses(c, %{"GET user" => %{"id" => 99}})
     {:ok, [wrong_identity]} = Listener.issues()
     assert wrong_identity.native_ref["publication_error"] =~ "gitlab_identity_mismatch"
@@ -462,8 +471,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     faults(c, %{"1" => "drop"})
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    assert {:error, :review_publication_uncertain} = Listener.submit(issue.id, %{"findings" => []})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert {:error, :review_publication_uncertain} = owned_submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     stop_supervised!(Listener)
     start_supervised!({Listener, config: c.config})
     await_listener()
@@ -487,7 +496,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       faults(c, %{"1" => mode})
       {:ok, [issue]} = Listener.issues()
       {:ok, _, _} = Listener.begin_run(issue.id)
-      assert {:error, ^reason} = Listener.submit(issue.id, %{"findings" => ["空输入导致越界，请检查长度。"]})
+      assert {:error, ^reason} = owned_submit(issue.id, %{"findings" => ["空输入导致越界，请检查长度。"]})
       assert length(posts(c)) == 1
       assert saved_review(c, issue)["phase"] == "fenced"
     end
@@ -497,8 +506,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     faults(c, %{"1" => "head"})
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    assert {:error, :mr_head_changed} = Listener.submit(issue.id, %{"findings" => ["旧版本存在空输入越界。", "旧版本存在资源泄漏。"]})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert {:error, :mr_head_changed} = owned_submit(issue.id, %{"findings" => ["旧版本存在空输入越界。", "旧版本存在资源泄漏。"]})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     {:ok, rounds} = Listener.issues()
     assert length(rounds) == 2
     old = Enum.find(rounds, &(&1.id == issue.id))
@@ -512,8 +521,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   test "editing or deleting a confirmed publication invalidates its current delivery evidence", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.submit(issue.id, %{"findings" => []})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     path = Path.join(c.root, "discussions.json")
     [discussion] = Jason.decode!(File.read!(path))
     changed = update_in(discussion["notes"], fn [note] -> [Map.put(note, "id", 999)] end)
@@ -540,9 +549,9 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     faults(c, %{"1" => "reply"})
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    assert {:error, :review_responses_changed} = Listener.submit(issue.id, %{"findings" => ["空输入触发越界。"]})
+    assert {:error, :review_responses_changed} = owned_submit(issue.id, %{"findings" => ["空输入触发越界。"]})
     assert length(posts(c)) == 1
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     {:ok, rounds} = Listener.issues()
     assert [next] = Enum.filter(rounds, & &1.dispatchable)
     assert next.native_ref["round"] == 2
@@ -552,8 +561,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   test "journal corruption cannot change a publication's context, body, status or native receipt", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.submit(issue.id, %{"findings" => []})
-    :ok = Listener.checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    :ok = owned_submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
     path = Path.join(c.root, "state/review-lane.json")
     original = Jason.decode!(File.read!(path))
     record = saved_review(c, issue)
@@ -642,24 +651,180 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(path, Jason.encode!(original))
   end
 
+  test "only the admitted worker may checkpoint and publish, and worker updates cannot rewrite authority", c do
+    {:ok, [issue]} = Listener.issues()
+    {:ok, record, _} = Listener.begin_run(issue.id)
+    owner = record["execution_owner"]
+
+    task =
+      Task.async(fn ->
+        {Listener.checkpoint(issue.id, owner, %{"native_stop_confirmed" => true}), Listener.submit(issue.id, owner, %{"findings" => []})}
+      end)
+
+    assert {{:error, :review_execution_owner_mismatch}, {:error, :review_execution_owner_mismatch}} = Task.await(task)
+    assert review_record(c, issue) == record
+    assert {:error, :review_execution_owner_mismatch} = Listener.checkpoint("missing", owner, %{})
+    before_down = :sys.get_state(Listener)
+    send(Listener, {:DOWN, make_ref(), :process, self(), :normal})
+    assert :sys.get_state(Listener) == before_down
+    fixture_checkpoint(issue.id, %{"phase" => "queued", "native_stop_confirmed" => false})
+    assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
+    fixture_checkpoint(issue.id, %{"phase" => "running"})
+
+    for change <- [
+          %{"execution_owner" => owner},
+          %{"phase" => "queued"},
+          %{"head" => String.duplicate("f", 40)},
+          %{"thread_allocation_intent" => false},
+          %{"native_stop_confirmed" => nil},
+          %{"native_stop_confirmed" => true, "thread_allocation_intent" => true},
+          []
+        ] do
+      assert {:error, :invalid_review_checkpoint} = Listener.checkpoint(issue.id, owner, change)
+    end
+
+    assert :ok = Listener.checkpoint(issue.id, owner, %{"thread_allocation_intent" => true})
+    assert {:error, :review_execution_fenced} = Listener.checkpoint(issue.id, owner, %{"thread_allocation_intent" => true})
+    assert {:error, :review_execution_fenced} = Listener.checkpoint(issue.id, owner, %{"turn_allocation_intent" => true})
+    assert :ok = Listener.checkpoint(issue.id, owner, %{"thread_id" => "owned", "workspace" => "/owned", "worker_host" => nil, "backend" => "codex"})
+    assert {:error, :invalid_review_checkpoint} = Listener.checkpoint(issue.id, owner, %{"thread_id" => "foreign"})
+    assert {:error, :invalid_review_checkpoint} = Listener.checkpoint(issue.id, owner, %{"workspace" => "/foreign"})
+    assert :ok = Listener.checkpoint(issue.id, owner, %{"turn_allocation_intent" => true})
+    assert {:error, :review_execution_fenced} = Listener.checkpoint(issue.id, owner, %{"turn_allocation_intent" => true})
+    assert :ok = Listener.checkpoint(issue.id, owner, %{"native_stop_confirmed" => true})
+    assert {:error, :invalid_review_checkpoint} = Listener.checkpoint(issue.id, owner, %{"native_stop_confirmed" => false})
+    refute File.exists?(Path.join(c.root, "posts.json"))
+  end
+
+  test "listener restart stops its surviving worker through the original native connection", c do
+    %{issue: issue} = runner_fixture(c)
+    File.write!(Path.join(c.root, "hang"), "true")
+    recipient = self()
+    task = Task.async(fn -> Runner.run(issue, recipient) end)
+    assert_receive {:worker_runtime_info, _, _}, 5_000
+    assert_receive {:codex_worker_update, _, %{event: :session_started}}, 5_000
+    running = review_record(c, issue)
+    stop_supervised!(Listener)
+    assert Process.alive?(task.pid)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    assert Task.await(task, 5_000) == :ok
+    stopped = review_record(c, issue)
+    assert stopped["execution_owner"] == running["execution_owner"]
+    assert stopped["native_stop_confirmed"]
+    assert stopped["native_stop_receipt"]["thread_id"] == running["thread_id"]
+    assert Enum.count(native_methods(c), &(&1 == "initialize")) == 1
+    refute File.exists?(Path.join(c.root, "posts.json"))
+  end
+
+  test "an owner that exits during publication cannot send the remaining sealed comments", c do
+    faults(c, %{"1" => "hold"})
+    {:ok, [issue]} = Listener.issues()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        {:ok, record, _} = Listener.begin_run(issue.id)
+        owner = record["execution_owner"]
+        :ok = Listener.checkpoint(issue.id, owner, %{"thread_allocation_intent" => true})
+        Listener.submit(issue.id, owner, %{"findings" => ["第一条发现。", "第二条发现。"]})
+      end)
+
+    await_file(Path.join(c.root, "post-held"))
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
+    File.write!(Path.join(c.root, "release-post"), "continue")
+    assert {:ok, [_]} = Listener.issues()
+    record = review_record(c, issue)
+    assert record["phase"] == "fenced"
+    refute record["native_stop_confirmed"]
+    assert length(posts(c)) == 1
+    assert Enum.map(record["publication"]["entries"], & &1["status"]) == ["published", "prepared", "prepared"]
+  end
+
+  test "worker exit proves stop only when no native allocation intent was recorded, including listener downtime", c do
+    {:ok, [issue]} = Listener.issues()
+    recipient = self()
+
+    for {allocated, restart} <- [{false, false}, {true, false}, {false, true}, {true, true}] do
+      fixture_checkpoint(issue.id, %{"phase" => "queued", "native_stop_confirmed" => true, "thread_allocation_intent" => false})
+
+      worker =
+        Task.async(fn ->
+          {:ok, record, _} = Listener.begin_run(issue.id)
+          if allocated, do: Listener.checkpoint(issue.id, record["execution_owner"], %{"thread_allocation_intent" => true})
+          send(recipient, :owner_ready)
+
+          receive do
+            :finish -> :ok
+          end
+        end)
+
+      assert_receive :owner_ready, 5_000
+      if restart, do: stop_supervised!(Listener)
+      send(worker.pid, :finish)
+      assert Task.await(worker) == :ok
+
+      if restart do
+        start_supervised!({Listener, config: c.config})
+        await_listener()
+      end
+
+      record = await_review_phase(c, issue, "fenced")
+      assert record["native_stop_confirmed"] == not allocated
+      assert record["error"] =~ "Review worker exited"
+    end
+  end
+
+  test "changed native input and configuration stop new allocation but permit the owner's stop report", c do
+    {:ok, [issue]} = Listener.issues()
+    {:ok, record, _} = Listener.begin_run(issue.id)
+    owner = record["execution_owner"]
+    File.write!(Path.join(c.root, "changed-head"), "changed")
+    assert {:error, :review_execution_fenced} = Listener.checkpoint(issue.id, owner, %{"thread_allocation_intent" => true})
+    refute review_record(c, issue)["thread_allocation_intent"]
+    :sys.replace_state(Listener, &%{&1 | initial_config: nil})
+    assert {:error, :review_execution_fenced} = Listener.checkpoint(issue.id, owner, %{"turn_allocation_intent" => true})
+    assert :ok = Listener.checkpoint(issue.id, owner, %{"native_stop_confirmed" => true})
+    assert review_record(c, issue)["native_stop_confirmed"]
+  end
+
+  test "foreign VM ownership remains uncertain after restart and cannot authorize callbacks", c do
+    {:ok, [issue]} = Listener.issues()
+    {:ok, record, _} = Listener.begin_run(issue.id)
+    foreign = %{record["execution_owner"] | "vm" => String.duplicate("0", 32)}
+    fixture_checkpoint(issue.id, %{"execution_owner" => foreign})
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    record = review_record(c, issue)
+    refute record["native_stop_confirmed"]
+    assert record["phase"] == "fenced"
+    assert {:error, :review_execution_owner_mismatch} = Listener.checkpoint(issue.id, foreign, %{"native_stop_confirmed" => true})
+    assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
+  end
+
   test "review runner uses a fixed snapshot, submits findings and resumes only that same head", c do
     %{issue: issue, mr: mr, project: project} = runner_fixture(c)
     assert :ok = Runner.run(issue, self())
     assert_received {:worker_runtime_info, _, %{workspace_path: snapshot}}
     assert File.read!(Path.join(snapshot, "source.txt")) == "fixture"
     assert_received {:codex_worker_update, _, %{event: :session_started}}
-    assert :ok = Listener.checkpoint(issue.id, %{"phase" => "queued", "resume_thread_id" => "review-thread"})
+    previous_owner = owner_for(issue.id)
+    assert :ok = fixture_checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "queued", "resume_thread_id" => "review-thread"})
     assert :ok = Runner.run(issue, nil, [])
-    assert :ok = Listener.checkpoint(issue.id, %{"phase" => "queued"})
+    assert previous_owner != owner_for(issue.id)
+    assert {:error, :review_execution_owner_mismatch} = Listener.checkpoint(issue.id, previous_owner, %{"phase" => "failed"})
+    assert {:error, :review_execution_owner_mismatch} = Listener.submit(issue.id, previous_owner, %{"findings" => []})
+    assert :ok = fixture_checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "queued"})
     send(self(), :symphony_stop)
     assert :ok = Runner.run(issue, nil)
     assert review_record(c, issue)["native_stop_receipt"]["source"] == "thread/read"
     File.write!(Path.join(c.root, "no-submit"), "true")
-    assert :ok = Listener.checkpoint(issue.id, %{"phase" => "queued"})
+    assert :ok = fixture_checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "queued"})
     assert_raise RuntimeError, ~r/Review did not complete/, fn -> Runner.run(issue, nil) end
 
     for remote <- [nil, "https://review.invalid/team/repo.git", "https://wrong.invalid/team/repo.git"] do
-      assert :ok = Listener.checkpoint(issue.id, %{"phase" => "queued", "resume_thread_id" => nil})
+      assert :ok = fixture_checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "queued", "resume_thread_id" => nil})
       responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => mr, "GET projects/team%2Frepo" => %{project | "ssh_url_to_repo" => remote}})
       assert_raise RuntimeError, ~r/Review execution fenced/, fn -> Runner.run(issue, nil) end
     end
@@ -836,11 +1001,55 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
 
     responses(c, %{})
     {:ok, _, _} = Listener.begin_run(issue.id)
-    :ok = Listener.submit(issue.id, %{"findings" => ["空输入可触发越界，请在 source.cpp:10 检查输入长度。"]})
+    :ok = owned_submit(issue.id, %{"findings" => ["空输入可触发越界，请在 source.cpp:10 检查输入长度。"]})
     File.write!(Path.join(c.root, "discussions.json"), "[]")
     assert {:ok, [unknown]} = Listener.issues()
     assert unknown.native_ref["eligibility"] == "unknown"
     assert unknown.native_ref["error"] =~ "review_finding_source_missing"
+  end
+
+  defp owner_for(id), do: get_in(:sys.get_state(Listener), [:records, String.replace_prefix(id, "review:", ""), "execution_owner"])
+  defp owned_checkpoint(id, changes), do: Listener.checkpoint(id, owner_for(id), changes)
+  defp owned_submit(id, arguments), do: Listener.submit(id, owner_for(id), arguments)
+
+  defp await_file(path, attempts \\ 500) do
+    cond do
+      File.exists?(path) ->
+        :ok
+
+      attempts == 0 ->
+        flunk("Fixture did not reach #{path}")
+
+      true ->
+        Process.sleep(10)
+        await_file(path, attempts - 1)
+    end
+  end
+
+  defp await_review_phase(c, issue, phase, attempts \\ 100) do
+    record = review_record(c, issue)
+
+    cond do
+      record["phase"] == phase ->
+        record
+
+      attempts == 0 ->
+        flunk("Review did not reach #{phase}: #{inspect(record)}")
+
+      true ->
+        Process.sleep(10)
+        await_review_phase(c, issue, phase, attempts - 1)
+    end
+  end
+
+  # Set up historical states which workers have no authority to manufacture.
+  defp fixture_checkpoint(id, changes) do
+    key = String.replace_prefix(id, "review:", "")
+    state = :sys.replace_state(Listener, fn state -> update_in(state, [:records, key], &Map.merge(&1, changes)) end)
+    path = Path.join(state.config["state_dir"], "review-lane.json")
+    data = path |> File.read!() |> Jason.decode!() |> Map.put("records", state.records)
+    File.write!(path, Jason.encode!(data))
+    :ok
   end
 
   defp runner_fixture(c) do
