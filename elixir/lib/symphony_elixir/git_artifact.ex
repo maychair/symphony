@@ -8,6 +8,58 @@ defmodule SymphonyElixir.GitArtifact do
     "git:" <> TaskWorkflow.digest(%{"repository" => Map.take(work, ~w(provider host repository_id)), "revision" => revision})
   end
 
+  @doc "Recheck persisted snapshot metadata and all content without granting native publication or execution authority."
+  @spec validate(map(), String.t(), term(), keyword()) :: :ok | {:error, atom()}
+  def validate(work, revision, %{receipt: receipt, files: files}, opts) when is_map(receipt) and is_list(files) do
+    limit = Keyword.get(opts, :artifact_max_bytes, 104_857_600)
+
+    with :ok <- WorkRef.validate(work),
+         true <- oid?(revision) and is_integer(limit) and limit > 0,
+         true <- stored_files?(files),
+         true <- receipt_matches?(receipt, files, work, revision, limit) do
+      :ok
+    else
+      _ -> {:error, :invalid_stored_git_artifact}
+    end
+  end
+
+  def validate(_, _, _, _), do: {:error, :invalid_stored_git_artifact}
+
+  defp stored_files?(files) do
+    length(files) <= 10_000 and Enum.all?(files, &stored_file?/1) and files == Enum.sort_by(files, & &1["path"]) and
+      length(Enum.uniq_by(files, & &1["path"])) == length(files) and nonoverlapping?(files)
+  end
+
+  defp stored_file?(%{"path" => path, "mode" => mode, "oid" => oid, "size" => size, "sha256" => sha, "content" => content} = file) do
+    map_size(file) == 6 and path?(path) and mode in ~w(100644 100755 120000) and oid?(oid) and
+      is_binary(content) and byte_size(content) == size and sha == hash(:sha256, content) and
+      match?({:ok, ^content}, decode_blob(content, oid, size))
+  end
+
+  defp stored_file?(_), do: false
+
+  defp nonoverlapping?(files) do
+    paths = MapSet.new(files, & &1["path"])
+
+    Enum.all?(paths, fn path ->
+      path |> Path.split() |> Enum.drop(-1) |> Enum.scan(&Path.join(&2, &1)) |> Enum.all?(&(not MapSet.member?(paths, &1)))
+    end)
+  end
+
+  defp receipt_matches?(receipt, files, work, revision, limit) do
+    bytes = Enum.sum(Enum.map(files, & &1["size"]))
+
+    data = %{
+      "source" => source_ref(work, revision),
+      "version" => revision,
+      "repository" => Map.take(work, ~w(provider host repository_id)),
+      "files" => Enum.map(files, &Map.delete(&1, "content")),
+      "bytes" => bytes
+    }
+
+    bytes <= limit and receipt == Map.put(data, "digest", TaskWorkflow.digest(data))
+  end
+
   @doc "Read all trees and blobs at an exact commit; the reader is scoped by NativeWork to a verified repository."
   @spec read(map(), String.t(), function(), keyword()) :: {:ok, map()} | {:error, term()}
   def read(work, revision, get, opts) do

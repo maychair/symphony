@@ -5,6 +5,7 @@ defmodule SymphonyElixir.TaskEvidence do
   This supplies result facts only. Controls, dependencies, delivery, acceptance and
   native execution activity must still be resolved before lifecycle assessment.
   """
+  alias SymphonyElixir.ArtifactStore
   alias SymphonyElixir.{CommandCheck, ExecutionBinding, GitArtifact, NativeWork, TaskPublication, TaskWorkflow, WorkRef}
   alias SymphonyElixir.TaskPlanPreflight
 
@@ -75,30 +76,33 @@ defmodule SymphonyElixir.TaskEvidence do
   defp candidate(result, runtime, work, opts) do
     envelope = result.envelope
     payload = envelope["payload"]
+    digest = TaskWorkflow.digest(Map.take(payload, ~w(work contract_sha inputs artifacts)))
+    owner = %{"kind" => "candidate", "work" => work, "revision" => digest}
+    root = Keyword.get_lazy(opts, :artifact_store_root, fn -> if is_binary(runtime["directory"]), do: Path.join(Path.dirname(runtime["directory"]), ".artifacts") end)
 
     with {:ok, _execution} <- execution(envelope, runtime, "developer"),
-         {:ok, artifacts} <- acquire(payload["artifacts"], work, opts) do
-      value = Map.merge(payload, metadata(result)) |> Map.put("digest", TaskWorkflow.digest(Map.take(payload, ~w(work contract_sha inputs artifacts))))
+         {:ok, artifacts} <- acquire(payload["artifacts"], root, work, owner, opts) do
+      value = Map.merge(payload, metadata(result)) |> Map.put("digest", digest)
       {:ok, value, artifacts}
     end
   end
 
-  defp acquire(artifacts, work, opts) do
+  defp acquire(artifacts, root, work, owner, opts) do
     Enum.reduce_while(artifacts, {:ok, []}, fn artifact, {:ok, acquired} ->
-      case acquire_one(artifact, work, opts) do
+      case acquire_one(artifact, root, work, owner, opts) do
         {:ok, snapshot} -> {:cont, {:ok, acquired ++ [snapshot]}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp acquire_one(%{"version" => version, "source" => source}, work, opts) when is_binary(version) do
+  defp acquire_one(%{"version" => version, "source" => source}, root, work, owner, opts) when is_binary(version) do
     if source == GitArtifact.source_ref(work, version),
-      do: NativeWork.read_git(work, version, opts),
+      do: ArtifactStore.retain(root, work, version, owner, opts),
       else: {:error, :artifact_source_mismatch}
   end
 
-  defp acquire_one(_, _, _), do: {:error, :artifact_source_mismatch}
+  defp acquire_one(_, _, _, _, _), do: {:error, :artifact_source_mismatch}
 
   defp verification(nil, _, _), do: {:ok, nil}
 

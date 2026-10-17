@@ -17,9 +17,9 @@ Role-bound Issue evidence publication now has durable intent and native readback
 for GitHub and GitLab, including recovery after an uncertain send.
 Git-backed command checks now run in isolated verifier worktrees and produce
 host-owned process/output receipts that the publisher attests.
-Native result selection now checks journal/native identities, retrieves fixed
-Git snapshots and re-attests actual command results before returning member evidence.
-Child dispatch, artifact retention and the remaining lifecycle below are not
+Native result selection now checks journal/native identities, retrieves and retains
+fixed Git snapshots and re-attests actual command results before returning member evidence.
+Child dispatch, retention cleanup and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
 contract schemas, parent-linked contracts and malformed contract blocks are
@@ -342,7 +342,7 @@ its own current authority, candidate, inputs and check policy.
 An engine-authored comment alone does not prove that a command ran or an artifact
 was retrieved. Verification publication now attests each supplied command result
 against the host-owned receipts below. Git-backed result acquisition and
-selection are implemented below; retention, non-Git check inputs, child controls and
+selection and local retention are implemented below; non-Git check inputs, child controls and
 automatic execution wiring remain pending. Version 2 dispatch stays fenced.
 
 ## Supervised command checks
@@ -405,8 +405,9 @@ role-aware tool/dispatch integration are still pending.
 its owning execution journal, current verification policy and native read options.
 It rechecks the complete plan/authority, reads current member comments and checks
 the member snapshot again after acquisition. Changed scope or concurrent native
-changes prevent returning a current result. This is read-only: it never creates
-an Issue, reposts a report or grants execution/closure authority.
+changes prevent returning a current result. Native access is read-only: it never
+creates an Issue, reposts a report or grants execution/closure authority. Resolved
+artifact bytes and their retention references are persisted locally.
 
 `TaskPublication.observe/3` validates recorded envelope structure and compares
 native author, body, note identity and version with published receipts. A sending
@@ -452,10 +453,60 @@ This interface supplies candidate/verification/retrieval facts, not a complete
 lifecycle observation. The owner must separately resolve controls, dependencies,
 native activity, deliveries and acceptance. It cannot fill those facts with
 assumed empty values. Current acquisition covers Git-backed artifacts in the
-member's verified repository; independent retention/materialization, non-Git
+member's verified repository; verification materialization, non-Git
 artifacts, fork-source resolution, LFS/submodules and dispatch wiring remain
 under development. A successful retrieval is neither publication-stage proof
 nor a promise that the remote version will remain available indefinitely.
+
+## Retained artifacts
+
+`ArtifactStore.retain/5` stores a fully acquired snapshot independently of executor
+worktrees and records an immutable retention owner. The store is keyed by native
+repository identity and exact commit; its validated receipt binds sorted paths,
+file modes, Git object hashes, SHA-256 digests and total bytes. Source identifiers
+remain portable; local store paths are not artifact identities.
+
+`TaskEvidence` uses `.artifacts` under the owning journal root by default. Host
+options may select an absolute `artifact_store_root`. Its parent directory must
+already exist. The store creates its own private directory and ownership marker;
+unknown existing directories and symlinked path components are rejected. Artifacts
+and references are private files, outside developer/check worktrees. Native
+credentials and task goals are not copied into this storage.
+
+A new snapshot is fetched through `NativeWork`, fully validated, written to an
+exclusive temporary file, synced and published using a non-overwriting hard link.
+Directory entries are synced before success, including when a concurrent writer
+already published identical bytes. The ownership marker uses the same complete-file
+publication rule. Interrupted temporary files are not visible as snapshots.
+Existing conflicting data is preserved and reported, never replaced by a retry.
+
+Every read rechecks the exact repository/version, receipt structure, binary bytes,
+object hashes and current content-size limit. Directory/file path collisions,
+duplicate entries, malformed content and altered receipts fail closed. Registered
+repository scope is still required. A missing snapshot may be acquired natively;
+a corrupt existing snapshot is not silently redownloaded over. Cached content
+does not bypass current parent approval, member scope or native publication reads.
+It can remain usable when the Git-object endpoint is temporarily unavailable,
+provided those controlling facts are still confirmed.
+
+Each retention owner has `kind` (`candidate`, `dependency` or `manifest`), a full
+Issue `work` reference and an immutable `revision` digest. Candidate owners must
+match their producer; dependency/manifest owners can name another member or parent.
+The reference binds the owner to the artifact source and full receipt digest.
+`TaskEvidence` pins selected candidate artifacts automatically; separate consumers
+can pin the same bytes without duplicating storage. Retrying one pin is idempotent.
+Removing a worktree or selecting a newer candidate does not erase older pins.
+
+`ArtifactStore.read/4` returns validated retained bytes without native requests.
+`references/4` enumerates confirmed owners; damaged reference files are an error,
+not an empty reference set. These records describe content ownership and retention,
+not another task tracker, verification verdict or release authorization.
+
+The store currently retains references conservatively. Release, garbage collection
+under current dependency/manifest facts and project retention policy, cross-host
+transfer, and materializing retained bytes for new checks still require integration.
+The existing worktree cleaner cannot infer that deleting a worktree releases an
+artifact. Byte snapshots preserve files and modes, not a complete Git history.
 
 ## Execution and evidence
 

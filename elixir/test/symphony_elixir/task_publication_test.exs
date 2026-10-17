@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskPublicationTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.CommandCheck
+  alias SymphonyElixir.{ArtifactStore, CommandCheck}
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
   alias SymphonyElixir.{TaskEvidence, TaskLifecycle}
@@ -382,6 +382,23 @@ defmodule SymphonyElixir.TaskPublicationTest do
       Agent.update(fixture.state, &put_in(&1.objects[fixture.notes], []))
       assert {:error, :current_result_unconfirmed} = evidence(fixture, saved)
     end
+  end
+
+  test "retained candidate bytes survive source cleanup but never bypass fresh native publication evidence" do
+    fixture = fixture("github") |> git_artifact()
+    {:ok, saved, _} = publish(fixture)
+    assert {:ok, original} = evidence(fixture, saved)
+    File.rm_rf!(fixture.git.path)
+    File.rm_rf!(fixture.workspace)
+    Agent.update(fixture.state, &%{&1 | objects: Map.reject(&1.objects, fn {path, _} -> String.contains?(path, "/git/") end)})
+    assert {:ok, recovered} = evidence(fixture, saved)
+    assert recovered.artifacts == original.artifacts
+    assert recovered.candidate == original.candidate
+    root = Path.join(Path.dirname(saved["directory"]), ".artifacts")
+    assert {:ok, [owner]} = ArtifactStore.references(root, fixture.payload["work"], fixture.git.revision, fixture.opts)
+    assert owner["revision"] == original.candidate["digest"]
+    Agent.update(fixture.state, &put_in(&1.objects[fixture.notes], []))
+    assert {:error, :current_result_unconfirmed} = evidence(fixture, saved)
   end
 
   test "evidence selection cannot silently choose between conflicting results from one generation" do
