@@ -1,11 +1,103 @@
 defmodule SymphonyElixir.NativeWork do
-  @moduledoc "Read versioned Issue material only through explicitly configured repository identities."
+  @moduledoc "Read native Issue, change and Git evidence only through explicitly configured repository identities."
 
   alias SymphonyElixir.{Config, TaskWorkflow, WorkRef}
   alias SymphonyElixir.GitHub.Client, as: GitHub
   alias SymphonyElixir.GitLab.Client, as: GitLab
 
   @identity ~w(provider host repository_id)
+
+  @doc "Read a PR/MR's actual source and delivery identity twice; pre-merge test SHAs never prove delivery."
+  @spec read_change(WorkRef.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_change(work, opts) do
+    catalog = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end)
+    request = Keyword.get(opts, :request, &request/5)
+
+    with :ok <- WorkRef.validate(work),
+         true <- work["kind"] in ["pr", "mr"] or {:error, :expected_change},
+         {:ok, repository} <- resolve(work, catalog),
+         {:ok, native} <- get(request, repository, repository_path(repository)),
+         :ok <- verify_repository(repository, native),
+         path = repository_path(repository) <> if(work["kind"] == "pr", do: "/pulls/", else: "/merge_requests/") <> to_string(work["number"]),
+         {:ok, raw} <- get(request, repository, path),
+         {:ok, facts} <- change_facts(repository, work, raw),
+         {:ok, after_read} <- get(request, repository, path),
+         {:ok, current} <- change_facts(repository, work, after_read),
+         true <- current == facts or {:error, :native_change_changed} do
+      version = TaskWorkflow.digest(%{"work" => work, "facts" => facts})
+      {:ok, %{work: work, facts: facts, version: version, source: "change:" <> version}}
+    end
+  end
+
+  defp change_facts(repository, work, raw) when is_map(raw) do
+    facts = normalize_change(repository, raw)
+    suffix = if work["kind"] == "pr", do: "/pull/#{work["number"]}", else: "/-/merge_requests/#{work["number"]}"
+
+    if facts["number"] == work["number"] and facts["target_repository"] == Map.take(work, @identity) and
+         valid_native_url?(facts["url"], repository, suffix) and valid_change?(facts),
+       do: {:ok, facts},
+       else: {:error, :native_change_incomplete}
+  end
+
+  defp change_facts(_, _, _), do: {:error, :native_change_incomplete}
+
+  defp normalize_change(%{"provider" => "github"} = repository, %{"head" => %{"repo" => %{}}, "base" => %{"repo" => %{}}} = raw) do
+    %{
+      "id" => raw["id"],
+      "number" => raw["number"],
+      "url" => raw["html_url"],
+      "source_repository" => change_repository(repository, get_in(raw, ["head", "repo", "id"])),
+      "target_repository" => change_repository(repository, get_in(raw, ["base", "repo", "id"])),
+      "source_branch" => get_in(raw, ["head", "ref"]),
+      "target_branch" => get_in(raw, ["base", "ref"]),
+      "head" => get_in(raw, ["head", "sha"]),
+      "state" => if(raw["state"] in ["open", "closed"], do: raw["state"]),
+      "merged" => raw["merged"],
+      "merged_at" => raw["merged_at"],
+      "revision" => if(raw["merged"] == true, do: raw["merge_commit_sha"])
+    }
+  end
+
+  defp normalize_change(%{"provider" => "github"}, _), do: %{}
+
+  defp normalize_change(repository, raw) do
+    target = if raw["project_id"] == raw["target_project_id"], do: raw["target_project_id"]
+
+    %{
+      "id" => raw["id"],
+      "number" => raw["iid"],
+      "url" => raw["web_url"],
+      "source_repository" => change_repository(repository, raw["source_project_id"]),
+      "target_repository" => change_repository(repository, target),
+      "source_branch" => raw["source_branch"],
+      "target_branch" => raw["target_branch"],
+      "head" => raw["sha"],
+      "state" => raw["state"],
+      "merged" => raw["state"] == "merged",
+      "merged_at" => raw["merged_at"],
+      "revision" => if(raw["state"] == "merged", do: raw["merge_commit_sha"] || raw["squash_commit_sha"])
+    }
+  end
+
+  defp change_repository(repository, id) when is_integer(id) and id > 0,
+    do: repository |> Map.take(~w(provider host)) |> Map.put("repository_id", to_string(id))
+
+  defp change_repository(_, _), do: nil
+
+  defp valid_change?(facts) do
+    is_integer(facts["id"]) and facts["id"] > 0 and is_map(facts["source_repository"]) and
+      Enum.all?(~w(source_branch target_branch), &(is_binary(facts[&1]) and facts[&1] != "")) and
+      git_revision?(facts["head"]) and change_state?(facts)
+  end
+
+  defp change_state?(%{"merged" => true, "state" => state, "revision" => revision, "merged_at" => time}) do
+    state in ["closed", "merged"] and git_revision?(revision) and
+      is_binary(time) and match?({:ok, _, _}, DateTime.from_iso8601(time))
+  end
+
+  defp change_state?(%{"merged" => false, "state" => state, "merged_at" => nil}), do: state in ["open", "opened", "closed", "locked"]
+  defp change_state?(_), do: false
+  defp git_revision?(value), do: is_binary(value) and Regex.match?(~r/\A(?:[a-f0-9]{40}|[a-f0-9]{64})\z/, value)
 
   @doc "Retrieve a complete fixed Git snapshot after checking the configured native repository identity."
   @spec read_git(WorkRef.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}

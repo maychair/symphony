@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskDependencies do
   @moduledoc "Resolve approved dependency edges from native publications, owning journals and retained immutable bytes."
   alias SymphonyElixir.{ArtifactStore, NativeWork, RunJournal, TaskEvidence, TaskLifecycle}
-  alias SymphonyElixir.{TaskPlan, TaskPlanPreflight, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{TaskDelivery, TaskPlan, TaskPlanPreflight, TaskWorkflow, WorkRef}
 
   @doc "Read current inputs (nil) or revalidate pinned inputs. Execution locations and policies are host configuration, never agent arguments."
   @spec read(map(), map(), [map()] | nil, map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -54,7 +54,7 @@ defmodule SymphonyElixir.TaskDependencies do
 
   defp input_set?(_, _), do: false
 
-  defp dependency(context, %{"stage" => "verified"} = edge, reference, observed) do
+  defp dependency(context, %{"stage" => stage} = edge, reference, observed) when stage in ["verified", "delivered"] do
     with {:ok, facts, runtime, policy} <- member(context, edge["from"], reference),
          %{} = candidate <- facts.candidate,
          {:ok, upstream} <- dependencies(context, edge["from"], candidate["inputs"], observed),
@@ -62,10 +62,10 @@ defmodule SymphonyElixir.TaskDependencies do
          assessment = %{plan: context.plan, work: edge["from"], runtime: runtime, policy: policy, evidence: evidence},
          {:ok, artifacts} <- TaskLifecycle.verified_artifacts(assessment),
          %{} = artifact <- Enum.find(artifacts, &(&1["id"] == edge["artifact"])),
-         proof = proof(edge, artifact, facts.verification),
+         {:ok, proof, changes} <- delivery_proof(context, edge, artifact, facts.verification),
          :ok <- retain(context, edge, proof, runtime),
-         {:ok, observed} <- observe(upstream.observed, runtime, facts.snapshot) do
-      {:ok, proof, evidence["sources"], observed}
+         {:ok, observed} <- observe(upstream.observed, runtime, facts.snapshot, changes) do
+      {:ok, proof, Enum.uniq(evidence["sources"] ++ Enum.map(changes, & &1.source)), observed}
     else
       {:error, _} = error -> error
       _ -> {:error, :dependency_not_verified}
@@ -73,6 +73,27 @@ defmodule SymphonyElixir.TaskDependencies do
   end
 
   defp dependency(_, _, _, _), do: {:error, :dependency_delivery_evidence_unavailable}
+
+  defp delivery_proof(_context, %{"stage" => "verified"} = edge, artifact, verification), do: {:ok, proof(edge, artifact, verification), []}
+
+  defp delivery_proof(context, edge, artifact, verification) do
+    case TaskDelivery.read(edge["from"], artifact, context.opts) do
+      {:ok, %{status: "delivered", snapshot: snapshot}} ->
+        {:ok, proof(edge, artifact, verification) |> Map.put("stage", "delivered") |> Map.put("delivery", snapshot.source), [snapshot]}
+
+      {:ok, %{status: "verification_required"}} ->
+        {:error, :dependency_delivery_verification_required}
+
+      {:ok, %{status: "unsupported"}} ->
+        {:error, :dependency_delivery_evidence_unavailable}
+
+      {:ok, _} ->
+        {:error, :dependency_delivery_unconfirmed}
+
+      {:error, _} = error ->
+        error
+    end
+  end
 
   defp member(context, work, reference) do
     with %{directory: directory, policy: policy} when is_binary(directory) and is_map(policy) <- context.executions[WorkRef.key(work)],
@@ -115,13 +136,15 @@ defmodule SymphonyElixir.TaskDependencies do
     end
   end
 
-  defp observe(observed, runtime, snapshot) do
+  defp observe(observed, runtime, snapshot, changes) do
     key = WorkRef.key(snapshot.work)
     value = %{directory: runtime["directory"], version: runtime["journal_version"], snapshot: NativeWork.snapshot_ref(snapshot)}
+    prior = observed[key]
+    changes = Enum.uniq(if(prior, do: prior.changes, else: []) ++ changes)
 
-    if Map.has_key?(observed, key) and observed[key] != value,
+    if (not is_nil(prior) and Map.delete(prior, :changes) != value) or length(Enum.uniq_by(changes, & &1.work)) != length(changes),
       do: {:error, :dependency_changed_during_read},
-      else: {:ok, Map.put(observed, key, value)}
+      else: {:ok, Map.put(observed, key, Map.put(value, :changes, changes))}
   end
 
   defp unchanged(_, observed) when map_size(observed) == 0, do: :ok
@@ -132,7 +155,7 @@ defmodule SymphonyElixir.TaskDependencies do
          true <- NativeWork.snapshot_ref(current.parent) == NativeWork.snapshot_ref(context.plan.parent),
          key = WorkRef.key(context.work),
          true <- NativeWork.snapshot_ref(current.members[key]) == NativeWork.snapshot_ref(context.plan.members[key]),
-         true <- Enum.all?(observed, fn {key, value} -> unchanged_member?(current.members[key], value) end) do
+         true <- Enum.all?(observed, fn {key, value} -> unchanged_member?(current.members[key], value, context.opts) end) do
       :ok
     else
       {:error, _} = error -> error
@@ -140,10 +163,15 @@ defmodule SymphonyElixir.TaskDependencies do
     end
   end
 
-  defp unchanged_member?(snapshot, value) do
+  defp unchanged_member?(snapshot, value, opts) do
+    changes_current = Enum.all?(value.changes, &(NativeWork.read_change(&1.work, opts) == {:ok, &1}))
+
     case RunJournal.read(value.directory) do
-      {:ok, %{} = runtime} -> runtime["journal_version"] == value.version and NativeWork.snapshot_ref(snapshot) == value.snapshot
-      _ -> false
+      {:ok, %{} = runtime} ->
+        changes_current and runtime["journal_version"] == value.version and NativeWork.snapshot_ref(snapshot) == value.snapshot
+
+      _ ->
+        false
     end
   end
 end

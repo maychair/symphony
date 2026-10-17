@@ -328,6 +328,8 @@ defmodule SymphonyElixir.TaskPlanPreflightTest do
       %{"criteria" => [], "criteria_details" => %{}},
       %{"deliverables" => []},
       %{"deliverables" => [%{"id" => "output"}]},
+      %{"deliverables" => [%{"id" => "output", "kind" => "mr", "criteria" => ["result"]}]},
+      %{"deliverables" => [%{"id" => "output", "kind" => "mr", "criteria" => ["result"], "target_branch" => " "}]},
       %{"criteria_details" => %{"result" => ""}},
       %{"non_goals" => nil}
     ]

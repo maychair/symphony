@@ -122,8 +122,8 @@ defmodule SymphonyElixir.TaskPlanPreflight do
 
   defp outputs?(outputs, criteria) when is_list(outputs) and outputs != [] do
     Enum.all?(outputs, fn
-      %{"id" => id, "kind" => kind, "criteria" => covered} ->
-        text?(id) and kind in ["mr", "pr", "report", "publication"] and strings?(covered) and Enum.all?(covered, &(&1 in criteria))
+      %{"id" => id, "kind" => kind, "criteria" => covered} = output ->
+        text?(id) and kind in ["mr", "pr", "report", "publication"] and strings?(covered) and Enum.all?(covered, &(&1 in criteria)) and output_scope?(output)
 
       _ ->
         false
@@ -132,6 +132,9 @@ defmodule SymphonyElixir.TaskPlanPreflight do
   end
 
   defp outputs?(_, _), do: false
+
+  defp output_scope?(%{"kind" => kind} = output) when kind in ["pr", "mr"], do: text?(output["target_branch"])
+  defp output_scope?(_), do: true
 
   defp assigned_authorizer?(%{"assignees" => [%{"id" => id}]}, authorizer) when is_integer(id), do: to_string(id) == authorizer
   defp assigned_authorizer?(_, _), do: false

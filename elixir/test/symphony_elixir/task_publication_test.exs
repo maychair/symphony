@@ -4,10 +4,10 @@ defmodule SymphonyElixir.TaskPublicationTest do
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{TaskDependencies, TaskEvidence, TaskLifecycle}
+  alias SymphonyElixir.{TaskDelivery, TaskDependencies, TaskEvidence, TaskLifecycle}
   alias SymphonyElixir.TaskPlanPreflight
 
-  defp contract(work, parent) do
+  defp contract(work, parent, kind \\ "report") do
     data = %{
       "schema_version" => 2,
       "work" => work,
@@ -21,16 +21,17 @@ defmodule SymphonyElixir.TaskPublicationTest do
       "acceptance_mode" => if(parent, do: "technical", else: "separate"),
       "acceptor" => if(parent, do: nil, else: "2"),
       "budget_ms" => 100_000,
-      "deliverables" => [%{"id" => "output", "kind" => "report", "criteria" => ["result"]}]
+      "deliverables" => [%{"id" => "output", "kind" => kind, "criteria" => ["result"]}]
     }
 
+    data = if kind in ["pr", "mr"], do: Map.update!(data, "deliverables", &Enum.map(&1, fn output -> Map.put(output, "target_branch", "main") end)), else: data
     Map.put(data, "contract_sha", TaskWorkflow.digest(data))
   end
 
-  defp fixture(provider, stages \\ []) do
+  defp fixture(provider, stages \\ [], kind \\ "report") do
     work = %{"provider" => provider, "host" => provider <> ".test", "repository_id" => "10", "kind" => "issue", "number" => 2}
     parent = %{work | "number" => 1}
-    child_scope = contract(work, parent)
+    child_scope = contract(work, parent, kind)
     root_scope = contract(parent, nil) |> Map.delete("contract_sha") |> Map.put("budget_ms", 100_000 * (1 + length(stages)))
     root_scope = Map.put(root_scope, "contract_sha", TaskWorkflow.digest(root_scope))
     member = %{"work" => work, "contract_sha" => child_scope["contract_sha"], "criteria" => ["result"], "budget_ms" => 100_000, "human_gate" => false}
@@ -39,7 +40,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
       Enum.with_index(stages, 3)
       |> Enum.map(fn {_, number} ->
         child = %{work | "number" => number}
-        %{member | "work" => child, "contract_sha" => contract(child, parent)["contract_sha"]}
+        %{member | "work" => child, "contract_sha" => contract(child, parent, kind)["contract_sha"]}
       end)
 
     edges =
@@ -89,7 +90,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
       Enum.reduce(extra, objects, fn member, objects ->
         child = member["work"]
         path = prefix <> "/issues/#{child["number"]}"
-        objects |> Map.put(path, raw.(child["number"], block(contract(child, parent)))) |> Map.put(path <> suffix, [])
+        objects |> Map.put(path, raw.(child["number"], block(contract(child, parent, kind)))) |> Map.put(path <> suffix, [])
       end)
 
     state = start_supervised!({Agent, fn -> %{objects: objects, posts: [], mode: :success} end}, id: make_ref())
@@ -134,7 +135,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
     on_exit(fn -> File.rm_rf!(root) end)
     {:ok, record} = RunJournal.admit(root, WorkRef.key(work), execution_binding: binding)
     {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "developer"})
-    payload = %{"work" => work, "contract_sha" => child_scope["contract_sha"], "inputs" => [], "artifacts" => [%{"id" => "output", "kind" => "report", "version" => "v1"}]}
+    payload = %{"work" => work, "contract_sha" => child_scope["contract_sha"], "inputs" => [], "artifacts" => [%{"id" => "output", "kind" => kind, "version" => "v1"}]}
 
     %{
       record: record,
@@ -209,14 +210,14 @@ defmodule SymphonyElixir.TaskPublicationTest do
   end
 
   defp candidate_args(fixture),
-    do: %{"artifacts" => Enum.map(fixture.payload["artifacts"], &Map.take(&1, ~w(id version))), "summary" => "Fixed candidate ready"}
+    do: %{"artifacts" => Enum.map(fixture.payload["artifacts"], &Map.take(&1, ~w(id version target))), "summary" => "Fixed candidate ready"}
 
   defp verifier_tools(fixture, developer) do
     {:ok, stopped} = RunJournal.checkpoint(developer, %{"native_stop_confirmed" => true})
     :ok = RunJournal.complete(stopped, "completed")
     binding = %{stopped["execution_binding"] | "role" => "verifier", "candidate" => TaskWorkflow.digest(fixture.payload)}
     {:ok, verifier} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
-    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "tool-verifier", "workspace" => fixture.workspace})
+    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "tool-verifier-#{verifier["execution_generation"]}", "workspace" => fixture.workspace})
     task_tools(fixture, verifier)
   end
 
@@ -240,7 +241,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
 
   defp consumer(f, number, inputs, producers) do
     work = %{f.payload["work"] | "number" => number}
-    binding = %{f.record["execution_binding"] | "work" => work, "contract_sha" => contract(work, f.parent)["contract_sha"], "inputs" => inputs}
+    binding = %{f.record["execution_binding"] | "work" => work, "contract_sha" => contract(work, f.parent, hd(f.payload["artifacts"])["kind"])["contract_sha"], "inputs" => inputs}
     {:ok, record} = RunJournal.admit(Path.dirname(f.record["directory"]), WorkRef.key(work), execution_binding: binding)
     {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "developer-#{number}"})
     payload = Map.take(binding, ~w(work contract_sha inputs)) |> Map.put("artifacts", Enum.map(f.payload["artifacts"], &Map.put(&1, "source", GitArtifact.source_ref(work, f.git.revision))))
@@ -253,6 +254,124 @@ defmodule SymphonyElixir.TaskPublicationTest do
         child: String.replace(f.child, "/issues/2", "/issues/#{number}"),
         notes: String.replace(f.notes, "/issues/2", "/issues/#{number}")
     }
+  end
+
+  defp change_target(f) do
+    work = f.payload["work"]
+    artifact = hd(f.payload["artifacts"])
+    target = %{work | "kind" => artifact["kind"], "number" => 7}
+    prefix = String.replace_suffix(f.child, "/issues/2", "")
+    path = prefix <> if(work["provider"] == "github", do: "/pulls/7", else: "/merge_requests/7")
+    url = "https://" <> work["host"] <> "/team/repo"
+
+    raw =
+      if work["provider"] == "github" do
+        %{
+          "id" => 700,
+          "number" => 7,
+          "html_url" => url <> "/pull/7",
+          "head" => %{"sha" => f.git.revision, "ref" => "feature", "repo" => %{"id" => 10}},
+          "base" => %{"ref" => "main", "repo" => %{"id" => 10}},
+          "state" => "open",
+          "merged" => false,
+          "merged_at" => nil
+        }
+      else
+        %{
+          "id" => 700,
+          "iid" => 7,
+          "web_url" => url <> "/-/merge_requests/7",
+          "sha" => f.git.revision,
+          "source_branch" => "feature",
+          "target_branch" => "main",
+          "project_id" => 10,
+          "source_project_id" => 10,
+          "target_project_id" => 10,
+          "state" => "opened",
+          "merged_at" => nil
+        }
+      end
+
+    Agent.update(f.state, &put_in(&1.objects[path], raw))
+    %{f | payload: Map.put(f.payload, "artifacts", [Map.merge(artifact, %{"target" => target, "target_branch" => "main"})])} |> Map.put(:change_path, path)
+  end
+
+  defp merged_candidate(f) do
+    git = GitArtifactFixture.create(Path.join(f.record["directory"], "merged-source"), f.payload["work"]["provider"], %{"result" => "expected\n", "merged" => "target branch content\n"})
+    prefix = String.replace_suffix(f.child, "/issues/2", "")
+    objects = Map.new(git.objects, fn {path, value} -> {prefix <> path, value} end)
+    Agent.update(f.state, &%{&1 | objects: Map.merge(&1.objects, objects)})
+
+    Agent.update(
+      f.state,
+      &update_in(&1.objects[f.change_path], fn raw ->
+        Map.merge(raw, %{
+          "state" => if(f.payload["work"]["provider"] == "github", do: "closed", else: "merged"),
+          "merged" => true,
+          "merged_at" => "2026-10-18T00:00:00Z",
+          "merge_commit_sha" => git.revision
+        })
+      end)
+    )
+
+    workspace = Path.join(f.record["directory"], "merged-worktree")
+    GitArtifactFixture.git(git.path, ["worktree", "add", "--detach", workspace, git.revision])
+    artifacts = Enum.map(f.payload["artifacts"], &Map.merge(&1, %{"version" => git.revision, "source" => GitArtifact.source_ref(f.payload["work"], git.revision)}))
+    %{f | payload: Map.put(f.payload, "artifacts", artifacts), git: git, workspace: workspace}
+  end
+
+  test "merged dependencies require verification of the actual delivered commit and recheck native delivery" do
+    for {provider, kind} <- [{"github", "pr"}, {"gitlab", "mr"}] do
+      f = fixture(provider, ["delivered"], kind) |> git_artifact() |> change_target() |> verified_tools()
+      assert {:error, :dependency_delivery_unconfirmed} = dependencies(f, 3, nil, [f])
+      final = merged_candidate(f)
+      assert {:error, :dependency_delivery_verification_required} = dependencies(f, 3, nil, [f])
+      assert {true, %{"data" => %{"delivery" => [%{"status" => "verification_required"}]}}} = tool(task_tools(f), "task_context", %{})
+      {:ok, stopped} = RunJournal.checkpoint(current(f), %{"native_stop_confirmed" => true})
+      :ok = RunJournal.complete(stopped, "completed")
+      binding = %{stopped["execution_binding"] | "role" => "developer"}
+      {:ok, record} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
+      {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "delivery-developer"})
+      final = %{final | record: record} |> verified_tools()
+      assert {:ok, facts} = dependencies(final, 3, nil, [final])
+      [proof] = facts.dependencies
+      assert proof["stage"] == "delivered"
+      assert proof["version"] == final.git.revision
+      refute proof["version"] == f.git.revision
+      assert proof["delivery"] in facts.sources
+      assert {:ok, observations} = TaskDelivery.read_candidate(final.payload["work"], final.payload, final.opts)
+      assert hd(observations).receipt["head"] == f.git.revision
+
+      # A final-state change after the first native delivery read blocks the assembled proof.
+      counter = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
+
+      request = fn p, method, path, query, settings ->
+        result = final.opts[:request].(p, method, path, query, settings)
+
+        if path == final.change_path do
+          count = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+          if count == 2, do: Agent.update(final.state, &put_in(&1.objects[path]["merge_commit_sha"], String.duplicate("c", 40)))
+        end
+
+        result
+      end
+
+      assert {:error, :dependency_changed_during_read} = dependencies(final, 3, inputs(facts), [final], Keyword.put(final.opts, :request, request))
+      assert {:error, :delivery_candidate_changed} = dependencies(final, 3, inputs(facts), [final])
+    end
+  end
+
+  test "candidate tools require native targets only for PR/MR outputs and do not publish target assertions blindly" do
+    f = fixture("github", [], "pr") |> git_artifact()
+    tools = task_tools(f)
+    assert {false, %{"error" => ":candidate_delivery_target_invalid"}} = tool(tools, "task_candidate", candidate_args(f))
+    f = change_target(f)
+    Agent.update(f.state, &put_in(&1.objects[f.change_path]["head"]["sha"], String.duplicate("c", 40)))
+    assert {false, %{"error" => ":delivery_candidate_changed"}} = tool(tools, "task_candidate", candidate_args(f))
+    assert posts(f) == []
+    report = fixture("github") |> git_artifact()
+    args = candidate_args(report) |> Map.update!("artifacts", &Enum.map(&1, fn item -> Map.put(item, "target", hd(f.payload["artifacts"])["target"]) end))
+    assert {false, %{"error" => ":candidate_delivery_target_invalid"}} = tool(task_tools(report), "task_candidate", args)
   end
 
   test "native verified dependencies are transitive, retained and consumed by role tools on both providers" do

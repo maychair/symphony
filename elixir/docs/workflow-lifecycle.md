@@ -660,12 +660,56 @@ The context includes dependency references and their source evidence.
 
 Technical verification is independent of upstream Issue closure, execution
 activity, delivery and human acceptance. It neither proves those facts nor
-permits replacing an active executor. Edges requiring `delivered` or `published`
-currently report `dependency_delivery_evidence_unavailable`; verified bytes are
-never promoted to a native merge or publication receipt. Native delivery
-acquisition, automatic dispatch/stop reconciliation, input materialization and
-parent manifest selection still require integration. Version 2 automatic
+permits replacing an active executor. For `delivered` PR/MR edges, native merge evidence must match the independently
+verified candidate version and the approved target branch. Edges requiring
+`published`, and non-PR/MR delivery, still report an explicit evidence gap.
+Verified bytes are never promoted to a native merge or publication receipt.
+Automatic dispatch/stop reconciliation, input materialization and parent
+manifest selection still require integration. Version 2 automatic
 dispatch remains fenced until those lifecycle boundaries are connected.
+
+## Native PR/MR delivery
+
+Version 2 PR/MR deliverables require `target_branch` in the sealed contract.
+The developer supplies a full native change `target` WorkRef with the candidate's
+artifact ID and fixed Git version. The host copies the approved branch into the
+candidate; agent arguments cannot replace it. The change must belong to the
+owning Issue's exact provider, host and repository. The target participates in
+the immutable candidate digest and independent verification.
+
+`NativeWork.read_change/2` verifies the configured native repository and reads
+the change twice, retaining native source/target repository IDs, branches, head,
+merge state, merge time and actual final revision. A native `closed` state alone
+is not merge proof. Missing identity, ambiguous delivery version, invalid time,
+permission failure or concurrent change remains an error. Fork source and target
+repositories remain distinct; the target repository is where a final merged
+candidate is retrieved and verified. Pre-merge fork input materialization still
+needs its own source-repository acquisition path.
+
+GitHub's `merge_commit_sha` is a test commit before merge; after merge it denotes
+the final merge/squash/rebase result. GitLab exposes `merge_commit_sha` and
+`squash_commit_sha`; when no actual final revision is reported, Symphony does not
+substitute the current branch or original head. These reads are GET-only and do
+not request merge or platform approval. See the [GitHub pull request API](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request)
+and [GitLab merge request API](https://docs.gitlab.com/api/merge_requests/).
+
+`TaskDelivery` returns native observations: awaiting merge, closed without merge,
+verification required, or delivered. This describes native delivery facts, not
+technical acceptance or task completion. Role context exposes the exact merged
+revision when it differs from the candidate. The developer can publish that
+actual final revision as a new candidate in a subsequent admitted generation;
+the existing separate verifier then checks its complete fixed snapshot under
+the original contract and policy. Prior head verification is retained as history.
+No new verifier kind, asserted mapping Boolean or inherited pass bypasses these
+checks. Native head-to-result metadata remains attached to the delivery receipt.
+
+Only when the currently selected candidate equals the actual merged revision can
+its independent verification support a `delivered` dependency. The reader checks
+native delivery again after resolving the full upstream chain. Target-branch
+changes, changed native results, missing native access and stale source evidence
+block the proof. Direct native observations never close an Issue or select a
+parent manifest. Report/publication delivery, merge execution policy and full
+automatic lifecycle wiring remain pending.
 
 ## Execution and evidence
 

@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskTools do
   @moduledoc "Role-bound native tools for an admitted plan-member execution."
   alias SymphonyElixir.{CommandCheck, Config, ExecutionBinding, GitArtifact, NativeWork, RunJournal}
-  alias SymphonyElixir.{TaskControl, TaskDependencies, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
+  alias SymphonyElixir.{TaskControl, TaskDelivery, TaskDependencies, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
   alias SymphonyElixir.{TaskPublication, TaskWorkflow, WorkRef}
 
   @identity ~w(directory attempt_id execution_generation execution_binding)
@@ -89,13 +89,15 @@ defmodule SymphonyElixir.TaskTools do
   end
 
   defp invoke("task_context", _, scope, context) do
-    with {:ok, scope, evidence} <- observe_candidate(scope, context) do
+    with {:ok, scope, evidence} <- observe_candidate(scope, context),
+         {:ok, delivery} <- TaskDelivery.read_candidate(scope.member.work, evidence.candidate, context.opts) do
       {:ok,
        %{
          "contract" => scope.member.contract,
          "binding" => scope.record["execution_binding"],
          "candidate" => evidence.candidate,
          "dependencies" => scope.dependencies.dependencies,
+         "delivery" => delivery,
          "controls" => evidence.controls.restrictions,
          "sources" => Enum.uniq(evidence.sources ++ scope.dependencies.sources),
          "checks" => context.policy["checks"]
@@ -127,6 +129,7 @@ defmodule SymphonyElixir.TaskTools do
 
     with {:ok, artifacts} <- artifacts(args["artifacts"], scope.member.contract["deliverables"], binding["work"]),
          payload = Map.take(binding, ~w(work contract_sha inputs)) |> Map.put("artifacts", artifacts),
+         {:ok, _} <- TaskDelivery.read_candidate(binding["work"], payload, context.opts),
          {:ok, _} <- TaskEvidence.retain_candidate(scope.record, payload, context.opts) do
       publish(scope, context, "candidate", payload, args["summary"])
     end
@@ -180,18 +183,25 @@ defmodule SymphonyElixir.TaskTools do
   end
 
   defp artifacts(items, outputs, work) do
-    valid = Enum.all?(items, &(is_map(&1) and keys?(&1, ~w(id version)) and text?(&1["version"])))
+    valid = Enum.all?(items, &(is_map(&1) and keys?(Map.delete(&1, "target"), ~w(id version)) and text?(&1["version"])))
 
     if valid and Enum.sort(Enum.map(items, & &1["id"])) == Enum.sort(Enum.map(outputs, & &1["id"])) do
-      {:ok,
-       Enum.map(outputs, fn output ->
-         item = Enum.find(items, &(&1["id"] == output["id"]))
-         Map.merge(item, %{"kind" => output["kind"], "source" => GitArtifact.source_ref(work, item["version"])})
-       end)}
+      artifacts =
+        Enum.map(outputs, fn output ->
+          item = Enum.find(items, &(&1["id"] == output["id"]))
+
+          Map.merge(item, %{"kind" => output["kind"], "source" => GitArtifact.source_ref(work, item["version"])})
+          |> Map.merge(Map.take(output, ["target_branch"]))
+        end)
+
+      if Enum.all?(artifacts, &artifact_target?(work, &1)), do: {:ok, artifacts}, else: {:error, :candidate_delivery_target_invalid}
     else
       {:error, :candidate_outputs_do_not_match_contract}
     end
   end
+
+  defp artifact_target?(work, %{"kind" => kind} = artifact) when kind in ["pr", "mr"], do: TaskDelivery.target?(work, artifact)
+  defp artifact_target?(_, artifact), do: not Map.has_key?(artifact, "target")
 
   defp required(scope), do: scope.member.contract["verification_checks"] |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
 
@@ -265,7 +275,7 @@ defmodule SymphonyElixir.TaskTools do
           "task_candidate",
           "Publish the complete candidate for independent verification. Supply each declared output ID and fixed Git revision; the host retrieves and retains it. This does not complete the task.",
           %{
-            "artifacts" => array(%{"type" => "object", "additionalProperties" => false, "required" => ~w(id version), "properties" => %{"id" => string(), "version" => string()}}),
+            "artifacts" => array(artifact_schema()),
             "summary" => string()
           }
         )
@@ -291,6 +301,21 @@ defmodule SymphonyElixir.TaskTools do
         )
       ]
     end
+  end
+
+  defp artifact_schema do
+    properties = %{"id" => string(), "version" => string(), "target" => target_schema()}
+    %{"type" => "object", "additionalProperties" => false, "required" => ~w(id version), "properties" => properties}
+  end
+
+  defp target_schema do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ~w(provider host repository_id kind number),
+      "description" => "Required for PR/MR outputs: exact native change in the owning repository; the version may name its head or actual merged commit.",
+      "properties" => %{"provider" => string(), "host" => string(), "repository_id" => string(), "kind" => string(), "number" => %{"type" => "integer", "minimum" => 1}}
+    }
   end
 
   defp finding_schema do

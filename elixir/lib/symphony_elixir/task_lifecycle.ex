@@ -271,8 +271,8 @@ defmodule SymphonyElixir.TaskLifecycle do
     Enum.all?(artifacts, &is_map/1) and length(artifacts) == length(outputs) and length(Enum.uniq_by(artifacts, & &1["id"])) == length(outputs) and
       Enum.all?(outputs, fn output ->
         case Enum.find(artifacts, &(&1["id"] == output["id"])) do
-          %{"kind" => kind, "version" => version, "source" => source} ->
-            kind == output["kind"] and text?(version) and source?(context, source)
+          %{"kind" => kind, "version" => version, "source" => source} = artifact ->
+            kind == output["kind"] and text?(version) and source?(context, source) and target?(artifact, output, context.work)
 
           _ ->
             false
@@ -281,6 +281,12 @@ defmodule SymphonyElixir.TaskLifecycle do
   end
 
   defp artifacts?(_, _, _), do: false
+
+  defp target?(%{"kind" => kind} = artifact, output, work) when kind in ["pr", "mr"] do
+    SymphonyElixir.TaskDelivery.target?(work, artifact) and text?(output["target_branch"]) and artifact["target_branch"] == output["target_branch"]
+  end
+
+  defp target?(_, _, _), do: true
 
   defp execution_receipt?(%{"generation" => generation, "thread_id" => thread}, role, candidate, flow, context) do
     receipts = [context.runtime | context.runtime["execution_history"] || []]
