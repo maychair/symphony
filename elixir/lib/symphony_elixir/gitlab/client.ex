@@ -299,6 +299,7 @@ defmodule SymphonyElixir.GitLab.Client do
         url: settings.api_url <> path,
         headers: gitlab_headers(settings.api_key),
         params: query,
+        decode_body: not String.ends_with?(path, "/raw"),
         connect_options: [timeout: 30_000]
       ]
 

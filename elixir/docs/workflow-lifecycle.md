@@ -17,7 +17,9 @@ Role-bound Issue evidence publication now has durable intent and native readback
 for GitHub and GitLab, including recovery after an uncertain send.
 Git-backed command checks now run in isolated verifier worktrees and produce
 host-owned process/output receipts that the publisher attests.
-Child dispatch, artifact verification and the remaining lifecycle below are not
+Native result selection now checks journal/native identities, retrieves fixed
+Git snapshots and re-attests actual command results before returning member evidence.
+Child dispatch, artifact retention and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
 contract schemas, parent-linked contracts and malformed contract blocks are
@@ -288,10 +290,11 @@ reopening work. `closeable` is a derived eligibility flag, not a close receipt:
 the effect owner must re-read native sources and stop facts, record its intent,
 perform the authorized close and read back the result.
 
-Native evidence attestation/selection, parent rework, fine-grained execution
-under criterion restrictions, shared board projection and effect integration
-remain pending. In particular, supplying a `sources` list is not itself proof
-that an external artifact was retrieved or a real command was executed.
+The result evidence reader below supplies authenticated candidate, verification
+and retrieval sources. Controls, dependency/delivery evidence, parent rework,
+fine-grained criterion restrictions, shared board projection and effect integration
+remain pending. Supplying an arbitrary `sources` list is not proof of retrieval
+or command execution.
 
 ## Native evidence publication
 
@@ -338,8 +341,8 @@ its own current authority, candidate, inputs and check policy.
 
 An engine-authored comment alone does not prove that a command ran or an artifact
 was retrieved. Verification publication now attests each supplied command result
-against the host-owned receipts below. Candidate/artifact acquisition,
-authenticated evidence selection, non-Git check inputs, child controls and
+against the host-owned receipts below. Git-backed result acquisition and
+selection are implemented below; retention, non-Git check inputs, child controls and
 automatic execution wiring remain pending. Version 2 dispatch stays fenced.
 
 ## Supervised command checks
@@ -393,8 +396,66 @@ Independent review conclusions remain the verifier's evidence-bearing judgments.
 Check worktrees and transcripts are separate: once a receipt records the checked
 snapshot, removing that worktree need not erase the command evidence or require
 rerunning it. Retaining the referenced candidate artifact itself remains the
-artifact owner's responsibility. Automatic cleanup, evidence selection and the
+artifact owner's responsibility. Automatic cleanup and the
 role-aware tool/dispatch integration are still pending.
+
+## Native result evidence
+
+`TaskEvidence.read_member/5` consumes a preflight result, one member WorkRef,
+its owning execution journal, current verification policy and native read options.
+It rechecks the complete plan/authority, reads current member comments and checks
+the member snapshot again after acquisition. Changed scope or concurrent native
+changes prevent returning a current result. This is read-only: it never creates
+an Issue, reposts a report or grants execution/closure authority.
+
+`TaskPublication.observe/3` validates recorded envelope structure and compares
+native author, body, note identity and version with published receipts. A sending
+intent must be reconciled before consumption, even when its comment exists.
+Unrecorded engine results and malformed journals remain explicit gaps. Foreign
+copies of a known publication ID cannot hide ambiguity.
+
+Selection uses the highest recorded execution generation under the current plan,
+authority, member contract and publisher identity. Conflicting results from one
+generation are ambiguous; loss of the selected source never falls back to an
+older success. Verification additionally matches the selected candidate, pinned
+inputs and current policy. A policy change leaves the candidate available but
+requires a new applicable verifier result. Execution identities must occur in
+the owning journal/history, and command evidence is re-attested against its
+actual supervisor receipt and transcript. Review conclusions remain attributable
+judgments from that independent verifier.
+
+Git-backed artifacts identify a full commit and the deterministic source from
+`GitArtifact.source_ref/2`. `NativeWork.read_git/3` first checks native repository
+identity against the configured catalog. It then retrieves commit metadata, the
+complete tree and every blob at that fixed version. GitHub trees are traversed
+by object identity; GitLab tree pages always use the pinned commit. Missing,
+truncated or malformed trees, duplicate/unsafe paths and mismatched object bytes
+cannot produce a retrieval receipt. Blob content is checked against its Git
+object hash; receipts also record file modes, byte counts and SHA-256 digests.
+
+The reader uses GitHub [tree](https://docs.github.com/en/rest/git/trees)
+and [blob](https://docs.github.com/en/rest/git/blobs) APIs
+and [GitLab repository APIs](https://docs.gitlab.com/api/repositories/). GitLab
+raw blobs preserve original bytes; its client disables body decoding on raw
+endpoints so a JSON file is not converted into a different representation.
+
+Acquisition defaults to a 100 MiB total content limit and a 30-second traversal
+deadline, configurable by host options `artifact_max_bytes` and
+`artifact_timeout_ms`. It stops between requests and rejects results arriving
+after the deadline; an in-flight read retains the HTTP client's transport timeout.
+Tree depth is limited to 100 and entries to 10,000. Unresolved Git LFS pointers
+and gitlinks fail explicitly. Symlink contents are returned as data, never followed
+or extracted. Read results contain the acquired bytes separately from receipt
+metadata; constructing a source reference alone proves nothing.
+
+This interface supplies candidate/verification/retrieval facts, not a complete
+lifecycle observation. The owner must separately resolve controls, dependencies,
+native activity, deliveries and acceptance. It cannot fill those facts with
+assumed empty values. Current acquisition covers Git-backed artifacts in the
+member's verified repository; independent retention/materialization, non-Git
+artifacts, fork-source resolution, LFS/submodules and dispatch wiring remain
+under development. A successful retrieval is neither publication-stage proof
+nor a promise that the remote version will remain available indefinitely.
 
 ## Execution and evidence
 

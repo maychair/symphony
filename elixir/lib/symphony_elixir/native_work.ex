@@ -7,6 +7,22 @@ defmodule SymphonyElixir.NativeWork do
 
   @identity ~w(provider host repository_id)
 
+  @doc "Retrieve a complete fixed Git snapshot after checking the configured native repository identity."
+  @spec read_git(WorkRef.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_git(work, revision, opts) do
+    catalog = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end)
+    request = Keyword.get(opts, :request, &request/5)
+
+    with :ok <- WorkRef.validate(work),
+         {:ok, repository} <- resolve(work, catalog),
+         prefix = repository_path(repository),
+         {:ok, native} <- get(request, repository, prefix),
+         :ok <- verify_repository(repository, native) do
+      reader = fn suffix, query -> get(request, repository, prefix <> suffix, query) end
+      SymphonyElixir.GitArtifact.read(work, revision, reader, opts)
+    end
+  end
+
   @doc "Read an Issue and all its comments, checking identity and concurrent Issue changes."
   @spec read(WorkRef.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def read(work, opts \\ []) do

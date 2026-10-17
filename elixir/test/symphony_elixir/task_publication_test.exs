@@ -1,7 +1,9 @@
 defmodule SymphonyElixir.TaskPublicationTest do
   use ExUnit.Case, async: true
   alias SymphonyElixir.CommandCheck
+  alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{TaskEvidence, TaskLifecycle}
   alias SymphonyElixir.TaskPlanPreflight
 
   defp contract(work, parent) do
@@ -13,6 +15,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
       "non_goals" => [],
       "criteria" => ["result"],
       "criteria_details" => %{"result" => "Reproducible output"},
+      "verification_checks" => %{"result" => ["test"]},
       "authorizer" => "1",
       "acceptance_mode" => if(parent, do: "technical", else: "separate"),
       "acceptor" => if(parent, do: nil, else: "2"),
@@ -139,6 +142,24 @@ defmodule SymphonyElixir.TaskPublicationTest do
   defp current(fixture), do: elem(RunJournal.read(fixture.record["directory"]), 1)
   defp publish(fixture, record \\ nil), do: TaskPublication.publish(record || fixture.record, "candidate", fixture.payload, "Candidate ready for verification", fixture.opts)
   defp posts(fixture), do: Agent.get(fixture.state, & &1.posts)
+
+  defp git_artifact(fixture) do
+    provider = fixture.payload["work"]["provider"]
+    source = Path.join(fixture.record["directory"], "fixture-source")
+    workspace = Path.join(fixture.record["directory"], "fixture-developer")
+    git = GitArtifactFixture.create(source, provider)
+    GitArtifactFixture.git(source, ["worktree", "add", "--detach", workspace, git.revision])
+    prefix = String.replace_suffix(fixture.child, "/issues/2", "")
+    objects = Map.new(git.objects, fn {path, value} -> {prefix <> path, value} end)
+    Agent.update(fixture.state, &%{&1 | objects: Map.merge(&1.objects, objects)})
+    artifact = hd(fixture.payload["artifacts"]) |> Map.merge(%{"version" => git.revision, "source" => GitArtifact.source_ref(fixture.payload["work"], git.revision)})
+    Map.merge(fixture, %{payload: Map.put(fixture.payload, "artifacts", [artifact]), git: git, workspace: workspace})
+  end
+
+  defp evidence(fixture, record, policy \\ nil) do
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(fixture.parent, fixture.opts)
+    TaskEvidence.read_member(plan, fixture.payload["work"], record, policy || fixture.opts[:policy], fixture.opts)
+  end
 
   test "both providers publish only to the owning Issue, read back the exact actor and reuse one receipt" do
     for provider <- ["github", "gitlab"] do
@@ -296,24 +317,8 @@ defmodule SymphonyElixir.TaskPublicationTest do
   end
 
   test "a real isolated command receipt is published as evidence by the independent verifier generation" do
-    fixture = fixture("gitlab")
-    source = Path.join(fixture.record["directory"], "fixture-source")
-    workspace = Path.join(fixture.record["directory"], "fixture-developer")
-    File.mkdir_p!(source)
-
-    git = fn args ->
-      {output, 0} = System.cmd("git", ["-C", source | args], stderr_to_stdout: true)
-      String.trim(output)
-    end
-
-    git.(["init", "-q"])
-    File.write!(Path.join(source, "result"), "expected\n")
-    git.(["add", "result"])
-    git.(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "Report"])
-    revision = git.(["rev-parse", "HEAD"])
-    git.(["worktree", "add", "--detach", workspace, revision])
-    payload = update_in(fixture.payload["artifacts"], &Enum.map(&1, fn artifact -> Map.put(artifact, "version", revision) end))
-    payload = payload.payload
+    fixture = fixture("gitlab") |> git_artifact()
+    payload = fixture.payload
     {:ok, developer, _} = TaskPublication.publish(fixture.record, "candidate", payload, "Fixed report", fixture.opts)
     {:ok, developer} = RunJournal.checkpoint(developer, %{"native_stop_confirmed" => true})
     :ok = RunJournal.complete(developer, "completed")
@@ -321,16 +326,143 @@ defmodule SymphonyElixir.TaskPublicationTest do
     binding = %{developer["execution_binding"] | "role" => "verifier", "candidate" => candidate["digest"]}
     {:ok, verifier} = RunJournal.admit(Path.dirname(developer["directory"]), developer["issue_id"], execution_binding: binding)
     now = System.system_time(:millisecond)
-    flow = TaskWorkflow.new(10_000, now) |> TaskWorkflow.start(now) |> Map.put("schema_version", 2)
-    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "independent-verifier", "workspace" => workspace, "workflow" => flow})
+    flow = TaskWorkflow.new(10_000, now) |> TaskWorkflow.start(now) |> Map.merge(%{"schema_version" => 2, "repair_history" => %{}})
+    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "independent-verifier", "workspace" => fixture.workspace, "workflow" => flow})
     assert {:ok, checked, receipt} = CommandCheck.run(verifier, candidate, "test", fixture.opts[:policy])
     assert receipt["exit_code"] == 0
     check = receipt |> Map.take(~w(candidate command exit_code output_sha reason snapshot_valid)) |> Map.put("id", "test")
     report = Map.take(binding, ~w(candidate inputs policy_sha)) |> Map.merge(%{"checks" => [check], "findings" => []})
-    assert {:ok, _, published} = TaskPublication.publish(checked, "verification", report, "Fixed report verified", fixture.opts)
+    assert {:ok, saved, published} = TaskPublication.publish(checked, "verification", report, "Fixed report verified", fixture.opts)
     assert published["work"] == binding["work"]
     assert length(posts(fixture)) == 2
     assert List.last(posts(fixture)) =~ receipt["output_sha"]
+
+    assert {:ok, facts} = evidence(fixture, saved)
+    assert facts.candidate["digest"] == candidate["digest"]
+    assert facts.verification["source"] == published["source"]
+    assert hd(facts.artifacts).files |> hd() |> Map.fetch!("content") == "expected\n"
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(fixture.parent, fixture.opts)
+
+    resolved = %{
+      "candidate" => facts.candidate,
+      "verification" => facts.verification,
+      "sources" => facts.sources,
+      "restrictions" => [],
+      "releases" => [],
+      "deliveries" => [],
+      "dependencies" => [],
+      "acceptance" => nil,
+      "active" => false
+    }
+
+    context = %{plan: plan, work: fixture.payload["work"], runtime: Map.put(saved, "native_stop_confirmed", true), evidence: resolved, policy: fixture.opts[:policy]}
+    assert {:ok, assessment} = TaskLifecycle.assess(context, System.system_time(:millisecond))
+    assert assessment["action"] == "deliver"
+    assert assessment["dispatchable"]
+    refute assessment["closeable"]
+
+    changed_policy = Map.put(fixture.opts[:policy], "max_repairs", 3)
+    assert {:ok, %{verification: nil, candidate: %{}}} = evidence(fixture, saved, changed_policy)
+    output = Path.join([saved["directory"], "checks", receipt["id"], "output"])
+    File.write!(output, "tampered")
+    assert {:error, :command_evidence_not_attested} = evidence(fixture, saved)
+  end
+
+  test "native candidate retrieval works for both providers and absent evidence remains absent" do
+    for provider <- ["github", "gitlab"] do
+      fixture = fixture(provider) |> git_artifact()
+      assert {:ok, %{candidate: nil, verification: nil}} = evidence(fixture, fixture.record)
+      {:ok, saved, receipt} = publish(fixture)
+      assert {:ok, facts} = evidence(fixture, saved)
+      assert facts.candidate["source"] == receipt["source"]
+      assert hd(facts.artifacts).receipt["source"] in facts.sources
+      assert {:error, :result_execution_unconfirmed} = evidence(fixture, Map.put(saved, "thread_id", "not-the-publisher"))
+      assert {:error, :unrecorded_native_result} = evidence(fixture, Map.delete(saved, "publications"))
+      assert {:error, :invalid_publication_journal} = evidence(fixture, Map.put(saved, "publications", []))
+      Agent.update(fixture.state, &put_in(&1.objects[fixture.notes], []))
+      assert {:error, :current_result_unconfirmed} = evidence(fixture, saved)
+    end
+  end
+
+  test "evidence selection cannot silently choose between conflicting results from one generation" do
+    fixture = fixture("github") |> git_artifact()
+    {:ok, saved, _} = publish(fixture)
+    changed = Map.update!(fixture.payload, "artifacts", &Enum.map(&1, fn artifact -> Map.put(artifact, "id", "conflicting") end))
+    {:ok, saved, _} = TaskPublication.publish(saved, "candidate", changed, "Conflicting candidate", fixture.opts)
+    assert {:error, :ambiguous_execution_result} = evidence(fixture, saved)
+  end
+
+  test "newer execution results replace historical ones but losing the newest source never falls back" do
+    fixture = fixture("github") |> git_artifact()
+    {:ok, original, _} = publish(fixture)
+    {:ok, original} = RunJournal.checkpoint(original, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(original, "completed")
+    binding = Map.put(original["execution_binding"], "candidate", TaskWorkflow.digest(fixture.payload))
+    {:ok, next} = RunJournal.admit(Path.dirname(original["directory"]), original["issue_id"], execution_binding: binding)
+    {:ok, next} = RunJournal.checkpoint(next, %{"thread_id" => "next-developer"})
+    {:ok, saved, receipt} = publish(fixture, next)
+    assert {:ok, facts} = evidence(fixture, saved)
+    assert facts.candidate["execution"]["thread_id"] == "next-developer"
+    assert facts.candidate["source"] == receipt["source"]
+    Agent.update(fixture.state, &update_in(&1.objects[fixture.notes], fn [old, _new] -> [old] end))
+    assert {:error, :current_result_unconfirmed} = evidence(fixture, saved)
+  end
+
+  test "a native write not yet reconciled cannot become current evidence merely because the comment exists" do
+    fixture = fixture("github") |> git_artifact()
+    {:ok, saved, receipt} = publish(fixture)
+    entry = saved["publications"][receipt["id"]] |> Map.put("status", "sending") |> Map.delete("receipt")
+    uncertain = Map.put(saved, "publications", %{receipt["id"] => entry})
+    assert {:error, :current_result_unconfirmed} = evidence(fixture, uncertain)
+  end
+
+  test "a native publication edit during artifact retrieval invalidates the complete observation" do
+    fixture = fixture("github") |> git_artifact()
+    {:ok, saved, _} = publish(fixture)
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(fixture.parent, fixture.opts)
+    original = fixture.opts[:request]
+
+    racing = fn provider, method, path, query, settings ->
+      result = original.(provider, method, path, query, settings)
+
+      if String.contains?(path, "/git/blobs/") do
+        Agent.update(fixture.state, &update_in(&1.objects[fixture.notes], fn [note] -> [Map.put(note, "body", note["body"] <> "\nChanged during retrieval")] end))
+      end
+
+      result
+    end
+
+    opts = Keyword.put(fixture.opts, :request, racing)
+    assert {:error, :member_evidence_scope_changed} = TaskEvidence.read_member(plan, fixture.payload["work"], saved, fixture.opts[:policy], opts)
+  end
+
+  test "a malformed journal envelope cannot invent an execution generation" do
+    fixture = fixture("github") |> git_artifact()
+    {:ok, saved, receipt} = publish(fixture)
+    entry = saved["publications"][receipt["id"]]
+    [json] = Regex.run(~r/<!-- symphony-evidence (\{[^\n]*\}) -->/, entry["body"], capture: :all_but_first)
+    envelope = Jason.decode!(json) |> Map.put("generation", "invented")
+    id = TaskWorkflow.digest(Map.drop(envelope, ~w(id summary)))
+    envelope = Map.put(envelope, "id", id)
+    body = envelope["summary"] <> "\n\n<!-- symphony-evidence " <> TaskWorkflow.canonical_json(envelope) <> " -->\n<!-- symphony-engine-notice -->"
+    entry = entry |> Map.merge(%{"id" => id, "body" => body, "status" => "prepared"}) |> Map.delete("receipt")
+    assert {:error, :invalid_publication_journal} = evidence(fixture, Map.put(saved, "publications", %{id => entry}))
+  end
+
+  test "unretrievable sources and changed native scope cannot be treated as current candidates" do
+    for artifact <- [%{"id" => "output", "kind" => "report", "version" => "v1"}, %{"id" => "output", "kind" => "report", "version" => "v1", "source" => "asserted"}] do
+      fixture = fixture("github")
+      {:ok, saved, _} = TaskPublication.publish(fixture.record, "candidate", Map.put(fixture.payload, "artifacts", [artifact]), "Unavailable", fixture.opts)
+      assert {:error, :artifact_source_mismatch} = evidence(fixture, saved)
+    end
+
+    fixture = fixture("github") |> git_artifact()
+    {:ok, saved, _} = publish(fixture)
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(fixture.parent, fixture.opts)
+    Agent.update(fixture.state, &update_in(&1.objects[fixture.child]["body"], fn body -> body <> "\nChanged" end))
+    assert {:error, :member_evidence_scope_changed} = TaskEvidence.read_member(plan, fixture.payload["work"], saved, fixture.opts[:policy], fixture.opts)
+    Agent.update(fixture.state, &update_in(&1.objects[fixture.notes], fn [note] -> [Map.put(note, "body", note["body"] <> "\nEdited")] end))
+    assert {:error, :unrecorded_native_result} = evidence(fixture, saved)
   end
 
   test "damaged intents fail before attempting recovery or allowing a new publication" do

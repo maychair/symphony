@@ -11,6 +11,39 @@ defmodule SymphonyElixir.TaskPublication do
 
   @marker "<!-- symphony-evidence "
 
+  @doc "Read recorded result envelopes and their current native confirmation without granting result validity."
+  @spec observe(map(), map(), String.t()) :: {:ok, [map()]} | {:error, atom()}
+  def observe(record, snapshot, actor) do
+    entries = Map.get(record, "publications", %{})
+
+    if is_map(entries) and Enum.all?(entries, fn {id, entry} -> valid_entry?(id, entry) and entry["work"] == snapshot.work end) do
+      results = Enum.map(entries, fn {_id, entry} -> observation(entry, snapshot) end)
+      known = [actor | Enum.map(entries, fn {_id, entry} -> entry["actor"] end)]
+      bodies = Enum.map(entries, fn {_id, entry} -> entry["body"] end)
+      unknown = Enum.any?(snapshot.notes, &(String.contains?(&1["body"], @marker) and to_string(get_in(&1, ["author", "id"])) in known and &1["body"] not in bodies))
+      if unknown, do: {:error, :unrecorded_native_result}, else: {:ok, results}
+    else
+      {:error, :invalid_publication_journal}
+    end
+  end
+
+  defp observation(entry, snapshot) do
+    [json] = Regex.run(~r/\n\n<!-- symphony-evidence (\{[^\n]*\}) -->\n<!-- symphony-engine-notice -->\z/, entry["body"], capture: :all_but_first)
+    envelope = Jason.decode!(json)
+
+    receipt =
+      case matches(snapshot, entry) do
+        [note] ->
+          expected = %{"work" => entry["work"], "note_id" => note["id"], "source" => TaskDecision.source_ref(note), "id" => entry["id"]}
+          if entry["status"] == "published" and unchanged?(note, entry) and entry["receipt"] == expected, do: expected
+
+        _ ->
+          nil
+      end
+
+    %{envelope: envelope, receipt: receipt}
+  end
+
   @doc "Publish a role-bound engine result; uncertain sends recover by reading, never by blind reposting."
   @spec publish(map(), String.t(), map(), String.t(), keyword()) :: {:ok, map(), map()} | {:error, term()}
   def publish(record, kind, payload, summary, opts \\ []) do
@@ -86,7 +119,8 @@ defmodule SymphonyElixir.TaskPublication do
          {:ok, ^binding} <- ExecutionBinding.normalize(binding),
          [json] <- Regex.run(~r/\n\n<!-- symphony-evidence (\{[^\n]*\}) -->\n<!-- symphony-engine-notice -->\z/, body, capture: :all_but_first),
          {:ok, %{"id" => ^id, "binding" => ^binding, "actor" => actor} = envelope} <- Jason.decode(json) do
-      summary?(envelope["summary"]) and render(envelope) == body and entry["work"] == binding["work"] and
+      envelope_shape?(envelope) and
+        summary?(envelope["summary"]) and render(envelope) == body and entry["work"] == binding["work"] and
         text?(actor) and entry["actor"] == actor and id == TaskWorkflow.digest(Map.drop(envelope, ~w(id summary)))
     else
       _ -> false
@@ -94,6 +128,12 @@ defmodule SymphonyElixir.TaskPublication do
   end
 
   defp valid_entry?(_, _), do: false
+
+  defp envelope_shape?(envelope) do
+    envelope["schema_version"] == 1 and is_integer(envelope["generation"]) and envelope["generation"] > 0 and
+      text?(envelope["thread_id"]) and is_map(envelope["payload"]) and
+      role_payload?(envelope["kind"], envelope["payload"], envelope["binding"])
+  end
 
   defp receipt_shape?(%{"status" => "published", "receipt" => %{"work" => work, "note_id" => note, "source" => source, "id" => id}} = entry) do
     work == entry["work"] and id == entry["id"] and is_integer(note) and note > 0 and text?(source)

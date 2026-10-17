@@ -50,6 +50,7 @@ defmodule SymphonyElixir.MixProject do
         ]
       ],
       test_ignore_filters: [
+        "test/support/git_artifact_fixture.exs",
         "test/support/snapshot_support.exs",
         "test/support/test_support.exs"
       ],
