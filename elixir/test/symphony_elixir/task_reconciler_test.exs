@@ -248,6 +248,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert ready["ref"] == label_ref(11)
     assert TaskDecision.label_events([label_event(11, "symphony:ready")], []) == []
     assert TaskReconciler.description_contract(description <> "\n" <> contract_block(development_contract())) == nil
+    assert TaskReconciler.description_contract(description <> "\n<!-- symphony-contract broken") == nil
   end
 
   test "old ready cannot approve edited scope on first admission", %{server: server, issue: issue} do

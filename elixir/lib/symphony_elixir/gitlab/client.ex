@@ -346,9 +346,9 @@ defmodule SymphonyElixir.GitLab.Client do
 
   defp resolve_setting(nil, fallback), do: normalize_string(fallback)
 
-  defp resolve_setting("$" <> env_name, fallback) do
+  defp resolve_setting("$" <> env_name, _fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name) || fallback)
+      normalize_string(System.get_env(env_name))
     else
       nil
     end

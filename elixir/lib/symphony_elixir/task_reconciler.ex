@@ -289,7 +289,8 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec description_contract(String.t() | nil) :: map() | nil
   def description_contract(description) do
-    with [[_, json]] <- Regex.scan(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
+    with [_] <- Regex.scan(~r/<!--\s*symphony-contract\b/, description || ""),
+         [[_, json]] <- Regex.scan(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
          {:ok, %{"contract_sha" => sha} = block} when is_binary(sha) <- Jason.decode(json),
          data = Map.delete(block, "contract_sha"),
          true <- sha == TaskWorkflow.digest(data) do

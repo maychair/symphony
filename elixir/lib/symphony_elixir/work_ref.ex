@@ -40,9 +40,9 @@ defmodule SymphonyElixir.WorkRef do
 
   defp host?(host) when is_binary(host) and byte_size(host) > 0 do
     case URI.new("https://" <> host) do
-      {:ok, %URI{host: name, userinfo: nil, path: path, query: nil, fragment: nil, port: port}}
+      {:ok, %URI{host: name, userinfo: nil, path: path, query: nil, fragment: nil, port: port} = uri}
       when is_binary(name) and name != "" and path in [nil, ""] ->
-        canonical = URI.to_string(%URI{scheme: "https", host: String.downcase(name), port: port})
+        canonical = URI.to_string(%{uri | host: String.downcase(name)})
 
         "https://" <> host == canonical and not String.ends_with?(name, ".") and port in 1..65_535 and
           not String.contains?(host, [" ", "\n", "\r", "\t", "%", "\\"])

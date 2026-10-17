@@ -38,6 +38,12 @@ defmodule SymphonyElixir.Execution do
   def prepare(%Tracker.Issue{kind: :plan}, _opts), do: {:error, :parent_plan_has_no_executor}
 
   def prepare(issue, opts) do
+    if SymphonyElixir.TaskPlan.requires_plan_lifecycle?(issue),
+      do: {:error, :plan_execution_unavailable},
+      else: prepare_legacy(issue, opts)
+  end
+
+  defp prepare_legacy(issue, opts) do
     if enabled?() do
       with :ok <- ExecutionBackend.check_record(journal_root(), issue.id),
            :ok <- recover_stopped(issue),

@@ -2389,3 +2389,5 @@ versioned parent/child plans and independent PR/MR review. Repository Issues rem
 the sole task source; this is not a general-purpose workflow service or an extra
 tracker. A parent is coordination work, not a coding executor. Native facts,
 versioned human decisions and existing repository permissions remain authoritative.
+
+Configured parent plans now receive [native preflight](elixir/docs/workflow-lifecycle.md#native-plan-preflight) on tracker reads. This verifies complete cross-repository scope and approval without granting child dispatch or treating Issue closure as dependency evidence.

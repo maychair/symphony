@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Tracker do
   leak into scheduler policy.
   """
 
-  alias SymphonyElixir.{Config, TaskPlan}
+  alias SymphonyElixir.{Config, TaskPlan, TaskPlanPreflight}
   alias SymphonyElixir.MailReview.Listener
   alias SymphonyElixir.Tracker.Issue
 
@@ -70,7 +70,8 @@ defmodule SymphonyElixir.Tracker do
   def fetch_issues_by_states(states) do
     with {:ok, issues} <- adapter().fetch_issues_by_states(states),
          {:ok, reviews} <- review_issues() do
-      {:ok, Enum.map(Enum.reject(issues, &("symphony-review" in &1.labels)), &TaskPlan.project/1) ++ Enum.filter(reviews, &(&1.state in states))}
+      parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
+      {:ok, parents ++ Enum.filter(reviews, &(&1.state in states))}
     end
   end
 
@@ -80,7 +81,8 @@ defmodule SymphonyElixir.Tracker do
 
     with {:ok, issues} <- adapter().fetch_issues_by_ids(normal_ids),
          {:ok, reviews} <- review_issues() do
-      {:ok, Enum.map(Enum.reject(issues, &("symphony-review" in &1.labels)), &TaskPlan.project/1) ++ Enum.filter(reviews, &(&1.id in review_ids))}
+      parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
+      {:ok, parents ++ Enum.filter(reviews, &(&1.id in review_ids))}
     end
   end
 
@@ -173,7 +175,7 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp adapter_secret_environment_names(adapter, tracker_settings) do
-    adapter.secret_environment_names(tracker_settings)
+    Enum.uniq(adapter.secret_environment_names(tracker_settings) ++ SymphonyElixir.NativeWork.secret_environment_names(tracker_settings))
   end
 
   defp unsupported_agent_tool_response(tool) do

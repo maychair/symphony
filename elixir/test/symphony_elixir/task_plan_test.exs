@@ -39,6 +39,7 @@ defmodule SymphonyElixir.TaskPlanTest do
     assert parent.native_ref["plan"] == plan
     refute Issue.routable?(%{parent | dispatchable: true}, ["symphony:ready"])
     assert {:error, :parent_plan_has_no_executor} = Execution.prepare(parent, [])
+    assert TaskPlan.project(%{issue | description: String.replace(block, "<!-- ", "<!--\n  ")}).kind == :plan
 
     for body <- ["<!-- symphony-plan broken -->", block <> "\n" <> block, "<!-- symphony-plan {bad json} -->", "<!-- symphony-plan " <> Jason.encode!(%{plan | "revision" => "edited"}) <> " -->"] do
       invalid = TaskPlan.project(%{parent | description: body})
@@ -49,6 +50,14 @@ defmodule SymphonyElixir.TaskPlanTest do
     end
 
     normal = %{issue | description: "An ordinary task"}
+
+    for broken <- [block <> "\n<!-- symphony-plan broken", "<!--\n symphony-plan"] do
+      rejected = TaskPlan.project(%{normal | description: broken})
+      assert rejected.kind == :plan
+      refute rejected.dispatchable
+      assert rejected.native_ref["plan_error"] == "invalid_plan_block"
+    end
+
     assert TaskPlan.project(normal) == normal
     assert TaskPlan.project(%{normal | description: nil}) == %{normal | description: nil}
   end

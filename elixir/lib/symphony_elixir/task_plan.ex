@@ -13,11 +13,12 @@ defmodule SymphonyElixir.TaskPlan do
   @fields ~w(schema_version parent contract_sha authorizer criteria members dependencies integration budget_ms revision)
   @member_fields ~w(work contract_sha criteria budget_ms human_gate)
   @edge_fields ~w(from to artifact stage criteria)
+  @marker ~r/<!--\s*symphony-plan(?=\s|-->|$)/
 
   @doc "Project a parent Issue as coordination work; malformed plans never fall through to execution."
   @spec project(Issue.t()) :: Issue.t()
   def project(%Issue{description: description} = issue) when is_binary(description) do
-    if String.contains?(description, "<!-- symphony-plan") do
+    if Regex.match?(@marker, description) do
       native = Map.drop(issue.native_ref || %{}, ["plan", "plan_error"])
       result = parse(description)
 
@@ -35,10 +36,26 @@ defmodule SymphonyElixir.TaskPlan do
 
   def project(%Issue{} = issue), do: issue
 
+  @doc "Keep versioned plan contracts out of legacy execution, including invalid or unsupported contracts."
+  @spec requires_plan_lifecycle?(Issue.t()) :: boolean()
+  def requires_plan_lifecycle?(%Issue{description: description}) when is_binary(description) do
+    if Regex.match?(~r/<!--\s*symphony-contract\b/, description) do
+      case SymphonyElixir.TaskReconciler.description_contract(description) do
+        %{} = contract -> Map.has_key?(contract, "parent") or contract["schema_version"] not in [nil, 1]
+        _ -> true
+      end
+    else
+      false
+    end
+  end
+
+  def requires_plan_lifecycle?(%Issue{}), do: false
+
   @doc "Read the single sealed native plan block without treating prose as authority."
   @spec parse(String.t()) :: {:ok, map()} | {:error, atom()}
   def parse(description) do
-    with [[_, json]] <- Regex.scan(~r/<!-- symphony-plan\s+(\{.*?\})\s*-->/s, description),
+    with [_] <- Regex.scan(@marker, description),
+         [[_, json]] <- Regex.scan(~r/<!--\s*symphony-plan\s+(\{.*?\})\s*-->/s, description),
          {:ok, plan} <- Jason.decode(json),
          :ok <- validate(plan) do
       {:ok, plan}

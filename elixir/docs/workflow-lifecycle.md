@@ -8,9 +8,14 @@ projections; Codex owns native agent sessions.
 The current implementation validates sealed plan graphs and classifies parent
 Issues as coordination work. The existing GitLab task path also binds label
 decisions to unchanged native candidate notes and rejects unversioned acceptance.
-Parent dispatch, cross-provider evidence reconciliation
-and the remaining lifecycle below are not yet complete. A parent must never run
-as a coding task while coordination support is incomplete.
+Configured parents now receive complete native scope/approval preflight on
+tracker reads, including GitHub/GitLab repository identity and member contracts.
+Child dispatch, artifact verification and the remaining lifecycle below are not
+yet complete. Preflight success alone is not execution eligibility. A parent must never run
+as a coding task while coordination support is incomplete. Version 2 and unknown
+contract schemas, parent-linked contracts and malformed contract blocks are
+also fenced at tracker projection and executor admission; legacy routing labels
+cannot bypass the pending plan lifecycle, even when goal mode is disabled.
 
 ## Observable requirements
 
@@ -99,6 +104,85 @@ criteria requires a new authorized revision.
 Parent Issues are tagged `kind: :plan` and cannot pass ordinary issue routing or
 `Execution.prepare/2`. Malformed or duplicate plan blocks remain coordination
 work with a visible error; they must not fall through to coding execution.
+
+## Native plan preflight
+
+`tracker.provider.plan_roots` lists explicitly selected parent `WorkRef` objects.
+`plan_repositories` contains the permitted repository read contexts. Each entry
+has `provider`, `host`, `repository_id`, `path`, `api_url` and `credential` (an
+explicit `$ENVIRONMENT_VARIABLE` reference). Explicit GitHub/GitLab environment
+references must resolve their named variable; a missing variable cannot fall back
+to the global token or repository setting for another execution context.
+No repository or endpoint is learned
+from Issue prose. Credentials remain outside journals and are included in the
+executor secret-environment exclusion list. For example:
+
+```yaml
+tracker:
+  provider:
+    plan_roots:
+      - {provider: github, host: github.example, repository_id: "10", kind: issue, number: 1}
+    plan_repositories:
+      - provider: github
+        host: github.example
+        repository_id: "10"
+        path: team/project
+        api_url: https://github.example/api/v3
+        credential: $PLAN_PROJECT_TOKEN
+```
+
+GitHub.com uses `https://api.github.com`; Enterprise uses the configured host's
+`/api/v3`. GitLab uses `/api/v4`. A nondefault port belongs to the host identity;
+HTTP requires explicit `allow_insecure_http: true` and includes port 80 in that
+identity. Duplicate identities and a foreign API host are rejected before any
+request. Native repository metadata must match both the stable ID and registered
+path. GitHub PRs cannot be substituted for Issues, and GitLab project IDs must
+match the target. Identity mismatch or rename requires updating the configured
+path after checking the same native ID.
+
+A parent and every member have one self-checked `symphony-contract` block with
+`schema_version: 2`. In addition to its checksum it includes:
+
+- `work` and `parent`: complete native identities; `parent` is null on the root.
+- `goal`, `non_goals`, `criteria` and `criteria_details`: the goal and exclusions,
+  distinct criterion IDs, and an exact ID-to-observable-requirement map. Mutable
+  progress prose outside this block is not the semantic contract.
+- `authorizer`: the sole native assignee's stable user ID.
+- `budget_ms`: finite on every child; optional on the root. The root cap matches
+  the plan cap, and child allocations match their plan member entries.
+- `acceptance_mode` and `acceptor`: the root uses `separate` and names its
+  acceptor. Ordinary children use `technical` with a null acceptor. A child with
+  an explicit human gate uses `separate` and names its acceptor.
+- `deliverables`: distinct entries with `id`, `kind` and covered `criteria`.
+  Together they cover the whole contract. Every dependency edge names an actual
+  producer deliverable and only criteria covered by that deliverable.
+
+A readable parent approval note ends with:
+
+```html
+<!-- symphony-plan-decision {"action":"authorize","revision":"FULL_PLAN_REVISION"} -->
+```
+
+The native actor must match the sealed parent authorizer. The note must be
+unchanged with valid source times. A later non-authorize control or unresolvable
+control blocks preflight; it never falls back to an older approval. Full pause,
+resume and rework interpretation remains part of the pending execution lifecycle.
+Approval evidence binds the parent WorkRef, native note version and plan revision.
+
+`TaskPlanPreflight.inspect_plan/2` returns all member snapshots or an error;
+it never returns a partial eligible set. Reads paginate comments, detect duplicate
+pages, and re-read Issue content after reading comments. After all members have
+been checked, the parent and its decision sources are read again. These are read
+fences, not a distributed transaction: dispatch and every later effect must
+reconcile fresh evidence again. The tracker exposes only a compact
+`native_ref.plan_preflight` projection, without copying all member content into
+the parent or another task tracker. The local Issue URL and revision must match
+the verified parent, so a pasted plan cannot inherit the original's projection.
+
+Native reads use the documented [GitHub repository endpoint](https://docs.github.com/en/rest/repos/repos#get-a-repository),
+[GitHub Issue comments](https://docs.github.com/en/rest/issues/comments#list-issue-comments),
+[GitLab project endpoint](https://docs.gitlab.com/api/projects/#get-a-single-project)
+and [GitLab Issue notes](https://docs.gitlab.com/api/notes/#list-all-issue-notes).
 
 ## Execution and evidence
 

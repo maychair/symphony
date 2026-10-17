@@ -349,3 +349,5 @@ version-bound evidence, parent acceptance and comments-only standalone review.
 Parent plan Issues are coordination work and never ordinary coding executions.
 Plan graph validation is available; coordinated dispatch and the remaining
 lifecycle integration are still under development.
+
+Configured parent plans now receive [native preflight](docs/workflow-lifecycle.md#native-plan-preflight) on tracker reads. This verifies complete cross-repository scope and approval without granting child dispatch or treating Issue closure as dependency evidence.
