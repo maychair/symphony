@@ -2,12 +2,16 @@ defmodule SymphonyElixirWeb.StaticAssets do
   @moduledoc false
 
   @dashboard_css_path Path.expand("../../priv/static/dashboard.css", __DIR__)
+  @taskboard_css_path Path.expand("../../priv/static/taskboard.css", __DIR__)
+  @taskboard_js_path Path.expand("../../priv/static/taskboard.js", __DIR__)
   @favicon_path Path.expand("../../priv/static/favicon.png", __DIR__)
   @phoenix_html_js_path Application.app_dir(:phoenix_html, "priv/static/phoenix_html.js")
   @phoenix_js_path Application.app_dir(:phoenix, "priv/static/phoenix.js")
   @phoenix_live_view_js_path Application.app_dir(:phoenix_live_view, "priv/static/phoenix_live_view.js")
 
   @external_resource @dashboard_css_path
+  @external_resource @taskboard_css_path
+  @external_resource @taskboard_js_path
   @external_resource @favicon_path
   @external_resource @phoenix_html_js_path
   @external_resource @phoenix_js_path
@@ -17,6 +21,20 @@ defmodule SymphonyElixirWeb.StaticAssets do
   @dashboard_css_digest :crypto.hash(:sha256, @dashboard_css)
                         |> Base.encode16(case: :lower)
                         |> binary_part(0, 12)
+  @taskboard_css File.read!(@taskboard_css_path)
+                 |> then(fn source ->
+                   {source,
+                    :crypto.hash(:sha256, source)
+                    |> Base.encode16(case: :lower)
+                    |> binary_part(0, 12)}
+                 end)
+  @taskboard_js File.read!(@taskboard_js_path)
+                |> then(fn source ->
+                  {source,
+                   :crypto.hash(:sha256, source)
+                   |> Base.encode16(case: :lower)
+                   |> binary_part(0, 12)}
+                end)
   @favicon File.read!(@favicon_path)
   @favicon_digest :crypto.hash(:sha256, @favicon)
                   |> Base.encode16(case: :lower)
@@ -27,6 +45,8 @@ defmodule SymphonyElixirWeb.StaticAssets do
 
   @assets %{
     "/dashboard.css" => {"text/css", @dashboard_css},
+    "/taskboard.css" => {"text/css", elem(@taskboard_css, 0)},
+    "/taskboard.js" => {"application/javascript", elem(@taskboard_js, 0)},
     "/favicon.png" => {"image/png", @favicon},
     "/vendor/phoenix_html/phoenix_html.js" => {"application/javascript", @phoenix_html_js},
     "/vendor/phoenix/phoenix.js" => {"application/javascript", @phoenix_js},
@@ -35,6 +55,12 @@ defmodule SymphonyElixirWeb.StaticAssets do
 
   @spec dashboard_css_url() :: String.t()
   def dashboard_css_url, do: "/dashboard.css?v=#{@dashboard_css_digest}"
+
+  @spec taskboard_css_url() :: String.t()
+  def taskboard_css_url, do: "/taskboard.css?v=#{elem(@taskboard_css, 1)}"
+
+  @spec taskboard_js_url() :: String.t()
+  def taskboard_js_url, do: "/taskboard.js?v=#{elem(@taskboard_js, 1)}"
 
   @spec favicon_url() :: String.t()
   def favicon_url, do: "/favicon.png?v=#{@favicon_digest}"

@@ -30,6 +30,9 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.HttpServer,
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,
+          SymphonyElixir.Taskboard.GitHub,
+          SymphonyElixir.Taskboard.GitLab,
+          SymphonyElixir.Taskboard.Memory,
           SymphonyElixir.Workspace,
           SymphonyElixirWeb.DashboardLive,
           SymphonyElixirWeb.Endpoint,
@@ -40,6 +43,8 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixirWeb.Presenter,
           SymphonyElixirWeb.StaticAssetController,
           SymphonyElixirWeb.StaticAssets,
+          SymphonyElixirWeb.TaskboardApiController,
+          SymphonyElixirWeb.TaskboardLive,
           SymphonyElixirWeb.Router,
           SymphonyElixirWeb.Router.Helpers
         ]

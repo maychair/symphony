@@ -1473,6 +1473,11 @@ Extension config:
   - Enables the HTTP server extension.
   - `0` requests an ephemeral port for local development and tests.
   - CLI `--port` overrides `server.port` when both are present.
+- `server.host` (string, OPTIONAL)
+  - Selects the HTTP listener address.
+  - Defaults to loopback.
+  - A non-loopback bind is an explicit deployment decision and requires the operator to restrict
+    network access or provide authentication at an outer gateway.
 
 Enablement (extension):
 
@@ -1485,17 +1490,30 @@ Enablement (extension):
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 
-#### 13.7.1 Human-Readable Dashboard (`/`)
+#### 13.7.1 Human-Readable Surfaces (`/` and `/runtime`)
 
-- Host a human-readable dashboard at `/`.
-- The returned document SHOULD depict the current state of the system (for example active sessions,
-  retry delays, token consumption, runtime totals, recent events, and health/error indicators).
+- Host a repository Issue Taskboard at `/`.
+- Host the runtime observability dashboard at `/runtime`.
+- The Taskboard SHOULD depict repository Issues in exactly four user-facing columns: `Todo`,
+  `In Progress`, `Human Review`, and `Done`.
+- These columns are projections over tracker state, scheduler labels, execution observations, and
+  the agreed acceptance protocol. They MUST NOT introduce a second task source or replace the
+  internal scheduler state machine.
+- `Done` requires both the agreed acceptance decision and native Issue closure. A successful Agent
+  turn, published delivery, or merged change alone MUST NOT project an Issue as `Done`.
+- The runtime surface SHOULD depict active sessions, retry delays, token consumption, runtime
+  totals, recent events, and health/error indicators.
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
   consumes the JSON API below.
 
 #### 13.7.2 JSON REST API (`/api/v1/*`)
 
 Provide a JSON REST API under `/api/v1/*` for current runtime state and operational debugging.
+
+Taskboard reads and runtime reads MAY be unauthenticated only when the listener is protected by its
+private deployment boundary. Taskboard mutations MUST require explicit operator authentication.
+Operator comments and human-owned labels MUST use the human tracker identity rather than silently
+attributing those actions to the scheduler identity.
 
 Minimum endpoints:
 
@@ -1630,6 +1648,22 @@ API design notes:
 - API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state
   logic.
+
+#### 13.7.3 Repository Issue Taskboard API
+
+- `GET /api/v1/taskboard` returns the four fixed columns, counts, project metadata, Issue cards, and
+  current write capabilities.
+- `GET /api/v1/taskboard/issues/:project_id/:issue_identifier` returns the Issue body, comments,
+  linked pull/merge requests, review evidence, execution evidence, and allowed UI capabilities.
+- `POST /api/v1/taskboard/issues` creates an Issue only after an explicit operator confirmation.
+- `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/comments` publishes an operator
+  comment.
+- `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/actions/:action` requests dispatch,
+  pause, retry, rework, or acceptance through the existing adapter and state-transition rules.
+- A Taskboard API MUST re-read the current Issue and reject an action that is invalid for its
+  current projection. It MUST NOT directly mutate orchestrator memory.
+- Repository Issues remain the authoritative task records. Taskboard detail, drafts, and execution
+  evidence MUST NOT become an alternate task database.
 
 ## 14. Failure Model and Recovery Strategy
 

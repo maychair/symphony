@@ -23,7 +23,10 @@ defmodule SymphonyElixir.GitLab.Client do
       "GITLAB_PAT",
       "GITLAB_ACCESS_TOKEN",
       "GITLAB_TOKEN",
-      "OAUTH_TOKEN" | env_reference_names([provider["api_key"]])
+      "OAUTH_TOKEN",
+      "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+      "SYMPHONY_TASKBOARD_CONTROL_TOKEN"
+      | env_reference_names([provider["api_key"]])
     ]
     |> Enum.uniq()
   end
@@ -33,9 +36,21 @@ defmodule SymphonyElixir.GitLab.Client do
     fetch_issues_by_states(states, Config.settings!().tracker, &perform_request/5)
   end
 
+  @spec fetch_issues_by_states([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, tracker_settings)
+      when is_list(states) and is_map(tracker_settings) do
+    fetch_issues_by_states(states, tracker_settings, &perform_request/5)
+  end
+
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(ids) when is_list(ids) do
     fetch_issues_by_ids(ids, Config.settings!().tracker, &perform_request/5)
+  end
+
+  @spec fetch_issues_by_ids([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(ids, tracker_settings)
+      when is_list(ids) and is_map(tracker_settings) do
+    fetch_issues_by_ids(ids, tracker_settings, &perform_request/5)
   end
 
   @spec request(String.t(), String.t(), map(), term(), keyword()) ::

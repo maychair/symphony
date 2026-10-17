@@ -122,6 +122,11 @@ defmodule SymphonyElixir.TestSupport do
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
+          taskboard_enabled: nil,
+          taskboard_refresh_ms: nil,
+          taskboard_control_token: nil,
+          taskboard_provider_token: nil,
+          taskboard_projects: nil,
           server_port: nil,
           server_host: nil,
           prompt: @workflow_prompt
@@ -160,6 +165,11 @@ defmodule SymphonyElixir.TestSupport do
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    taskboard_enabled = Keyword.get(config, :taskboard_enabled)
+    taskboard_refresh_ms = Keyword.get(config, :taskboard_refresh_ms)
+    taskboard_control_token = Keyword.get(config, :taskboard_control_token)
+    taskboard_provider_token = Keyword.get(config, :taskboard_provider_token)
+    taskboard_projects = Keyword.get(config, :taskboard_projects)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
@@ -196,6 +206,13 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        taskboard_yaml(
+          taskboard_enabled,
+          taskboard_refresh_ms,
+          taskboard_control_token,
+          taskboard_provider_token,
+          taskboard_projects
+        ),
         server_yaml(server_port, server_host),
         "---",
         prompt
@@ -264,6 +281,21 @@ defmodule SymphonyElixir.TestSupport do
       "  refresh_ms: #{yaml_value(refresh_ms)}",
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
     ]
+    |> Enum.join("\n")
+  end
+
+  defp taskboard_yaml(nil, nil, nil, nil, nil), do: nil
+
+  defp taskboard_yaml(enabled, refresh_ms, control_token, provider_token, projects) do
+    [
+      "taskboard:",
+      !is_nil(enabled) && "  enabled: #{yaml_value(enabled)}",
+      !is_nil(refresh_ms) && "  refresh_ms: #{yaml_value(refresh_ms)}",
+      !is_nil(control_token) && "  control_token: #{yaml_value(control_token)}",
+      !is_nil(provider_token) && "  provider_token: #{yaml_value(provider_token)}",
+      !is_nil(projects) && "  projects: #{yaml_value(projects)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

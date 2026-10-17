@@ -1525,6 +1525,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec retry_now(String.t()) :: :ok | :not_retrying | :unavailable
+  def retry_now(issue_id), do: retry_now(__MODULE__, issue_id)
+
+  @spec retry_now(GenServer.server(), String.t()) :: :ok | :not_retrying | :unavailable
+  def retry_now(server, issue_id) when is_binary(issue_id) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:retry_now, issue_id})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1634,6 +1646,18 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:retry_now, issue_id}, _from, state) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{retry_token: retry_token, timer_ref: timer_ref} when is_reference(retry_token) ->
+        if is_reference(timer_ref), do: Process.cancel_timer(timer_ref)
+        send(self(), {:retry_issue, issue_id, retry_token})
+        {:reply, :ok, state}
+
+      _ ->
+        {:reply, :not_retrying, state}
+    end
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state

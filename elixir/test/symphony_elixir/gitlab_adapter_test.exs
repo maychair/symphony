@@ -98,6 +98,8 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
              "GITLAB_ACCESS_TOKEN",
              "GITLAB_TOKEN",
              "OAUTH_TOKEN",
+             "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+             "SYMPHONY_TASKBOARD_CONTROL_TOKEN",
              "SYMPHONY_GITLAB_TOKEN"
            ]
 
@@ -442,6 +444,8 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
              "GITLAB_ACCESS_TOKEN",
              "GITLAB_TOKEN",
              "OAUTH_TOKEN",
+             "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+             "SYMPHONY_TASKBOARD_CONTROL_TOKEN",
              token_env
            ]
 

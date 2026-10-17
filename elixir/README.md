@@ -21,6 +21,12 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
+The Phoenix service exposes a repository Issue Taskboard at `/` and the lower-level runtime
+observability dashboard at `/runtime`. The Taskboard is a projection over configured GitHub,
+GitLab, or memory-backed Issues; it does not keep a second task database. Its four columns are
+user-facing views over tracker state, labels, and Symphony execution observations. See
+[Taskboard](docs/taskboard.md) for state mapping, operator authentication, and the JSON API.
+
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
@@ -157,6 +163,12 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+taskboard:
+  control_token: $SYMPHONY_TASKBOARD_CONTROL_TOKEN
+  provider_token: $SYMPHONY_OPERATOR_TRACKER_TOKEN
+server:
+  host: 127.0.0.1
+  port: 8092
 codex:
   command: codex app-server
 ---
@@ -206,6 +218,16 @@ Notes:
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
   launched shell.
+- `taskboard.control_token` authenticates write API calls made by the operator UI. The UI requests
+  it once per browser session and stores it only in `sessionStorage`.
+- `taskboard.provider_token` is the human operator's tracker token. Symphony uses it only for
+  Taskboard Issue creation, comments, and explicit human labels, so those writes keep the human
+  identity while scheduler writes continue to use the engine identity.
+- Both Taskboard secrets should be environment references. Symphony removes these variables from
+  agent subprocesses. The read-only Taskboard projections do not require either secret.
+- `server.host` defaults to loopback. Set `0.0.0.0` only when the dashboard must be reached from
+  another machine on a trusted network, and put an authenticated gateway or private network in
+  front of it before exposing it beyond the LAN.
 
 ```yaml
 tracker:
@@ -223,8 +245,10 @@ codex:
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
-- `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `server.port` or CLI `--port` enables the Phoenix service. The repository Issue Taskboard is at
+  `/`; the original runtime dashboard remains at `/runtime`. Runtime JSON endpoints remain under
+  `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`. Taskboard endpoints are
+  documented in [Taskboard](docs/taskboard.md).
 
 ### Linear adapter profile
 
@@ -315,10 +339,11 @@ codex:
 
 ## Web dashboard
 
-The observability UI now runs on a minimal Phoenix stack:
+The web UI runs on a minimal Phoenix stack:
 
-- LiveView for the dashboard at `/`
-- JSON API for operational debugging under `/api/v1/*`
+- Four-column Repository Issue Taskboard at `/`
+- Original runtime observability dashboard at `/runtime`
+- Taskboard and operational JSON APIs under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
