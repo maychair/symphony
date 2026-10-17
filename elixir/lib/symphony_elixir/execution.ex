@@ -2,6 +2,12 @@ defmodule SymphonyElixir.Execution do
   @moduledoc "Durable native execution for repository Issues, independent of task storage."
   alias SymphonyElixir.{Config, ExecutionBackend, RunJournal, TaskReconciler, Tracker}
 
+  # Logical workflow states that wait for a person. A confirmed native stop in
+  # any of them means no worker may be dispatched: the poll reconciler observes
+  # the Issue and the next human label, answer or decision re-enters the task
+  # workflow.
+  @human_decision_states ["waiting", "review", "ended"]
+
   @spec enabled?() :: boolean()
   def enabled?, do: Config.settings!().agent.goal_mode
 
@@ -111,6 +117,35 @@ defmodule SymphonyElixir.Execution do
     end
   end
 
+  @doc """
+  Whether the recorded run confirmed its native stop and left the Issue at a
+  human decision.
+
+  The continuation check after a normal worker exit, dispatch selection and the
+  retry timer all consult this, so a task that waits for `symphony:accept`,
+  `symphony:rework`, another human label or an answer keeps the poll reconciler
+  as its only owner instead of re-dispatching an executor that admission rejects.
+  """
+  @spec awaiting_human?(String.t()) :: boolean()
+  def awaiting_human?(id) do
+    if enabled?() do
+      case RunJournal.read(RunJournal.directory(journal_root(), id)) do
+        {:ok, %{} = record} -> human_decision_record?(record)
+        _ -> false
+      end
+    else
+      false
+    end
+  end
+
+  defp human_decision_record?(%{
+         "native_stop_confirmed" => true,
+         "workflow" => %{"state" => state}
+       }),
+       do: state in @human_decision_states
+
+  defp human_decision_record?(_record), do: false
+
   defp release_for_resume(record) do
     with false <- File.exists?(Path.join([record["directory"], "executor.lock", "cleanup-owner.json"])),
          false <- File.exists?(Path.join([record["directory"], "executor.lock", "reconcile-owner"])),
@@ -169,7 +204,7 @@ defmodule SymphonyElixir.Execution do
   defp count_retry(record, {:error, :scheduler_stop}), do: record
 
   defp count_retry(%{"native_stop_confirmed" => true, "workflow" => %{"state" => state}} = record, _)
-       when state in ["waiting", "review", "ended"], do: record
+       when state in @human_decision_states, do: record
 
   defp count_retry(%{"native_stop_confirmed" => true, "control_restart" => true} = record, _), do: record
   defp count_retry(record, _), do: Map.update(record, "retry_count", 1, &(&1 + 1))
@@ -272,7 +307,7 @@ defmodule SymphonyElixir.Execution do
     with %{} = initial <- opts[:run_record],
          {:ok, current} <- RunJournal.read(initial["directory"]) do
       known = current["attempt_id"] == initial["attempt_id"] and current["native_stop_confirmed"] == true
-      control = get_in(current, ["workflow", "state"]) in ["waiting", "review", "ended"] or current["control_restart"] == true
+      control = get_in(current, ["workflow", "state"]) in @human_decision_states or current["control_restart"] == true
       known and control
     else
       _ -> false
@@ -280,7 +315,7 @@ defmodule SymphonyElixir.Execution do
   end
 
   defp final_phase(_issue, %{"native_stop_confirmed" => true, "workflow" => %{"state" => state}}, _result)
-       when state in ["waiting", "review", "ended"], do: {"completed", nil}
+       when state in @human_decision_states, do: {"completed", nil}
 
   defp final_phase(_issue, %{"native_stop_confirmed" => true, "control_restart" => true}, _result), do: {"completed", nil}
 

@@ -10,9 +10,9 @@ defmodule SymphonyElixir.TaskReconciler do
   @human_labels ["symphony:ready", "symphony:rework", "symphony:accept"]
   # Engine labels. The engine owns them; people never write them.
   @engine_labels ["symphony:running", "symphony:review", "symphony:blocked", "symphony:failed"]
-  # Engine notices carry a hidden marker. The engine currently writes through the
-  # same credentials as the human, so the marker is what tells its own question
-  # apart from the owner's answer.
+  # Engine notices carry a hidden marker so a reply that quotes one still binds to
+  # the question it answers. The engine writes with its own project-token identity,
+  # so a note author alone cannot tell an engine notice from a human reply.
   @engine_notice_marker "<!-- symphony-engine-notice -->"
 
   @spec human_labels() :: [String.t()]

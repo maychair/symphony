@@ -1059,6 +1059,137 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "normal worker exit at a human decision releases the claim without a continuation retry" do
+    issue_id = "issue-human-decision"
+    ref = make_ref()
+    test_root = human_decision_root()
+    journal_root = write_goal_mode_workflow!(test_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_run_record(journal_root, issue_id, %{
+      "native_stop_confirmed" => true,
+      "workflow" => %{"state" => "review"}
+    })
+
+    orchestrator_name = Module.concat(__MODULE__, :HumanDecisionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-570",
+      issue: %Issue{id: issue_id, identifier: "MT-570", state: "Todo"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+  end
+
+  test "dispatch and retry skip an Issue that waits for a human decision" do
+    issue_id = "issue-human-decision-gate"
+    test_root = human_decision_root()
+    journal_root = write_goal_mode_workflow!(test_root)
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_run_record(journal_root, issue_id, %{
+      "native_stop_confirmed" => true,
+      "workflow" => %{"state" => "review"}
+    })
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-571",
+      title: "Waiting for acceptance",
+      state: "Todo",
+      dispatchable: true,
+      labels: []
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    updated_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+        identifier: issue.identifier
+      })
+
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+
+    # The same Issue returns to dispatch after the human decision is resolved.
+    write_run_record(journal_root, issue_id, %{
+      "native_stop_confirmed" => true,
+      "workflow" => %{"state" => "ready"}
+    })
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, %{state | claimed: MapSet.new()})
+  end
+
+  # `write_workflow_file!/1` renders a fixed agent section, so goal mode and the
+  # private run journal directory are added to the rendered YAML. Both are needed
+  # to reach a confirmed native stop recorded in the durable journal.
+  defp write_goal_mode_workflow!(test_root) do
+    journal_root = Path.join(test_root, "runs")
+    write_workflow_file!(Workflow.workflow_file_path())
+
+    text =
+      Workflow.workflow_file_path()
+      |> File.read!()
+      |> String.replace(
+        "agent:\n",
+        "agent:\n  goal_mode: true\n  run_journal_dir: #{Jason.encode!(journal_root)}\n"
+      )
+
+    File.write!(Workflow.workflow_file_path(), text)
+    :ok = WorkflowStore.force_reload()
+    journal_root
+  end
+
+  defp human_decision_root do
+    Path.join(
+      System.tmp_dir!(),
+      "symphony-elixir-human-decision-#{System.unique_integer([:positive])}"
+    )
+  end
+
+  defp write_run_record(journal_root, issue_id, fields) do
+    directory = SymphonyElixir.RunJournal.directory(journal_root, issue_id)
+    File.mkdir_p!(directory)
+    File.write!(Path.join(directory, "run.json"), Jason.encode!(fields))
+    directory
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
