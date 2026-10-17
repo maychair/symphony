@@ -25,7 +25,7 @@ defmodule SymphonyElixirWeb.Presenter do
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits,
-          mail_review_listener: mail_review_health()
+          review_lane_listener: review_lane_health()
         }
 
       :timeout ->
@@ -66,9 +66,9 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp mail_review_health do
-    if Process.whereis(SymphonyElixir.MailReview.Listener) do
-      GenServer.call(SymphonyElixir.MailReview.Listener, :health, 100)
+  defp review_lane_health do
+    if Process.whereis(SymphonyElixir.ReviewLane.Listener) do
+      GenServer.call(SymphonyElixir.ReviewLane.Listener, :health, 100)
     else
       %{health: :disabled}
     end

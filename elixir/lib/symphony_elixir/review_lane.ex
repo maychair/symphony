@@ -1,6 +1,6 @@
-defmodule SymphonyElixir.MailReview do
-  @moduledoc "Opt-in review-only tracker lane using the existing Orchestrator admission and capacity."
-  alias SymphonyElixir.MailReview.Listener
+defmodule SymphonyElixir.ReviewLane do
+  @moduledoc "Native repository review discovery using the existing Orchestrator admission and capacity."
+  alias SymphonyElixir.ReviewLane.Listener
 
   @spec enabled?() :: boolean()
   def enabled?, do: not is_nil(config())
@@ -8,28 +8,31 @@ defmodule SymphonyElixir.MailReview do
   @spec config() :: map() | nil
   def config do
     case SymphonyElixir.Config.settings() do
-      {:ok, %{tracker: %{provider: %{"mail_review" => %{"enabled" => true} = config}}}} -> resolve(config)
+      {:ok, %{tracker: %{provider: %{"review_lane" => %{"enabled" => true} = config}}}} -> resolve(config)
       _ -> nil
     end
   end
 
   @spec job?(SymphonyElixir.Tracker.Issue.t()) :: boolean()
-  def job?(%{id: "mail-review:" <> _, native_ref: %{"execution_kind" => "mail_review"}}), do: true
+  def job?(%{id: "review:" <> _, native_ref: %{"execution_kind" => "review_lane"}}), do: true
   def job?(_issue), do: false
 
   @spec validate_config(map()) :: :ok | {:error, term()}
-  def validate_config(%{provider: %{"mail_review" => %{"enabled" => true} = raw}}) do
+  def validate_config(%{provider: %{"mail_review" => %{"enabled" => true}}}), do: {:error, :mail_review_retired_migration_required}
+
+  def validate_config(%{provider: %{"review_lane" => %{"enabled" => true} = raw}}) do
     config = resolve(raw)
 
     checks = [
-      {valid_host?(config["host"]), :mail_review_host_required},
-      {nonempty_string?(config["username"]), :mail_review_username_required},
-      {nonempty_map?(config["projects"]), :mail_review_projects_required},
-      {valid_projects?(config["projects"]), :mail_review_invalid_projects},
-      {absolute_path?(config["state_dir"]), :mail_review_absolute_state_required},
-      {valid_names?(config["reviewer_names"]), :mail_review_names_required},
-      {nonempty_list?(config["mail_senders"]), :mail_review_senders_required},
-      {instructions_file?(config["instructions_file"]), :mail_review_instructions_file_required}
+      {config["provider"] == "gitlab", :review_lane_provider_unsupported},
+      {valid_host?(config["host"]), :review_lane_host_required},
+      {positive?(config["reviewer_id"]), :review_lane_reviewer_id_required},
+      {positive?(config["publisher_id"]), :review_lane_publisher_id_required},
+      {nonempty_map?(config["projects"]), :review_lane_projects_required},
+      {valid_projects?(config["projects"]), :review_lane_invalid_projects},
+      {absolute_path?(config["state_dir"]), :review_lane_absolute_state_required},
+      {positive?(Map.get(config, "poll_interval_ms", 60_000)), :review_lane_poll_interval_required},
+      {instructions_file?(config["instructions_file"]), :review_lane_instructions_file_required}
     ]
 
     case Enum.find(checks, fn {valid, _reason} -> not valid end) do
@@ -41,18 +44,16 @@ defmodule SymphonyElixir.MailReview do
   def validate_config(_settings), do: :ok
 
   defp valid_host?(host), do: is_binary(host) and Regex.match?(~r/^[a-zA-Z0-9.-]+$/, host)
-  defp nonempty_string?(value), do: is_binary(value) and value != ""
+  defp positive?(value), do: is_integer(value) and value > 0
   defp nonempty_map?(value), do: is_map(value) and map_size(value) > 0
-  defp nonempty_list?(value), do: is_list(value) and value != []
   defp absolute_path?(value), do: is_binary(value) and Path.type(value) == :absolute
-  defp valid_names?(names), do: nonempty_list?(names) and Enum.all?(names, &nonempty_string?/1)
   defp instructions_file?(path), do: absolute_path?(path) and File.regular?(path)
   defp valid_projects?(projects) when is_map(projects), do: Enum.all?(projects, &valid_project?/1)
   defp valid_projects?(_projects), do: false
 
-  defp valid_project?({project, %{"checkout" => checkout}}) when is_binary(project) do
+  defp valid_project?({project, %{"checkout" => checkout, "id" => id}}) when is_binary(project) do
     Regex.match?(~r{^[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)+$}, project) and
-      absolute_path?(checkout) and File.dir?(checkout)
+      positive?(id) and absolute_path?(checkout) and File.dir?(checkout)
   end
 
   defp valid_project?(_project), do: false
@@ -75,13 +76,13 @@ defmodule SymphonyElixir.MailReview do
   def resolve(value), do: value
 
   @spec secret_environment_names(map()) :: [String.t()]
-  def secret_environment_names(_settings), do: ["GITLAB_TOKEN", "GLAB_TOKEN", "LARK_USER_ACCESS_TOKEN", "LARK_APP_SECRET"]
+  def secret_environment_names(_settings), do: ["GITLAB_TOKEN", "GLAB_TOKEN"]
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs do
     [
       %{
-        "name" => "mail_review_submit",
+        "name" => "review_submit",
         "description" => "Submit substantiated Chinese findings; the scheduler validates the fixed MR head and posts discussions. An empty list explicitly completes a no-findings review.",
         "inputSchema" => %{
           "type" => "object",
@@ -94,7 +95,7 @@ defmodule SymphonyElixir.MailReview do
   end
 
   @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
-  def execute_agent_tool("mail_review_submit", arguments, opts) do
+  def execute_agent_tool("review_submit", arguments, opts) do
     result = Listener.submit(opts[:issue].id, arguments)
     output = Jason.encode!(%{"result" => inspect(result)})
     %{"success" => result == :ok, "output" => output, "contentItems" => [%{"type" => "inputText", "text" => output}]}

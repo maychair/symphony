@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Execution
-  alias SymphonyElixir.MailReview.Listener
+  alias SymphonyElixir.ReviewLane.Listener
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -244,7 +244,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
-  defp handle_agent_down(reason, state, "mail-review:" <> _ = issue_id, running_entry, _session_id) do
+  defp handle_agent_down(reason, state, "review:" <> _ = issue_id, running_entry, _session_id) do
     if reason == :normal do
       release_issue_claim(state, issue_id)
     else
@@ -651,7 +651,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     if Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex" and
          is_map(entry) and is_pid(entry[:pid]) and Process.alive?(entry.pid) and
-         not SymphonyElixir.MailReview.job?(entry[:issue]) do
+         not SymphonyElixir.ReviewLane.job?(entry[:issue]) do
       unless entry[:stop_requested] do
         send(entry.pid, :symphony_stop)
         Process.send_after(self(), {:execution_stop_timeout, issue_id, entry.ref}, @execution_stop_grace_ms)
@@ -674,7 +674,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         stop_running_task(pid, ref, state.task_supervisor)
 
-        if SymphonyElixir.MailReview.job?(Map.get(running_entry, :issue)) do
+        if SymphonyElixir.ReviewLane.job?(Map.get(running_entry, :issue)) do
           Listener.checkpoint(issue_id, %{"phase" => "failed", "error" => "Scheduler stopped the review worker; native session must be reconciled before retry"})
         end
 

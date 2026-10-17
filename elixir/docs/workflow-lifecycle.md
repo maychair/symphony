@@ -602,6 +602,74 @@ budgets, retaining historical delivery and avoiding automatic rollback or new
 Issues. A manually reopened Issue, drift alone or a post-acceptance new problem
 does not independently grant new execution authority.
 
+## Native review ingress
+
+The scheduler now runs `ReviewLane.Listener`; it does not start a mailbox command
+or accept the retired mail replay endpoint. Enabled `mail_review` configuration
+fails validation with an explicit migration requirement. The new listener uses
+`tracker.provider.review_lane`, currently with the GitLab adapter:
+
+```yaml
+review_lane:
+  enabled: true
+  provider: gitlab
+  host: gitlab.example
+  reviewer_id: 123
+  publisher_id: 456
+  state_dir: /absolute/private/review-state
+  instructions_file: /absolute/trusted/review-instructions.md
+  poll_interval_ms: 60000
+  webhook_secret: $REVIEW_WEBHOOK_SECRET
+  projects:
+    team/project:
+      id: 789
+      checkout: /absolute/registered/source
+```
+
+The reviewer and publisher use distinct, explicit stable native user IDs. Project
+IDs, paths and URLs must match the configured host. Discovery reads each configured
+project's paginated open MRs with `scope=all` and `reviewer_id`, then re-reads each
+candidate. This discovers requests even if the first event was lost. Duplicate or
+malformed pages and the 100-page limit remain failures, not empty successful scans.
+The adapter uses the [GitLab MR list API](https://docs.gitlab.com/api/merge_requests/#list-project-merge-requests)
+and [discussion API](https://docs.gitlab.com/api/discussions/). HTTPS is required
+by default; a private HTTP instance requires explicit `allow_insecure_http: true`.
+The URL and clone-remote checks retain the exact configured host and path.
+
+Authenticated GitLab MR/note webhooks validate the native project identity and
+persist a scoped MR hint before acknowledgment. Hints contain repository/number
+references, not task content or execution authorization. Duplicate hints coalesce;
+failed reads keep the hint across restart. Scans also revisit known requests,
+including completed reviews and requests no longer in the assigned-open listing.
+
+A changed fixed head, base, relevant author response or review-instruction digest
+selects a new round. No-findings results also respond to new pushes. Relevant
+replies need not answer every finding; their IDs/content versions and resolution
+state contribute to a stable response digest. Duplicate polling, unrelated replies
+and the engine's own marked notes do not create a round. Missing finding sources
+block interpretation. Old rounds retain evidence but lose dispatch eligibility.
+
+Before admission the listener reconciles native state again. Closed, merged or
+unassigned requests lose eligibility; an observed reopening/reassignment may
+start a fresh round after prior native stop is confirmed. Active or uncertain
+threads cannot be replaced because the input changed. `Runner` records thread
+allocation intent and confirms native stop only after the fixed review turn
+completes; merely stopping a process is not that proof. A published result keeps
+its existing worker active until that native completion arrives, while refusing
+another execution of the same round. Restart during this interval fences the
+uncertain thread. Unknown native reads fence eligibility. The review tool is `review_submit`; its only effect is comment
+publication, including an explicit no-findings statement. Native approvals,
+requests for changes and merges remain outside this tool.
+
+`review-lane.json` stores schema-versioned execution records and pending hints.
+A legacy `mail-review.json` beside it blocks startup rather than importing old
+execution authority. Migration still requires reconciling old native executions
+and publication receipts before activating the new deployment. This change does
+not itself restart an existing service. GitHub review discovery, complete native
+assignment history, target-branch refresh, automatic uncertain-stop recovery,
+partial publication reconciliation and task-owned review deduplication remain
+necessary for the full lifecycle described below.
+
 ## Review and recovery
 
 Standalone review has a distinct work kind and assignment generation, fixed

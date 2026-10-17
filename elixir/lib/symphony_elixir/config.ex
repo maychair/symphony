@@ -124,7 +124,7 @@ defmodule SymphonyElixir.Config do
       with true <- backend in ["codex", "omp"] || {:error, :invalid_execution_backend},
            :ok <- validate_task_workflow(settings, backend),
            :ok <- Tracker.validate_config(settings.tracker) do
-        SymphonyElixir.MailReview.validate_config(settings.tracker)
+        SymphonyElixir.ReviewLane.validate_config(settings.tracker)
       end
     end
   end

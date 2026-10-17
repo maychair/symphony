@@ -40,7 +40,7 @@ defmodule SymphonyElixir.Application do
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.AgentRuntimeSupervisor,
-      SymphonyElixir.MailReview.Listener,
+      SymphonyElixir.ReviewLane.Listener,
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard
     ]

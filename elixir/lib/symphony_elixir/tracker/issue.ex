@@ -55,6 +55,11 @@ defmodule SymphonyElixir.Tracker.Issue do
   @spec routable?(t(), [String.t()] | map()) :: boolean()
   def routable?(%__MODULE__{kind: :plan}, _requirements), do: false
 
+  # The review lane resolves its native reviewer assignment. A separate task
+  # tracker's Issue assignee is not authority over that MR/PR.
+  def routable?(%__MODULE__{kind: :review, native_ref: %{"execution_kind" => "review_lane"}} = issue, %{required_labels: labels}),
+    do: routable?(issue, labels)
+
   def routable?(%__MODULE__{} = issue, %{required_labels: labels} = tracker) do
     owner = if tracker.kind in ["github", "gitlab"], do: Map.get(tracker, :assignee)
 

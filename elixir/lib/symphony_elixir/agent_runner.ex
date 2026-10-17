@@ -6,7 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
-  alias SymphonyElixir.MailReview.Runner
+  alias SymphonyElixir.ReviewLane.Runner
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -24,7 +24,7 @@ defmodule SymphonyElixir.AgentRunner do
     budget = Execution.run_budget_ms(issue.id)
     opts = if Execution.enabled?(), do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
 
-    if SymphonyElixir.MailReview.job?(issue),
+    if SymphonyElixir.ReviewLane.job?(issue),
       do: Runner.run(issue, codex_update_recipient, opts),
       else: do_run(issue, codex_update_recipient, opts)
   end

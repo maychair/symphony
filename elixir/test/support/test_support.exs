@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
-  defmacro __using__(_opts) do
+  defmacro __using__(opts) do
     quote do
       use ExUnit.Case
       import ExUnit.CaptureLog
@@ -23,6 +23,12 @@ defmodule SymphonyElixir.TestSupport do
 
       import SymphonyElixir.TestSupport,
         only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+
+      setup_all do
+        if unquote(Keyword.get(opts, :runtime, true)),
+          do: :ok,
+          else: SymphonyElixir.TestSupport.isolate_default_runtime()
+      end
 
       setup do
         workflow_root =
@@ -48,6 +54,21 @@ defmodule SymphonyElixir.TestSupport do
         :ok
       end
     end
+  end
+
+  # Provider/board fixtures must not be consumed by the application's live
+  # scheduler. Tests opting out own any runtime they explicitly start.
+  def isolate_default_runtime do
+    runtime = SymphonyElixir.AgentRuntimeSupervisor
+    supervisor = SymphonyElixir.Supervisor
+    running? = is_pid(Process.whereis(runtime))
+    :ok = Supervisor.terminate_child(supervisor, runtime)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      if running?, do: Supervisor.restart_child(supervisor, runtime)
+    end)
+
+    :ok
   end
 
   def write_workflow_file!(path, overrides \\ []) do

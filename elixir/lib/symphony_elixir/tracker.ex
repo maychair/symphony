@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.{Config, TaskPlan, TaskPlanPreflight}
-  alias SymphonyElixir.MailReview.Listener
+  alias SymphonyElixir.ReviewLane.Listener
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
@@ -77,7 +77,7 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) do
-    {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "mail-review:"))
+    {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "review:"))
 
     with {:ok, issues} <- adapter().fetch_issues_by_ids(normal_ids),
          {:ok, reviews} <- review_issues() do
@@ -87,7 +87,7 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp review_issues do
-    if SymphonyElixir.MailReview.enabled?() and Process.whereis(SymphonyElixir.MailReview.Listener), do: Listener.issues(), else: {:ok, []}
+    if SymphonyElixir.ReviewLane.enabled?() and Process.whereis(SymphonyElixir.ReviewLane.Listener), do: Listener.issues(), else: {:ok, []}
   end
 
   @doc """

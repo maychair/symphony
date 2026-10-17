@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.TaskboardTest do
-  use SymphonyElixir.TestSupport
+  use SymphonyElixir.TestSupport, runtime: false
 
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.Taskboard, as: TaskboardSchema

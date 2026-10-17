@@ -4,7 +4,7 @@ defmodule SymphonyElixirWeb.WebhookController do
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
 
-  alias SymphonyElixir.MailReview.Listener
+  alias SymphonyElixir.ReviewLane.{GitLab, Listener}
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
   def read_body(conn, opts) do
     case Conn.read_body(conn, opts) do
@@ -17,21 +17,17 @@ defmodule SymphonyElixirWeb.WebhookController do
   end
 
   @spec receive_event(Conn.t(), map()) :: Conn.t()
-  def receive_event(conn, %{"provider" => "mail"}) do
-    config = SymphonyElixir.MailReview.config()
-    secret = if config, do: config["replay_secret"], else: nil
+  def receive_event(conn, %{"provider" => provider}) do
+    config = SymphonyElixir.ReviewLane.config()
 
-    with true <- is_binary(secret) and byte_size(secret) >= 32,
-         :ok <- compare(List.first(Conn.get_req_header(conn, "x-symphony-token")), secret),
-         :ok <- request_mail_review(conn.body_params) do
-      Orchestrator.request_refresh()
-      conn |> put_status(202) |> json(%{accepted: true})
+    if config && provider == config["provider"] && conn.body_params["object_kind"] in ["merge_request", "note"] do
+      receive_review(conn, provider, config)
     else
-      _ -> conn |> put_status(403) |> json(%{error: "mail_replay_rejected"})
+      receive_tracker(conn, provider)
     end
   end
 
-  def receive_event(conn, %{"provider" => provider}) do
+  defp receive_tracker(conn, provider) do
     settings = Config.settings!().tracker
     secret = resolve(settings.provider["webhook_secret"])
     body = conn.assigns[:webhook_body] || ""
@@ -47,15 +43,26 @@ defmodule SymphonyElixirWeb.WebhookController do
     end
   end
 
-  defp request_mail_review(%{"message_id" => id}) when is_binary(id) and byte_size(id) in 1..512 do
-    Listener.ingest(%{"ok" => true, "data" => %{"event" => %{"message_id" => id}}})
-  end
+  defp receive_review(conn, provider, config) do
+    secret = config["webhook_secret"]
+    project = get_in(conn.body_params, ["project", "path_with_namespace"])
+    native_id = get_in(conn.body_params, ["project", "id"])
+    expected_id = get_in(config, ["projects", project, "id"])
+    url = get_in(conn.body_params, ["project", "web_url"])
+    attributes = if conn.body_params["object_kind"] == "note", do: conn.body_params["merge_request"], else: conn.body_params["object_attributes"]
 
-  defp request_mail_review(%{"project" => project, "iid" => iid}) when is_binary(project) and is_integer(iid) do
-    Listener.request_review(project, iid)
+    with true <- is_binary(secret) and byte_size(secret) >= 32,
+         :ok <- authenticate(conn, provider, secret, conn.assigns[:webhook_body] || ""),
+         true <- is_integer(expected_id) and native_id == expected_id,
+         true <- GitLab.web_url?(url, config, "/" <> project),
+         true <- is_map(attributes),
+         :ok <- Listener.request_review(project, attributes["iid"]) do
+      Orchestrator.request_refresh()
+      conn |> put_status(202) |> json(%{accepted: true})
+    else
+      _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
+    end
   end
-
-  defp request_mail_review(_payload), do: {:error, :invalid_mail_review_request}
 
   defp authenticate(conn, "github", secret, body) do
     expected = "sha256=" <> Base.encode16(:crypto.mac(:hmac, :sha256, secret, body), case: :lower)

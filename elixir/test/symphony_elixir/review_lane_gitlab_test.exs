@@ -1,6 +1,17 @@
-defmodule SymphonyElixir.MailReviewGitLabTest do
+defmodule SymphonyElixir.ReviewLaneGitLabTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.MailReview.GitLab
+  alias SymphonyElixir.ReviewLane.GitLab
+
+  test "private HTTP scope is explicit and cannot redirect metadata to another native path" do
+    config = %{"host" => "review.invalid", "projects" => %{"team/repo" => %{"id" => 10}}}
+    repository = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "http://review.invalid/team/repo"}
+    refute GitLab.repository?(repository, config, "team/repo")
+    permitted = Map.put(config, "allow_insecure_http", true)
+    assert GitLab.repository?(repository, permitted, "team/repo")
+    refute GitLab.repository?(Map.put(repository, "id", 11), permitted, "team/repo")
+    refute GitLab.web_url?("http://review.invalid/team/repo?redirect=other", permitted, "/team/repo")
+    refute GitLab.web_url?("https://foreign.invalid/team/repo", permitted, "/team/repo")
+  end
 
   test "command failures and malformed or excessive discussion pages are rejected" do
     root = Path.dirname(Workflow.workflow_file_path())
@@ -12,8 +23,9 @@ defmodule SymphonyElixir.MailReviewGitLabTest do
     mode=(pathlib.Path(__file__).parent/'mode').read_text()
     if mode=='error':sys.exit(3)
     if mode=='invalid':print('{}')
-    elif mode=='limit':print(json.dumps([{}]*100))
-    elif mode=='pages':print(json.dumps([{}]*100 if sys.argv[-1].endswith('&page=1') else []))
+    elif mode=='limit':
+      page=int(sys.argv[-1].split('page=')[-1]);print(json.dumps([{'id':str(page*100+i)} for i in range(100)]))
+    elif mode=='pages':print(json.dumps([{'id':str(i)} for i in range(100)] if sys.argv[-1].endswith('&page=1') else []))
     """)
 
     File.chmod!(cli, 0o755)
