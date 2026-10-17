@@ -51,6 +51,22 @@ defmodule SymphonyElixir.Taskboard.GitLab do
   end
 
   @impl true
+  def delivery_summaries(settings, %Issue{} = issue, opts) do
+    with true <- linked_merge_requests?(issue),
+         number when is_integer(number) <- Provider.issue_number(issue),
+         {:ok, merge_requests} <- related_merge_requests_raw(settings, number, opts) do
+      {:ok,
+       merge_requests
+       |> Enum.map(&merge_request_summary/1)
+       |> Enum.reject(&is_nil/1)}
+    else
+      false -> {:ok, []}
+      nil -> {:error, :taskboard_issue_not_found}
+      error -> error
+    end
+  end
+
+  @impl true
   def create_issue(settings, attrs, opts) do
     body =
       %{
@@ -168,11 +184,17 @@ defmodule SymphonyElixir.Taskboard.GitLab do
   defp matches_identifier?(_issue, _identifier), do: false
 
   defp related_merge_requests(settings, issue_iid, opts) do
+    with {:ok, merge_requests} <- related_merge_requests_raw(settings, issue_iid, opts) do
+      {:ok, Enum.map(merge_requests, &merge_request_details(settings, &1, opts))}
+    end
+  end
+
+  defp related_merge_requests_raw(settings, issue_iid, opts) do
     path = issue_path(settings, issue_iid) <> "/related_merge_requests"
 
     case request(settings, "GET", path, %{"per_page" => @per_page}, nil, opts) do
       {:ok, merge_requests} when is_list(merge_requests) ->
-        {:ok, Enum.map(merge_requests, &merge_request_details(settings, &1, opts))}
+        {:ok, merge_requests}
 
       {:ok, _payload} ->
         {:error, :gitlab_invalid_related_merge_requests}
@@ -183,6 +205,28 @@ defmodule SymphonyElixir.Taskboard.GitLab do
         {:ok, []}
     end
   end
+
+  defp linked_merge_requests?(%Issue{native_ref: native_ref}) when is_map(native_ref) do
+    case native_ref["merge_requests_count"] do
+      count when is_integer(count) -> count > 0
+      _ -> false
+    end
+  end
+
+  defp linked_merge_requests?(_issue), do: false
+
+  defp merge_request_summary(%{"iid" => iid, "web_url" => url} = merge_request)
+       when is_integer(iid) and iid > 0 and is_binary(url) do
+    %{
+      kind: "mr",
+      number: iid,
+      title: merge_request["title"],
+      url: url,
+      state: merge_request["state"]
+    }
+  end
+
+  defp merge_request_summary(_merge_request), do: nil
 
   defp merge_request_details(settings, merge_request, opts) do
     iid = merge_request["iid"]

@@ -225,6 +225,7 @@ defmodule SymphonyElixir.GitLab.Client do
       "iid" => issue["iid"],
       "project_id" => issue["project_id"],
       "project_path" => project_path,
+      "merge_requests_count" => issue["merge_requests_count"],
       "references" => issue["references"]
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)

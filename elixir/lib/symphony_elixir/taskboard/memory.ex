@@ -57,6 +57,13 @@ defmodule SymphonyElixir.Taskboard.Memory do
   end
 
   @impl true
+  def delivery_summaries(_settings, %Issue{} = issue, _opts) do
+    details = configured_details()
+    detail = Map.get(details, issue.identifier) || Map.get(details, issue.id) || %{}
+    {:ok, List.wrap(detail["deliveries"] || detail[:deliveries])}
+  end
+
+  @impl true
   def create_issue(_settings, attrs, _opts) do
     number = System.unique_integer([:positive])
 

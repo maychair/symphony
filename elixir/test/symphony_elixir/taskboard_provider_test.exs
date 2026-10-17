@@ -76,6 +76,68 @@ defmodule SymphonyElixir.Taskboard.ProviderTest do
     assert_receive {:issue_states, ["opened", "reopened", "closed"]}
   end
 
+  test "GitLab cards expose linked merge requests without loading Issue detail", %{settings: settings} do
+    issue = %{
+      issue("GL-30", [])
+      | id: "30",
+        native_ref: %{"iid" => 30, "merge_requests_count" => 1}
+    }
+
+    request_fun = fn "GET", path, query, nil, _settings ->
+      assert path == "/projects/mock%2Fissues/issues/30/related_merge_requests"
+      assert query == %{"per_page" => 100}
+
+      {:ok,
+       %{
+         status: 200,
+         body: [
+           %{
+             "iid" => 5,
+             "title" => "Implement linked delivery",
+             "state" => "opened",
+             "web_url" => "https://gitlab.test/mock/issues/-/merge_requests/5"
+           }
+         ]
+       }}
+    end
+
+    assert {:ok,
+            [
+              %{
+                kind: "mr",
+                number: 5,
+                title: "Implement linked delivery",
+                url: "https://gitlab.test/mock/issues/-/merge_requests/5",
+                state: "opened"
+              }
+            ]} = GitLab.delivery_summaries(settings, issue, request_fun: request_fun)
+  end
+
+  test "GitHub cards expose explicit pull request links without extra requests", %{
+    settings: settings
+  } do
+    issue = %{
+      issue("GH-30", [])
+      | id: "30",
+        description: "Delivery: https://github.com/mock/issues/pull/8"
+    }
+
+    request_fun = fn _method, _path, _query, _body, _settings ->
+      flunk("explicit pull request links should not require a timeline request")
+    end
+
+    assert {:ok,
+            [
+              %{
+                kind: "pr",
+                number: 8,
+                title: nil,
+                url: "https://github.com/mock/issues/pull/8",
+                state: nil
+              }
+            ]} = GitHub.delivery_summaries(settings, issue, request_fun: request_fun)
+  end
+
   test "GitHub detail resolves prefixed identifiers through their native Issue number", %{
     settings: settings
   } do

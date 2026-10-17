@@ -114,6 +114,14 @@ defmodule SymphonyElixir.TaskboardTest do
     assert by_id["MOCK-6"].column == "Human Review"
     assert by_id["MOCK-1"].priority == 2
     assert by_id["MOCK-1"].summary == "Implement the replayed fixture."
+
+    assert [
+             %{
+               kind: "mr",
+               label: "Open merge request !9",
+               url: "https://example.invalid/merge_requests/9"
+             }
+           ] = by_id["MOCK-1"].artifacts
   end
 
   test "detail combines repository content, comments, delivery review, and execution evidence", %{
@@ -325,6 +333,42 @@ defmodule SymphonyElixir.TaskboardTest do
     failed_card = Taskboard.card_payload(failed_issue, gitlab, nil)
     assert failed_card.human_action.label == "symphony:rework"
     assert failed_card.human_action.summary =~ "the latest agent run failed"
+  end
+
+  test "delivery enrichment failures leave the tracker card available" do
+    settings = Config.settings!()
+
+    tracker = %{
+      settings.tracker
+      | kind: "gitlab",
+        provider: %{"project_path" => "model-compiler-team/nanocore-hw", "api_key" => "token"},
+        active_states: ["opened"],
+        terminal_states: ["closed"]
+    }
+
+    settings = %{settings | tracker: tracker}
+
+    issue = %{
+      issue(
+        "30",
+        "GL-30",
+        "Linked delivery",
+        "opened",
+        ["wayfinder:task"]
+      )
+      | id: "not-a-number",
+        native_ref: %{"merge_requests_count" => 1}
+    }
+
+    assert %{cards: [%{issue_identifier: "GL-30", artifacts: []}]} =
+             Taskboard.snapshot(
+               settings: settings,
+               issues_fun: fn _states -> {:ok, [issue]} end,
+               runtime_snapshot_fun: fn -> %{} end,
+               request_fun: fn _method, _path, _query, _body, _settings ->
+                 flunk("an invalid native Issue number should fail before making a request")
+               end
+             )
   end
 
   test "an accepted open Issue waits for native closure instead of appearing Done", %{

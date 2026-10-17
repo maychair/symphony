@@ -20,10 +20,13 @@ defmodule SymphonyElixir.Taskboard.Provider do
 
   @callback list_issues(map(), keyword()) :: result([Issue.t()])
   @callback issue_detail(map(), String.t(), keyword()) :: result(map())
+  @callback delivery_summaries(map(), Issue.t(), keyword()) :: result([map()])
   @callback create_issue(map(), map(), keyword()) :: result(map())
   @callback comment(map(), String.t(), String.t(), keyword()) :: result(map())
   @callback add_label(map(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   @callback remove_label(map(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+
+  @optional_callbacks delivery_summaries: 3
 
   @spec module_for(String.t()) :: {:ok, module()} | {:error, term()}
   def module_for("github"), do: {:ok, SymphonyElixir.Taskboard.GitHub}

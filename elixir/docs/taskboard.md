@@ -48,9 +48,9 @@ Done. The existing acceptance decision and native Issue closure remain required.
 ## Navigation-only dashboard
 
 Each Issue title opens the tracker-provided Issue URL in a new browser tab so the Taskboard remains
-an independent status view. Delivered MRs and reports appear as separate links from the same card,
-using the manifest and verified execution journal. For report-only work, the card states that no MR
-is expected instead of leaving an empty delivery area. Human Review cards also show the concrete
+an independent status view. Linked MRs from the tracker and delivered reports from the execution
+manifest appear as separate links from the same card. For report-only work, the card states that no
+MR is expected instead of leaving an empty delivery area. Human Review cards also show the concrete
 decision the person must make, such as reviewing the report and adding `symphony:accept`.
 
 The board has no detail panel, comment composer, drag-and-drop gesture, or scheduler action. Issue
@@ -120,7 +120,7 @@ the local project projection.
 
 - No Dashi dependency, local Taskboard service, or mirrored task store is introduced.
 - The Taskboard browser page is read-only and cannot write scheduler memory directly.
-- Artifact links come from repository delivery evidence and the execution manifest; report-only work
+- Artifact links come from native tracker associations and the execution manifest; report-only work
   is explicitly different from missing MR evidence.
 - Provider review enrichment is best effort; unsupported unresolved-thread queries are labelled
   unavailable instead of rendered as zero.

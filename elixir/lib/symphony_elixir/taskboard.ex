@@ -102,7 +102,12 @@ defmodule SymphonyElixir.Taskboard do
       card =
         if project.local do
           detail.issue
-          |> card_payload(project, local_runtime_entry(detail.issue, opts), detail.execution)
+          |> card_payload(
+            project,
+            local_runtime_entry(detail.issue, opts),
+            detail.execution,
+            Map.get(detail, :deliveries, [])
+          )
         else
           nil
         end
@@ -177,12 +182,12 @@ defmodule SymphonyElixir.Taskboard do
   def runtime_status(%{status: status}) when is_binary(status), do: status
   def runtime_status(_entry), do: "active"
 
-  @spec card_payload(Issue.t(), map(), map() | nil, map() | nil) :: map()
-  def card_payload(%Issue{} = issue, project, runtime_entry, execution \\ nil) do
+  @spec card_payload(Issue.t(), map(), map() | nil, map() | nil, [map()]) :: map()
+  def card_payload(%Issue{} = issue, project, runtime_entry, execution \\ nil, deliveries \\ []) do
     labels = Enum.map(issue.labels, &normalize_label/1)
     column = column_for(issue, labels, runtime_entry)
     status = agent_status(column, labels, runtime_entry)
-    artifacts = card_artifacts(execution, project)
+    artifacts = card_artifacts(execution, deliveries, project)
 
     %{
       issue_id: issue.id,
@@ -274,7 +279,8 @@ defmodule SymphonyElixir.Taskboard do
               issue,
               project,
               runtime_entry(issue, runtime),
-              local_execution(issue.id, issue.identifier)
+              local_execution(issue.id, issue.identifier),
+              provider_delivery_summaries(provider, project.settings.tracker, issue, opts)
             )
 
           _ ->
@@ -360,6 +366,22 @@ defmodule SymphonyElixir.Taskboard do
       entry[:issue_id] == issue.id or entry[:identifier] == issue.identifier or
         entry[:issue_identifier] == issue.identifier
     end)
+  end
+
+  defp provider_delivery_summaries(provider, settings, issue, opts) do
+    if Code.ensure_loaded?(provider) and function_exported?(provider, :delivery_summaries, 3) do
+      case provider.delivery_summaries(settings, issue, opts) do
+        {:ok, deliveries} when is_list(deliveries) ->
+          deliveries
+
+        {:error, reason} ->
+          Logger.warning("Taskboard delivery enrichment failed issue=#{issue.identifier || issue.id} reason=#{inspect(reason)}")
+
+          []
+      end
+    else
+      []
+    end
   end
 
   defp column_for(%Issue{} = issue, labels, runtime_entry) do
@@ -640,9 +662,9 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp card_artifacts(nil, _project), do: []
+  defp card_artifacts(execution, deliveries, project) do
+    execution = execution || %{}
 
-  defp card_artifacts(execution, project) do
     manifest_items =
       execution
       |> Map.get(:manifest)
@@ -651,24 +673,32 @@ defmodule SymphonyElixir.Taskboard do
         _ -> []
       end
 
-    [execution[:delivery], execution[:intermediate] | manifest_items]
-    |> Enum.filter(&is_map/1)
-    |> Enum.map(&artifact_payload(&1, project))
+    execution_artifacts =
+      [execution[:delivery], execution[:intermediate] | manifest_items]
+      |> Enum.filter(&is_map/1)
+      |> Enum.map(&artifact_payload(&1, project))
+
+    delivery_artifacts =
+      deliveries
+      |> Enum.filter(&is_map/1)
+      |> Enum.map(&artifact_payload(&1, project))
+
+    (execution_artifacts ++ delivery_artifacts)
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq_by(& &1.url)
   end
 
   defp artifact_payload(item, project) do
-    kind = item["kind"]
-    url = item["url"]
+    kind = item["kind"] || item[:kind]
+    url = item["url"] || item[:url]
 
     if kind in ["mr", "pr", "report"] and http_url?(url) do
       %{
         kind: kind,
         label: artifact_label(kind, url, project.kind),
-        title: item["id"] || item["title"],
+        title: item["id"] || item["title"] || item[:id] || item[:title],
         url: url,
-        state: item["state"]
+        state: item["state"] || item[:state]
       }
     end
   end

@@ -133,6 +133,7 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
              "iid" => 42,
              "project_id" => 77,
              "project_path" => "group/project",
+             "merge_requests_count" => 1,
              "references" => %{"full" => "group/project#42"}
            }
 
@@ -481,6 +482,7 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
       "assignees" => [%{"id" => 99, "username" => "octocat"}],
       "assignee" => %{"username" => "octocat"},
       "labels" => [" Bug ", "bug", "Platform"],
+      "merge_requests_count" => 1,
       "references" => %{"full" => "group/project##{iid}"},
       "created_at" => "2026-01-01T00:00:00Z",
       "updated_at" => "2026-01-02T00:00:00Z"

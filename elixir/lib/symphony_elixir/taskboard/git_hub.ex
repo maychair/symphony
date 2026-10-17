@@ -51,6 +51,26 @@ defmodule SymphonyElixir.Taskboard.GitHub do
   end
 
   @impl true
+  def delivery_summaries(settings, %Issue{} = issue, opts) do
+    body_urls = pull_request_urls(settings, issue.description)
+
+    timeline_urls =
+      if body_urls == [] and delivery_enrichment_candidate?(issue) do
+        pull_request_timeline_urls(settings, issue, opts)
+      else
+        []
+      end
+
+    summaries =
+      (body_urls ++ timeline_urls)
+      |> Enum.uniq()
+      |> Enum.map(&pull_request_summary/1)
+      |> Enum.reject(&is_nil/1)
+
+    {:ok, summaries}
+  end
+
+  @impl true
   def create_issue(settings, attrs, opts) do
     body =
       %{
@@ -174,27 +194,54 @@ defmodule SymphonyElixir.Taskboard.GitHub do
       |> Enum.flat_map(&pull_request_urls(settings, &1))
       |> Enum.uniq()
 
-    timeline_urls =
-      case pages(settings, issue_path(settings, Provider.issue_number(issue)) <> "/timeline", opts, []) do
-        {:ok, events} ->
-          events
-          |> Enum.filter(&(&1["event"] == "cross-referenced"))
-          |> Enum.map(fn event ->
-            get_in(event, ["source", "issue"]) || %{}
-          end)
-          |> Enum.filter(&(get_in(&1, ["pull_request"]) != nil))
-          |> Enum.map(& &1["html_url"])
-          |> Enum.filter(&is_binary/1)
-
-        _ ->
-          []
-      end
+    timeline_urls = pull_request_timeline_urls(settings, issue, opts)
 
     urls
     |> Kernel.++(timeline_urls)
     |> Enum.uniq()
     |> Enum.map(&pull_request_details(settings, &1, opts))
     |> then(&{:ok, Enum.reject(&1, fn delivery -> delivery.url == nil end)})
+  end
+
+  defp pull_request_timeline_urls(settings, issue, opts) do
+    case pages(settings, issue_path(settings, Provider.issue_number(issue)) <> "/timeline", opts, []) do
+      {:ok, events} ->
+        events
+        |> Enum.filter(&(&1["event"] == "cross-referenced"))
+        |> Enum.map(fn event ->
+          get_in(event, ["source", "issue"]) || %{}
+        end)
+        |> Enum.filter(&(get_in(&1, ["pull_request"]) != nil))
+        |> Enum.map(& &1["html_url"])
+        |> Enum.filter(&is_binary/1)
+
+      _ ->
+        []
+    end
+  end
+
+  defp delivery_enrichment_candidate?(%Issue{labels: labels}) do
+    labels
+    |> Enum.map(&String.downcase/1)
+    |> Enum.any?(
+      &(&1 in [
+          "symphony:running",
+          "symphony:review",
+          "symphony:blocked",
+          "symphony:failed",
+          "symphony:accept"
+        ])
+    )
+  end
+
+  defp pull_request_summary(url) do
+    case Regex.run(~r{/pull/([1-9][0-9]*)$}, url) do
+      [_, number] ->
+        %{kind: "pr", number: String.to_integer(number), title: nil, url: url, state: nil}
+
+      _ ->
+        nil
+    end
   end
 
   defp pull_request_urls(settings, body) do
