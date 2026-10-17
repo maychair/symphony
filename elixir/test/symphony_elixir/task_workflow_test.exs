@@ -196,6 +196,24 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     assert Flow.handoff(authorized(), %{"kind" => "decision"})["restrictions"]["handoff"]["kind"] == "decision"
   end
 
+  test "acceptance without an explicit manifest never borrows the current delivery" do
+    {:ok, flow} = Flow.submit(authorized(), manifest())
+    unbound = event("accept", "accept", 3, %{}, "2")
+    result = Flow.reconcile(flow, facts(), [unbound], 0)
+    refute result["acceptance"]
+    refute Flow.valid_conclusion?(result)
+  end
+
+  test "a label acceptance loses authority when its native candidate binding cannot be reconstructed" do
+    {:ok, flow} = Flow.submit(authorized(), manifest())
+    accepted = event("accept", "label:7@2@time", 3, %{"manifest" => "manifest"}, "2") |> Map.put("binding", "candidate")
+    current = facts(%{"source_refs" => ["auth", "manifest", accepted["ref"]], "decision_bindings" => %{accepted["ref"] => "candidate"}})
+    flow = Flow.reconcile(flow, current, [accepted], 0)
+    assert flow["acceptance"]["manifest"] == "manifest"
+    refute Flow.reconcile(flow, Map.put(current, "decision_bindings", %{}), [], 0)["acceptance"]
+    refute Flow.reconcile(flow, put_in(current, ["decision_bindings", accepted["ref"]], "replacement"), [], 0)["acceptance"]
+  end
+
   test "merge acceptance works during pause, without dispatching another executor" do
     flow = authorized(%{"acceptance_mode" => "merge"})
     {:ok, flow} = Flow.submit(flow, manifest())

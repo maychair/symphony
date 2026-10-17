@@ -6,7 +6,9 @@ code and review facts. Symphony owns execution identity, recovery and derived
 projections; Codex owns native agent sessions.
 
 The current implementation validates sealed plan graphs and classifies parent
-Issues as coordination work. Parent dispatch, provider evidence reconciliation
+Issues as coordination work. The existing GitLab task path also binds label
+decisions to unchanged native candidate notes and rejects unversioned acceptance.
+Parent dispatch, cross-provider evidence reconciliation
 and the remaining lifecycle below are not yet complete. A parent must never run
 as a coding task while coordination support is incomplete.
 

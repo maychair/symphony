@@ -2380,7 +2380,7 @@ Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMP
 
 ## Repository task workflow extension
 
-The optional GitLab/Codex native Goal extension in [the execution contract](elixir/docs/task-workflow.md) adds five logical states, versioned authorized decisions, independent restrictions, cumulative execution accounting and delivery-bound acceptance. People own the `symphony:ready`, `symphony:rework` and `symphony:accept` labels; the engine owns only the `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels and keeps them consistent with its journal. Native Issue state keeps its existing meaning. A successful execution attempt is not overall completion.
+The optional GitLab/Codex native Goal extension in [the execution contract](elixir/docs/task-workflow.md) adds five logical states, versioned authorized decisions, independent restrictions, cumulative execution accounting and delivery-bound acceptance. People own the `symphony:ready`, `symphony:rework` and `symphony:accept` labels; the engine owns only the `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels and keeps them consistent with its journal. Native Issue state keeps its existing meaning. A successful execution attempt is not overall completion. In the GitLab task extension, labels bind unchanged native candidate notes using source times and the actual actor; ambiguous history grants no authority. Acceptance decisions must name an exact manifest; the reducer never supplies the current one for an unbound decision.
 
 ## Repository parent-plan lifecycle extension
 

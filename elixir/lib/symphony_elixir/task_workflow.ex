@@ -201,10 +201,9 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp transition(flow, %{"action" => "accept"} = event) do
     manifest = flow["manifest"]
     ref = event["data"]["manifest"]
-    ref = if is_binary(ref), do: ref, else: manifest && manifest["ref"]
 
-    if is_map(manifest) and ref == manifest["ref"],
-      do: {flow |> Map.put("acceptance", %{"ref" => event["ref"], "manifest" => manifest["ref"]}) |> Map.put("acceptance_order", order(event)), "accepted_version"},
+    if is_map(manifest) and is_binary(ref) and ref != "" and ref == manifest["ref"],
+      do: {flow |> Map.put("acceptance", %{"ref" => event["ref"], "manifest" => manifest["ref"], "binding" => event["binding"]}) |> Map.put("acceptance_order", order(event)), "accepted_version"},
       else: {flow, "no_authorized_transition"}
   end
 
@@ -216,7 +215,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp remember_natural_resume(flow, _), do: flow
 
-  defp order(event), do: Map.take(event, ["at", "id", "version", "ref"])
+  defp order(event), do: Map.take(event, ["at", "id", "version", "ref", "binding"])
   defp event_priority(%{"ref" => "note:" <> _}), do: 0
   defp event_priority(_), do: 1
 
@@ -398,9 +397,22 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp check_baseline(flow, facts) do
     contract = flow["contract"]
 
-    if is_map(contract) and contract["issue_version"] == facts["issue_version"] and contract["type"] == facts["type"] and
-         contract["ref"] in facts["source_refs"], do: clear(flow, "baseline"), else: automatic(flow, "baseline", "decision")
+    valid = is_map(contract) and contract["issue_version"] == facts["issue_version"] and contract["type"] == facts["type"]
+
+    if valid and current_decision?(contract, facts),
+      do: clear(flow, "baseline"),
+      else: automatic(flow, "baseline", "decision")
   end
+
+  # Old labels without a verifiable candidate stay readable but cannot grant
+  # new execution or closure after migration. Explicit note decisions already
+  # carry their target in their versioned content.
+  defp valid_binding?(%{"ref" => "label:" <> _} = decision, facts),
+    do: is_binary(decision["binding"]) and get_in(facts, ["decision_bindings", decision["ref"]]) == decision["binding"]
+
+  defp valid_binding?(_, _), do: true
+
+  defp current_decision?(decision, facts), do: decision["ref"] in facts["source_refs"] and valid_binding?(decision, facts)
 
   defp check_decision_sources(flow, facts) do
     if is_binary(flow["cancellation"]) and flow["cancellation"] not in facts["source_refs"], do: automatic(flow, "cancellation_source", "decision"), else: clear(flow, "cancellation_source")
@@ -468,7 +480,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
     flow =
       if is_map(flow["acceptance"]) and flow["acceptance"]["ref"] != "verified_merge" and
-           flow["acceptance"]["ref"] not in facts["source_refs"], do: Map.put(flow, "acceptance", nil), else: flow
+           not current_decision?(flow["acceptance"], facts), do: Map.put(flow, "acceptance", nil), else: flow
 
     cond do
       not valid ->

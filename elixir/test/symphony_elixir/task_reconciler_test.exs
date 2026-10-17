@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskReconcilerTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.{Execution, RunJournal, TaskReconciler, TaskWorkflow}
+  alias SymphonyElixir.{Execution, RunJournal, TaskDecision, TaskReconciler, TaskWorkflow}
   @ready_at "2026-10-16T00:00:01Z"
 
   setup do
@@ -42,7 +42,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
     state = %{
       raw: raw,
-      notes: [],
+      notes: [candidate(description)],
       label_events: [ready],
       mr: %{},
       dependency: %{"state" => "opened"},
@@ -128,6 +128,12 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
   defp contract_block(data) do
     "<!-- symphony-contract\n" <> Jason.encode!(Map.put(data, "contract_sha", TaskWorkflow.digest(data))) <> "\n-->"
+  end
+
+  defp candidate(description) do
+    data = TaskReconciler.description_contract(description) |> Map.put("issue_version", TaskWorkflow.digest(description))
+    body = "Review this agreement before applying ready.\n\n" <> TaskDecision.candidate_block(%{"action" => "authorize", "data" => data})
+    reply(10_000, body, 1, "2026-10-16T00:00:00Z")
   end
 
   defp label_event(id, name, at \\ @ready_at, action \\ "add", actor \\ 1) do
@@ -232,43 +238,40 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     assert Enum.all?(TaskReconciler.human_labels(), &(not String.contains?(inspect(writes), &1)))
   end
 
-  test "human label events translate to control events and unknown labels are ignored" do
+  test "ready binds a native candidate and never substitutes the current description" do
     description = "Deliver the result\n\n" <> contract_block(development_contract())
-    contract = TaskReconciler.description_contract(description)
-    issue_version = TaskWorkflow.digest(description)
-    flow = %{"contract" => %{"ref" => "note:1@v1", "criteria" => ["a"], "authorizer" => "2"}, "manifest" => %{"ref" => "note:9@v1"}, "restrictions" => %{}}
+    published = candidate(description)
+    [ready] = TaskDecision.label_events([label_event(11, "symphony:ready")], [published])
+    assert ready["data"] == Map.put(TaskReconciler.description_contract(description), "issue_version", TaskWorkflow.digest(description))
+    assert ready["binding"] == TaskReconciler.source_ref(published)
+    assert ready["actor"] == "1"
+    assert ready["ref"] == label_ref(11)
+    assert TaskDecision.label_events([label_event(11, "symphony:ready")], []) == []
+  end
 
-    events =
-      TaskReconciler.label_events(
-        [
-          label_event(11, "symphony:ready"),
-          label_event(12, "symphony:rework", "2026-10-16T00:00:02Z"),
-          label_event(13, "symphony:accept", "2026-10-16T00:00:03Z"),
-          %{"id" => 14, "action" => "add", "label" => %{"name" => "type:development"}, "created_at" => "2026-10-16T00:00:04Z"},
-          %{"id" => 15, "action" => "add", "label" => %{"id" => 3}, "created_at" => "2026-10-16T00:00:05Z"},
-          label_event(16, "symphony:ready", "2026-10-16T00:00:06Z", "remove")
-        ],
-        flow,
-        contract,
-        issue_version,
-        "1"
-      )
+  test "old ready cannot approve edited scope on first admission", %{server: server, issue: issue} do
+    Agent.update(server, &put_in(&1.raw["description"], &1.raw["description"] <> "\nExtra requirement."))
+    assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
+    refute Enum.any?(Agent.get(server, & &1.calls), fn {method, _, _, body} -> method == "PUT" and body["state_event"] == "close" end)
+  end
 
-    assert [ready, rework, accept] = events
-    assert ready["action"] == "authorize"
-    assert ready["data"] == Map.put(contract, "issue_version", issue_version)
-    assert rework["action"] == "rework"
-    assert rework["contract"] == "note:1@v1"
-    assert rework["data"] == %{"criteria" => ["a"], "changes" => []}
-    assert accept["action"] == "accept"
-    assert accept["contract"] == "note:1@v1"
-    assert accept["data"] == %{}
+  test "ready without its actual actor cannot borrow the assignee", %{server: server, issue: issue} do
+    Agent.update(server, &%{&1 | label_events: [Map.delete(label_event(11, "symphony:ready"), "user")]})
+    assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
+  end
 
-    assert Enum.map(events, & &1["ref"]) == [
-             "label:11@1@2026-10-16T00:00:01Z",
-             "label:12@1@2026-10-16T00:00:02Z",
-             "label:13@1@2026-10-16T00:00:03Z"
-           ]
+  test "deleting or editing a candidate revokes its projection after journal reload", %{server: server, issue: issue} do
+    {:ok, _, opts} = Execution.prepare(issue, [])
+    record = opts[:run_record]
+    published = Agent.get(server, & &1.notes)
+    Agent.update(server, &%{&1 | notes: Enum.map(published, fn note -> Map.put(note, "updated_at", "2026-10-16T00:00:02Z") end)})
+    {:ok, edited} = TaskReconciler.refresh(current(record), false)
+    assert edited["workflow"]["restrictions"]["baseline"]
+    assert edited["workflow"]["allowed_criteria"] == []
+    Agent.update(server, &%{&1 | notes: []})
+    {:ok, deleted} = TaskReconciler.refresh(current(record), false)
+    assert deleted["workflow"]["restrictions"]["baseline"]
+    assert deleted["workflow"]["allowed_criteria"] == []
   end
 
   test "unknown external routing removal, ownership loss and external closure cannot complete a task", %{server: server, issue: issue} do
@@ -296,7 +299,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
     # Editing the description changes its digest, so the recorded authorization
     # no longer matches the confirmed agreement and the engine raises the
-    # baseline decision restriction until a human reapplies the label.
+    # baseline decision restriction until a new candidate receives explicit authorization.
     Agent.update(server, &put_in(&1.raw["description"], description <> "\n\nReworded scope."))
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["restrictions"]["baseline"]
@@ -368,7 +371,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["resume_requested"]
     # The contract lives in the description, so editing it invalidates the
-    # recorded authorization until the label is applied again.
+    # recorded authorization until a new candidate receives explicit authorization.
     Agent.update(server, fn state -> %{state | raw: Map.put(state.raw, "description", "Edited agreement")} end)
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["restrictions"]["baseline"]
@@ -391,7 +394,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
         |> Map.put("labels", ["symphony:ready", "type:research"])
         |> Map.put("description", "Research the answer\n\n" <> contract_block(research))
 
-      %{state | raw: raw}
+      %{state | raw: raw, notes: [candidate(raw["description"])]}
     end)
 
     {:ok, _, opts} = Execution.prepare(%{issue | labels: ["symphony:ready", "type:research"]}, [])
@@ -435,7 +438,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
         |> Map.put("labels", ["symphony:ready", "type:research"])
         |> Map.put("description", "Research the answer\n\n" <> contract_block(research))
 
-      %{state | raw: raw}
+      %{state | raw: raw, notes: [candidate(raw["description"])]}
     end)
 
     {:ok, _, opts} = Execution.prepare(%{issue | labels: ["symphony:ready", "type:research"]}, [])
@@ -452,8 +455,8 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     accept = label_event(3, "symphony:accept", "2026-10-16T00:00:08Z", "add", 2)
     Agent.update(server, &%{&1 | label_events: &1.label_events ++ [accept]})
 
-    # The accept label carries no manifest ref; it must resolve against the
-    # manifest reduced from the note earlier in the same refresh.
+    # Native note time proves which immutable manifest preceded the label;
+    # binding happens before reduction, including on the first poll.
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["acceptance"]["ref"] == "label:3@2@2026-10-16T00:00:08Z"
     assert record["workflow"]["acceptance"]["manifest"] == TaskReconciler.source_ref(submission)
@@ -592,7 +595,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
         |> Map.put("labels", ["symphony:ready", "type:research"])
         |> Map.put("description", "Deliver the result\n\n" <> contract_block(research))
 
-      %{state | raw: raw}
+      %{state | raw: raw, notes: [candidate(raw["description"])]}
     end)
 
     {:ok, _, opts} = Execution.prepare(issue, [])
@@ -687,7 +690,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
 
     url = "https://gitlab.test/group/project/-/merge_requests/9"
     mr = %{"web_url" => url, "sha" => "v1", "source_project_id" => 1, "target_project_id" => 1, "state" => "merged", "merged_at" => "2026-10-16T00:00:00Z"}
-    Agent.update(server, &%{&1 | notes: [note(1, "authorize", Map.put(agreement, "issue_version", TaskWorkflow.digest(description)))], mr: mr})
+    Agent.update(server, &%{&1 | notes: [candidate(description)], mr: mr})
     {:ok, _, opts} = Execution.prepare(issue, [])
     record = opts[:run_record]
     contract = record["workflow"]["contract"]["ref"]
@@ -796,7 +799,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
         |> Map.put("description", description)
         |> Map.put("labels", ["symphony:ready", "type:research"])
 
-      %{state | raw: raw}
+      %{state | raw: raw, notes: [candidate(raw["description"])]}
     end)
 
     issue = %{issue | labels: ["symphony:ready", "type:research"]}
@@ -858,7 +861,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
         |> Map.put("web_url", url)
         |> Map.put("labels", ["symphony:ready", "type:mixed"])
 
-      %{state | raw: raw}
+      %{state | raw: raw, notes: [candidate(raw["description"])]}
     end)
 
     issue = %{issue | id: "43", identifier: "GL-43", url: url, labels: ["symphony:ready", "type:mixed"]}

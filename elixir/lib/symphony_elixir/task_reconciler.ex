@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskReconciler do
   @moduledoc "Reconcile Issue decisions on the existing execution and scheduler loops."
   require Logger
-  alias SymphonyElixir.{Config, Execution, RunJournal, TaskWorkflow}
+  alias SymphonyElixir.{Config, Execution, RunJournal, TaskDecision, TaskWorkflow}
   alias SymphonyElixir.GitLab.Client
 
   # Human labels. The engine never writes them: authorization, rework and
@@ -258,7 +258,7 @@ defmodule SymphonyElixir.TaskReconciler do
     flow = record["workflow"] || TaskWorkflow.new(Execution.run_budget_ms(record["issue_id"]), now)
     contract = description_contract(raw["description"])
     issue_version = TaskWorkflow.digest(raw["description"] || "")
-    events = events(notes, flow, owner) ++ label_events(label_events, flow, contract, issue_version, owner)
+    events = events(notes, flow, owner) ++ TaskDecision.label_events(label_events, notes)
 
     basic = %{
       "owner" => owner,
@@ -270,6 +270,7 @@ defmodule SymphonyElixir.TaskReconciler do
       "versions" => %{},
       "now" => now,
       "source_refs" => Enum.map(events, & &1["ref"]),
+      "decision_bindings" => Map.new(events, &{&1["ref"], &1["binding"]}),
       "observed_refs" => notes |> Enum.reject(&(&1["system"] == true)) |> Enum.map(&source_ref/1),
       "owner_valid" => owner == settings.assignee
     }
@@ -295,46 +296,6 @@ defmodule SymphonyElixir.TaskReconciler do
       _ -> nil
     end
   end
-
-  @spec label_events([map()], map(), map() | nil, String.t(), String.t() | nil) :: [map()]
-  def label_events(raw_events, flow, contract, issue_version, owner) do
-    raw_events
-    |> Enum.filter(&(&1["action"] == "add"))
-    |> Enum.flat_map(&label_event(&1, flow, contract, issue_version, owner))
-  end
-
-  defp label_event(%{"label" => %{"name" => name}, "id" => id} = raw, flow, contract, issue_version, owner) do
-    actor = to_string(get_in(raw, ["user", "id"]) || owner)
-    ref = "label:#{id}@#{actor}@#{raw["created_at"]}"
-
-    # Zero-padding keeps `{at, id, version}` in numeric order for label events
-    # instead of lexicographic order, while every label id still sorts above the
-    # integer note ids, matching `event_priority/1`.
-    base = %{"id" => "label:#{String.pad_leading(to_string(id), 12, "0")}", "ref" => ref, "at" => time(raw["created_at"]), "actor" => actor}
-
-    case name do
-      "symphony:ready" ->
-        [base |> Map.put("action", "authorize") |> Map.put("contract", nil) |> Map.put("data", authorize_data(contract, issue_version))]
-
-      "symphony:rework" ->
-        [base |> Map.put("action", "rework") |> Map.put("contract", contract_ref(flow)) |> Map.put("data", rework_data(flow))]
-
-      "symphony:accept" ->
-        [base |> Map.put("action", "accept") |> Map.put("contract", contract_ref(flow)) |> Map.put("data", %{})]
-
-      _ ->
-        []
-    end
-  end
-
-  defp label_event(_, _, _, _, _), do: []
-
-  defp contract_ref(flow), do: get_in(flow, ["contract", "ref"])
-
-  defp authorize_data(nil, issue_version), do: %{"issue_version" => issue_version}
-  defp authorize_data(contract, issue_version), do: Map.put(contract, "issue_version", issue_version)
-
-  defp rework_data(flow), do: %{"criteria" => get_in(flow, ["contract", "criteria"]) || [], "changes" => []}
 
   @spec events([map()], map(), String.t() | nil) :: [map()]
   def events(notes, flow, owner) do
@@ -462,8 +423,8 @@ defmodule SymphonyElixir.TaskReconciler do
   end
 
   @spec source_ref(map()) :: String.t()
-  def source_ref(note), do: "note:#{note["id"]}@#{note_version(note)}"
-  defp note_version(note), do: TaskWorkflow.digest(%{"body" => note["body"] || "", "updated_at" => note["updated_at"]})
+  def source_ref(note), do: TaskDecision.source_ref(note)
+  defp note_version(note), do: TaskDecision.version(note)
 
   @spec intent(String.t()) :: map() | nil
   def intent(text) do

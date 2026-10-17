@@ -53,7 +53,7 @@ Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMP
 
 ## Versioned task workflow
 
-GitLab repositories can opt into the [versioned task workflow](elixir/docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels. Enable it only after migrating retained private workflows and their Issue agreements.
+GitLab repositories can opt into the [versioned task workflow](elixir/docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels. Label authorization requires a published, unchanged candidate and the actual native actor; acceptance must bind an exact manifest. Enable it only after migrating retained private workflows and their Issue agreements.
 
 ## Parent plans and standalone review
 
