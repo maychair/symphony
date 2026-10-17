@@ -362,6 +362,28 @@ defmodule SymphonyElixir.TaskLifecycleTest do
     end
   end
 
+  test "released controls remain source-bound across restart and missing evidence prevents execution" do
+    context = fixture()
+    receipts = %{"pause-note" => "pause", "resume-note" => "resume"}
+    context = put_in(context.evidence["control_receipts"], receipts)
+    flow = assess(context)
+    assert flow["dispatchable"]
+    assert flow["control_receipts"] == receipts
+    restored = persist(context, flow)
+    assert assess(restored)["dispatchable"]
+
+    for current <- [%{}, %{"pause-note" => "pause"}, %{"pause-note" => "changed"}, [], %{"resume-note" => nil}] do
+      changed = put_in(restored.evidence["control_receipts"], current)
+      assert assess(changed)["restrictions"]["native_control_source"]
+      refute assess(changed)["dispatchable"]
+    end
+
+    missing = put_in(restored.evidence["sources"], ["pause"])
+    assert assess(missing)["restrictions"]["native_control_source"]
+    publisher = put_in(context.runtime["control_receipts"], %{"newer" => "different"})
+    assert assess(publisher)["restrictions"]["native_control_source"]
+  end
+
   test "delivery transformations and optional child gates bind the exact candidate" do
     context = fixture(human_gate: true) |> candidate() |> verified() |> delivered()
     assert assess(context)["restrictions"]["child_acceptance"]

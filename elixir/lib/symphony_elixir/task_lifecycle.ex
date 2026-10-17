@@ -7,7 +7,7 @@ defmodule SymphonyElixir.TaskLifecycle do
   being closed, an agent exit or an author-supplied boolean as verification.
   A projection is not a replacement task store or permission to perform an effect.
   """
-  alias SymphonyElixir.{ExecutionBinding, TaskDecision, TaskPlan, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{ExecutionBinding, TaskControl, TaskDecision, TaskPlan, TaskWorkflow, WorkRef}
 
   @stages %{"verified" => 1, "delivered" => 2, "published" => 3}
 
@@ -130,11 +130,28 @@ defmodule SymphonyElixir.TaskLifecycle do
         "contract" => Map.take(context.member.contract, ~w(criteria acceptance_mode acceptor))
       })
 
+    flow = control_receipts(flow, context)
     flow = Enum.reduce(context.evidence["releases"], flow, &native_release(&2, &1, context))
     flow = Enum.reduce(context.evidence["restrictions"], flow, &native_restriction(&2, &1, context))
     flow = if context.plan.parent.raw["state"] in ["open", "opened"], do: flow, else: restrict(flow, "parent_closed", "evidence")
     if context.member.raw["state"] in ["open", "opened"], do: flow, else: restrict(flow, "native_closed", "evidence")
   end
+
+  defp control_receipts(flow, %{evidence: evidence, runtime: runtime}) do
+    prior = TaskControl.recorded(runtime)
+    current = Map.get(evidence, "control_receipts", %{})
+
+    if source_receipts?(prior) and source_receipts?(current) and
+         Enum.all?(prior, fn {id, source} -> current[id] == source end) and
+         Enum.all?(current, fn {_, source} -> source in evidence["sources"] end) do
+      Map.put(flow, "control_receipts", current)
+    else
+      restrict(flow, "native_control_source", "evidence")
+    end
+  end
+
+  defp source_receipts?(receipts) when is_map(receipts), do: Enum.all?(receipts, fn {id, source} -> text?(id) and text?(source) end)
+  defp source_receipts?(_), do: false
 
   defp native_restriction(flow, %{"id" => id, "kind" => kind, "source" => source, "scope" => scope} = restriction, context) do
     if text?(id) and kind in ~w(pause cancel decision scope dependency budget evidence acceptance) and source?(context, source) and

@@ -161,6 +161,81 @@ defmodule SymphonyElixir.TaskPublicationTest do
     TaskEvidence.read_member(plan, fixture.payload["work"], record, policy || fixture.opts[:policy], fixture.opts)
   end
 
+  defp control(fixture, scope, action, id, extra \\ %{}) do
+    binding = fixture.record["execution_binding"]
+    payload = %{"action" => action, "revision" => binding["plan_revision"]}
+    payload = if scope == :member, do: Map.put(payload, "contract_sha", binding["contract_sha"]), else: payload
+    marker = if scope == :member, do: "task", else: "plan"
+    body = "<!-- symphony-#{marker}-decision " <> Jason.encode!(Map.merge(payload, extra)) <> " -->"
+    {:ok, base, _} = DateTime.from_iso8601("2026-10-17T00:00:00Z")
+    time = DateTime.add(base, id) |> DateTime.to_iso8601()
+    note(id, 1, body) |> Map.merge(%{"created_at" => time, "updated_at" => time})
+  end
+
+  test "parent and child pauses fence native writes and persist source memory before returning a blocked result" do
+    for provider <- ["github", "gitlab"], scope <- [:parent, :member] do
+      f = fixture(provider)
+      path = if scope == :parent, do: f.parent_notes, else: f.notes
+      original = Agent.get(f.state, & &1.objects[path])
+      pause = control(f, scope, "pause", 10)
+      Agent.update(f.state, &put_in(&1.objects[path], original ++ [pause]))
+      assert {:error, :publication_controlled} = publish(f)
+      persisted = current(f)
+      assert map_size(persisted["control_receipts"]) == 1
+      assert posts(f) == []
+
+      Agent.update(f.state, &put_in(&1.objects[path], original))
+      assert {:error, :control_source_unconfirmed} = publish(f, persisted)
+      assert posts(f) == []
+
+      source = hd(Map.values(persisted["control_receipts"]))
+      resume = control(f, scope, "resume", 11, %{"restriction" => source})
+      Agent.update(f.state, &put_in(&1.objects[path], original ++ [pause, resume]))
+      assert {:ok, saved, _} = publish(f, current(f))
+      assert map_size(saved["control_receipts"]) == 2
+      assert length(posts(f)) == 1
+
+      Agent.update(f.state, &update_in(&1.objects[path], fn notes -> Enum.reject(notes, fn note -> note["id"] == 11 end) end))
+      changed = update_in(f.payload["artifacts"], fn [artifact] -> [Map.put(artifact, "version", "v2")] end)
+      assert {:error, :control_source_unconfirmed} = publish(changed, saved)
+      assert length(posts(f)) == 1
+    end
+  end
+
+  test "native evidence includes current controls without discarding an already published candidate" do
+    f = fixture("github") |> git_artifact()
+    assert {:ok, saved, _} = publish(f)
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [control(f, :parent, "pause", 10)] end))
+    assert {:ok, facts} = evidence(f, saved)
+    assert facts.candidate
+    assert [%{"kind" => "pause", "source" => source}] = facts.controls.restrictions
+    assert source in facts.sources
+    assert map_size(facts.controls.receipts) == 1
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+
+    resolved = %{
+      "sources" => facts.sources,
+      "restrictions" => facts.controls.restrictions,
+      "releases" => facts.controls.releases,
+      "control_receipts" => facts.controls.receipts,
+      "candidate" => facts.candidate,
+      "verification" => nil,
+      "dependencies" => [],
+      "deliveries" => [],
+      "acceptance" => nil,
+      "active" => true
+    }
+
+    context = %{plan: plan, work: f.payload["work"], runtime: saved, policy: f.opts[:policy], evidence: resolved}
+    assert {:ok, flow} = TaskLifecycle.assess(context, 0)
+    assert flow["stop_required"]
+    assert flow["execution"] == "stopping"
+    refute flow["dispatchable"]
+    {:ok, saved} = RunJournal.checkpoint(saved, %{"workflow" => flow})
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn [approval, _pause] -> [approval] end))
+    assert {:error, :control_source_unconfirmed} = evidence(f, saved)
+  end
+
   test "both providers publish only to the owning Issue, read back the exact actor and reuse one receipt" do
     for provider <- ["github", "gitlab"] do
       fixture = fixture(provider)
@@ -451,6 +526,26 @@ defmodule SymphonyElixir.TaskPublicationTest do
 
     opts = Keyword.put(fixture.opts, :request, racing)
     assert {:error, :member_evidence_scope_changed} = TaskEvidence.read_member(plan, fixture.payload["work"], saved, fixture.opts[:policy], opts)
+  end
+
+  test "a new parent pause during artifact retrieval invalidates the result before it can authorize work" do
+    f = fixture("github") |> git_artifact()
+    {:ok, saved, _} = publish(f)
+    {:ok, plan} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    original = f.opts[:request]
+
+    racing = fn provider, method, path, query, settings ->
+      result = original.(provider, method, path, query, settings)
+
+      if String.contains?(path, "/git/blobs/") do
+        Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> Enum.uniq_by(notes ++ [control(f, :parent, "pause", 10)], fn note -> note["id"] end) end))
+      end
+
+      result
+    end
+
+    assert {:error, :member_evidence_scope_changed} =
+             TaskEvidence.read_member(plan, f.payload["work"], saved, f.opts[:policy], Keyword.put(f.opts, :request, racing))
   end
 
   test "a malformed journal envelope cannot invent an execution generation" do

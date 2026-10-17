@@ -2,12 +2,12 @@ defmodule SymphonyElixir.TaskEvidence do
   @moduledoc """
   Resolve candidate and verification evidence from native publications and actual artifacts.
 
-  This supplies result facts only. Controls, dependencies, delivery, acceptance and
+  This supplies result and native control facts. Dependencies, delivery, acceptance and
   native execution activity must still be resolved before lifecycle assessment.
   """
   alias SymphonyElixir.ArtifactStore
   alias SymphonyElixir.{CommandCheck, ExecutionBinding, GitArtifact, NativeWork, TaskPublication, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.TaskPlanPreflight
+  alias SymphonyElixir.{TaskControl, TaskPlanPreflight}
 
   @doc "Read a member's current native results; never replace unavailable current evidence with an older success."
   @spec read_member(map(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -20,6 +20,8 @@ defmodule SymphonyElixir.TaskEvidence do
          {:ok, _} <- ExecutionBinding.bind(runtime, runtime["execution_binding"]),
          {:ok, snapshot} <- NativeWork.read(work, opts),
          true <- snapshot.description == member.description,
+         current_plan = put_in(current_plan.members[WorkRef.key(work)], Map.put(snapshot, :contract, member.contract)),
+         {:ok, controls} <- TaskControl.observe(current_plan, work, TaskControl.recorded(runtime)),
          {:ok, results} <- TaskPublication.observe(runtime, snapshot, policy["engine_actor"]),
          current = Enum.filter(results, &scope?(&1.envelope, plan, member, policy)),
          {:ok, selected} <- latest(current, "candidate"),
@@ -27,9 +29,11 @@ defmodule SymphonyElixir.TaskEvidence do
          {:ok, selected} <- latest_verification(current, candidate, policy),
          {:ok, verification} <- verification(selected, runtime, policy),
          {:ok, after_read} <- NativeWork.read(work, opts),
-         true <- NativeWork.snapshot_ref(snapshot) == NativeWork.snapshot_ref(after_read) do
-      sources = Enum.map(artifacts, & &1.receipt["source"]) ++ result_sources([candidate, verification])
-      {:ok, %{candidate: candidate, verification: verification, sources: Enum.uniq(sources), artifacts: artifacts, snapshot: snapshot}}
+         true <- NativeWork.snapshot_ref(snapshot) == NativeWork.snapshot_ref(after_read),
+         {:ok, parent_after} <- NativeWork.read(plan.plan["parent"], opts),
+         true <- NativeWork.snapshot_ref(current_plan.parent) == NativeWork.snapshot_ref(parent_after) do
+      sources = Enum.map(artifacts, & &1.receipt["source"]) ++ result_sources([candidate, verification]) ++ controls.sources
+      {:ok, %{candidate: candidate, verification: verification, sources: Enum.uniq(sources), artifacts: artifacts, snapshot: snapshot, controls: controls}}
     else
       {:error, _} = error -> error
       _ -> {:error, :member_evidence_scope_changed}

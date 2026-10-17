@@ -7,7 +7,7 @@ defmodule SymphonyElixir.TaskPublication do
   approval, merge, Issue creation or closure operation is exposed here.
   """
   alias SymphonyElixir.{ExecutionBinding, NativeWork, RunJournal, TaskDecision, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.TaskPlanPreflight
+  alias SymphonyElixir.{TaskControl, TaskPlanPreflight}
 
   @marker "<!-- symphony-evidence "
 
@@ -171,7 +171,9 @@ defmodule SymphonyElixir.TaskPublication do
   end
 
   defp complete(record, %{"status" => "prepared"} = entry, opts) do
-    with {:ok, snapshot} <- publication_scope(entry, opts),
+    with {:ok, snapshot, controls} <- publication_scope(record, entry, opts),
+         {:ok, record} <- RunJournal.checkpoint(record, %{"control_receipts" => controls.receipts}),
+         true <- controls.restrictions == [] or {:error, :publication_controlled},
          :ok <- absent(snapshot, entry),
          {:ok, sending} <- save(record, Map.put(entry, "status", "sending")) do
       finish_send(NativeWork.comment(snapshot, entry["body"], entry["actor"], opts), sending, entry, opts)
@@ -187,15 +189,16 @@ defmodule SymphonyElixir.TaskPublication do
          do: {:ok, recovered, recovered["publications"][entry["id"]]}
   end
 
-  defp publication_scope(entry, opts) do
+  defp publication_scope(record, entry, opts) do
     binding = entry["binding"]
 
     with {:ok, plan} <- TaskPlanPreflight.inspect_plan(binding["authority"]["work"], opts),
          true <- plan.authority == binding["authority"] and plan.plan["revision"] == binding["plan_revision"],
          %{} = member <- plan.members[WorkRef.key(entry["work"])],
          true <- member.contract["contract_sha"] == binding["contract_sha"],
-         true <- member.raw["state"] in ["open", "opened"] do
-      {:ok, member}
+         true <- member.raw["state"] in ["open", "opened"],
+         {:ok, controls} <- TaskControl.observe(plan, entry["work"], TaskControl.recorded(record)) do
+      {:ok, member, controls}
     else
       {:error, _} = error -> error
       _ -> {:error, :publication_scope_changed}

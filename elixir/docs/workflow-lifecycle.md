@@ -19,7 +19,9 @@ Git-backed command checks now run in isolated verifier worktrees and produce
 host-owned process/output receipts that the publisher attests.
 Native result selection now checks journal/native identities, retrieves and retains
 fixed Git snapshots and re-attests actual command results before returning member evidence.
-Child dispatch, retention cleanup and the remaining lifecycle below are not
+Native parent/member pause, cancel and source-bound resume decisions now feed
+member evidence and fence fresh result publication; remembered source loss blocks
+resumption after restart. Child dispatch, retention cleanup and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
 contract schemas, parent-linked contracts and malformed contract blocks are
@@ -173,10 +175,12 @@ A readable parent approval note ends with:
 ```
 
 The native actor must match the sealed parent authorizer. The note must be
-unchanged with valid source times. A later non-authorize control or unresolvable
-control blocks preflight; it never falls back to an older approval. Full pause,
-resume and rework interpretation remains part of the pending execution lifecycle.
-Approval evidence binds the parent WorkRef, native note version and plan revision.
+unchanged with valid source times. The latest explicit approval supplies the grant;
+pause and resume decisions cannot replace that grant or expand its scope. Tied
+latest approvals, edited decisions and unresolvable control sources block
+preflight. Approval evidence binds the parent WorkRef, native note version and
+plan revision. A parent with active controls projects `restricted` with its
+restriction kinds, while retaining the exact original approval source.
 
 `TaskPlanPreflight.inspect_plan/2` returns all member snapshots or an error;
 it never returns a partial eligible set. Reads paginate comments, detect duplicate
@@ -192,6 +196,58 @@ Native reads use the documented [GitHub repository endpoint](https://docs.github
 [GitHub Issue comments](https://docs.github.com/en/rest/issues/comments#list-issue-comments),
 [GitLab project endpoint](https://docs.gitlab.com/api/projects/#get-a-single-project)
 and [GitLab Issue notes](https://docs.gitlab.com/api/notes/#list-all-issue-notes).
+
+## Native controls
+
+`TaskControl` separates the sealed grant from the current restrictions on its
+execution. `authority/2` resolves the latest unambiguous parent approval.
+`observe/3` reads parent controls and, for a member, only that member's controls.
+A parent pause/cancel therefore affects every member; a child pause does not
+in itself block an independent sibling. Dependency eligibility remains a separate
+calculation. Control receipts include the complete native work identity so equal
+note numbers on different Issues or providers cannot collide.
+
+The structured native transport uses an unchanged `symphony-plan-decision` block
+on the parent or `symphony-task-decision` block on the child. Both bind the full
+plan `revision`; child decisions also bind their sealed `contract_sha`.
+The supported control actions are `pause`, `cancel` and `resume`. A resume names
+one exact prior pause source in `restriction`. Multiple pauses require their own
+releases. The release must occur strictly later, on the same Issue, by its sealed
+authorizer. Equal native timestamps are not ordered by note ID or arrival time.
+A resume cannot clear a cancellation, another Issue's control, scope changes,
+missing evidence or an exhausted budget. A new approval is not a resume.
+
+Known foreign actors, system notes and ordinary unbound prose cannot control
+execution. Unknown actors, edited/malformed structured decisions, extra fields,
+unsupported actions and stale plan/member revisions remain explicit gaps.
+The current structured reader is an internal transport boundary; the planned
+human-facing reply/label interpretation must still prove unique actor, target
+and version bindings. Users are not required to compose this JSON. Question
+resolution, scope changes, cancellation closure, parent acceptance/rework and
+cross-plan control migration are not supplied by this reader.
+
+Every successful observation returns active restrictions, source-specific releases,
+current sources and an immutable source-receipt map. The lifecycle projection
+retains that map in its execution journal, including already released pauses.
+Later reads must confirm every remembered pause and resume at the same version;
+deleting a release cannot silently leave a task unpaused. `recorded/1` combines
+prior projection receipts with publication-time receipts without hiding conflicts.
+These are decision readback receipts, not a second task database or new authority.
+
+Before a fresh candidate/verification POST, `TaskPublication` rechecks the current
+parent and member controls and checkpoints their receipts before returning either
+a blocked result or sending intent. Thus an observed pause still prevents a later
+publication after its comment disappears or the process restarts. Recovery of an
+already sent result only reads and records the original effect; it does not resend
+under a pause. A cancelled result is never presented as human acceptance.
+
+`TaskEvidence.read_member/5` returns these controls alongside artifact/result facts
+and re-reads the parent after artifact acquisition as well as the member. A pause
+arriving during retrieval invalidates the observation. The lifecycle consumes
+`control_receipts` with the restrictions/releases and requests stopping an active
+executor; a missing remembered source blocks execution. The scheduler must still
+apply that stop intent and confirm native shutdown. Read fences do not promise an
+atomic transaction across Issues/providers or instant cancellation of remote work.
 
 ## Native execution generations
 
@@ -291,7 +347,8 @@ the effect owner must re-read native sources and stop facts, record its intent,
 perform the authorized close and read back the result.
 
 The result evidence reader below supplies authenticated candidate, verification
-and retrieval sources. Controls, dependency/delivery evidence, parent rework,
+and retrieval sources together with native pause/cancel/resume controls.
+Dependency/delivery evidence, parent rework,
 fine-grained criterion restrictions, shared board projection and effect integration
 remain pending. Supplying an arbitrary `sources` list is not proof of retrieval
 or command execution.
@@ -342,7 +399,7 @@ its own current authority, candidate, inputs and check policy.
 An engine-authored comment alone does not prove that a command ran or an artifact
 was retrieved. Verification publication now attests each supplied command result
 against the host-owned receipts below. Git-backed result acquisition and
-selection and local retention are implemented below; non-Git check inputs, child controls and
+selection, local retention and native control checks are implemented; non-Git check inputs and
 automatic execution wiring remain pending. Version 2 dispatch stays fenced.
 
 ## Supervised command checks
@@ -450,7 +507,8 @@ or extracted. Read results contain the acquired bytes separately from receipt
 metadata; constructing a source reference alone proves nothing.
 
 This interface supplies candidate/verification/retrieval facts, not a complete
-lifecycle observation. The owner must separately resolve controls, dependencies,
+lifecycle observation. Its `controls` result includes restrictions, releases and
+source receipts. The owner must separately resolve dependencies,
 native activity, deliveries and acceptance. It cannot fill those facts with
 assumed empty values. Current acquisition covers Git-backed artifacts in the
 member's verified repository; verification materialization, non-Git

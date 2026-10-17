@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskPlanPreflight do
   @moduledoc "Resolve the whole sealed plan and its native approval before any member can be considered for execution."
 
-  alias SymphonyElixir.{Config, NativeWork, TaskDecision, TaskPlan, TaskReconciler, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{Config, NativeWork, TaskControl, TaskDecision, TaskPlan, TaskReconciler, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @doc "Discover and check configured parents even when they have no execution journal."
@@ -35,9 +35,13 @@ defmodule SymphonyElixir.TaskPlanPreflight do
   end
 
   defp projection(issue, plan, evidence) do
-    if issue.url == evidence.parent.url and plan["revision"] == evidence.plan["revision"],
-      do: %{"status" => "approved", "revision" => evidence.plan["revision"], "authority" => evidence.authority, "members" => map_size(evidence.members)},
-      else: %{"status" => "blocked", "reason" => "parent_projection_changed"}
+    if issue.url == evidence.parent.url and plan["revision"] == evidence.plan["revision"] do
+      restrictions = Enum.map(evidence.controls.restrictions, & &1["kind"]) |> Enum.uniq() |> Enum.sort()
+      status = if restrictions == [], do: "approved", else: "restricted"
+      %{"status" => status, "restrictions" => restrictions, "revision" => evidence.plan["revision"], "authority" => evidence.authority, "members" => map_size(evidence.members)}
+    else
+      %{"status" => "blocked", "reason" => "parent_projection_changed"}
+    end
   end
 
   defp reason_name({reason, _}), do: reason_name(reason)
@@ -53,12 +57,13 @@ defmodule SymphonyElixir.TaskPlanPreflight do
          true <- (contract["contract_sha"] == plan["contract_sha"] and contract["authorizer"] == plan["authorizer"]) or {:error, :parent_contract_changed},
          true <- Enum.sort(contract["criteria"]) == Enum.sort(plan["criteria"]) or {:error, :parent_criteria_changed},
          true <- plan["budget_ms"] == contract["budget_ms"] or {:error, :parent_budget_changed},
-         {:ok, authority} <- authorization(root, plan),
+         {:ok, authority} <- TaskControl.authority(root, plan),
          {:ok, members} <- members(plan, opts),
          :ok <- edges(plan, members),
          {:ok, current} <- NativeWork.read(parent, opts),
          true <- snapshot_version(current) == snapshot_version(root) or {:error, :parent_changed_during_preflight} do
-      {:ok, %{plan: plan, authority: authority, parent: root, members: members}}
+      result = %{plan: plan, authority: authority, parent: root, members: members}
+      with {:ok, controls} <- TaskControl.observe(result, parent), do: {:ok, Map.put(result, :controls, controls)}
     end
   end
 
@@ -140,43 +145,6 @@ defmodule SymphonyElixir.TaskPlanPreflight do
     producer = members[WorkRef.key(edge["from"])].contract
     artifact = Enum.find(producer["deliverables"], &(&1["id"] == edge["artifact"]))
     is_map(artifact) and Enum.all?(edge["criteria"], &(&1 in artifact["criteria"]))
-  end
-
-  defp authorization(root, plan) do
-    decisions = Enum.filter(root.notes, &(&1["system"] != true and String.contains?(&1["body"], "<!-- symphony-plan-decision")))
-
-    if Enum.all?(decisions, &decision_identity?/1) do
-      decisions = Enum.filter(decisions, &(to_string(get_in(&1, ["author", "id"])) == plan["authorizer"]))
-      latest_authorization(decisions, root, plan)
-    else
-      {:error, :unknown_plan_decision_source}
-    end
-  end
-
-  defp decision_identity?(note) do
-    times = Enum.map([note["created_at"], note["updated_at"]], &TaskDecision.timestamp/1)
-    positive?(get_in(note, ["author", "id"])) and Enum.all?(times, &is_integer/1)
-  end
-
-  defp latest_authorization(decisions, root, plan) do
-    case Enum.max_by(decisions, &{TaskDecision.timestamp(&1["updated_at"]) || 0, &1["id"]}, fn -> nil end) do
-      nil -> {:error, :missing_plan_authorization}
-      note -> authorized_note(note, root, plan)
-    end
-  end
-
-  defp authorized_note(note, root, plan) do
-    with true <- root.raw["state"] in ["open", "opened"] or {:error, :parent_not_open},
-         at when is_integer(at) <- TaskDecision.timestamp(note["created_at"]),
-         true <- at == TaskDecision.timestamp(note["updated_at"]) or {:error, :edited_plan_decision},
-         [[_, json]] <- Regex.scan(~r/(?:^|\n)<!-- symphony-plan-decision\s+(\{.*?\})\s*-->\s*$/s, note["body"]),
-         {:ok, %{"action" => "authorize", "revision" => revision}} <- Jason.decode(json),
-         true <- revision == plan["revision"] or {:error, :plan_decision_revision_mismatch} do
-      {:ok, %{"work" => root.work, "source" => TaskDecision.source_ref(note), "actor" => plan["authorizer"], "revision" => revision}}
-    else
-      {:error, _} = error -> error
-      _ -> {:error, :plan_decision_requires_resolution}
-    end
   end
 
   defp snapshot_version(snapshot), do: {snapshot.version, TaskWorkflow.digest(Enum.map(snapshot.notes, &TaskDecision.source_ref/1) |> Enum.sort())}

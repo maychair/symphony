@@ -193,6 +193,22 @@ defmodule SymphonyElixir.TaskPlanPreflightTest do
     end
   end
 
+  test "a native parent pause preserves the grant but projects a restriction instead of renewed approval" do
+    f = fixture()
+    path = {"github", "/repos/team/parent/issues/1/comments"}
+    [approval] = f.objects[path]
+    body = "<!-- symphony-plan-decision " <> Jason.encode!(%{"action" => "pause", "revision" => f.plan["revision"]}) <> " -->"
+    pause = %{approval | "id" => 6, "body" => body, "created_at" => "2026-10-16T00:00:02Z", "updated_at" => "2026-10-16T00:00:02Z"}
+    changed = put_in(f.objects[path], [approval, pause])
+    assert {:ok, result} = TaskPlanPreflight.inspect_plan(f.parent, options(changed))
+    assert result.authority["source"] == TaskDecision.source_ref(Map.put(approval, "author", approval["user"]))
+    assert [%{"kind" => "pause"}] = result.controls.restrictions
+    issue = TaskPlan.project(%Issue{url: result.parent.url, description: result.parent.description})
+    [projected] = TaskPlanPreflight.project([issue], options(changed))
+    assert projected.native_ref["plan_preflight"]["status"] == "restricted"
+    assert projected.native_ref["plan_preflight"]["restrictions"] == ["pause"]
+  end
+
   test "cross-repository credentials are collected for executor redaction" do
     fixture = fixture()
     assert NativeWork.secret_environment_names(%{provider: %{"plan_repositories" => fixture.repositories}}) == ["PLAN_FIXTURE_TOKEN"]
