@@ -139,7 +139,7 @@ defmodule SymphonyElixir.Taskboard.GitHub do
   end
 
   defp fetch_issue_identifier(fetch_fun, identifier) do
-    identifiers = [identifier | identifier_candidates(identifier)] |> Enum.uniq()
+    identifiers = (identifier_candidates(identifier) ++ [identifier]) |> Enum.uniq()
 
     Enum.reduce_while(identifiers, {:error, :taskboard_issue_not_found}, fn candidate, _acc ->
       case fetch_fun.([candidate]) do

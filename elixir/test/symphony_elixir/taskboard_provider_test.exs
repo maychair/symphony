@@ -57,6 +57,86 @@ defmodule SymphonyElixir.Taskboard.ProviderTest do
     refute_receive {:label_request, "PUT", _, %{"remove_labels" => _}}
   end
 
+  test "providers read lifecycle states from the tracker settings", %{settings: settings} do
+    tracker = %{
+      settings
+      | active_states: ["opened", "reopened"],
+        terminal_states: ["closed"]
+    }
+
+    issues_fun = fn states ->
+      send(self(), {:issue_states, states})
+      {:ok, []}
+    end
+
+    assert {:ok, []} = GitHub.list_issues(tracker, issues_fun: issues_fun)
+    assert_receive {:issue_states, ["opened", "reopened", "closed"]}
+
+    assert {:ok, []} = GitLab.list_issues(tracker, issues_fun: issues_fun)
+    assert_receive {:issue_states, ["opened", "reopened", "closed"]}
+  end
+
+  test "GitHub detail resolves prefixed identifiers through their native Issue number", %{
+    settings: settings
+  } do
+    issue = %{issue("GH-34", []) | id: "34", state: "open", description: "Issue body"}
+
+    issue_fun = fn ids ->
+      assert ids == ["34"]
+      {:ok, [issue]}
+    end
+
+    request_fun = fn _method, path, _query, _body, _settings ->
+      body =
+        case path do
+          "/repos/mock/issues/issues/34" -> %{"number" => 34, "body" => "Issue body"}
+          "/repos/mock/issues/issues/34/comments" -> []
+          "/repos/mock/issues/issues/34/timeline" -> []
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, detail} =
+             GitHub.issue_detail(settings, "GH-34", issue_fun: issue_fun, request_fun: request_fun)
+
+    assert detail.issue.identifier == "GH-34"
+    assert detail.description == "Issue body"
+  end
+
+  test "GitLab detail resolves prefixed identifiers through their native Issue number", %{
+    settings: settings
+  } do
+    issue = %{issue("GL-34", []) | id: "34", state: "opened", description: "Issue description"}
+
+    issue_fun = fn ids ->
+      assert ids == ["34"]
+      {:ok, [issue]}
+    end
+
+    request_fun = fn _method, path, _query, _body, _settings ->
+      body =
+        case path do
+          "/projects/mock%2Fissues/issues/34" ->
+            %{"iid" => 34, "description" => "Issue description"}
+
+          "/projects/mock%2Fissues/issues/34/notes" ->
+            []
+
+          "/projects/mock%2Fissues/issues/34/related_merge_requests" ->
+            []
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, detail} =
+             GitLab.issue_detail(settings, "GL-34", issue_fun: issue_fun, request_fun: request_fun)
+
+    assert detail.issue.identifier == "GL-34"
+    assert detail.description == "Issue description"
+  end
+
   test "provider resolution and Issue presentation helpers preserve board contracts" do
     assert {:ok, GitHub} = Provider.module_for("github")
     assert {:ok, GitLab} = Provider.module_for("gitlab")

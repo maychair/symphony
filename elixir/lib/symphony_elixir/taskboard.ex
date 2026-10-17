@@ -257,7 +257,7 @@ defmodule SymphonyElixir.Taskboard do
 
   defp project_snapshot_entry(%{local: true} = project, opts) do
     with {:ok, provider} <- Provider.module_for(project.kind),
-         {:ok, issues} <- provider.list_issues(project.settings, opts) do
+         {:ok, issues} <- provider.list_issues(project.settings.tracker, opts) do
       runtime = local_runtime_snapshot(opts)
 
       cards =
@@ -443,7 +443,7 @@ defmodule SymphonyElixir.Taskboard do
       execution = local_execution(identifier)
 
       provider.issue_detail(
-        project.settings,
+        project.settings.tracker,
         identifier,
         Keyword.put(opts, :execution, execution)
       )
@@ -648,7 +648,7 @@ defmodule SymphonyElixir.Taskboard do
 
   defp write_create(%{local: true} = project, attrs, opts) do
     with {:ok, provider} <- Provider.module_for(project.kind) do
-      provider.create_issue(operator_settings(project.settings), attrs, opts)
+      provider.create_issue(operator_tracker_settings(project.settings), attrs, opts)
     end
   end
 
@@ -658,7 +658,7 @@ defmodule SymphonyElixir.Taskboard do
 
   defp write_comment(%{local: true} = project, identifier, body, opts) do
     with {:ok, provider} <- Provider.module_for(project.kind) do
-      provider.comment(operator_settings(project.settings), identifier, body, opts)
+      provider.comment(operator_tracker_settings(project.settings), identifier, body, opts)
     end
   end
 
@@ -698,7 +698,7 @@ defmodule SymphonyElixir.Taskboard do
     with {:ok, provider} <- Provider.module_for(project.kind) do
       execute_local_action(
         provider,
-        operator_settings(project.settings),
+        operator_tracker_settings(project.settings),
         issue,
         action,
         attrs,
@@ -770,13 +770,13 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp operator_settings(settings) do
+  defp operator_tracker_settings(settings) do
     provider =
       settings.tracker.provider
       |> Map.put("token", settings.taskboard.provider_token)
       |> Map.put("api_key", settings.taskboard.provider_token)
 
-    %{settings | tracker: %{settings.tracker | provider: provider}}
+    %{settings.tracker | provider: provider}
   end
 
   defp remote_request(method, project, path, query, body, opts) do
