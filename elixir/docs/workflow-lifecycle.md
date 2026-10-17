@@ -456,11 +456,60 @@ the command. Historical command attestation uses its durable receipt and does no
 require the ephemeral role workspace to survive retention cleanup.
 
 Local verifier Codex sessions use read-only sandbox policy. Remote role workspace
-transport, host registry configuration resolution, automatic session activation and
-scheduler continuation remain pending. Git-backed host command checks still require
+transport, host registry configuration resolution, automatic dispatch and scheduler
+continuation remain pending. Git-backed host command checks still require
 Git; report-only verification uses configured review checks. Native API fixtures,
 real local worktrees and real supervised commands exercise this boundary; this is
 not a live-provider acceptance result.
+
+## Native role session boundary
+
+`TaskSession.start/3` takes an already admitted record and the host execution
+registry. It prepares the generation workspace, re-reads the native lifecycle and
+starts or resumes the owning local Codex thread. It does not create another
+workspace through the legacy Issue hooks. Only the recorded generation may reuse
+its thread; native idle/turn identity checks still precede resumption. Each transport
+claims its own persisted session ID. An open or uncertain transport blocks another
+claim; confirmed stop permits a new ID. Old callbacks and bound role tools cannot
+act through the replacement, even within the same process and attempt. Rotation
+retains the session ID/phase in generation history and clears the current fields. Remote hosts
+and non-Codex recorded transports are rejected before allocation.
+
+The final `on_thread_intent` callback rechecks current plan authority, native
+controls, evidence, role selection, materialized inputs and remaining budget after
+the transport initializes. It persists allocation intent before the native request.
+A failed allocation remains uncertain; closing the port does not erase that intent
+or permit an unrecorded thread to be silently replaced.
+
+`TaskSession.activation_options/1` supplies a finite deadline and callbacks for
+`AppServer.run_goal/4` and `run_turn/4`, passing the managed session’s `native`
+transport. Callers must retain those callbacks. They
+repeat the same checks immediately before activation, so a pause or role change
+after constructing the options cannot authorize work. The native client now honors
+an error returned by `before_goal`, checks an expired deadline before allocation,
+and consumes a pending scheduler stop before activating an interruptible Goal.
+
+`TaskSession.checkpoint/2` accepts native event updates only from the original
+caller process and unchanged journal attempt, binding, generation, workspace and
+transport session ID.
+It rereads the current journal revision before checkpointing; it cannot adopt a
+replacement attempt merely because that record exists at the same path.
+
+`TaskSession.stop/1` first fences ownership and records stop as unconfirmed, then
+halts and reads the thread through its owning transport. Only validated native
+readback records a stop receipt. Failure keeps stop unconfirmed. A stale callback
+closes its old transport without issuing native halt requests against a thread
+that may now be owned by a replacement. The session API never releases the
+execution admission lock, closes an Issue or treats native Goal completion as
+technical verification or business acceptance.
+
+These APIs are exercised together with native Issue fixtures and a real local
+app-server protocol process, including Goal activation, same-thread resume,
+late callbacks, controls arriving between preparation and allocation, expired
+budgets and failed stop readback. They are not yet the polling worker entry point.
+The role-specific Goal prompt, ongoing asynchronous control observation, worker
+finalization/recovery, configuration resolution and scheduler continuation still
+need integration before version 2 automatic dispatch can be enabled.
 
 ## Native evidence publication
 

@@ -185,10 +185,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp turn_admission(opts) do
     interruptible = opts[:interruptible] == true
 
-    receive do
-      :symphony_stop when interruptible -> {:error, :scheduler_stop}
-    after
-      0 -> :ok
+    if is_integer(opts[:deadline]) and opts[:deadline] <= System.monotonic_time(:millisecond) do
+      {:error, :execution_budget_exhausted}
+    else
+      receive do
+        :symphony_stop when interruptible -> {:error, :scheduler_stop}
+      after
+        0 -> :ok
+      end
     end
   end
 
@@ -202,9 +206,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
 
     with {:ok, existing} <- read_goal(session),
-         :ok <- resumable_goal(existing, opts) do
-      Keyword.get(opts, :before_goal, fn -> :ok end).()
-
+         :ok <- resumable_goal(existing, opts),
+         :ok <- Keyword.get(opts, :before_goal, fn -> :ok end).(),
+         :ok <- turn_admission(opts) do
       context =
         execution_context(executor, session.thread_id, nil, session.dynamic_tool_binding)
         |> Map.merge(%{

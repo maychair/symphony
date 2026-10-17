@@ -5,7 +5,7 @@ defmodule SymphonyElixir.TaskTools do
   alias SymphonyElixir.{TaskControl, TaskDelivery, TaskDependencies, TaskEvidence, TaskLifecycle, TaskPlanPreflight}
   alias SymphonyElixir.{TaskPublication, TaskWorkflow, TaskWorkspace, WorkRef}
 
-  @identity ~w(directory attempt_id execution_generation execution_binding)
+  @identity ~w(directory attempt_id execution_generation execution_binding task_session_id)
   @command_fields ~w(candidate command exit_code output_sha reason snapshot_valid)
 
   @spec bind(map(), map(), keyword()) :: {:ok, map()} | {:error, term()}

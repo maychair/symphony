@@ -98,6 +98,12 @@ defmodule SymphonyElixir.AppServerTest do
     issue = %Issue{id: "stopped", identifier: "STOP", title: "Stop before turn", state: "open"}
     reject_turn = fn -> {:error, :review_execution_fenced} end
     assert {:error, :review_execution_fenced} = AppServer.run_turn(session, "do not start", issue, before_turn: reject_turn)
+    assert {:error, :review_execution_fenced} = AppServer.run_goal(session, "do not activate", issue, before_goal: reject_turn)
+    expired = [deadline: System.monotonic_time(:millisecond) - 1]
+    assert {:error, :execution_budget_exhausted} = AppServer.run_goal(session, "expired goal", issue, expired)
+    assert {:error, :execution_budget_exhausted} = AppServer.run_turn(session, "expired turn", issue, expired)
+    send(self(), :symphony_stop)
+    assert {:error, :scheduler_stop} = AppServer.run_goal(session, "cancelled goal", issue, interruptible: true)
     send(self(), :symphony_stop)
     assert {:error, :scheduler_stop} = AppServer.run_turn(session, "do not start", issue, interruptible: true)
     AppServer.stop_session(session)
@@ -106,7 +112,7 @@ defmodule SymphonyElixir.AppServerTest do
     assert evidence["native_stop_receipt"]["turn_id"] == nil
     methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
     assert Enum.count(methods, &(&1 == "thread/start")) == 1
-    refute Enum.any?(methods, &(&1 in ["thread/resume", "turn/start"]))
+    refute Enum.any?(methods, &(&1 in ["thread/resume", "turn/start", "thread/goal/set"]))
     reject_thread = fn _ -> {:error, :checkpoint_rejected} end
     assert {:error, :checkpoint_rejected} = AppServer.start_session(workspace, on_thread_started: reject_thread)
   end
