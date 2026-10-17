@@ -15,6 +15,8 @@ The member lifecycle reducer now selects roles from resolved evidence and applie
 candidate, verification, delivery, control and cumulative accounting constraints.
 Role-bound Issue evidence publication now has durable intent and native readback
 for GitHub and GitLab, including recovery after an uncertain send.
+Git-backed command checks now run in isolated verifier worktrees and produce
+host-owned process/output receipts that the publisher attests.
 Child dispatch, artifact verification and the remaining lifecycle below are not
 yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
@@ -247,7 +249,8 @@ outputs, not a wire format that agents may self-certify:
   journal as development under the same authority, scope and inputs.
 - Verification binds that candidate, inputs and policy, with a separate recorded
   verifier thread. Every required command has its exact command, integer exit
-  code and output checksum; every review has a result and rationale. Check
+  code, output checksum, completed reason and an unchanged checked snapshot;
+  every review has a result and rationale. Check
   success is derived by check kind. Missing checks or failed commands cannot be
   overridden by an otherwise clean review.
 - Findings bind original criteria, status, required/advisory classification,
@@ -333,10 +336,65 @@ send may preserve a historical receipt after authority changes, but does not
 grant new execution or make that result current. Every consumer must reconcile
 its own current authority, candidate, inputs and check policy.
 
-This is a publication boundary, not evidence attestation: an engine-authored
-comment does not prove that a command ran or an artifact was retrieved. Actual
-candidate/check producers, authenticated evidence selection, child controls and
+An engine-authored comment alone does not prove that a command ran or an artifact
+was retrieved. Verification publication now attests each supplied command result
+against the host-owned receipts below. Candidate/artifact acquisition,
+authenticated evidence selection, non-Git check inputs, child controls and
 automatic execution wiring remain pending. Version 2 dispatch stays fenced.
+
+## Supervised command checks
+
+`CommandCheck.run/4` executes a policy check for the current verifier generation.
+The candidate's canonical digest, work, scope and fixed inputs must match its
+execution binding. A command policy names `artifact`, the exact `command`
+and a positive finite `timeout_ms`; the selected candidate artifact must identify
+a full Git commit available in the recorded isolated developer worktree.
+Primary checkouts are rejected as executor sources.
+
+The executor creates a separate detached worktree at that commit. Dirty developer
+changes are not copied. A prepared check requires a clean snapshot, including
+untracked/ignored files; interrupted setup retains its intent and cannot adopt
+an unknown directory or redirect its specification through a symlink. The command
+budget is clipped to the remaining cumulative task budget after preparation.
+The supervisor also observes the absolute launch deadline, so process startup
+does not grant another full timeout.
+
+The embedded Python supervisor requires Linux, Python 3, Git, child-subreaper
+support and Landlock ABI 3 or newer. It starts commands with an explicit small
+environment. Commands may write only their check worktree and dedicated temporary
+directory. System runtime/configuration directories and Git metadata are readable;
+host journal receipts and the developer checkout are not writable. Optional
+policy `path` and `read_roots` select installed tools and their read-only runtime
+directories. They participate in the policy digest. Unsupported isolation never
+falls back to an unrestricted command.
+
+The supervisor merges stdout/stderr into a bounded 1 MiB transcript, hashes the
+stored bytes and records actual exit status, termination reason, elapsed time,
+snapshot validity and native stop. Timeouts, cancellation and output overflow
+terminate the process tree. The subreaper also collects background descendants
+that create another session. An ended shell alone is insufficient stop proof.
+Checks that modify tracked candidate content retain stop evidence but cannot
+attest success for the original candidate.
+
+The host journal records `prepared -> running -> completed`. A running check
+without a valid supervisor receipt is recovered by reading, never by relaunching.
+Cancellation requests a stop; its return does not assert that the process has
+stopped. Stale callbacks cannot overwrite later cancellation/recovery.
+`RunJournal.admit/3` and execution-generation rotation both reject replacement
+while host-check stop is unknown, even if the agent thread itself has stopped.
+
+`TaskPublication` compares supplied command results with the matching verifier
+generation's actual receipts and transcripts before publishing. Missing or edited
+receipts, invented exit codes and modified output cannot become verification.
+The lifecycle requires a completed command on an unchanged snapshot; a timeout
+or a supervisor error cannot pass by carrying an exit-code-shaped field.
+Independent review conclusions remain the verifier's evidence-bearing judgments.
+
+Check worktrees and transcripts are separate: once a receipt records the checked
+snapshot, removing that worktree need not erase the command evidence or require
+rerunning it. Retaining the referenced candidate artifact itself remains the
+artifact owner's responsibility. Automatic cleanup, evidence selection and the
+role-aware tool/dispatch integration are still pending.
 
 ## Execution and evidence
 

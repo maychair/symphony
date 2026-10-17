@@ -139,7 +139,11 @@ defmodule SymphonyElixir.ExecutionBinding do
   defp same_work(_, _), do: :ok
 
   defp allocated?(record), do: is_binary(record["thread_id"]) or record["thread_allocation_intent"] == true
-  defp rotatable?(record), do: not allocated?(record) or (text?(record["thread_id"]) and record["native_stop_confirmed"] == true)
+
+  defp rotatable?(record) do
+    SymphonyElixir.CommandCheck.stopped?(record) and
+      (not allocated?(record) or (text?(record["thread_id"]) and record["native_stop_confirmed"] == true))
+  end
 
   defp rotate(record, binding) do
     history = record["execution_history"] || []

@@ -53,7 +53,8 @@ defmodule SymphonyElixir.TaskPublication do
          true <- is_binary(record["thread_id"]) and record["thread_id"] != "",
          true <- is_map(policy) and TaskWorkflow.digest(policy) == binding["policy_sha"],
          true <- text?(policy["engine_actor"]) and summary?(summary) and is_map(payload),
-         true <- role_payload?(kind, payload, binding) do
+         true <- role_payload?(kind, payload, binding),
+         :ok <- attest(kind, record, payload, policy) do
       envelope = %{
         "schema_version" => 1,
         "kind" => kind,
@@ -73,6 +74,9 @@ defmodule SymphonyElixir.TaskPublication do
       _ -> {:error, :invalid_publication_context}
     end
   end
+
+  defp attest("verification", record, payload, policy), do: SymphonyElixir.CommandCheck.attest(record, payload, policy)
+  defp attest(_, _, _, _), do: :ok
 
   defp render(envelope), do: envelope["summary"] <> "\n\n" <> @marker <> TaskWorkflow.canonical_json(envelope) <> " -->\n<!-- symphony-engine-notice -->"
   defp summary?(summary), do: text?(summary) and not String.contains?(summary, "<!-- symphony-")

@@ -27,6 +27,7 @@ defmodule SymphonyElixir.RunJournal do
 
   defp admit_locked(directory, issue_id, opts) do
     with {:ok, previous} <- read(directory),
+         true <- SymphonyElixir.CommandCheck.stopped?(previous || %{}) or {:error, :check_execution_requires_recovery},
          {:ok, record} <- admission(previous, issue_id),
          {:ok, record} <- SymphonyElixir.ExecutionBinding.bind(record, opts[:execution_binding]) do
       {:ok, host} = :inet.gethostname()

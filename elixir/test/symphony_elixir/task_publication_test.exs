@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.TaskPublicationTest do
   use ExUnit.Case, async: true
+  alias SymphonyElixir.CommandCheck
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
   alias SymphonyElixir.TaskPlanPreflight
 
@@ -83,7 +84,13 @@ defmodule SymphonyElixir.TaskPublicationTest do
       Map.take(work, ~w(provider host repository_id))
       |> Map.merge(%{"path" => "team/repo", "api_url" => "https://" <> work["host"] <> if(provider == "github", do: "/api/v3", else: "/api/v4"), "credential" => "$UNUSED_PUBLICATION_FIXTURE"})
 
-    policy = %{"engine_actor" => "99", "max_repairs" => 2, "max_retries" => 2}
+    policy = %{
+      "engine_actor" => "99",
+      "max_repairs" => 2,
+      "max_retries" => 2,
+      "checks" => %{"test" => %{"kind" => "command", "command" => "grep -qx expected result", "artifact" => "output", "timeout_ms" => 2_000}}
+    }
+
     opts = [repositories: [repository], request: request, write_request: writer, policy: policy]
     {:ok, preflight} = TaskPlanPreflight.inspect_plan(parent, opts)
 
@@ -280,10 +287,50 @@ defmodule SymphonyElixir.TaskPublicationTest do
     {:ok, verifier} = RunJournal.admit(Path.dirname(developer["directory"]), developer["issue_id"], execution_binding: binding)
     {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "verifier"})
     payload = Map.take(binding, ~w(candidate inputs policy_sha)) |> Map.merge(%{"checks" => [], "findings" => []})
+    forged = Map.put(payload, "checks", [%{"id" => "test", "exit_code" => 0, "output_sha" => TaskWorkflow.digest("asserted")}])
+    assert {:error, :invalid_publication_context} = TaskPublication.publish(verifier, "verification", forged, "Claimed success", fixture.opts)
     assert {:ok, _, receipt} = TaskPublication.publish(verifier, "verification", payload, "Verification report", fixture.opts)
     assert receipt["work"] == binding["work"]
     assert length(posts(fixture)) == 2
     refute Enum.at(posts(fixture), 0) == Enum.at(posts(fixture), 1)
+  end
+
+  test "a real isolated command receipt is published as evidence by the independent verifier generation" do
+    fixture = fixture("gitlab")
+    source = Path.join(fixture.record["directory"], "fixture-source")
+    workspace = Path.join(fixture.record["directory"], "fixture-developer")
+    File.mkdir_p!(source)
+
+    git = fn args ->
+      {output, 0} = System.cmd("git", ["-C", source | args], stderr_to_stdout: true)
+      String.trim(output)
+    end
+
+    git.(["init", "-q"])
+    File.write!(Path.join(source, "result"), "expected\n")
+    git.(["add", "result"])
+    git.(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-qm", "Report"])
+    revision = git.(["rev-parse", "HEAD"])
+    git.(["worktree", "add", "--detach", workspace, revision])
+    payload = update_in(fixture.payload["artifacts"], &Enum.map(&1, fn artifact -> Map.put(artifact, "version", revision) end))
+    payload = payload.payload
+    {:ok, developer, _} = TaskPublication.publish(fixture.record, "candidate", payload, "Fixed report", fixture.opts)
+    {:ok, developer} = RunJournal.checkpoint(developer, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(developer, "completed")
+    candidate = Map.put(payload, "digest", TaskWorkflow.digest(payload))
+    binding = %{developer["execution_binding"] | "role" => "verifier", "candidate" => candidate["digest"]}
+    {:ok, verifier} = RunJournal.admit(Path.dirname(developer["directory"]), developer["issue_id"], execution_binding: binding)
+    now = System.system_time(:millisecond)
+    flow = TaskWorkflow.new(10_000, now) |> TaskWorkflow.start(now) |> Map.put("schema_version", 2)
+    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "independent-verifier", "workspace" => workspace, "workflow" => flow})
+    assert {:ok, checked, receipt} = CommandCheck.run(verifier, candidate, "test", fixture.opts[:policy])
+    assert receipt["exit_code"] == 0
+    check = receipt |> Map.take(~w(candidate command exit_code output_sha reason snapshot_valid)) |> Map.put("id", "test")
+    report = Map.take(binding, ~w(candidate inputs policy_sha)) |> Map.merge(%{"checks" => [check], "findings" => []})
+    assert {:ok, _, published} = TaskPublication.publish(checked, "verification", report, "Fixed report verified", fixture.opts)
+    assert published["work"] == binding["work"]
+    assert length(posts(fixture)) == 2
+    assert List.last(posts(fixture)) =~ receipt["output_sha"]
   end
 
   test "damaged intents fail before attempting recovery or allowing a new publication" do

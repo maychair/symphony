@@ -96,7 +96,16 @@ defmodule SymphonyElixir.TaskLifecycleTest do
       "source" => "verification",
       "execution" => receipt(record),
       "checks" => [
-        %{"id" => "test", "candidate" => flow["candidate"], "source" => "test", "command" => "make check", "exit_code" => 0, "output_sha" => TaskWorkflow.digest("actual output")},
+        %{
+          "id" => "test",
+          "candidate" => flow["candidate"],
+          "source" => "test",
+          "command" => "make check",
+          "exit_code" => 0,
+          "output_sha" => TaskWorkflow.digest("actual output"),
+          "reason" => "completed",
+          "snapshot_valid" => true
+        },
         %{"id" => "review", "candidate" => flow["candidate"], "source" => "review", "result" => "passed", "rationale" => "All original criteria checked"}
       ],
       "findings" => []
@@ -379,6 +388,8 @@ defmodule SymphonyElixir.TaskLifecycleTest do
     assert assess(put_in(active.evidence["active"], false))["restrictions"]["native_stop"]
     uncertain = fixture() |> put_in([:runtime, "thread_allocation_intent"], true)
     assert assess(uncertain)["restrictions"]["native_stop"]
+    pending_check = put_in(context.runtime["check_runs"], %{"pending" => %{"status" => "running"}})
+    assert assess(pending_check)["restrictions"]["native_stop"]
 
     complete = context |> verified() |> delivered()
     active = complete |> put_in([:runtime, "native_stop_confirmed"], false) |> put_in([:evidence, "active"], true)

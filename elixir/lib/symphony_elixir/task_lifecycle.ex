@@ -284,7 +284,9 @@ defmodule SymphonyElixir.TaskLifecycle do
   defp checks?(_, _, _), do: false
 
   defp check_result?(check, %{"kind" => "command", "command" => command}),
-    do: check["command"] == command and is_integer(check["exit_code"]) and digest?(check["output_sha"])
+    do:
+      check["command"] == command and is_integer(check["exit_code"]) and digest?(check["output_sha"]) and
+        check["reason"] == "completed" and check["snapshot_valid"] == true
 
   defp check_result?(check, %{"kind" => "review"}), do: check["result"] in ["passed", "failed"] and text?(check["rationale"])
   defp passed?(check, %{"kind" => "command"}), do: check["exit_code"] == 0
@@ -382,8 +384,9 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   defp execution_state(record, active) do
     cond do
-      record["native_stop_confirmed"] == true and text?(record["thread_id"]) -> "stopped"
       active and text?(record["thread_id"]) -> "active"
+      not SymphonyElixir.CommandCheck.stopped?(record) -> "uncertain"
+      record["native_stop_confirmed"] == true and text?(record["thread_id"]) -> "stopped"
       record["thread_allocation_intent"] == true or text?(record["thread_id"]) -> "uncertain"
       true -> "idle"
     end
