@@ -112,6 +112,8 @@ defmodule SymphonyElixir.AgentRunner do
       worker_host: worker_host,
       run_record: record,
       tracker_settings: opts[:tracker_settings],
+      execution_policy: opts[:execution_policy],
+      task_native_options: opts[:task_native_options],
       resume_thread_id: record && record["thread_id"],
       expected_turn_id: record && (record["turn_id"] || :no_turns),
       suspend_goal: Execution.enabled?(),

@@ -26,7 +26,7 @@ defmodule SymphonyElixir.TaskEvidence do
          current = Enum.filter(results, &scope?(&1.envelope, plan, member, policy)),
          {:ok, selected} <- latest(current, "candidate"),
          {:ok, candidate, artifacts} <- candidate(selected, runtime, work, opts),
-         {:ok, selected} <- latest_verification(current, candidate, policy),
+         {:ok, selected} <- select_verification(current, candidate, policy, opts),
          {:ok, verification} <- verification(selected, runtime, policy),
          {:ok, after_read} <- NativeWork.read(work, opts),
          true <- NativeWork.snapshot_ref(snapshot) == NativeWork.snapshot_ref(after_read),
@@ -38,6 +38,15 @@ defmodule SymphonyElixir.TaskEvidence do
       {:error, _} = error -> error
       _ -> {:error, :member_evidence_scope_changed}
     end
+  end
+
+  @doc "Read the current candidate without requiring the current verifier publication to be complete."
+  @spec read_candidate(map(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_candidate(plan, work, runtime, policy, opts),
+    do: read_member(plan, work, runtime, policy, Keyword.put(opts, :candidate_only, true))
+
+  defp select_verification(current, candidate, policy, opts) do
+    if opts[:candidate_only], do: {:ok, nil}, else: latest_verification(current, candidate, policy)
   end
 
   defp scope?(%{"binding" => binding} = envelope, plan, member, policy) do
@@ -77,18 +86,26 @@ defmodule SymphonyElixir.TaskEvidence do
 
   defp candidate(nil, _, _, _), do: {:ok, nil, []}
 
-  defp candidate(result, runtime, work, opts) do
+  defp candidate(result, runtime, _work, opts) do
     envelope = result.envelope
     payload = envelope["payload"]
     digest = TaskWorkflow.digest(Map.take(payload, ~w(work contract_sha inputs artifacts)))
-    owner = %{"kind" => "candidate", "work" => work, "revision" => digest}
-    root = Keyword.get_lazy(opts, :artifact_store_root, fn -> if is_binary(runtime["directory"]), do: Path.join(Path.dirname(runtime["directory"]), ".artifacts") end)
 
     with {:ok, _execution} <- execution(envelope, runtime, "developer"),
-         {:ok, artifacts} <- acquire(payload["artifacts"], root, work, owner, opts) do
+         {:ok, artifacts} <- retain_candidate(runtime, payload, opts) do
       value = Map.merge(payload, metadata(result)) |> Map.put("digest", digest)
       {:ok, value, artifacts}
     end
+  end
+
+  @doc "Retain candidate Git outputs before publishing or consuming their immutable references."
+  @spec retain_candidate(map(), map(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  def retain_candidate(runtime, payload, opts) do
+    digest = TaskWorkflow.digest(Map.take(payload, ~w(work contract_sha inputs artifacts)))
+    work = payload["work"]
+    owner = %{"kind" => "candidate", "work" => work, "revision" => digest}
+    root = Keyword.get_lazy(opts, :artifact_store_root, fn -> if is_binary(runtime["directory"]), do: Path.join(Path.dirname(runtime["directory"]), ".artifacts") end)
+    acquire(payload["artifacts"], root, work, owner, opts)
   end
 
   defp acquire(artifacts, root, work, owner, opts) do

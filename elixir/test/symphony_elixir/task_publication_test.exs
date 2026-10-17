@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskPublicationTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.{ArtifactStore, CommandCheck}
+  alias SymphonyElixir.{ArtifactStore, CommandCheck, TaskTools}
+  alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
   alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
   alias SymphonyElixir.{TaskEvidence, TaskLifecycle}
@@ -91,7 +92,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
       "engine_actor" => "99",
       "max_repairs" => 2,
       "max_retries" => 2,
-      "checks" => %{"test" => %{"kind" => "command", "command" => "grep -qx expected result", "artifact" => "output", "timeout_ms" => 2_000}}
+      "checks" => %{"test" => %{"kind" => "command", "command" => "grep -x expected result", "artifact" => "output", "timeout_ms" => 2_000}}
     }
 
     opts = [repositories: [repository], request: request, write_request: writer, policy: policy]
@@ -170,6 +171,210 @@ defmodule SymphonyElixir.TaskPublicationTest do
     {:ok, base, _} = DateTime.from_iso8601("2026-10-17T00:00:00Z")
     time = DateTime.add(base, id) |> DateTime.to_iso8601()
     note(id, 1, body) |> Map.merge(%{"created_at" => time, "updated_at" => time})
+  end
+
+  defp task_tools(fixture, record \\ nil) do
+    record = record || current(fixture)
+    now = System.system_time(:millisecond)
+    flow = TaskWorkflow.new(100_000, now) |> TaskWorkflow.start(now) |> Map.merge(%{"schema_version" => 2, "repair_history" => %{}})
+    {:ok, record} = RunJournal.checkpoint(record, %{"workflow" => flow, "native_stop_confirmed" => false})
+    {:ok, tools} = TaskTools.bind(record, fixture.opts[:policy], fixture.opts)
+    tools
+  end
+
+  defp tool(tools, name, arguments, opts \\ []) do
+    result = DynamicTool.execute(name, arguments, tools, opts)
+    {result["success"], Jason.decode!(result["output"])}
+  end
+
+  defp candidate_args(fixture),
+    do: %{"artifacts" => Enum.map(fixture.payload["artifacts"], &Map.take(&1, ~w(id version))), "summary" => "Fixed candidate ready"}
+
+  defp verifier_tools(fixture, developer) do
+    {:ok, stopped} = RunJournal.checkpoint(developer, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    binding = %{stopped["execution_binding"] | "role" => "verifier", "candidate" => TaskWorkflow.digest(fixture.payload)}
+    {:ok, verifier} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
+    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "tool-verifier", "workspace" => fixture.workspace})
+    task_tools(fixture, verifier)
+  end
+
+  test "role tools publish retained candidates and actual command results through both native providers" do
+    for provider <- ["github", "gitlab"] do
+      f = fixture(provider) |> git_artifact()
+      developer = task_tools(f)
+      assert Enum.map(developer.tool_specs, & &1["name"]) == ["task_context", "task_candidate"]
+      assert developer.agent_environment == %{}
+      assert "UNUSED_PUBLICATION_FIXTURE" in developer.secret_environment_names
+      assert {true, %{"data" => %{"candidate" => nil, "contract" => contract}}} = tool(developer, "task_context", "{}")
+      assert contract["work"] == f.payload["work"]
+      assert {true, %{"data" => receipt}} = tool(developer, "task_candidate", candidate_args(f))
+      assert receipt["work"] == f.payload["work"]
+      assert {true, %{"data" => ^receipt}} = tool(developer, "task_candidate", candidate_args(f))
+      assert length(posts(f)) == 1
+      assert {true, %{"data" => %{"candidate" => candidate}}} = tool(developer, "task_context", %{})
+      assert candidate["artifacts"] == f.payload["artifacts"]
+      verifier = verifier_tools(f, current(f))
+      assert Enum.map(verifier.tool_specs, & &1["name"]) == ["task_context", "task_check", "task_verification"]
+      args = %{"review_checks" => [], "findings" => [], "summary" => "Independent check complete"}
+      assert {false, %{"error" => ":command_check_not_completed"}} = tool(verifier, "task_verification", args)
+      assert {false, %{"error" => ":unassigned_verification_check"}} = tool(verifier, "task_check", %{"check_id" => "foreign"})
+
+      assert {true, %{"data" => %{"exit_code" => 0, "output_sha" => sha, "output" => "expected\n", "output_encoding" => "utf8", "output_truncated" => false}}} =
+               tool(verifier, "task_check", %{"check_id" => "test"})
+
+      assert {true, %{"data" => %{"output_sha" => ^sha}}} = tool(verifier, "task_check", %{"check_id" => "test"})
+      assert {true, %{"data" => verified}} = tool(verifier, "task_verification", args)
+      assert {true, %{"data" => ^verified}} = tool(verifier, "task_verification", args)
+      assert length(posts(f)) == 2
+      assert {:ok, facts} = evidence(f, current(f))
+      assert facts.verification["source"] == verified["source"]
+      assert hd(facts.verification["checks"])["output_sha"] == sha
+      assert {false, %{"error" => ":task_execution_no_longer_owned"}} = tool(developer, "task_context", %{})
+    end
+  end
+
+  test "bound task sessions reject policy substitution, copied callers, scope overrides and unsupported tools" do
+    f = fixture("github") |> git_artifact()
+    developer = task_tools(f)
+    assert {:error, :invalid_task_tool_binding} = TaskTools.bind(current(f), %{}, f.opts)
+    assert {:error, :invalid_task_tool_binding} = TaskTools.bind(%{}, nil, f.opts)
+    missing_policy = [run_record: current(f), dynamic_tool_binding: %{}]
+    options = [run_record: current(f), execution_policy: f.opts[:policy], task_native_options: f.opts]
+    assert {:error, :invalid_task_tool_binding} = DynamicTool.bind_session(missing_policy)
+    assert {:ok, bound} = DynamicTool.bind_session(options)
+    assert Map.has_key?(bound, :task_execution)
+    foreign = Task.async(fn -> tool(developer, "task_context", %{}) end)
+    assert {false, %{"error" => ":task_tool_owner_mismatch"}} = Task.await(foreign)
+    assert {false, %{"error" => ":task_tool_owner_mismatch"}} = tool(developer, "task_context", %{}, issue: %{id: "foreign"})
+    assert {true, _} = tool(developer, "task_context", %{}, issue: %{id: f.record["issue_id"]})
+
+    for {name, args} <- [
+          {"task_check", %{"check_id" => "test"}},
+          {"task_handoff", %{}},
+          {"github_api", %{}},
+          {"task_candidate", Map.put(candidate_args(f), "work", %{})},
+          {"task_context", %{"policy" => %{}}}
+        ] do
+      assert {false, %{"error" => ":invalid_task_tool_call"}} = tool(developer, name, args)
+    end
+
+    for args <- ["invalid json", "[]", nil, []] do
+      assert {false, %{"error" => ":invalid_task_tool_arguments"}} = tool(developer, "task_context", args)
+    end
+
+    for artifacts <- [[], [nil], [%{"id" => "foreign", "version" => f.git.revision}], [%{"id" => "output", "version" => f.git.revision, "source" => "invented"}]] do
+      assert {false, %{"error" => ":candidate_outputs_do_not_match_contract"}} =
+               tool(developer, "task_candidate", Map.put(candidate_args(f), "artifacts", artifacts))
+    end
+
+    assert posts(f) == []
+    {:ok, _} = RunJournal.checkpoint(current(f), %{"native_stop_confirmed" => true})
+    assert {false, %{"error" => ":task_execution_no_longer_owned"}} = tool(developer, "task_context", %{})
+  end
+
+  test "task tools retain native pause receipts, respect budgets and reject changed parent identity" do
+    f = fixture("gitlab") |> git_artifact()
+    tools = task_tools(f)
+    original = Agent.get(f.state, & &1.objects[f.parent_notes])
+    pause = control(f, :parent, "pause", 10)
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], original ++ [pause]))
+    assert {false, %{"error" => ":task_execution_controlled"}} = tool(tools, "task_candidate", candidate_args(f))
+    assert {true, %{"data" => %{"controls" => [%{"kind" => "pause"}]}}} = tool(tools, "task_context", %{})
+    assert map_size(current(f)["control_receipts"]) == 1
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], original))
+    assert {false, %{"error" => ":control_source_unconfirmed"}} = tool(tools, "task_context", %{})
+    source = hd(Map.values(current(f)["control_receipts"]))
+    resume = control(f, :parent, "resume", 11, %{"restriction" => source})
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], original ++ [pause, resume]))
+    record = current(f)
+    {:ok, _} = RunJournal.checkpoint(record, %{"workflow" => Map.put(record["workflow"], "used_ms", 100_000)})
+    assert {false, %{"error" => ":task_execution_controlled"}} = tool(tools, "task_candidate", candidate_args(f))
+    assert posts(f) == []
+    record = current(f)
+    {:ok, _} = RunJournal.checkpoint(record, %{"workflow" => Map.delete(record["workflow"], "budget_ms")})
+    assert {false, %{"error" => ":task_execution_controlled"}} = tool(tools, "task_candidate", candidate_args(f))
+    parent_path = String.replace_suffix(f.parent_notes, "/notes", "")
+    Agent.update(f.state, &put_in(&1.objects[parent_path]["state"], "closed"))
+    assert {false, %{"error" => ":parent_not_open"}} = tool(tools, "task_context", %{})
+  end
+
+  test "a verifier can submit only configured review checks and cannot replace a generation result" do
+    f = fixture("github") |> git_artifact()
+    policy = Map.put(f.opts[:policy], "checks", %{"test" => %{"kind" => "review"}})
+    binding = Map.put(f.record["execution_binding"], "policy_sha", TaskWorkflow.digest(policy))
+    {:ok, stopped} = RunJournal.checkpoint(f.record, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    {:ok, developer} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
+    {:ok, developer} = RunJournal.checkpoint(developer, %{"thread_id" => "review-developer"})
+    f = %{f | opts: Keyword.put(f.opts, :policy, policy)}
+    tools = task_tools(f, developer)
+    assert {true, _} = tool(tools, "task_candidate", candidate_args(f))
+    verifier = verifier_tools(f, current(f))
+
+    args = %{
+      "review_checks" => [%{"id" => "test", "result" => "passed", "rationale" => "Checked the fixed source against result criterion"}],
+      "findings" => [],
+      "summary" => "Independent source review"
+    }
+
+    for checks <- [[], [nil], [%{"id" => "test", "result" => "passed", "rationale" => "okay", "exit_code" => 0}]] do
+      assert {false, %{"error" => ":review_checks_do_not_match_policy"}} = tool(verifier, "task_verification", %{args | "review_checks" => checks})
+    end
+
+    assert {false, %{"error" => ":invalid_verification_findings"}} = tool(verifier, "task_verification", %{args | "findings" => [%{"id" => "unsupported"}]})
+    assert {true, _} = tool(verifier, "task_verification", args)
+    changed = put_in(args["review_checks"], [%{"id" => "test", "result" => "failed", "rationale" => "Changed opinion"}])
+    assert {false, %{"error" => ":execution_result_already_submitted"}} = tool(verifier, "task_verification", changed)
+    assert length(posts(f)) == 2
+  end
+
+  test "a pause first observed during candidate retrieval stops host checks and survives source disappearance" do
+    f = fixture("gitlab") |> git_artifact()
+    developer = task_tools(f)
+    assert {true, _} = tool(developer, "task_candidate", candidate_args(f))
+    _verifier = verifier_tools(f, current(f))
+    original = Agent.get(f.state, & &1.objects[f.parent_notes])
+    request = f.opts[:request]
+    Process.put(:task_tools_parent_reads, 0)
+
+    wrapped = fn provider, method, path, query, settings ->
+      if path == f.parent_notes do
+        count = Process.get(:task_tools_parent_reads) + 1
+        Process.put(:task_tools_parent_reads, count)
+        if count == 3, do: Agent.update(f.state, &put_in(&1.objects[f.parent_notes], original ++ [control(f, :parent, "pause", 10)]))
+      end
+
+      request.(provider, method, path, query, settings)
+    end
+
+    opts = Keyword.put(f.opts, :request, wrapped)
+    {:ok, tools} = TaskTools.bind(current(f), f.opts[:policy], opts)
+    assert {false, %{"error" => ":task_execution_controlled"}} = tool(tools, "task_check", %{"check_id" => "test"})
+    assert map_size(current(f)["control_receipts"]) == 1
+    assert current(f)["check_runs"] in [nil, %{}]
+    Agent.update(f.state, &put_in(&1.objects[f.parent_notes], original))
+    assert {false, %{"error" => ":control_source_unconfirmed"}} = tool(tools, "task_check", %{"check_id" => "test"})
+  end
+
+  test "changed candidate and closed member facts cannot be used by an older bound role" do
+    f = fixture("github") |> git_artifact()
+    tools = task_tools(f)
+    assert {true, _} = tool(tools, "task_candidate", candidate_args(f))
+    {:ok, developer} = RunJournal.checkpoint(current(f), %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(developer, "completed")
+    binding = %{developer["execution_binding"] | "role" => "verifier", "candidate" => TaskWorkflow.digest("different candidate")}
+    {:ok, record} = RunJournal.admit(Path.dirname(developer["directory"]), developer["issue_id"], execution_binding: binding)
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "stale-candidate-verifier"})
+    verifier = task_tools(f, record)
+    assert {false, %{"error" => ":task_candidate_changed"}} = tool(verifier, "task_check", %{"check_id" => "test"})
+    notes = Agent.get(f.state, & &1.objects[f.notes])
+    Agent.update(f.state, &put_in(&1.objects[f.notes], Enum.map(notes, fn note -> Map.update!(note, "body", fn body -> body <> "edited" end) end)))
+    assert {false, %{"error" => ":unrecorded_native_result"}} = tool(verifier, "task_check", %{"check_id" => "test"})
+    Agent.update(f.state, &put_in(&1.objects[f.notes], notes))
+    Agent.update(f.state, &put_in(&1.objects[f.child]["state"], "closed"))
+    assert {false, %{"error" => ":task_tool_scope_changed"}} = tool(verifier, "task_context", %{})
+    assert length(posts(f)) == 1
   end
 
   test "parent and child pauses fence native writes and persist source memory before returning a blocked result" do

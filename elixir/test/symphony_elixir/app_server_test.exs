@@ -1,6 +1,76 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "bound execution sessions advertise only role tools and reject legacy mutation calls on the real protocol" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "workspaces/bound-tools")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "bound-server")
+    trace = Path.join(root, "bound-requests.jsonl")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    def emit(value):print(json.dumps(value),flush=True)
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialized':continue
+      if m=='initialize':result={}
+      elif m=='thread/start':result={'thread':{'id':'bound-native'}}
+      elif m=='turn/start':
+        emit({'id':q['id'],'result':{'turn':{'id':'bound-turn'}}})
+        emit({'id':76,'method':'item/tool/call','params':{'tool':'task_context','arguments':{}}})
+        continue
+      elif q.get('id')==76:
+        assert q['result']['success'] is False
+        assert 'root_task_tools_only' in q['result']['contentItems'][0]['text']
+        emit({'id':77,'method':'item/tool/call','params':{'tool':'task_handoff','arguments':{},'callId':'forbidden','threadId':'bound-native','turnId':'bound-turn'}})
+        continue
+      elif q.get('id')==77:
+        assert q['result']['success'] is False
+        emit({'method':'turn/completed','params':{'threadId':'bound-native','turn':{'id':'bound-turn','status':'completed'}}})
+        continue
+      else:raise AssertionError('Unexpected method: '+str(m))
+      emit({'id':q['id'],'result':result})
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace), codex_command: binary)
+    work = %{"provider" => "github", "host" => "github.test", "repository_id" => "1", "kind" => "issue", "number" => 2}
+    sha = SymphonyElixir.TaskWorkflow.digest("scope")
+    policy = %{"engine_actor" => "99", "max_retries" => 2, "max_repairs" => 2, "checks" => %{"review" => %{"kind" => "review"}}}
+
+    for role <- ["developer", "verifier"] do
+      binding = %{
+        "work" => work,
+        "role" => role,
+        "plan_revision" => sha,
+        "contract_sha" => sha,
+        "policy_sha" => SymphonyElixir.TaskWorkflow.digest(policy),
+        "inputs" => [],
+        "candidate" => if(role == "verifier", do: sha),
+        "authority" => %{"work" => %{work | "number" => 1}, "actor" => "1", "source" => "note:1", "revision" => sha}
+      }
+
+      {:ok, record} = SymphonyElixir.RunJournal.admit(Path.join(root, "runs"), role, execution_binding: binding)
+      assert {:error, :invalid_task_tool_binding} = AppServer.start_session(workspace, run_record: record)
+      opts = [run_record: record, execution_policy: policy, dynamic_tool_binding: %{tool_specs: [%{"name" => "unsafe"}]}]
+      {:ok, session} = AppServer.start_session(workspace, opts)
+      expected = if role == "developer", do: ["task_context", "task_candidate"], else: ["task_context", "task_check", "task_verification"]
+      assert Enum.map(session.dynamic_tool_binding.tool_specs, & &1["name"]) == expected
+      issue = %Issue{id: role, identifier: role, title: "Bound task", state: "open"}
+      assert {:ok, _} = AppServer.run_turn(session, "Probe forbidden legacy tool", issue)
+      :ok = AppServer.stop_session(session)
+    end
+
+    requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    starts = Enum.filter(requests, &(&1["method"] == "thread/start"))
+    assert length(starts) == 2
+    assert Enum.all?(starts, fn start -> Enum.all?(start["params"]["dynamicTools"], &String.starts_with?(&1["name"], "task_")) end)
+    assert Enum.count(requests, &(&1["id"] == 77 and get_in(&1, ["result", "success"]) == false)) == 2
+  end
+
   test "stop after native thread allocation prevents turn allocation and verifies the empty thread" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "workspaces/stopped")

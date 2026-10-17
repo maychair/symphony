@@ -14,7 +14,9 @@ Native execution generation fencing is available for role separation and recover
 The member lifecycle reducer now selects roles from resolved evidence and applies
 candidate, verification, delivery, control and cumulative accounting constraints.
 Role-bound Issue evidence publication now has durable intent and native readback
-for GitHub and GitLab, including recovery after an uncertain send.
+for GitHub and GitLab, including recovery after an uncertain send. Bound Codex
+sessions now expose dedicated developer/verifier tools for native context,
+retained candidates, configured host checks and independent verification.
 Git-backed command checks now run in isolated verifier worktrees and produce
 host-owned process/output receipts that the publisher attests.
 Native result selection now checks journal/native identities, retrieves and retains
@@ -401,6 +403,65 @@ was retrieved. Verification publication now attests each supplied command result
 against the host-owned receipts below. Git-backed result acquisition and
 selection, local retention and native control checks are implemented; non-Git check inputs and
 automatic execution wiring remain pending. Version 2 dispatch stays fenced.
+
+## Role-bound execution tools
+
+An app-server session carrying an `execution_binding` must also receive the exact
+`execution_policy` whose digest it names. `DynamicTool.bind_session/1` selects
+`TaskTools` before starting the native transport; missing or substituted policy
+fails session startup. Such a session cannot select a general tracker binding
+through `dynamic_tool_binding`. Legacy and standalone-review sessions retain
+their existing tool bindings. `AgentRunner` forwards the bound policy and the
+trusted native repository options prepared by the executor admission path.
+
+The tool set is role-specific:
+
+| Tool | Role | Effect |
+|---|---|---|
+| `task_context` | Developer/verifier | Read the sealed contract, fixed binding, native candidate, source references, restrictions and configured checks |
+| `task_candidate` | Developer | Retrieve and retain each declared Git output, then publish one candidate with native readback |
+| `task_check` | Verifier | Run an assigned configured command against the fixed candidate through the host check supervisor |
+| `task_verification` | Verifier | Combine host command receipts with explicit review checks and source-bound findings, then publish the independent result |
+
+The execution process, attempt, generation and binding are captured when the
+session is created. Every call checks the actual caller and current journal,
+requires its lock and live native thread, and re-reads the sealed plan and native
+controls. Bound sessions require root thread/turn identities on native tool
+requests even when the global legacy goal-mode flag is disabled. A copied binding, superseded attempt, stopped execution, closed member,
+changed scope or missing remembered control source cannot execute a tool. Native
+repository credentials are excluded from the agent environment; credential
+references and provider options stay in the host's captured context.
+
+Write/check tools additionally require an active v2 budget ledger with no local
+or native restrictions and remaining member budget. The context tool can explain
+a pause without releasing it. Candidate reads may observe a newer pause than
+the first scope check: those receipts are checkpointed and enforced before a
+host check starts. Publication performs its own fresh native scope and control
+checks. These reads are not an atomic transaction across providers.
+
+Agents supply candidate output IDs and Git revisions. The host derives kinds,
+work identity, input bindings and retrieval sources from the sealed contract and
+execution; missing, duplicate or undeclared outputs are rejected. The artifact
+store must retain the actual fixed bytes before publication. Only one immutable
+result payload may be submitted by a generation; identical retries reuse native
+receipts. A different result requires a reconciled new execution generation.
+
+Verifiers cannot supply commands, raw exit codes or arbitrary command results.
+`task_check` accepts only a check ID; configured commands run through
+`CommandCheck`. Results include up to 16 KiB of integrity-checked output, with an
+explicit encoding and truncation flag; the checksum covers the complete output.
+Verification combines its actual durable receipts with exactly
+the required review check IDs and validates finding criteria/source references.
+The lifecycle still decides technical pass, repair or an unresolved decision.
+A submission never grants human acceptance, approval, merge, Issue closure or
+new task creation. A candidate-only evidence read does not require an unfinished
+verification publication to be complete, so prepared verifier results can resume.
+
+This tool boundary is connected to app-server sessions, but is not automatic
+plan admission. The v2 dispatch guard remains until current dependencies,
+delivery facts, role workspaces and lifecycle scheduling are connected. Non-Git
+candidate materialization and native question/decision tools remain pending;
+these tools must not be used to bypass those missing lifecycle paths.
 
 ## Supervised command checks
 

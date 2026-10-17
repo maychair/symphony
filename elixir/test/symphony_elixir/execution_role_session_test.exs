@@ -35,6 +35,8 @@ defmodule SymphonyElixir.ExecutionRoleSessionTest do
     {:ok, root: root, workspace: workspace, mode: mode, trace: trace}
   end
 
+  defp role_policy, do: %{"engine_actor" => "99", "max_retries" => 2, "max_repairs" => 2, "checks" => %{"review" => %{"kind" => "review"}}}
+
   defp role_binding(role) do
     work = %{"provider" => "github", "host" => "github.test", "repository_id" => "1", "kind" => "issue", "number" => 2}
     revision = TaskWorkflow.digest("plan")
@@ -44,7 +46,7 @@ defmodule SymphonyElixir.ExecutionRoleSessionTest do
       "role" => role,
       "plan_revision" => revision,
       "contract_sha" => TaskWorkflow.digest("contract"),
-      "policy_sha" => TaskWorkflow.digest("policy"),
+      "policy_sha" => TaskWorkflow.digest(role_policy()),
       "authority" => %{"work" => %{work | "number" => 1}, "source" => "native-approval", "actor" => "1", "revision" => revision},
       "inputs" => [],
       "candidate" => if(role == "verifier", do: TaskWorkflow.digest("candidate"))
@@ -60,6 +62,7 @@ defmodule SymphonyElixir.ExecutionRoleSessionTest do
   defp session_options(record) do
     [
       run_record: record,
+      execution_policy: role_policy(),
       resume_thread_id: record["thread_id"],
       on_thread_intent: fn -> checkpoint(record, %{"thread_allocation_intent" => true}) end,
       on_thread_started: fn thread -> checkpoint(record, %{"thread_id" => thread}) end
@@ -69,6 +72,9 @@ defmodule SymphonyElixir.ExecutionRoleSessionTest do
   defp complete_role(context, record, thread) do
     File.write!(context.mode, thread)
     assert {:ok, session} = AppServer.start_session(context.workspace, session_options(record))
+    tools = Enum.map(session.dynamic_tool_binding.tool_specs, & &1["name"])
+    assert "task_candidate" in tools == (record["execution_binding"]["role"] == "developer")
+    assert "task_verification" in tools == (record["execution_binding"]["role"] == "verifier")
     issue = %Issue{id: "2", identifier: "ROLE-2", title: "Role protocol fixture", state: "Todo"}
 
     try do

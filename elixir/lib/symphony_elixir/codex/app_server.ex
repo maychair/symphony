@@ -45,12 +45,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
-    dynamic_tool_binding = Keyword.get_lazy(opts, :dynamic_tool_binding, fn -> DynamicTool.bind(opts[:tracker_settings]) end)
 
     on_thread_intent = Keyword.get(opts, :on_thread_intent, fn -> :ok end)
     on_thread_started = Keyword.get(opts, :on_thread_started, fn _id -> :ok end)
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+    with {:ok, dynamic_tool_binding} <- DynamicTool.bind_session(opts),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       metadata = port_metadata(port, worker_host)
 
@@ -91,8 +91,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     policies.approval_policy == "never"
   end
 
-  defp execution_context(executor, thread_id, turn_id, _binding) do
-    strict = Config.settings!().agent.goal_mode
+  defp execution_context(executor, thread_id, turn_id, binding) do
+    strict = Config.settings!().agent.goal_mode or Map.has_key?(binding, :task_execution)
     %{executor: executor, thread_id: thread_id, turn_id: turn_id, strict: strict}
   end
 

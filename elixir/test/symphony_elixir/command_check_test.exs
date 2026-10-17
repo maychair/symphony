@@ -65,11 +65,18 @@ defmodule SymphonyElixir.CommandCheckTest do
     assert File.read!(Path.join(context.primary, "input")) == "approved\n"
     output = File.read!(Path.join(check_dir(saved, receipt["id"]), "output"))
     assert output == "approved\nstderr\n"
+    assert {:ok, %{"output" => ^output, "output_encoding" => "utf8", "output_truncated" => false}} = CommandCheck.output(saved, receipt["id"])
     assert receipt["output_sha"] == Base.encode16(:crypto.hash(:sha256, output), case: :lower)
     assert :ok = CommandCheck.attest(saved, %{"checks" => [check(receipt)]}, context.policy)
     assert :ok = CommandCheck.attest(saved, %{"checks" => [check(receipt), %{"id" => "review"}]}, context.policy)
     assert {:ok, _, ^receipt} = run(context, saved)
     assert {:error, :stale_or_unowned_execution_checkpoint} = run(context)
+  end
+
+  test "binary command output is explicitly encoded rather than corrupting the tool response" do
+    context = fixture(~S|printf '\377'|)
+    {:ok, saved, receipt} = run(context)
+    assert {:ok, %{"output" => "/w==", "output_encoding" => "base64", "output_truncated" => false}} = CommandCheck.output(saved, receipt["id"])
   end
 
   test "actual command evidence cannot be replaced by success booleans, different exits or edited logs" do
@@ -82,6 +89,8 @@ defmodule SymphonyElixir.CommandCheckTest do
 
     assert {:error, :command_evidence_not_attested} = CommandCheck.attest(saved, %{"checks" => nil}, context.policy)
     File.write!(Path.join(check_dir(saved, receipt["id"]), "output"), "changed")
+    assert {:error, :check_output_unconfirmed} = CommandCheck.output(saved, receipt["id"])
+    assert {:error, :check_output_unconfirmed} = CommandCheck.output(saved, "missing")
     assert {:error, :check_receipt_unconfirmed} = CommandCheck.recover(saved, receipt["id"])
     assert {:error, :command_evidence_not_attested} = CommandCheck.attest(saved, %{"checks" => [check(receipt)]}, context.policy)
   end
@@ -124,6 +133,8 @@ defmodule SymphonyElixir.CommandCheckTest do
     {:ok, saved, receipt} = run(context)
     assert receipt["reason"] == "output_limit"
     assert receipt["output_bytes"] == 1_048_576
+    assert {:ok, %{"output" => preview, "output_truncated" => true}} = CommandCheck.output(saved, receipt["id"])
+    assert byte_size(preview) == 16_384
     assert byte_size(File.read!(Path.join(check_dir(saved, receipt["id"]), "output"))) == 1_048_576
     assert receipt["native_stop_confirmed"]
   end

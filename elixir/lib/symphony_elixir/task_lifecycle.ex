@@ -20,7 +20,7 @@ defmodule SymphonyElixir.TaskLifecycle do
          %{} = member <- context.plan.members[WorkRef.key(context.work)],
          {:ok, _} <- TaskPlan.member(context.plan.plan, context.work, member.contract["contract_sha"]),
          true <- native_scope?(context, member) or {:error, :inconsistent_plan_evidence},
-         :ok <- policy(context.policy, member.contract),
+         :ok <- validate_policy(context.policy, member.contract),
          :ok <- observation(context.evidence, context.runtime),
          {:ok, flow} <- ledger(context.runtime["workflow"], member.contract["budget_ms"], now) do
       context = Map.put(context, :member, member)
@@ -50,7 +50,9 @@ defmodule SymphonyElixir.TaskLifecycle do
       authority["source"] in Enum.map(notes, &TaskDecision.source_ref/1)
   end
 
-  defp policy(policy, contract) when is_map(policy) do
+  @doc "Validate the finite verification policy against the sealed member criteria."
+  @spec validate_policy(term(), map()) :: :ok | {:error, atom()}
+  def validate_policy(policy, contract) when is_map(policy) do
     valid =
       nonnegative?(policy["max_retries"]) and nonnegative?(policy["max_repairs"]) and text?(policy["engine_actor"]) and
         check_assignments?(policy["checks"], contract["verification_checks"], contract["criteria"])
@@ -58,7 +60,7 @@ defmodule SymphonyElixir.TaskLifecycle do
     if valid, do: :ok, else: {:error, :incomplete_verification_policy}
   end
 
-  defp policy(_, _), do: {:error, :incomplete_verification_policy}
+  def validate_policy(_, _), do: {:error, :incomplete_verification_policy}
 
   defp check_assignments?(checks, assignments, criteria) when is_map(checks) and is_map(assignments) do
     map_size(checks) > 0 and Enum.all?(checks, &check_policy?/1) and
@@ -312,7 +314,7 @@ defmodule SymphonyElixir.TaskLifecycle do
   defp findings(flow, verification, context) do
     findings = verification["findings"]
 
-    if Enum.all?(findings, &finding?(&1, context)) do
+    if validate_findings(findings, context.member.contract["criteria"], context.evidence["sources"]) == :ok do
       required = Enum.filter(findings, &(&1["required"] and &1["status"] == "valid"))
 
       cond do
@@ -333,14 +335,20 @@ defmodule SymphonyElixir.TaskLifecycle do
     end
   end
 
-  defp finding?(finding, context) when is_map(finding) do
-    text?(finding["id"]) and finding["criterion"] in context.member.contract["criteria"] and
-      finding["status"] in ["valid", "fixed", "unsubstantiated", "unknown"] and is_boolean(finding["required"]) and
-      text?(finding["rationale"]) and Enum.all?(~w(problem_sha repair_basis_sha), &digest?(finding[&1])) and
-      strings?(finding["evidence"]) and Enum.all?(finding["evidence"], &source?(context, &1))
+  @doc "Check finding structure, original criteria and current evidence references before publication or repair."
+  @spec validate_findings(term(), [String.t()], [String.t()]) :: :ok | {:error, atom()}
+  def validate_findings(findings, criteria, sources) do
+    if is_list(findings) and Enum.all?(findings, &finding?(&1, criteria, sources)), do: :ok, else: {:error, :invalid_verification_findings}
   end
 
-  defp finding?(_, _), do: false
+  defp finding?(finding, criteria, sources) when is_map(finding) do
+    text?(finding["id"]) and finding["criterion"] in criteria and
+      finding["status"] in ["valid", "fixed", "unsubstantiated", "unknown"] and is_boolean(finding["required"]) and
+      text?(finding["rationale"]) and Enum.all?(~w(problem_sha repair_basis_sha), &digest?(finding[&1])) and
+      strings?(finding["evidence"]) and Enum.all?(finding["evidence"], &(&1 in sources))
+  end
+
+  defp finding?(_, _, _), do: false
 
   defp repair(flow, findings, context) do
     signature = findings |> Enum.map(&Map.take(&1, ~w(criterion problem_sha repair_basis_sha))) |> Enum.uniq() |> Enum.sort() |> TaskWorkflow.digest()

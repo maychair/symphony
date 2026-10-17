@@ -35,6 +35,24 @@ defmodule SymphonyElixir.CommandCheck do
     end
   end
 
+  @doc "Read a bounded output preview only when its bytes still match the completed host receipt."
+  @spec output(map(), String.t()) :: {:ok, map()} | {:error, atom()}
+  def output(record, id) do
+    with %{"id" => ^id, "status" => "completed", "receipt" => %{} = receipt} <- check_entry(record, id),
+         {:ok, bytes} <- File.read(Path.join(directory(record, id), "output")),
+         sha = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+         true <- byte_size(bytes) == receipt["output_bytes"] and sha == receipt["output_sha"] do
+      preview = binary_part(bytes, 0, min(byte_size(bytes), 16_384))
+      utf8 = String.valid?(preview)
+      output = if utf8, do: preview, else: Base.encode64(preview)
+      encoding = if utf8, do: "utf8", else: "base64"
+      truncated = byte_size(bytes) > byte_size(preview)
+      {:ok, %{"output" => output, "output_encoding" => encoding, "output_truncated" => truncated}}
+    else
+      _ -> {:error, :check_output_unconfirmed}
+    end
+  end
+
   @doc "A stopped agent thread cannot permit replacement while a host check still has unknown stop state."
   @spec stopped?(map()) :: boolean()
   def stopped?(record) do
