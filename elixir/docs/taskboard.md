@@ -36,6 +36,12 @@ queue, native Goal state, and acceptance protocol remain authoritative.
 | Human Review | Runtime blocked, `symphony:review`/`symphony:blocked`/`symphony:failed`, accepted but still open, or externally closed without acceptance |
 | Done | Tracker state is closed/cancelled/done **and** `symphony:accept` is present |
 
+When `tracker.assignee` is configured, the local projection includes only Issues whose normalized
+`assignee_id` matches that tracker identity. Managed Workspace workflows configure this field to
+the current operator, so Issues assigned to another person, unassigned Issues, and Issues without a
+single normalized assignee stay off the personal board. Without `tracker.assignee`, the projection
+keeps its project-wide behavior.
+
 The projection checks Done before any runtime state. This prevents a stale agent process or retry
 entry from moving a verified closed Issue back into execution. An open Issue with
 `symphony:accept` stays in Human Review with `accepted; awaiting closure`; it cannot be accepted or

@@ -124,6 +124,23 @@ defmodule SymphonyElixir.TaskboardTest do
            ] = by_id["MOCK-1"].artifacts
   end
 
+  test "projects only Issues assigned to the configured tracker owner", %{settings: settings} do
+    assigned = %{issue("20", "MOCK-20", "Assigned", "Todo", ["symphony:ready"]) | assignee_id: "20"}
+    another = %{issue("21", "MOCK-21", "Another owner", "Todo", ["symphony:ready"]) | assignee_id: "21"}
+    unassigned = issue("22", "MOCK-22", "Unassigned", "Todo", ["symphony:ready"])
+    settings = put_in(settings.tracker.assignee, "20")
+
+    snapshot =
+      Taskboard.snapshot(
+        settings: settings,
+        issues_fun: fn _states -> [assigned, another, unassigned] end,
+        runtime_snapshot_fun: fn -> %{} end
+      )
+
+    assert [%{issue_identifier: "MOCK-20", column: "Todo"}] = snapshot.cards
+    assert snapshot.counts == %{"Todo" => 1, "In Progress" => 0, "Human Review" => 0, "Done" => 0}
+  end
+
   test "detail combines repository content, comments, delivery review, and execution evidence", %{
     settings: settings
   } do

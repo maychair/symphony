@@ -27,7 +27,8 @@ GitHub, GitLab, or memory-backed Issues, execution manifests, and the runtime sn
 keep a second task database. Its four columns are user-facing views over tracker state, labels, and
 Symphony execution observations. Cards open the native Issue in a new tab and expose delivered MRs
 or reports as separate links. Linked MRs are read from the tracker, while report evidence comes from
-the execution manifest. Human Review cards state the concrete acceptance or decision action.
+the execution manifest. When `tracker.assignee` is configured, the personal projection includes
+only Issues assigned to that identity. Human Review cards state the concrete acceptance or decision action.
 Issue operations take place in the tracker. See
 [Taskboard](docs/taskboard.md) for state mapping, operator authentication, and the JSON API.
 
@@ -457,7 +458,7 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 
 See [repository execution](docs/repository-issues.md) for native Goal sessions, durable execution records and handoffs.
 
-Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
+Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies to the personal Taskboard projection, admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
 
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR, posts the deduplicated review notification and requests the engine-owned `symphony:review` label, without another Agent call. Handoff never writes or removes the human `symphony:ready` authorization label. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
 

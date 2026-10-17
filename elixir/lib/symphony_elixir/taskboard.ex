@@ -273,6 +273,7 @@ defmodule SymphonyElixir.Taskboard do
 
       cards =
         issues
+        |> assigned_to(project.settings.tracker)
         |> Enum.map(fn
           %Issue{} = issue ->
             card_payload(
@@ -317,6 +318,16 @@ defmodule SymphonyElixir.Taskboard do
         failed_project(project, reason)
     end
   end
+
+  defp assigned_to(issues, %{assignee: assignee})
+       when is_binary(assignee) and assignee != "" do
+    Enum.filter(issues, fn
+      %Issue{assignee_id: ^assignee} -> true
+      _ -> false
+    end)
+  end
+
+  defp assigned_to(issues, _tracker), do: issues
 
   defp failed_project(project, reason) do
     project
