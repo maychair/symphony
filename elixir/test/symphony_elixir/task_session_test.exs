@@ -2,6 +2,7 @@ defmodule SymphonyElixir.TaskSessionTest do
   use SymphonyElixir.TestSupport, runtime: false
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{RunJournal, TaskExecution, TaskObserver, TaskPlan, TaskSession, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.TaskPlanExecution
 
   defp contract(work, parent) do
     data = %{
@@ -165,6 +166,291 @@ defmodule SymphonyElixir.TaskSessionTest do
 
   defp current(c), do: elem(SymphonyElixir.RunJournal.read(c.record["directory"]), 1)
   defp requests(c), do: c.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+
+  defp scheduler_options(c) do
+    policy = c.registry[WorkRef.key(c.work)].policy
+    repositories = Enum.map(c.opts[:repositories], &Map.put(&1, "execution", %{"policy" => policy}))
+    provider = %{"plan_roots" => [c.parent], "plan_repositories" => repositories}
+    path = Workflow.workflow_file_path()
+    workflow = String.replace(File.read!(path), "tracker:\n", "tracker:\n  provider: " <> Jason.encode!(provider) <> "\n")
+    workflow = String.replace(workflow, "agent:\n", "agent:\n  run_journal_dir: " <> Jason.encode!(Path.dirname(c.record["directory"])) <> "\n")
+    File.write!(path, workflow)
+    WorkflowStore.force_reload()
+    Keyword.delete(c.opts, :repositories)
+  end
+
+  defp start_scheduler(opts) do
+    supervisor = start_supervised!({Task.Supervisor, []})
+    start_orchestrator(supervisor, opts)
+  end
+
+  defp start_orchestrator(supervisor, opts) do
+    options = [name: SymphonyElixir.TaskSessionOrchestrator, task_supervisor: supervisor, plan_options: opts]
+    start_supervised!({Orchestrator, options})
+  end
+
+  defp await_scheduler(fun, attempts \\ 500)
+  defp await_scheduler(_fun, 0), do: flunk("scheduler did not reach the expected state")
+
+  defp await_scheduler(fun, attempts) do
+    case fun.() do
+      value when value in [false, nil] ->
+        Process.sleep(10)
+        await_scheduler(fun, attempts - 1)
+
+      value ->
+        value
+    end
+  end
+
+  @tag :unadmitted
+  test "the existing scheduler discovers a configured plan and continues through independent repair roles", c do
+    owner = self()
+
+    ready = fn record ->
+      generation = record["execution_generation"]
+      mode = Enum.at(["develop", "reject", "develop", "verify"], generation - 1)
+      File.write!(c.mode, mode)
+      send(owner, {:scheduled_role, generation, record["execution_binding"]["role"]})
+      :ok
+    end
+
+    opts = scheduler_options(c) |> Keyword.put(:on_ready, ready)
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), "agent:\n", "agent:\n  goal_mode: true\n  run_budget_ms: 1\n"))
+    WorkflowStore.force_reload()
+    assert SymphonyElixir.Execution.run_budget_ms("legacy") == 1
+    assert {:ok, [job]} = Tracker.fetch_issues_by_states(["Todo"], opts)
+    assert job.dispatchable
+    assert TaskPlanExecution.job?(job)
+    refute File.exists?(c.record["directory"])
+    scheduler = start_scheduler(opts)
+
+    for {generation, role} <- [{1, "developer"}, {2, "verifier"}, {3, "developer"}, {4, "verifier"}] do
+      assert_receive {:scheduled_role, ^generation, ^role}, 10_000
+
+      if generation < 4 do
+        await_scheduler(fn -> :sys.get_state(scheduler).retry_attempts[job.id] end)
+        assert :ok = GenServer.call(scheduler, {:retry_now, job.id})
+      end
+    end
+
+    await_scheduler(fn -> map_size(:sys.get_state(scheduler).running) == 0 end)
+    state = :sys.get_state(scheduler)
+    assert state.retry_attempts == %{}
+    assert state.blocked == %{}
+    assert current(c)["native_stop_confirmed"]
+    assert current(c)["retry_count"] == 0
+    assert current(c)["execution_generation"] == 4
+    assert {:ok, [finished]} = Tracker.fetch_issues_by_ids([job.id], opts)
+    refute finished.dispatchable
+    assert finished.native_ref["lifecycle"]["closeable"]
+    assert Agent.get(c.state, & &1["/repos/team/repo/issues/2"]["state"]) == "open"
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 4
+  end
+
+  @tag :unadmitted
+  test "scheduler polling preserves an active locked member and rejects foreign completion messages", c do
+    File.write!(c.mode, "hold")
+    owner = self()
+
+    opts =
+      scheduler_options(c)
+      |> Keyword.put(:on_ready, fn _ ->
+        send(owner, :member_ready)
+        :ok
+      end)
+
+    scheduler = start_scheduler(opts)
+    assert_receive :member_ready, 10_000
+    id = "member:" <> WorkRef.key(c.work)
+    entry = :sys.get_state(scheduler).running[id]
+    assert entry.worker_host == nil
+    send(scheduler, {:member_worker_result, id, entry.pid, make_ref(), {:waiting, %{}}})
+    send(scheduler, {:member_worker_result, id, self(), entry.dispatch_token, {:waiting, %{}}})
+    send(scheduler, :run_poll_cycle)
+    assert :sys.get_state(scheduler).running[id].pid == entry.pid
+    refute :sys.get_state(scheduler).running[id][:member_result]
+    refute :sys.get_state(scheduler).running[id][:stop_requested]
+    assert Process.alive?(entry.pid)
+    assert {:error, :member_result_unconfirmed} = TaskExecution.completed_result(current(c))
+    assert {:ok, [locked]} = Tracker.fetch_issues_by_ids([id], opts)
+    refute locked.dispatchable
+
+    pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+    await_scheduler(fn -> map_size(:sys.get_state(scheduler).running) == 0 end)
+    assert current(c)["native_stop_confirmed"]
+    assert :sys.get_state(scheduler).retry_attempts == %{}
+    send(scheduler, :run_poll_cycle)
+    assert :sys.get_state(scheduler).running == %{}
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+  end
+
+  @tag :unadmitted
+  test "a killed member worker retains its lock and cannot be replaced by a fresh scheduler", c do
+    File.write!(c.mode, "hold")
+    owner = self()
+
+    opts =
+      scheduler_options(c)
+      |> Keyword.put(:on_ready, fn _ ->
+        send(owner, :member_ready)
+        :ok
+      end)
+
+    scheduler = start_scheduler(opts)
+    assert_receive :member_ready, 10_000
+    id = "member:" <> WorkRef.key(c.work)
+    entry = :sys.get_state(scheduler).running[id]
+    Process.exit(entry.pid, :kill)
+    await_scheduler(fn -> :sys.get_state(scheduler).blocked[id] end)
+    assert :sys.get_state(scheduler).retry_attempts == %{}
+    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    send(scheduler, :run_poll_cycle)
+    assert :sys.get_state(scheduler).running == %{}
+    assert :sys.get_state(scheduler).blocked[id]
+    supervisor = :sys.get_state(scheduler).task_supervisor
+    assert :ok = stop_supervised(Orchestrator)
+    restarted = start_orchestrator(supervisor, opts)
+    send(restarted, :run_poll_cycle)
+    assert :sys.get_state(restarted).running == %{}
+    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+  end
+
+  @tag :unadmitted
+  test "scheduler retries consume the original finite counter and stop after repeated no progress", c do
+    opts = scheduler_options(c)
+    scheduler = start_scheduler(opts)
+    id = "member:" <> WorkRef.key(c.work)
+
+    for count <- [1, 2] do
+      await_scheduler(fn -> :sys.get_state(scheduler).retry_attempts[id] end)
+      assert current(c)["retry_count"] == count
+      assert :ok = GenServer.call(scheduler, {:retry_now, id})
+    end
+
+    await_scheduler(fn ->
+      record = current(c)
+      record["retry_count"] == 3 and record["phase"] == "completed" and :sys.get_state(scheduler).running == %{}
+    end)
+
+    assert :sys.get_state(scheduler).retry_attempts == %{}
+    send(scheduler, :run_poll_cycle)
+    assert :sys.get_state(scheduler).running == %{}
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+    assert Enum.count(requests(c), &(&1["method"] == "thread/resume")) == 2
+    assert current(c)["native_stop_confirmed"]
+  end
+
+  @tag :unadmitted
+  test "removing a routed plan stops its active worker and retains its workspace", c do
+    File.write!(c.mode, "hold")
+    opts = scheduler_options(c)
+    scheduler = start_scheduler(opts)
+    id = "member:" <> WorkRef.key(c.work)
+
+    await_scheduler(fn ->
+      case RunJournal.read(c.record["directory"]) do
+        {:ok, record} -> record["execution_mode"] == "goal" and record["native_stop_confirmed"] == false
+        _ -> false
+      end
+    end)
+
+    before = :sys.get_state(scheduler).running[id]
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), Jason.encode!([c.parent]), "[]"))
+    WorkflowStore.force_reload()
+    send(scheduler, :run_poll_cycle)
+    await_scheduler(fn -> :sys.get_state(scheduler).running == %{} end)
+    assert current(c)["native_stop_confirmed"]
+    assert File.dir?(current(c)["workspace"])
+    assert :sys.get_state(scheduler).retry_attempts == %{}
+    refute Process.alive?(before.pid)
+    assert {:ok, []} = Tracker.fetch_issues_by_ids([id], opts)
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+  end
+
+  @tag :unadmitted
+  test "discovery contains invalid native plans and refuses unrouted or paused workers without allocation", c do
+    assert {:ok, []} = TaskPlanExecution.discover()
+    refute File.exists?(c.record["directory"])
+    opts = scheduler_options(c)
+    assert {:error, :invalid_plan_roots} = TaskPlanExecution.discover(Keyword.put(opts, :roots, [%{}]))
+    assert {:ok, [blocked]} = TaskPlanExecution.discover(Keyword.put(opts, :active_state, ""))
+    assert blocked.kind == :plan
+    refute blocked.dispatchable
+    missing_policy = Keyword.put(opts, :repositories, c.opts[:repositories])
+    assert {:ok, [blocked]} = TaskPlanExecution.discover(missing_policy)
+    assert blocked.native_ref["plan_preflight"]["reason"] =~ "missing_repository_execution_policy"
+    refute File.exists?(c.record["directory"])
+    assert {:ok, [job]} = TaskPlanExecution.discover(opts)
+    token = make_ref()
+    unrouted = Keyword.merge(opts, roots: [], dispatch_token: token)
+    assert :ok = AgentRunner.run(job, self(), unrouted)
+    assert_receive {:member_worker_result, _, _, ^token, {:error, :plan_member_not_routed}}
+    assert :ok = AgentRunner.run(job, nil, unrouted)
+    assert :ok = AgentRunner.run(job, self(), Keyword.put(missing_policy, :dispatch_token, token))
+    assert_receive {:member_worker_result, _, _, ^token, {:error, {:member_execution_configuration, _, _}}}
+    pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+    assert :ok = AgentRunner.run(job, self(), Keyword.put(opts, :dispatch_token, token))
+    assert_receive {:member_worker_result, _, _, ^token, waiting = {:waiting, _}}
+    assert {:ok, %{outcome: "waiting"}} = TaskPlanExecution.completed_result(job, waiting)
+    assert {:ok, [paused]} = TaskPlanExecution.discover(opts)
+    refute paused.dispatchable
+    refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    refute File.exists?(c.trace)
+  end
+
+  @tag :unadmitted
+  test "discovery fences observation read failures after configuration without hiding other roots", c do
+    opts = scheduler_options(c)
+    counter = start_supervised!({Agent, fn -> 0 end}, id: :native_read_counter)
+    request = c.opts[:request]
+
+    counting = fn provider, method, path, params, config ->
+      Agent.update(counter, &(&1 + 1))
+      request.(provider, method, path, params, config)
+    end
+
+    assert {:ok, _} = SymphonyElixir.TaskExecutionConfig.prepare(c.parent, Keyword.put(opts, :request, counting))
+    configuration_reads = Agent.get(counter, & &1)
+
+    for fault <- [:unavailable, :raise, :throw] do
+      Agent.update(counter, fn _ -> 0 end)
+
+      failing = fn provider, method, path, params, config ->
+        reads = Agent.get_and_update(counter, fn n -> {n + 1, n + 1} end)
+
+        if reads > configuration_reads do
+          case fault do
+            :unavailable -> {:error, :native_unavailable}
+            :raise -> raise "native observation failed"
+            :throw -> throw(:native_observation_failed)
+          end
+        else
+          request.(provider, method, path, params, config)
+        end
+      end
+
+      assert {:ok, [blocked]} = TaskPlanExecution.discover(Keyword.put(opts, :request, failing))
+      refute blocked.dispatchable
+      assert blocked.native_ref["lifecycle"]["error"]
+    end
+
+    missing = fn
+      "github", "GET", "/repos/team/repo/issues/99", _, _ -> {:ok, %{status: 404, body: %{}}}
+      provider, method, path, params, config -> request.(provider, method, path, params, config)
+    end
+
+    options = Keyword.merge(opts, roots: [%{c.parent | "number" => 99}, c.parent], request: missing)
+    assert {:ok, jobs} = TaskPlanExecution.discover(options)
+    assert Enum.any?(jobs, &(&1.kind == :plan and not &1.dispatchable))
+    assert Enum.any?(jobs, & &1.dispatchable)
+    refute File.exists?(c.trace)
+  end
 
   test "a prepared role activates a real native Goal, records stop proof and resumes its own thread", c do
     assert {:ok, session} = TaskSession.start(c.record, c.registry, c.opts)
@@ -805,6 +1091,14 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert length(Enum.uniq_by(results, & &1.record["thread_id"])) == 4
     assert Enum.map(results, & &1.record["execution_generation"]) == [1, 2, 3, 4]
     final = List.last(results)
+    job = %Issue{id: "member:" <> key, native_ref: %{"execution_kind" => "plan_member", "work" => c.work, "parent" => c.parent}}
+    assert {:ok, %{outcome: "waiting"}} = TaskPlanExecution.completed_result(job, {:ok, final})
+    assert {:error, :member_result_unconfirmed} = TaskPlanExecution.completed_result(job, {:ok, hd(results)})
+    assert {:error, :member_result_unconfirmed} = TaskPlanExecution.completed_result(job, {:ok, %{final | outcome: "retry"}})
+    assert {:error, :member_result_unconfirmed} = TaskPlanExecution.completed_result(%Issue{id: "foreign"}, {:ok, final})
+    assert {:error, {:member_worker_failed, :missing}} = TaskPlanExecution.completed_result(job, :missing)
+    assert {:error, :member_result_unconfirmed} = TaskExecution.completed_result(%{})
+    assert {:error, :member_result_unconfirmed} = TaskExecution.completed_result(%{"directory" => Path.join(c.root, "absent")})
     assert final.record["retry_count"] == 0
     assert final.flow["repair_count"] == 1
     assert final.flow["closeable"]

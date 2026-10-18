@@ -280,6 +280,22 @@ defmodule SymphonyElixir.TaskExecution do
       record["phase"] in ["finalizing", receipt["phase"]] and (receipt["phase"] == "incident" or stopped?(record))
   end
 
+  @doc "Validate a captured completed attempt without adopting a successor's journal or treating an exit as evidence."
+  @spec completed_result(term()) :: {:ok, map()} | {:error, term()}
+  def completed_result(%{"directory" => directory} = record) when is_binary(directory) do
+    receipt = get_in(record, ["task_attempt_results", record["attempt_id"]])
+
+    with {:ok, ^record} <- RunJournal.read(record["directory"]),
+         true <- record["phase"] == "completed" and valid_finish?(receipt, record),
+         true <- not File.exists?(Path.join(record["directory"], "executor.lock")) do
+      {:ok, receipt}
+    else
+      _ -> {:error, :member_result_unconfirmed}
+    end
+  end
+
+  def completed_result(_), do: {:error, :member_result_unconfirmed}
+
   defp stopped?(record),
     do: CommandCheck.stopped?(record) and (record["native_stop_confirmed"] == true or (is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true))
 

@@ -23,12 +23,13 @@ Native result selection now checks journal/native identities, retrieves and reta
 fixed Git snapshots and re-attests actual command results before returning member evidence.
 Native parent/member pause, cancel and source-bound resume decisions now feed
 member evidence and fence fresh result publication; remembered source loss blocks
-resumption after restart. Child dispatch, retention cleanup and the remaining lifecycle below are not
-yet complete. Preflight success alone is not execution eligibility. A parent must never run
+resumption after restart. Configured native members now dispatch and continue through
+the existing scheduler. Parent coordination, automatic crash recovery, retention
+cleanup and the remaining lifecycle below are not yet complete. Preflight success alone is not execution eligibility. A parent must never run
 as a coding task while coordination support is incomplete. Version 2 and unknown
 contract schemas, parent-linked contracts and malformed contract blocks are
-also fenced at tracker projection and executor admission; legacy routing labels
-cannot bypass the pending plan lifecycle, even when goal mode is disabled.
+also fenced at legacy tracker projection and executor admission; legacy routing
+labels cannot bypass the native plan admission path, even when goal mode is disabled.
 
 ## Observable requirements
 
@@ -264,8 +265,8 @@ unchanged inputs resumes the same generation rather than allocating another.
 This binding is an execution boundary, not proof that its inputs are verified or
 that the work is authorized. The lifecycle must still check those native facts,
 all restrictions, remaining budget and finite retry/repair limits before calling
-admission. The member reducer derives role selection, but native evidence producers
-and automatic dispatch integration are still pending.
+admission. The member reducer derives role selection; native evidence producers
+and configured member scheduling connect that selection to execution below.
 
 Changing role or fixed inputs requires a confirmed stop of the recorded native
 thread. Allocation without a known thread remains uncertain even if a local
@@ -403,10 +404,10 @@ labels, closure or journal writes.
 
 This coordinator is exercised with owning journals, role-bound tools, real host
 check receipts, and native API fixtures. It does not itself launch Codex, assemble
-role sessions, authenticate a child acceptance, merge or close an Issue. Polling
-still blocks version 2 automatic dispatch until role workspace/session ownership
-and scheduler continuation are wired to this admission boundary. It must not be
-activated by removing the dispatch guard alone.
+role sessions, authenticate a child acceptance, merge or close an Issue. The
+configured member scheduling path below supplies role session ownership and
+continuation through this admission boundary. Legacy v2 entry points remain
+blocked; removing their dispatch guard is not an execution integration.
 
 ## Generation-owned role workspaces
 
@@ -468,8 +469,7 @@ the command. Historical command attestation uses its durable receipt and does no
 require the ephemeral role workspace to survive retention cleanup.
 
 Local verifier Codex sessions use read-only sandbox policy. Remote role workspace
-transport, automatic dispatch and scheduler
-continuation remain pending. Git-backed host command checks still require
+transport remains pending; configured local member scheduling is described below. Git-backed host command checks still require
 Git; report-only verification uses configured review checks. Native API fixtures,
 real local worktrees and real supervised commands exercise this boundary; this is
 not a live-provider acceptance result.
@@ -654,8 +654,8 @@ Issue fixtures. They check current findings in the developer context, separate
 read-only verifier sessions, unchanged retry/repair budgets, startup fault cleanup
 explicit native pause/resume and stopping after no-progress repair. A verified report can become closeable, but
 the worker does not close its Issue or accept the parent. This is local protocol
-integration, not a live-provider acceptance result. Polling projection and crash
-recovery remain separate integration work.
+integration, not a live-provider acceptance result. Scheduler integration is described
+below; automatic crash recovery remains separate work.
 
 ## Configured member execution
 
@@ -719,9 +719,54 @@ an existing generation preserves its pinned workspace source. Unsupported remote
 transports fail before resolution. Tests load real workflow configuration, run
 the four-role report/repair protocol, resolve cross-provider membership, and
 exercise native branch changes during reads, partial preparation and resume.
-Automatic plan discovery, scheduler continuation, abrupt-worker/VM recovery and
-missing local Git object acquisition are still pending; the v2 dispatch guard
-remains in place until those boundaries are integrated.
+Configured plan discovery and scheduler continuation use the path below. Automatic
+abrupt-worker/VM recovery and missing local Git object acquisition remain pending.
+The legacy v2 dispatch guard remains in place; only validated native member jobs
+can enter the approved role worker.
+
+## Native member scheduling
+
+`TaskPlanExecution` translates explicit `tracker.provider.plan_roots` into member
+jobs for the existing `Orchestrator`; it owns no process, task store or retry
+queue. Discovery reads each root directly through its native repository catalog,
+including members outside the legacy tracker listing. Full plan configuration and
+`TaskExecution.observe/4` determine eligibility. An incomplete root or failed
+member observation is non-dispatchable. An existing executor lock excludes fresh
+dispatch even when the native lifecycle would otherwise permit execution.
+
+Scheduler IDs use `member:<WorkRef.key>`; the journal keeps its existing raw
+WorkRef key. Member work and parent identity remain explicit in the projection.
+The scheduler uses its normal global/state capacity, claim set, task supervisor
+and retry timers. Members use local Codex sessions independently of legacy SSH
+slots. Host-only request callbacks can be supplied through orchestrator
+`plan_options` for local native-protocol tests; these are not task declarations.
+
+The worker rechecks routing, resolves the full plan, and runs the existing
+admission/session/finalization path. It reports completion with the launch's
+reference token and worker PID. The scheduler accepts only that current launch,
+then verifies the captured result against the unchanged durable journal, binding,
+attempt, session, native stop evidence and released lock. A normal process exit
+alone cannot authorize continuation. `continue` uses the existing short delay;
+`retry` uses the existing backoff with the journal's cumulative retry count.
+Scheduling itself does not charge another execution retry. Legacy default
+execution deadlines do not shorten the sealed member budget.
+
+Running members remain owned by their worker when polling projects them as
+non-dispatchable because their journal is locked. The worker's native observer
+handles controls and evidence changes. Removing routing or membership requests
+that same worker's graceful stop; no replacement may start while stop is unknown.
+A stale or foreign completion message cannot replace the current launch's result.
+A crashed worker without a confirmed final result is blocked. Its retained lock
+also excludes replacement after scheduler restart. Automatic takeover and recovery
+of that interrupted native execution are not implemented by this adapter.
+
+Member workspaces are retained as execution/input evidence, including during
+terminal cleanup. A verified report can become closeable; this scheduling path
+does not accept a parent, merge a change or close an Issue. Real OTP scheduler
+and local app-server tests exercise development, rejection, repair, independent
+re-verification, finite no-progress retries, pauses, forged completion messages,
+active-lock polling and crash/restart exclusion. These tests do not perform live
+provider writes or live acceptance.
 
 ## Native evidence publication
 
@@ -769,8 +814,9 @@ its own current authority, candidate, inputs and check policy.
 An engine-authored comment alone does not prove that a command ran or an artifact
 was retrieved. Verification publication now attests each supplied command result
 against the host-owned receipts below. Git-backed result acquisition and
-selection, local retention and native control checks are implemented; non-Git check inputs and
-automatic execution wiring remain pending. Version 2 dispatch stays fenced.
+selection, local retention, native control checks and configured member scheduling
+are implemented. Non-Git command-check inputs remain pending. Legacy version 2
+dispatch stays fenced outside the approved native member path.
 
 ## Role-bound execution tools
 
@@ -882,8 +928,8 @@ Independent review conclusions remain the verifier's evidence-bearing judgments.
 Check worktrees and transcripts are separate: once a receipt records the checked
 snapshot, removing that worktree need not erase the command evidence or require
 rerunning it. Retaining the referenced candidate artifact itself remains the
-artifact owner's responsibility. Automatic cleanup and the
-role-aware tool/dispatch integration are still pending.
+artifact owner's responsibility. Automatic cleanup remains pending. Role tools
+and configured member scheduling consume these retained receipts.
 
 ## Native result evidence
 
@@ -1034,9 +1080,9 @@ verified candidate version and the approved target branch. Edges requiring
 `published` report edges use the owning Issue publication described below. Other
 publication kinds still report an explicit evidence gap.
 Verified bytes are never promoted to a native merge or publication receipt.
-Automatic dispatch/stop reconciliation, input materialization and parent
-manifest selection still require integration. Version 2 automatic
-dispatch remains fenced until those lifecycle boundaries are connected.
+Configured member scheduling, owned native stop and role workspace materialization
+connect these dependencies to execution. Parent manifest selection and automatic
+crash recovery remain separate integration work; legacy child entry points stay fenced.
 
 ## Native PR/MR delivery
 
@@ -1120,8 +1166,7 @@ the exact content and verification source, retaining a consumer reference.
 Review-only policies work without Git. Configured command checks still require
 their existing isolated Git workspace; report-specific command materialization
 is not implemented and those checks are not silently skipped. General release
-artifacts, role input materialization and automatic dispatch remain separate
-integration work.
+artifacts remain separate integration work.
 
 ## Execution and evidence
 

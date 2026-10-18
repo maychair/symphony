@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.Execution
+  alias SymphonyElixir.{Execution, TaskPlanExecution}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -38,6 +38,7 @@ defmodule SymphonyElixir.Orchestrator do
       :merge_cleanup_ref,
       :task_reconcile_ref,
       task_supervisor: SymphonyElixir.TaskSupervisor,
+      plan_options: [],
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -69,11 +70,12 @@ defmodule SymphonyElixir.Orchestrator do
           tick_timer_ref: nil,
           tick_token: nil,
           task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
+          plan_options: Keyword.get(opts, :plan_options, []),
           codex_totals: @empty_codex_totals,
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
+        run_terminal_workspace_cleanup(state.plan_options)
         state = schedule_tick(state, 0)
 
         {:ok, state}
@@ -214,6 +216,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
+  def handle_info({:member_worker_result, id, pid, token, result}, state) when is_reference(token) do
+    case state.running[id] do
+      %{pid: ^pid, dispatch_token: ^token} = entry ->
+        {:noreply, %{state | running: Map.put(state.running, id, Map.put(entry, :member_result, result))}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
       case pop_retry_attempt_state(state, issue_id, retry_token) do
@@ -248,6 +260,26 @@ defmodule SymphonyElixir.Orchestrator do
       release_issue_claim(state, issue_id)
     else
       block_issue_from_entry(state, issue_id, running_entry, "Review worker failed; native execution requires reconciliation")
+    end
+  end
+
+  defp handle_agent_down(_reason, state, issue_id, %{issue: %Issue{native_ref: %{"execution_kind" => "plan_member"}}} = entry, _) do
+    case TaskPlanExecution.completed_result(entry.issue, entry[:member_result]) do
+      {:ok, result} ->
+        if result.outcome in ["continue", "retry"] and not Map.get(entry, :stop_requested, false) do
+          schedule_issue_retry(state, issue_id, max(1, result.retry_count), %{
+            identifier: entry.identifier,
+            issue_url: entry.issue.url,
+            delay_type: if(result.outcome == "continue", do: :continuation, else: :failure),
+            worker_host: nil,
+            workspace_path: entry[:workspace_path]
+          })
+        else
+          release_issue_claim(state, issue_id)
+        end
+
+      {:error, reason} ->
+        block_issue_from_entry(state, issue_id, entry, "Plan member requires reconciliation: #{inspect(reason)}")
     end
   end
 
@@ -327,7 +359,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states, state.plan_options),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
     else
@@ -376,7 +408,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_reconcile_tasks(%State{task_reconcile_ref: nil} = state) do
     if SymphonyElixir.TaskReconciler.enabled?() do
-      ids = Map.keys(state.running) |> MapSet.new()
+      ids = state.running |> Enum.reject(fn {_, entry} -> TaskPlanExecution.job?(entry.issue) end) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
 
       task =
         Task.Supervisor.async_nolink(state.task_supervisor, fn ->
@@ -399,7 +431,7 @@ defmodule SymphonyElixir.Orchestrator do
     if running_ids == [] do
       state
     else
-      case Tracker.fetch_issues_by_ids(running_ids) do
+      case Tracker.fetch_issues_by_ids(running_ids, state.plan_options) do
         {:ok, issues} ->
           issues
           |> reconcile_running_issue_states(
@@ -423,7 +455,7 @@ defmodule SymphonyElixir.Orchestrator do
     if blocked_ids == [] do
       state
     else
-      case Tracker.fetch_issues_by_ids(blocked_ids) do
+      case Tracker.fetch_issues_by_ids(blocked_ids, state.plan_options) do
         {:ok, issues} ->
           issues
           |> reconcile_blocked_issue_states(
@@ -503,6 +535,12 @@ defmodule SymphonyElixir.Orchestrator do
     )
   end
 
+  defp reconcile_issue_state(%Issue{native_ref: %{"execution_kind" => "plan_member"}} = issue, state, _, _) do
+    # The live owner observes controls itself. An occupied journal is not loss of
+    # routing; treating its non-dispatchable projection as such would stop every poll.
+    if TaskPlanExecution.job?(issue), do: refresh_running_issue_state(state, issue), else: stop_reconciled_issue(state, issue.id, false)
+  end
+
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
       Execution.handing_off?(issue.id) ->
@@ -539,6 +577,10 @@ defmodule SymphonyElixir.Orchestrator do
       active_states,
       terminal_states
     )
+  end
+
+  defp reconcile_blocked_issue_state(%Issue{native_ref: %{"execution_kind" => "plan_member"}} = issue, state, _, _) do
+    if issue_routable?(issue), do: release_issue_claim(state, issue.id), else: refresh_blocked_issue_state(state, issue)
   end
 
   defp reconcile_blocked_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
@@ -647,9 +689,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp stop_reconciled_issue(%State{} = state, issue_id, cleanup_workspace) do
     entry = Map.get(state.running, issue_id)
 
-    graceful = is_map(entry) and (SymphonyElixir.ReviewLane.job?(entry[:issue]) or (Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex"))
-
-    if graceful and is_pid(entry[:pid]) and Process.alive?(entry.pid) do
+    if graceful_worker?(entry) do
       unless entry[:stop_requested] do
         send(entry.pid, :symphony_stop)
         Process.send_after(self(), {:execution_stop_timeout, issue_id, entry.ref}, @execution_stop_grace_ms)
@@ -661,6 +701,13 @@ defmodule SymphonyElixir.Orchestrator do
       terminate_running_issue(state, issue_id, cleanup_workspace)
     end
   end
+
+  defp graceful_worker?(%{pid: pid, issue: issue}) when is_pid(pid) do
+    managed = TaskPlanExecution.job?(issue) or SymphonyElixir.ReviewLane.job?(issue)
+    Process.alive?(pid) and (managed or (Execution.enabled?() and SymphonyElixir.ExecutionBackend.kind() == "codex"))
+  end
+
+  defp graceful_worker?(_), do: false
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
@@ -709,7 +756,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
-    goal_mode = Execution.enabled?()
+    goal_mode = Execution.enabled?() or TaskPlanExecution.job?(running_entry[:issue])
 
     cond do
       Map.has_key?(state.blocked, issue_id) -> state
@@ -938,7 +985,7 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
-      worker_slots_available?(state) and
+      (TaskPlanExecution.job?(issue) or worker_slots_available?(state)) and
       !Execution.awaiting_human?(issue.id)
   end
 
@@ -1019,7 +1066,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case refresh_issue_for_dispatch(issue) do
+    case refresh_issue_for_dispatch(issue, state.plan_options) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
@@ -1031,8 +1078,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp refresh_issue_for_dispatch(issue) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issues_by_ids/1, terminal_state_set()) do
+  defp refresh_issue_for_dispatch(issue, plan_options) do
+    fetch = &Tracker.fetch_issues_by_ids(&1, plan_options)
+
+    case revalidate_issue_for_dispatch(issue, fetch, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
         {:ok, refreshed_issue}
 
@@ -1054,7 +1103,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
+    host = if TaskPlanExecution.job?(issue), do: nil, else: select_worker_host(state, preferred_worker_host)
+
+    case host do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
@@ -1065,8 +1116,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    token = make_ref()
+    plan_options = if TaskPlanExecution.job?(issue), do: state.plan_options, else: []
+    opts = Keyword.merge(plan_options, attempt: attempt, worker_host: worker_host, dispatch_token: token)
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient, opts)
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -1077,6 +1132,7 @@ defmodule SymphonyElixir.Orchestrator do
           Map.put(state.running, issue.id, %{
             pid: pid,
             ref: ref,
+            dispatch_token: token,
             identifier: issue.identifier,
             issue: issue,
             worker_host: worker_host,
@@ -1205,7 +1261,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_issues_by_ids([issue_id]) do
+    case Tracker.fetch_issues_by_ids([issue_id], state.plan_options) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -1258,6 +1314,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Review snapshots remain recovery evidence until retention release is implemented.
   defp cleanup_issue_workspace(%Issue{kind: :review}, _metadata), do: :ok
+  defp cleanup_issue_workspace(%Issue{native_ref: %{"execution_kind" => "plan_member"}}, _metadata), do: :ok
 
   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
     if SymphonyElixir.TaskReconciler.enabled?() do
@@ -1285,8 +1342,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
-    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
+  defp run_terminal_workspace_cleanup(plan_options) do
+    case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states, plan_options) do
       {:ok, issues} ->
         issues
         |> Enum.each(fn
@@ -1315,8 +1372,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
-      case refresh_issue_for_dispatch(issue) do
+         (TaskPlanExecution.job?(issue) or worker_slots_available?(state, metadata[:worker_host])) do
+      case refresh_issue_for_dispatch(issue, state.plan_options) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
 

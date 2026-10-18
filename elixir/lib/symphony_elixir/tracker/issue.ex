@@ -55,6 +55,9 @@ defmodule SymphonyElixir.Tracker.Issue do
   @spec routable?(t(), [String.t()] | map()) :: boolean()
   def routable?(%__MODULE__{kind: :plan}, _requirements), do: false
 
+  def routable?(%__MODULE__{native_ref: %{"execution_kind" => "plan_member"}} = issue, _requirements),
+    do: issue.dispatchable and SymphonyElixir.TaskPlanExecution.job?(issue)
+
   # The review lane resolves its native reviewer assignment. A separate task
   # tracker's Issue assignee is not authority over that MR/PR.
   def routable?(%__MODULE__{kind: :review, native_ref: %{"execution_kind" => "review_lane"}} = issue, %{required_labels: labels}),

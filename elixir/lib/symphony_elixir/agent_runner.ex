@@ -23,12 +23,22 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    if SymphonyElixir.TaskPlanExecution.job?(issue) do
+      SymphonyElixir.TaskPlanExecution.run(issue, codex_update_recipient, opts)
+    else
+      run_tracker_issue(issue, codex_update_recipient, opts)
+    end
+  end
+
+  defp run_tracker_issue(issue, codex_update_recipient, opts) do
     budget = Execution.run_budget_ms(issue.id)
     opts = if Execution.enabled?(), do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
 
-    if SymphonyElixir.ReviewLane.job?(issue),
-      do: Runner.run(issue, codex_update_recipient, opts),
-      else: do_run(issue, codex_update_recipient, opts)
+    if SymphonyElixir.ReviewLane.job?(issue) do
+      Runner.run(issue, codex_update_recipient, opts)
+    else
+      do_run(issue, codex_update_recipient, opts)
+    end
   end
 
   @doc "Execute one plan-member role from native admission to owned finalization; the scheduler owns continuation."
@@ -36,7 +46,8 @@ defmodule SymphonyElixir.AgentRunner do
   def run_member(parent, work, executions, recipient \\ nil, opts \\ []) do
     with true <- (ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])) or {:error, :unsupported_task_session_transport},
          {:ok, admitted} <- TaskExecution.admit(parent, work, executions, opts) do
-      issue = %Issue{id: admitted.record["issue_id"], identifier: admitted.record["issue_id"], title: "Plan member", state: "open"}
+      id = opts[:dispatch_id] || admitted.record["issue_id"]
+      issue = %Issue{id: id, identifier: id, title: "Plan member", state: "open"}
 
       callbacks = [
         on_ready: fn record ->

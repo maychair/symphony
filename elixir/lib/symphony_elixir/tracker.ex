@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Tracker do
   leak into scheduler policy.
   """
 
-  alias SymphonyElixir.{Config, TaskPlan, TaskPlanPreflight}
+  alias SymphonyElixir.{Config, TaskPlan, TaskPlanExecution, TaskPlanPreflight}
   alias SymphonyElixir.ReviewLane.Listener
   alias SymphonyElixir.Tracker.Issue
 
@@ -66,23 +66,26 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_states(states) do
+  @spec fetch_issues_by_states([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, opts \\ []) do
     with {:ok, issues} <- adapter().fetch_issues_by_states(states),
-         {:ok, reviews} <- review_issues() do
+         {:ok, reviews} <- review_issues(),
+         {:ok, members} <- TaskPlanExecution.discover(opts) do
       parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
-      {:ok, parents ++ Enum.filter(reviews, &(&1.state in states))}
+      {:ok, parents ++ Enum.filter(reviews ++ members, &(&1.state in states))}
     end
   end
 
-  @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_ids(issue_ids) do
+  @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, opts \\ []) do
     {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "review:"))
+    {plan_ids, normal_ids} = Enum.split_with(normal_ids, &(String.starts_with?(&1, "member:") or String.starts_with?(&1, "plan:")))
 
     with {:ok, issues} <- adapter().fetch_issues_by_ids(normal_ids),
-         {:ok, reviews} <- review_issues() do
+         {:ok, reviews} <- review_issues(),
+         {:ok, members} <- TaskPlanExecution.discover(opts) do
       parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
-      {:ok, parents ++ Enum.filter(reviews, &(&1.id in review_ids))}
+      {:ok, parents ++ Enum.filter(reviews, &(&1.id in review_ids)) ++ Enum.filter(members, &(&1.id in plan_ids))}
     end
   end
 
