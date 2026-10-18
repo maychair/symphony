@@ -7,6 +7,8 @@ defmodule SymphonyElixir.TaskControl do
   """
   alias SymphonyElixir.{TaskDecision, TaskWorkflow, WorkRef}
 
+  @markers %{parent: "symphony-plan-decision", member: "symphony-task-decision", acceptance: "symphony-task-acceptance"}
+
   @doc "Resolve the latest explicit parent approval without treating a pause or resume as a new grant."
   @spec authority(map(), map()) :: {:ok, map()} | {:error, atom()}
   def authority(root, plan) do
@@ -23,11 +25,11 @@ defmodule SymphonyElixir.TaskControl do
   def observe(preflight, work, previous \\ %{}) do
     with :ok <- WorkRef.validate(work),
          {:ok, events} <- applicable(preflight, work),
-         true <- Enum.all?(events, &current?(&1, preflight, work)) or {:error, :control_revision_mismatch},
+         {:ok, released} <- releases(events),
+         true <- Enum.all?(events, &(historical?(&1, released) or current?(&1, preflight, work))) or {:error, :control_revision_mismatch},
          receipts = Map.new(events, &{&1["id"], &1["source"]}),
          true <- receipts?(previous) or {:error, :invalid_control_receipts},
-         true <- Enum.all?(previous, fn {id, source} -> receipts[id] == source end) or {:error, :control_source_unconfirmed},
-         {:ok, released} <- releases(events) do
+         true <- Enum.all?(previous, fn {id, source} -> receipts[id] == source end) or {:error, :control_source_unconfirmed} do
       restrictions =
         events
         |> Enum.filter(&(&1["action"] in ["pause", "cancel"] and &1["source"] not in released))
@@ -61,6 +63,31 @@ defmodule SymphonyElixir.TaskControl do
       do: Map.merge(observed, projected)
   end
 
+  @doc """
+  Read the designated acceptor's candidate-bound acceptance for a gated member.
+
+  Only a decision bound to the member's current sealed contract counts; absence is
+  waiting, never implicit acceptance. Technical members have no separate acceptor.
+  """
+  @spec acceptance(map(), map()) :: {:ok, map() | nil} | {:error, atom()}
+  def acceptance(snapshot, contract) do
+    with true <- contract["acceptance_mode"] == "separate",
+         {:ok, events} <- decisions(snapshot, contract["acceptor"], :acceptance) do
+      acceptance_from(events, contract)
+    else
+      false -> {:ok, nil}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp acceptance_from(events, contract) do
+    case events |> Enum.filter(&(&1["contract_sha"] == contract["contract_sha"])) |> Enum.sort_by(& &1["at"], :desc) do
+      [] -> {:ok, nil}
+      [%{"at" => at}, %{"at" => at} | _] -> {:error, :ambiguous_task_acceptance}
+      [event | _] -> {:ok, %{"actor" => contract["acceptor"], "source" => event["source"], "candidate" => event["candidate"]}}
+    end
+  end
+
   defp applicable(preflight, work) do
     with {:ok, root} <- decisions(preflight.parent, preflight.plan["authorizer"], :parent),
          {:ok, member} <- member_decisions(preflight, work) do
@@ -82,8 +109,13 @@ defmodule SymphonyElixir.TaskControl do
       (event["work"] == preflight.plan["parent"] or event["contract_sha"] == preflight.members[WorkRef.key(work)].contract["contract_sha"])
   end
 
+  # A released restriction and the resume that released it are history, not live
+  # controls: an older plan revision cannot keep blocking a later authorized one
+  # through a pair the corresponding authorizer already closed.
+  defp historical?(event, released), do: event["source"] in released or event["action"] == "resume"
+
   defp decisions(snapshot, actor, scope) do
-    marker = if scope == :parent, do: "symphony-plan-decision", else: "symphony-task-decision"
+    marker = Map.fetch!(@markers, scope)
 
     snapshot.notes
     |> Enum.filter(&(&1["system"] != true and String.contains?(&1["body"], "<!-- " <> marker)))
@@ -123,6 +155,10 @@ defmodule SymphonyElixir.TaskControl do
     else
       _ -> {:error, :unconfirmed_native_control}
     end
+  end
+
+  defp payload?(%{"action" => "accept"} = payload, :acceptance) do
+    Enum.sort(Map.keys(payload)) == ["action", "candidate", "contract_sha"] and Enum.all?(Map.values(payload), &text?/1)
   end
 
   defp payload?(%{"action" => action, "revision" => revision} = payload, scope) do

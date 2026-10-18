@@ -23,6 +23,7 @@ defmodule SymphonyElixir.TaskEvidence do
          true <- snapshot.description == member.description,
          current_plan = put_in(current_plan.members[WorkRef.key(work)], Map.put(snapshot, :contract, member.contract)),
          {:ok, controls} <- TaskControl.observe(current_plan, work, TaskControl.recorded(runtime)),
+         {:ok, acceptance} <- TaskControl.acceptance(snapshot, member.contract),
          {:ok, results} <- TaskPublication.observe(runtime, snapshot, policy["engine_actor"]),
          current = Enum.filter(results, &scope?(&1.envelope, plan, member, policy)),
          {:ok, selected} <- select_candidate(current, opts),
@@ -33,8 +34,13 @@ defmodule SymphonyElixir.TaskEvidence do
          true <- NativeWork.snapshot_ref(snapshot) == NativeWork.snapshot_ref(after_read),
          {:ok, parent_after} <- NativeWork.read(plan.plan["parent"], opts),
          true <- NativeWork.snapshot_ref(current_plan.parent) == NativeWork.snapshot_ref(parent_after) do
-      sources = Enum.map(artifacts, & &1.receipt["source"]) ++ result_sources([candidate, verification]) ++ controls.sources
-      {:ok, %{candidate: candidate, verification: verification, sources: Enum.uniq(sources), artifacts: artifacts, snapshot: snapshot, controls: controls}}
+      sources =
+        Enum.map(artifacts, & &1.receipt["source"]) ++
+          result_sources([candidate, verification]) ++
+          controls.sources ++
+          if acceptance, do: [acceptance["source"]], else: []
+
+      {:ok, %{candidate: candidate, verification: verification, acceptance: acceptance, sources: Enum.uniq(sources), artifacts: artifacts, snapshot: snapshot, controls: controls}}
     else
       {:error, _} = error -> error
       _ -> {:error, :member_evidence_scope_changed}

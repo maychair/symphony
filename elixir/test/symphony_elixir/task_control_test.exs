@@ -55,6 +55,36 @@ defmodule SymphonyElixir.TaskControlTest do
     assert map_size(resumed.receipts) == 2
   end
 
+  test "a released historical control cannot keep blocking a later approved plan revision" do
+    f = fixture()
+    authorize = note(f, :parent, "authorize", 1)
+    pause = note(f, :parent, "pause", 2)
+    f = parent_notes(f, [authorize, pause])
+    assert {:ok, paused} = observe(f)
+    resume = note(f, :parent, "resume", 3, %{"restriction" => hd(paused.sources)})
+    f = parent_notes(f, [authorize, pause, resume])
+    assert {:ok, %{restrictions: []}} = observe(f)
+
+    second = TaskWorkflow.digest("plan v2")
+    f = put_in(f.plan["revision"], second)
+    f = parent_notes(f, [note(f, :parent, "authorize", 4), pause, resume])
+    assert {:ok, authority} = TaskControl.authority(f.parent, f.plan)
+    assert authority["revision"] == second
+    assert {:ok, controls} = observe(f)
+    assert controls.restrictions == []
+    assert [%{"restriction_source" => source}] = controls.releases
+    assert source == hd(paused.sources)
+  end
+
+  test "an unreleased control bound to a superseded revision still blocks" do
+    f = fixture()
+    pause = note(f, :parent, "pause", 2)
+    f = put_in(f.plan["revision"], TaskWorkflow.digest("plan v2"))
+    f = parent_notes(f, [note(f, :parent, "authorize", 3), pause])
+    assert {:ok, _authority} = TaskControl.authority(f.parent, f.plan)
+    assert {:error, :control_revision_mismatch} = observe(f)
+  end
+
   test "parent and member note numbers cannot collide and child resume cannot clear a parent pause" do
     f = fixture()
     f = f |> parent_notes([note(f, :parent, "pause", 1)]) |> child_notes([note(f, :member, "pause", 1)])
@@ -217,5 +247,46 @@ defmodule SymphonyElixir.TaskControlTest do
         ] do
       assert is_nil(TaskControl.recorded(runtime))
     end
+  end
+
+  test "a gated member is accepted only by the designated acceptor against the current contract" do
+    f = fixture()
+    work = child(f)
+    sha = TaskWorkflow.digest("child scope")
+    candidate = TaskWorkflow.digest("candidate")
+    contract = %{"contract_sha" => sha, "acceptance_mode" => "separate", "acceptor" => "7"}
+    snapshot = fn notes -> %{work: work, notes: notes} end
+
+    assert {:ok, nil} = TaskControl.acceptance(snapshot.([note(f, :member, "pause", 1)]), Map.merge(contract, %{"acceptance_mode" => "technical", "acceptor" => nil}))
+    assert {:ok, nil} = TaskControl.acceptance(snapshot.([]), contract)
+    assert {:ok, nil} = TaskControl.acceptance(snapshot.([acceptance_note(8, 1, sha, candidate)]), contract)
+    assert {:ok, nil} = TaskControl.acceptance(snapshot.([acceptance_note(7, 1, TaskWorkflow.digest("old scope"), candidate)]), contract)
+
+    accepted = acceptance_note(7, 1, sha, candidate)
+    assert {:ok, %{"actor" => "7", "candidate" => ^candidate, "source" => source}} = TaskControl.acceptance(snapshot.([accepted]), contract)
+    assert String.starts_with?(source, "control:")
+
+    tied = %{acceptance_note(7, 2, sha, candidate) | "created_at" => accepted["created_at"], "updated_at" => accepted["updated_at"]}
+    assert {:error, :ambiguous_task_acceptance} = TaskControl.acceptance(snapshot.([accepted, tied]), contract)
+
+    extra = Jason.encode!(%{"action" => "accept", "candidate" => "x", "contract_sha" => "y", "extra" => "z"})
+    malformed = %{accepted | "body" => "Acceptance\n<!-- symphony-task-acceptance " <> extra <> " -->"}
+    assert {:error, :unconfirmed_native_control} = TaskControl.acceptance(snapshot.([malformed]), contract)
+
+    unknown = put_in(accepted, ["author", "id"], 0)
+    assert {:error, :unknown_control_actor} = TaskControl.acceptance(snapshot.([unknown]), contract)
+  end
+
+  defp acceptance_note(actor, id, contract_sha, candidate) do
+    timestamp = DateTime.from_unix!(1_792_200_000 + id) |> DateTime.to_iso8601()
+    payload = %{"action" => "accept", "candidate" => candidate, "contract_sha" => contract_sha}
+
+    %{
+      "id" => id,
+      "author" => %{"id" => actor},
+      "created_at" => timestamp,
+      "updated_at" => timestamp,
+      "body" => "Acceptance\n<!-- symphony-task-acceptance " <> Jason.encode!(payload) <> " -->"
+    }
   end
 end

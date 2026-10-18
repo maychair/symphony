@@ -71,7 +71,7 @@ defmodule SymphonyElixir.TaskExecution do
     %{
       "candidate" => facts.candidate,
       "verification" => facts.verification,
-      "acceptance" => nil,
+      "acceptance" => facts.acceptance,
       "active" => active,
       "dependencies" => dependencies.dependencies,
       "deliveries" => receipts,

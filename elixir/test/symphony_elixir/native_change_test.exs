@@ -192,10 +192,13 @@ defmodule SymphonyElixir.NativeChangeTest do
       Agent.update(f.state, fn _ -> fork end)
       assert {:ok, snapshot} = NativeWork.read_change(f.work, f.opts)
       assert snapshot.facts["source_repository"]["repository_id"] == "11"
-      assert {:error, :delivery_source_repository_mismatch} = TaskDelivery.read(f.work, f.artifact, f.opts)
+      assert snapshot.facts["target_repository"]["repository_id"] == "10"
+      assert {:ok, %{status: "awaiting_merge", receipt: nil}} = TaskDelivery.read(f.work, f.artifact, f.opts)
       merge(f)
       final = %{f.artifact | "version" => f.final, "source" => GitArtifact.source_ref(f.work, f.final)}
-      assert {:ok, %{status: "delivered"}} = TaskDelivery.read(f.work, final, f.opts)
+      assert {:ok, %{status: "delivered", receipt: receipt}} = TaskDelivery.read(f.work, final, f.opts)
+      assert receipt["source_repository"]["repository_id"] == "11"
+      assert receipt["target"]["repository_id"] == "10"
       merged = Agent.get(f.state, & &1)
 
       for raw <- [nil, Map.put(merged, "id", nil), Map.put(merged, "merged_at", "not-a-time"), Map.put(merged, "merge_commit_sha", nil)] do

@@ -361,12 +361,25 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp restore(state, config, content) do
-    with {:ok, data} <- Jason.decode(content),
-         true <- data["schema_version"] == 2 and scope(data["scope"] || %{}) == scope(config),
-         true <- records?(data["records"], config) and hints?(data["hints"], config) do
-      {:ok, %{state | config: config, records: data["records"], hints: data["hints"]}}
-    else
+    case Jason.decode(content) do
+      {:ok, data} -> restore_records(state, config, data)
       _ -> {:error, :invalid_review_journal}
+    end
+  end
+
+  defp restore_records(state, config, data) do
+    cond do
+      data["schema_version"] == 2 ->
+        {:error, :review_journal_migration_required}
+
+      data["schema_version"] != 3 or scope(data["scope"] || %{}) != scope(config) ->
+        {:error, :invalid_review_journal}
+
+      records?(data["records"], config) and hints?(data["hints"], config) ->
+        {:ok, %{state | config: config, records: data["records"], hints: data["hints"]}}
+
+      true ->
+        {:error, :invalid_review_journal}
     end
   end
 
@@ -375,6 +388,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp record?(id, %{} = record, config) do
     valid_subject?(record, config) and record_shape?(record) and Publication.valid?(record, config["publisher_id"]) and
+      target_branch?(record["target_branch"]) and
       record["work"] == work(config, record["project"], record["iid"]) and
       id == record["id"] and id == round_id(record["work"], record["round"], config)
   end
@@ -448,11 +462,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp valid_mr?(mr, project, iid, config) when is_map(mr) do
     mr["iid"] == iid and mr["project_id"] == config["projects"][project]["id"] and
       actors?(mr) and mr["state"] in ["opened", "closed", "merged"] and is_map(mr["diff_refs"]) and
+      target_branch?(mr["target_branch"]) and
       Enum.all?([mr["sha"], get_in(mr, ["diff_refs", "base_sha"])], &valid_sha?/1) and
       valid_mr_url?(mr["web_url"], project, iid, config)
   end
 
   defp valid_mr?(_, _, _, _), do: false
+  defp target_branch?(branch), do: is_binary(branch) and String.trim(branch) != "" and not String.contains?(branch, <<0>>)
+
   defp actors?(%{"author" => %{"id" => id}, "reviewers" => reviewers}), do: is_integer(id) and id > 0 and reviewers?(reviewers)
   defp actors?(_), do: false
   defp reviewers?(reviewers) when is_list(reviewers), do: Enum.all?(reviewers, &(is_map(&1) and is_integer(&1["id"]) and &1["id"] > 0))
@@ -476,6 +493,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       "round" => round,
       "head" => mr["sha"],
       "base" => mr["diff_refs"]["base_sha"],
+      "target_branch" => mr["target_branch"],
       "response_sha" => response_sha,
       "policy_sha" => policy_sha(state.config),
       "eligibility" => "current",
@@ -555,9 +573,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp changed_inputs?(config, record, mr, responses) do
-    mr["sha"] != record["head"] or mr["diff_refs"]["base_sha"] != record["base"] or responses != record["response_sha"] or
-      policy_sha(config) != record["policy_sha"] or record["phase"] == "ended"
+    mr["sha"] != record["head"] or target_changed?(record, mr) or mr["diff_refs"]["base_sha"] != record["base"] or
+      responses != record["response_sha"] or policy_sha(config) != record["policy_sha"] or record["phase"] == "ended"
   end
+
+  # Retargeting changes the integration context even when head and merge base
+  # are unchanged, so the previous round can no longer prove the new target.
+  defp target_changed?(record, mr), do: mr["target_branch"] != record["target_branch"]
 
   defp stopped?(record) do
     record["native_stop_confirmed"] == true or
@@ -665,7 +687,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp same_review?(mr, record, config) do
     valid_mr?(mr, record["project"], record["iid"], config) and
-      mr["sha"] == record["head"] and get_in(mr, ["diff_refs", "base_sha"]) == record["base"] and
+      mr["sha"] == record["head"] and not target_changed?(record, mr) and
+      get_in(mr, ["diff_refs", "base_sha"]) == record["base"] and
       policy_sha(config) == record["policy_sha"] and Policy.requested_reviewer?(mr, config["reviewer_id"])
   end
 
@@ -702,7 +725,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp scope(config), do: Map.take(config, ["provider", "host", "reviewer_id", "publisher_id", "projects", "allow_insecure_http"])
 
   defp persist(state) do
-    body = Jason.encode!(%{"schema_version" => 2, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints})
+    body = Jason.encode!(%{"schema_version" => 3, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints})
     :ok = Journal.write!(state.journal, body)
     state
   end

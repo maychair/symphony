@@ -81,13 +81,13 @@ defmodule SymphonyElixir.TaskDelivery do
 
   def current?(snapshot, opts), do: NativeWork.read_change(snapshot.work, opts) == {:ok, snapshot}
 
-  defp status(work, artifact, facts) do
-    repository = Map.take(work, ~w(provider host repository_id))
-
+  # The frozen target is verified against the owning WorkRef in target?/2. A
+  # source from a fork is a legitimate distinct repository; the delivery
+  # receipt binds its own identity instead of requiring equality with the target.
+  defp status(_work, artifact, facts) do
     cond do
       facts["merged"] and artifact["version"] == facts["revision"] -> {:ok, "delivered"}
       artifact["version"] != facts["head"] -> {:error, :delivery_candidate_changed}
-      facts["source_repository"] != repository -> {:error, :delivery_source_repository_mismatch}
       facts["merged"] -> {:ok, "verification_required"}
       facts["state"] == "closed" -> {:ok, "closed_unmerged"}
       true -> {:ok, "awaiting_merge"}

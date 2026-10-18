@@ -61,7 +61,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
           assert (r/'release-post').exists()
         if mode in ['lost','interrupt_read']:sys.exit(3)
       else:out=ds
-    else:out={'id':1001,'project_id':10,'iid':1,'state':'opened','sha':('c' if (r/'changed-head').exists() else 'a')*40,'diff_refs':{'base_sha':'b'*40},'author':{'id':30},'reviewers':[{'id':20,'username':'reviewer'}],'web_url':'https://review.invalid/team/repo/-/merge_requests/1'}
+    else:out={'id':1001,'project_id':10,'iid':1,'state':'opened','sha':('c' if (r/'changed-head').exists() else 'a')*40,'diff_refs':{'base_sha':'b'*40},'target_branch':('release' if (r/'changed-target').exists() else 'main'),'author':{'id':30},'reviewers':[{'id':20,'username':'reviewer'}],'web_url':'https://review.invalid/team/repo/-/merge_requests/1'}
     if path=='projects/team%2Frepo':out={'id':10,'path_with_namespace':'team/repo','web_url':'https://review.invalid/team/repo'}
     elif '/merge_requests?' in path:out=[out]
     print(json.dumps(out))
@@ -354,6 +354,28 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
   end
 
+  test "retargeting an open review retires the old round even when head and base are unchanged", c do
+    {:ok, [issue]} = Listener.issues()
+    assert issue.native_ref["target_branch"] == "main"
+    {:ok, _, _} = Listener.begin_run(issue.id)
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
+    :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert length(posts(c)) == 1
+
+    File.write!(Path.join(c.root, "changed-target"), "release")
+    {:ok, rounds} = Listener.issues()
+    assert length(rounds) == 2
+    assert [next] = Enum.filter(rounds, & &1.dispatchable)
+    assert next.native_ref["round"] == 2
+    assert next.native_ref["target_branch"] == "release"
+    assert next.native_ref["head"] == issue.native_ref["head"]
+    assert [previous] = Enum.filter(rounds, &(&1.native_ref["round"] == 1))
+    assert previous.native_ref["eligibility"] == "superseded"
+    refute previous.dispatchable
+    assert {:ok, ^rounds} = Listener.issues()
+    assert length(posts(c)) == 1
+  end
+
   test "changed input cannot replace an unconfirmed native executor", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
@@ -379,6 +401,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       "state" => "closed",
       "sha" => record["head"],
       "diff_refs" => %{"base_sha" => record["base"]},
+      "target_branch" => record["target_branch"],
       "author" => %{"id" => 30},
       "reviewers" => [%{"id" => 20}],
       "web_url" => record["url"]
@@ -411,6 +434,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       "state" => "opened",
       "sha" => record["head"],
       "diff_refs" => %{"base_sha" => record["base"]},
+      "target_branch" => record["target_branch"],
       "author" => %{"id" => 30},
       "reviewers" => [%{"id" => 20}],
       "web_url" => record["url"]
@@ -672,12 +696,20 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     before_unknown = :sys.get_state(Listener)
     send(Listener, :unknown)
     assert :sys.get_state(Listener) == before_unknown
-    stop_supervised!(Listener)
-    File.write!(Path.join(c.config["state_dir"], "review-lane.json"), "{}")
-    start_supervised!({Listener, config: c.config})
-    send(Listener, :configure)
-    assert %{health: :failed, error: error} = Listener.health()
-    assert error =~ "invalid_review_journal"
+
+    for {body, expected} <- [
+          {"{}", "invalid_review_journal"},
+          {"not json", "invalid_review_journal"},
+          {Jason.encode!(%{"schema_version" => 2}), "migration_required"}
+        ] do
+      stop_supervised!(Listener)
+      File.write!(Path.join(c.config["state_dir"], "review-lane.json"), body)
+      start_supervised!({Listener, config: c.config})
+      send(Listener, :configure)
+      assert %{health: :failed, error: error} = Listener.health()
+      assert error =~ expected
+    end
+
     stop_supervised!(Listener)
     File.write!(Path.join(c.config["state_dir"], "mail-review.json"), "legacy execution receipts")
     start_supervised!({Listener, config: c.config})
@@ -1190,6 +1222,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       "state" => "opened",
       "sha" => head,
       "diff_refs" => %{"base_sha" => head},
+      "target_branch" => "main",
       "author" => %{"id" => 30},
       "reviewers" => [%{"id" => 20, "username" => "reviewer"}],
       "web_url" => "https://review.invalid/team/repo/-/merge_requests/1"
