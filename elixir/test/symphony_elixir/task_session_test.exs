@@ -189,6 +189,25 @@ defmodule SymphonyElixir.TaskSessionTest do
     start_supervised!({Orchestrator, options})
   end
 
+  defp crash_member(c) do
+    File.write!(c.mode, "hold")
+    supervisor = start_supervised!({Task.Supervisor, []})
+    runner = fn -> AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts) end
+    {:ok, worker} = Task.Supervisor.start_child(supervisor, runner)
+
+    await_scheduler(fn ->
+      case RunJournal.read(c.record["directory"]) do
+        {:ok, %{"turn_id" => "owned-turn"}} -> true
+        _ -> false
+      end
+    end)
+
+    ref = Process.monitor(worker)
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^worker, :killed}
+    current(c)
+  end
+
   defp await_scheduler(fun, attempts \\ 500)
   defp await_scheduler(_fun, 0), do: flunk("scheduler did not reach the expected state")
 
@@ -288,7 +307,7 @@ defmodule SymphonyElixir.TaskSessionTest do
   end
 
   @tag :unadmitted
-  test "a killed member worker retains its lock and cannot be replaced by a fresh scheduler", c do
+  test "a killed local member is stopped under its original attempt before scheduler restart", c do
     File.write!(c.mode, "hold")
     owner = self()
 
@@ -302,20 +321,28 @@ defmodule SymphonyElixir.TaskSessionTest do
     scheduler = start_scheduler(opts)
     assert_receive :member_ready, 10_000
     id = "member:" <> WorkRef.key(c.work)
+    await_scheduler(fn -> current(c)["turn_id"] == "owned-turn" end)
     entry = :sys.get_state(scheduler).running[id]
+    original = current(c)
     Process.exit(entry.pid, :kill)
     await_scheduler(fn -> :sys.get_state(scheduler).blocked[id] end)
     assert :sys.get_state(scheduler).retry_attempts == %{}
     assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
     send(scheduler, :run_poll_cycle)
-    assert :sys.get_state(scheduler).running == %{}
-    assert :sys.get_state(scheduler).blocked[id]
+    await_scheduler(fn -> current(c)["phase"] == "completed" and :sys.get_state(scheduler).running == %{} end)
+    assert current(c)["native_stop_confirmed"]
+    assert current(c)["attempt_id"] == original["attempt_id"]
+    assert current(c)["attempt_count"] == original["attempt_count"]
+    assert current(c)["retry_count"] == (original["retry_count"] || 0)
+    refute :sys.get_state(scheduler).blocked[id]
     supervisor = :sys.get_state(scheduler).task_supervisor
     assert :ok = stop_supervised(Orchestrator)
     restarted = start_orchestrator(supervisor, opts)
     send(restarted, :run_poll_cycle)
     assert :sys.get_state(restarted).running == %{}
-    assert File.exists?(Path.join(c.record["directory"], "executor.lock"))
+    refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
     assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
   end
 
@@ -342,6 +369,183 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
     assert Enum.count(requests(c), &(&1["method"] == "thread/resume")) == 2
     assert current(c)["native_stop_confirmed"]
+  end
+
+  @tag :unadmitted
+  test "local recovery stops the original thread, charges one failure and resumes without another allocation", c do
+    original = crash_member(c)
+    assert RunJournal.interrupted_member?(original)
+    other = %{c.work | "number" => 3}
+    foreign_registry = %{WorkRef.key(other) => c.registry[WorkRef.key(c.work)]}
+    before = requests(c)
+
+    assert {:error, :member_recovery_scope_changed} =
+             AgentRunner.run_member(c.parent, other, foreign_registry, nil, c.opts)
+
+    assert current(c) == original
+    assert requests(c) == before
+    assert {:ok, recovered} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert recovered.outcome == "retry"
+    assert recovered.record["attempt_id"] == original["attempt_id"]
+    assert recovered.record["attempt_count"] == 1
+    assert recovered.record["retry_count"] == 1
+    assert recovered.record["workflow"]["used_ms"] >= original["workflow"]["used_ms"]
+    assert recovered.record["native_stop_confirmed"]
+    assert recovered.record["task_session_phase"] == "stopped"
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+    refute Enum.any?(requests(c), &(&1["method"] == "thread/resume"))
+    File.write!(c.mode, "develop")
+    assert {:ok, continued} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert continued.outcome == "continue"
+    assert continued.record["retry_count"] == 1
+    assert continued.record["attempt_count"] == 2
+    assert continued.record["thread_id"] == original["thread_id"]
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+    assert Enum.count(requests(c), &(&1["method"] == "thread/resume")) == 1
+  end
+
+  @tag :unadmitted
+  test "recovery with an unconfirmed native stop becomes an incident without replacement", c do
+    original = crash_member(c)
+    File.write!(c.failure, "")
+    assert {:ok, result} = SymphonyElixir.TaskRecovery.recover(original, c.registry, c.opts)
+    assert result.outcome == "incident"
+    refute result.record["native_stop_confirmed"]
+    refute result.flow["dispatchable"]
+    assert result.record["retry_count"] == (original["retry_count"] || 0)
+    assert {:waiting, _} = AgentRunner.run_member(c.parent, c.work, c.registry, nil, c.opts)
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+    refute Enum.any?(requests(c), &(&1["method"] == "thread/resume"))
+  end
+
+  @tag :unadmitted
+  test "only one recovery caller can claim a dead member, and stale recovery cannot steal it", c do
+    original = crash_member(c)
+    owner = self()
+
+    contenders =
+      for _ <- 1..2 do
+        spawn(fn ->
+          result = RunJournal.recover_member(original)
+          send(owner, {:claimed_recovery, self(), result})
+          receive do: (:release -> :ok)
+        end)
+      end
+
+    on_exit(fn -> Enum.each(contenders, &Process.exit(&1, :kill)) end)
+
+    results =
+      for _ <- contenders do
+        assert_receive {:claimed_recovery, worker, result}, 2_000
+        {worker, result}
+      end
+
+    assert Enum.count(results, &match?({_, {:ok, _}}, &1)) == 1
+    assert Enum.count(results, &match?({_, {:error, :member_recovery_not_owned}}, &1)) == 1
+    refute RunJournal.interrupted_member?(current(c))
+    assert {:error, :member_recovery_not_owned} = SymphonyElixir.TaskRecovery.recover(original, c.registry, c.opts)
+
+    Enum.each(contenders, fn worker ->
+      ref = Process.monitor(worker)
+      send(worker, :release)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :normal}
+    end)
+
+    assert {:ok, %{outcome: "retry"}} = SymphonyElixir.TaskRecovery.recover(current(c), c.registry, c.opts)
+    assert current(c)["attempt_count"] == original["attempt_count"]
+  end
+
+  test "live, foreign-VM and missing member ownership never authorize local recovery", c do
+    refute RunJournal.interrupted_member?(c.record)
+    refute RunJournal.interrupted_member?(Map.delete(c.record, "executor_identity"))
+    foreign = put_in(c.record, ["executor_identity", "vm"], String.duplicate("a", 32))
+    refute RunJournal.interrupted_member?(foreign)
+    refute RunJournal.interrupted_member?(nil)
+    assert {:error, :member_recovery_not_owned} = RunJournal.recover_member(c.record)
+    refute File.exists?(c.trace)
+  end
+
+  @tag :unadmitted
+  test "recovery replays a completed result after lock-release failure without charging twice", c do
+    File.write!(c.mode, "develop")
+    barrier = Path.join([c.record["directory"], "executor.lock", "release-barrier"])
+    opts = Keyword.put(c.opts, :on_ready, fn _ -> File.write(barrier, "") end)
+    task = Task.async(fn -> AgentRunner.run_member(c.parent, c.work, c.registry, nil, opts) end)
+    assert {:error, {:execution_lock_owner_changed, _}} = Task.await(task, 10_000)
+    stopped = current(c)
+    assert stopped["phase"] == "completed"
+    assert stopped["native_stop_confirmed"]
+    File.rm!(barrier)
+    before = requests(c)
+    assert {:ok, replayed} = SymphonyElixir.TaskRecovery.recover(stopped, c.registry, c.opts)
+    assert replayed.outcome == "continue"
+    assert replayed.record["task_attempt_results"] == stopped["task_attempt_results"]
+    assert replayed.record["retry_count"] == stopped["retry_count"]
+    assert requests(c) == before
+  end
+
+  @tag :unadmitted
+  test "an interrupted admission is recoverable but a lost thread allocation remains uncertain", c do
+    task = Task.async(fn -> TaskExecution.admit(c.parent, c.work, c.registry, c.opts) end)
+    assert {:ok, admitted} = Task.await(task)
+    assert {:ok, result} = SymphonyElixir.TaskRecovery.recover(admitted.record, c.registry, c.opts)
+    assert result.outcome == "retry"
+    assert result.record["native_stop_confirmed"]
+    refute File.exists?(c.trace)
+
+    task =
+      Task.async(fn ->
+        {:ok, admitted} = TaskExecution.admit(c.parent, c.work, c.registry, c.opts)
+        RunJournal.checkpoint(admitted.record, %{"thread_allocation_intent" => true, "native_stop_confirmed" => false})
+      end)
+
+    assert {:ok, uncertain} = Task.await(task)
+    assert {:ok, result} = SymphonyElixir.TaskRecovery.recover(uncertain, c.registry, c.opts)
+    assert result.outcome == "incident"
+    refute result.record["native_stop_confirmed"]
+    refute File.exists?(c.trace)
+  end
+
+  @tag :unadmitted
+  test "damaged or missing command stop evidence cannot be cleared by recovery", c do
+    id = String.duplicate("a", 64)
+    missing = %{id => %{"id" => id, "status" => "running"}}
+    variants = [invalid: [], missing_receipt: %{"lost" => %{"status" => "unknown"}}, missing_directory: missing]
+
+    for {name, checks} <- variants do
+      key = WorkRef.key(c.work)
+      directory = RunJournal.directory(Path.join(c.root, to_string(name)), key)
+      registry = put_in(c.registry, [key, :directory], directory)
+
+      task =
+        Task.async(fn ->
+          {:ok, admitted} = TaskExecution.admit(c.parent, c.work, registry, c.opts)
+          RunJournal.checkpoint(admitted.record, %{"native_stop_confirmed" => true, "check_runs" => checks})
+        end)
+
+      assert {:ok, broken} = Task.await(task)
+      assert {:ok, result} = SymphonyElixir.TaskRecovery.recover(broken, registry, c.opts)
+      assert result.outcome == "incident"
+      assert result.record["check_runs"] == checks
+      refute result.flow["dispatchable"]
+    end
+
+    refute File.exists?(c.trace)
+  end
+
+  @tag :unadmitted
+  test "an exception while validating retained recovery inputs cannot confirm native stop", c do
+    original = crash_member(c)
+    manifest_path = Path.join(original["task_workspace"]["directory"], "manifest.json")
+    manifest = manifest_path |> File.read!() |> Jason.decode!() |> Map.put("packages", [nil]) |> Jason.encode!()
+    File.write!(manifest_path, manifest)
+    sha = Base.encode16(:crypto.hash(:sha256, manifest), case: :lower)
+    damaged = put_in(original, ["task_workspace", "manifest_sha"], sha)
+    File.write!(Path.join(original["directory"], "run.json"), Jason.encode!(damaged))
+    assert {:ok, result} = SymphonyElixir.TaskRecovery.recover(damaged, c.registry, c.opts)
+    assert result.outcome == "incident"
+    refute result.record["native_stop_confirmed"]
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
   end
 
   @tag :unadmitted
@@ -449,6 +653,20 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert {:ok, jobs} = TaskPlanExecution.discover(options)
     assert Enum.any?(jobs, &(&1.kind == :plan and not &1.dispatchable))
     assert Enum.any?(jobs, & &1.dispatchable)
+    refute File.exists?(c.trace)
+  end
+
+  @tag :unadmitted
+  test "discovery reports an unreadable member journal as blocked instead of claiming recovery", c do
+    opts = scheduler_options(c)
+    File.mkdir_p!(Path.join(c.record["directory"], "run.json"))
+
+    assert {:ok, [job]} = TaskPlanExecution.discover(opts)
+    refute job.kind == :plan
+    refute job.dispatchable
+    refute job.native_ref["recovery_required"]
+    assert job.native_ref["lifecycle"]["error"] == ":eisdir"
+    refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
     refute File.exists?(c.trace)
   end
 

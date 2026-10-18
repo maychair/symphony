@@ -6,6 +6,8 @@ defmodule SymphonyElixir.RunJournal do
   only after native idle validation.
   """
 
+  alias SymphonyElixir.ExecutionOwner
+
   @spec admit(Path.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def admit(root, issue_id, opts \\ []) do
     directory = Path.join(root, key(issue_id))
@@ -40,6 +42,11 @@ defmodule SymphonyElixir.RunJournal do
         |> Map.put("directory", directory)
         |> Map.put("host", to_string(host))
         |> Map.put("executor_os_pid", System.pid())
+
+      record =
+        if record["execution_binding"],
+          do: Map.put(record, "executor_identity", ExecutionOwner.new(self())),
+          else: record
 
       with {:ok, record} <- carry_review_for_execution(previous, record),
            :ok <- save_lock_owner(record) do
@@ -212,6 +219,39 @@ defmodule SymphonyElixir.RunJournal do
     else
       true
     end
+  end
+
+  @doc "A local dead BEAM owner is recoverable; an OS PID, timeout or foreign VM is not proof of its exit."
+  @spec interrupted_member?(term()) :: boolean()
+  def interrupted_member?(%{"execution_binding" => %{}, "directory" => directory} = record) when is_binary(directory) do
+    case ExecutionOwner.local_pid(record["executor_identity"]) do
+      pid when is_pid(pid) ->
+        not Process.alive?(pid) and record["executor_os_pid"] == System.pid() and
+          File.dir?(Path.join(directory, "executor.lock")) and recoverable_lock?(record)
+
+      _ ->
+        false
+    end
+  end
+
+  def interrupted_member?(_), do: false
+
+  @doc "Claim only a proven dead owner in this VM, retaining the attempt, native identity and all accounting."
+  @spec recover_member(map()) :: {:ok, map()} | {:error, term()}
+  def recover_member(%{"directory" => directory} = record) do
+    :global.trans(
+      {{__MODULE__, directory}, self()},
+      fn ->
+        with {:ok, ^record} <- read(directory),
+             true <- interrupted_member?(record),
+             {:ok, ^record} <- SymphonyElixir.ExecutionBinding.bind(record, record["execution_binding"]) do
+          write_checkpoint(record, %{"executor_identity" => ExecutionOwner.new(self()), "recovery" => "local worker exit confirmed; native stop pending"})
+        else
+          _ -> {:error, :member_recovery_not_owned}
+        end
+      end,
+      [node()]
+    )
   end
 
   @spec read(Path.t()) :: {:ok, map() | nil} | {:error, term()}

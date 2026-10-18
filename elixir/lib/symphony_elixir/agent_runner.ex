@@ -7,7 +7,7 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
   alias SymphonyElixir.ReviewLane.Runner
-  alias SymphonyElixir.{TaskExecution, TaskExecutionConfig, TaskSession}
+  alias SymphonyElixir.{TaskExecution, TaskExecutionConfig, TaskRecovery, TaskSession, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -45,7 +45,34 @@ defmodule SymphonyElixir.AgentRunner do
   @spec run_member(map(), map(), map(), pid() | nil, keyword()) :: member_result()
   def run_member(parent, work, executions, recipient \\ nil, opts \\ []) do
     with true <- (ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])) or {:error, :unsupported_task_session_transport},
-         {:ok, admitted} <- TaskExecution.admit(parent, work, executions, opts) do
+         {:ok, record, directory} <- member_record(work, executions) do
+      if RunJournal.interrupted_member?(record),
+        do: recover_member(record, directory, parent, work, executions, opts),
+        else: run_admitted_member(parent, work, executions, recipient, opts)
+    end
+  end
+
+  defp member_record(work, executions) do
+    case executions[WorkRef.key(work)] do
+      %{directory: directory} ->
+        with {:ok, record} <- RunJournal.read(directory), do: {:ok, record, directory}
+
+      _ ->
+        {:ok, nil, nil}
+    end
+  end
+
+  defp recover_member(record, directory, parent, work, executions, opts) do
+    binding = record["execution_binding"]
+
+    if record["directory"] == directory and record["issue_id"] == WorkRef.key(work) and
+         binding["work"] == work and binding["authority"]["work"] == parent,
+       do: TaskRecovery.recover(record, executions, opts),
+       else: {:error, :member_recovery_scope_changed}
+  end
+
+  defp run_admitted_member(parent, work, executions, recipient, opts) do
+    with {:ok, admitted} <- TaskExecution.admit(parent, work, executions, opts) do
       id = opts[:dispatch_id] || admitted.record["issue_id"]
       issue = %Issue{id: id, identifier: id, title: "Plan member", state: "open"}
 

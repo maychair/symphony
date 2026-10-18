@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskPlanExecution do
   @moduledoc "Translate configured native plans into jobs for the existing scheduler; execution remains owned by the member worker."
-  alias SymphonyElixir.{AgentRunner, Config, ExecutionBackend, TaskExecution, TaskExecutionConfig, WorkRef}
+  alias SymphonyElixir.{AgentRunner, Config, ExecutionBackend, RunJournal, TaskExecution, TaskExecutionConfig, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @spec job?(term()) :: boolean()
@@ -46,6 +46,12 @@ defmodule SymphonyElixir.TaskPlanExecution do
     result = TaskExecution.observe(parent, member.work, configured.executions, configured.opts)
     directory = configured.executions[WorkRef.key(member.work)].directory
 
+    recovery =
+      case RunJournal.read(directory) do
+        {:ok, record} -> RunJournal.interrupted_member?(record)
+        _ -> false
+      end
+
     flow =
       case result do
         {:ok, observation} -> observation.flow
@@ -59,8 +65,8 @@ defmodule SymphonyElixir.TaskPlanExecution do
       description: member.description,
       url: member.url,
       state: state,
-      dispatchable: flow["dispatchable"] == true and not File.exists?(Path.join(directory, "executor.lock")),
-      native_ref: %{"execution_kind" => "plan_member", "work" => member.work, "parent" => parent, "native_state" => member.raw["state"], "lifecycle" => flow}
+      dispatchable: recovery or (flow["dispatchable"] == true and not File.exists?(Path.join(directory, "executor.lock"))),
+      native_ref: %{"execution_kind" => "plan_member", "work" => member.work, "parent" => parent, "native_state" => member.raw["state"], "lifecycle" => flow, "recovery_required" => recovery}
     }
   rescue
     error -> blocked_member(parent, member, state, Exception.message(error))

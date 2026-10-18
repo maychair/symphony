@@ -177,6 +177,35 @@ defmodule SymphonyElixir.CommandCheckTest do
     assert {:error, :check_not_running} = CommandCheck.cancel(stopped, id)
   end
 
+  test "member recovery cancels an orphaned real check and attests its stopped receipt" do
+    context = fixture("exec sleep 30", 10_000)
+    assert :ok = RunJournal.complete(context.record, "completed")
+    supervisor = start_supervised!({Task.Supervisor, []})
+
+    {:ok, worker} =
+      Task.Supervisor.start_child(supervisor, fn ->
+        {:ok, owned} = RunJournal.admit(Path.dirname(context.record["directory"]), "2", execution_binding: context.record["execution_binding"])
+        run(context, owned)
+      end)
+
+    {_running, id} = await_native(context)
+    ref = Process.monitor(worker)
+    Process.exit(worker, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^worker, :killed}
+    original = current(context)
+    assert RunJournal.interrupted_member?(original)
+    assert {:ok, result} = SymphonyElixir.TaskRecovery.recover(original, %{}, repositories: [])
+    assert result.record["attempt_id"] == original["attempt_id"]
+    assert result.record["native_stop_confirmed"]
+    assert CommandCheck.stopped?(result.record)
+    receipt = result.record["check_runs"][id]["receipt"]
+    assert receipt["reason"] == "cancelled"
+    assert receipt["native_stop_confirmed"]
+    assert File.exists?(Path.join(check_dir(result.record, id), "cancel"))
+    assert result.outcome == "waiting"
+    refute File.exists?(Path.join(result.record["directory"], "executor.lock"))
+  end
+
   defp prepared(context) do
     flow = Map.put(context.record["workflow"], "restrictions", %{"pause" => %{"kind" => "pause", "scope" => "task"}})
     {:ok, record} = RunJournal.checkpoint(context.record, %{"workflow" => flow})
