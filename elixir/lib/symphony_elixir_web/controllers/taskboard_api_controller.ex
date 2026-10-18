@@ -10,6 +10,7 @@ defmodule SymphonyElixirWeb.TaskboardApiController do
   @error_statuses %{
     taskboard_project_not_found: {404, "project_not_found"},
     taskboard_issue_not_found: {404, "issue_not_found"},
+    taskboard_read_only: {410, "taskboard_read_only"},
     invalid_taskboard_transition: {409, "invalid_taskboard_transition"},
     unsupported_taskboard_action: {422, "unsupported_taskboard_action"},
     issue_not_retrying: {409, "issue_not_retrying"},
@@ -40,12 +41,7 @@ defmodule SymphonyElixirWeb.TaskboardApiController do
   @spec create_issue(Conn.t(), map()) :: Conn.t()
   def create_issue(conn, params) do
     with_operator(conn, fn ->
-      project_id = params["project_id"]
-
-      case Taskboard.create_issue(project_id, params, taskboard_opts()) do
-        {:ok, payload} -> json(put_status(conn, 201), payload)
-        error -> task_error(conn, error)
-      end
+      task_error(conn, Taskboard.create_issue(params["project_id"], params, taskboard_opts()))
     end)
   end
 

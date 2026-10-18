@@ -1502,8 +1502,10 @@ Enablement (extension):
 - These columns are projections over tracker state, scheduler labels, execution observations, and
   the agreed acceptance protocol. They MUST NOT introduce a second task source or replace the
   internal scheduler state machine.
-- `Done` requires both the agreed acceptance decision and native Issue closure. A successful Agent
-  turn, published delivery, or merged change alone MUST NOT project an Issue as `Done`.
+- `Done` requires the versioned execution lifecycle to report the work completed and delivered
+  against the current candidate with no remaining restriction. A label, native Issue closure, or a
+  successful Agent turn, published delivery, or merged change alone MUST NOT project an Issue as
+  `Done`.
 - The runtime surface SHOULD depict active sessions, retry delays, token consumption, runtime
   totals, recent events, and health/error indicators.
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
@@ -1514,8 +1516,8 @@ Enablement (extension):
 Provide a JSON REST API under `/api/v1/*` for current runtime state and operational debugging.
 
 Taskboard reads and runtime reads MAY be unauthenticated only when the listener is protected by its
-private deployment boundary. Taskboard mutations MUST require explicit operator authentication.
-Operator comments and human-owned labels MUST use the human tracker identity rather than silently
+private deployment boundary. The Taskboard is a read-only projection: operator comments and
+human-owned labels MUST use the human tracker identity in the native tracker rather than silently
 attributing those actions to the scheduler identity.
 
 Minimum endpoints:
@@ -1658,13 +1660,11 @@ API design notes:
   current write capabilities.
 - `GET /api/v1/taskboard/issues/:project_id/:issue_identifier` returns the Issue body, comments,
   linked pull/merge requests, review evidence, execution evidence, and allowed UI capabilities.
-- `POST /api/v1/taskboard/issues` creates an Issue only after an explicit operator confirmation.
-- `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/comments` publishes an operator
-  comment.
-- `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/actions/:action` requests dispatch,
-  pause, retry, rework, or acceptance through the existing adapter and state-transition rules.
-- A Taskboard API MUST re-read the current Issue and reject an action that is invalid for its
-  current projection. It MUST NOT directly mutate orchestrator memory.
+- The former mutation endpoints (`POST /api/v1/taskboard/issues`, `POST .../comments`, and
+  `POST .../actions/:action`) are retired. They MUST NOT create, comment on, label, dispatch,
+  pause, retry, rework, or accept work; a stable retired route SHOULD answer `410 Gone` with an
+  error envelope.
+- The Taskboard API MUST NOT directly mutate orchestrator memory or a tracker.
 - Repository Issues remain the authoritative task records. Taskboard detail, drafts, and execution
   evidence MUST NOT become an alternate task database.
 

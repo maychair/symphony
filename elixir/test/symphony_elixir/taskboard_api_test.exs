@@ -103,7 +103,7 @@ defmodule SymphonyElixirWeb.TaskboardApiTest do
     assert [%{"body" => "Fixture comment"}] = detail["comments"]
   end
 
-  test "requires the operator token for creation, comments, and transitions" do
+  test "requires the operator token and retires every write with 410 Gone" do
     body = %{
       "project_id" => "memory-mock-issues",
       "title" => "Created by operator",
@@ -118,36 +118,20 @@ defmodule SymphonyElixirWeb.TaskboardApiTest do
 
     assert json_response(unauthorized, 401)["error"]["code"] == "operator_token_required"
 
-    created =
-      build_conn()
-      |> Conn.put_req_header("content-type", "application/json")
-      |> Conn.put_req_header("x-symphony-taskboard-token", "operator-control")
-      |> post("/api/v1/taskboard/issues", Jason.encode!(body))
+    for {path, payload} <- [
+          {"/api/v1/taskboard/issues", body},
+          {"/api/v1/taskboard/issues/memory-mock-issues/MOCK-1/comments", %{"body" => "Reply from operator"}},
+          {"/api/v1/taskboard/issues/memory-mock-issues/MOCK-1/actions/dispatch", %{}}
+        ] do
+      response =
+        build_conn()
+        |> Conn.put_req_header("content-type", "application/json")
+        |> Conn.put_req_header("x-symphony-taskboard-token", "operator-control")
+        |> post(path, Jason.encode!(payload))
 
-    assert %{"identifier" => "MOCK-" <> _} = json_response(created, 201)
-
-    comment =
-      build_conn()
-      |> Conn.put_req_header("content-type", "application/json")
-      |> Conn.put_req_header("x-symphony-taskboard-token", "operator-control")
-      |> post(
-        "/api/v1/taskboard/issues/memory-mock-issues/MOCK-1/comments",
-        Jason.encode!(%{"body" => "Reply from operator"})
-      )
-
-    assert %{"body" => "Reply from operator"} = json_response(comment, 200)
-
-    action =
-      build_conn()
-      |> Conn.put_req_header("content-type", "application/json")
-      |> Conn.put_req_header("x-symphony-taskboard-token", "operator-control")
-      |> post(
-        "/api/v1/taskboard/issues/memory-mock-issues/MOCK-1/actions/dispatch",
-        Jason.encode!(%{})
-      )
-
-    assert %{"action" => "dispatch", "detail" => "queued for dispatch"} =
-             json_response(action, 200)
+      assert %{"error" => %{"code" => "taskboard_read_only", "message" => "taskboard read only"}} =
+               json_response(response, 410)
+    end
   end
 
   defp taskboard_settings do

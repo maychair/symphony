@@ -1,10 +1,11 @@
 defmodule SymphonyElixir.Taskboard do
   @moduledoc """
-  Repository Issue board projection for the Symphony Dashboard.
+  Read-only repository Issue board projection for the Symphony Dashboard.
 
   The Taskboard is a view over tracker Issues and execution observations. It
-  keeps no task database. Mutations are forwarded through the tracker adapters
-  and still require the scheduler's normal labels and state transitions.
+  keeps no task database and never mutates a tracker: every write stays in the
+  native GitHub or GitLab Issue. `Done` and `accepted` come from the versioned
+  member lifecycle, never from a `symphony:accept` label.
   """
 
   require Logger
@@ -49,8 +50,6 @@ defmodule SymphonyElixir.Taskboard do
         {column, Enum.count(cards, &(&1.column == column))}
       end)
 
-    write_enabled? = Enum.any?(projects, &Map.get(&1, :write_enabled, false))
-
     %{
       generated_at: now(),
       columns: @columns,
@@ -58,16 +57,22 @@ defmodule SymphonyElixir.Taskboard do
       projects: Enum.map(projects, &public_project/1),
       cards: cards,
       errors: errors,
-      capabilities: %{
-        create_issue: write_enabled?,
-        comment: write_enabled?,
-        dispatch: write_enabled?,
-        retry: write_enabled?,
-        rework: write_enabled?,
-        accept: write_enabled?,
-        pause: write_enabled?,
-        drag_and_drop: write_enabled?
-      }
+      capabilities: read_only_capabilities()
+    }
+  end
+
+  # The projection advertises no write capability: every mutation lives in the
+  # native tracker, so a client must not offer Taskboard edits.
+  defp read_only_capabilities do
+    %{
+      create_issue: false,
+      comment: false,
+      dispatch: false,
+      retry: false,
+      rework: false,
+      accept: false,
+      pause: false,
+      drag_and_drop: false
     }
   end
 
@@ -122,48 +127,34 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
+  @doc """
+  Reject Issue creation.
+
+  The Taskboard is a read-only projection, so this entry point never mutates a
+  tracker; creation happens in the native GitHub or GitLab Issue. The function
+  stays exported with its original arity for a stable JSON route, and a caller
+  always receives the retired-write error.
+  """
   @spec create_issue(String.t(), map(), keyword()) :: result(map())
-  def create_issue(project_id, attrs, opts \\ []) when is_map(attrs) do
-    settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!() end)
+  def create_issue(_project_id, attrs, _opts \\ []) when is_map(attrs), do: {:error, :taskboard_read_only}
 
-    with {:ok, project} <- find_project(project_id, settings, opts),
-         :ok <- ensure_write_enabled(project, settings),
-         {:ok, attrs} <- validate_create_attrs(attrs),
-         {:ok, result} <- write_create(project, attrs, opts) do
-      refresh_local(project, opts)
-      {:ok, result}
-    end
-  end
-
+  @doc "Reject operator comments; the Taskboard publishes nothing to a tracker."
   @spec comment(String.t(), String.t(), String.t(), keyword()) :: result(map())
-  def comment(project_id, identifier, body, opts \\ [])
-      when is_binary(project_id) and is_binary(identifier) do
-    settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!() end)
+  def comment(project_id, identifier, _body, _opts \\ [])
+      when is_binary(project_id) and is_binary(identifier),
+      do: {:error, :taskboard_read_only}
 
-    with :ok <- validate_body(body),
-         {:ok, project} <- find_project(project_id, settings, opts),
-         :ok <- ensure_write_enabled(project, settings),
-         {:ok, result} <- write_comment(project, identifier, body, opts) do
-      refresh_local(project, opts)
-      {:ok, result}
-    end
-  end
+  @doc """
+  Reject every state-changing action.
 
+  Dispatch, pause, retry, rework, and accept each move a native Issue. The
+  Taskboard is a read-only projection, so it refuses the mutation and points
+  operators at the native tracker instead.
+  """
   @spec perform_action(String.t(), String.t(), String.t(), map(), keyword()) :: result(map())
-  def perform_action(project_id, identifier, action, attrs, opts \\ [])
-      when is_binary(project_id) and is_binary(identifier) and is_binary(action) and is_map(attrs) do
-    settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!() end)
-
-    with {:ok, project} <- find_project(project_id, settings, opts),
-         :ok <- ensure_write_enabled(project, settings),
-         {:ok, detail} <- fetch_detail(project, identifier, opts),
-         {:ok, card} <- action_card(project, detail, opts),
-         :ok <- validate_action(action, card),
-         {:ok, result} <- execute_action(project, detail.issue, action, attrs, opts) do
-      refresh_local(project, opts)
-      {:ok, Map.put(result, :action, action)}
-    end
-  end
+  def perform_action(project_id, identifier, action, _attrs, _opts \\ [])
+      when is_binary(project_id) and is_binary(identifier) and is_binary(action),
+      do: {:error, :taskboard_read_only}
 
   @spec write_enabled?(map()) :: boolean()
   def write_enabled?(settings) do
@@ -185,8 +176,8 @@ defmodule SymphonyElixir.Taskboard do
   @spec card_payload(Issue.t(), map(), map() | nil, map() | nil, [map()]) :: map()
   def card_payload(%Issue{} = issue, project, runtime_entry, execution \\ nil, deliveries \\ []) do
     labels = Enum.map(issue.labels, &normalize_label/1)
-    column = column_for(issue, labels, runtime_entry)
-    status = agent_status(column, labels, runtime_entry)
+    column = column_for(issue, labels, runtime_entry, lifecycle_accepted?(execution))
+    status = agent_status(column, labels, runtime_entry, issue)
     artifacts = card_artifacts(execution, deliveries, project)
 
     %{
@@ -302,7 +293,7 @@ defmodule SymphonyElixir.Taskboard do
   defp project_snapshot_entry(%{local: false} = project, opts) do
     path = "/api/v1/taskboard/projects/#{Provider.encode(project.id)}"
 
-    case remote_request(:get, project, path, %{}, nil, opts) do
+    case remote_request(project, path, opts) do
       {:ok, payload} when is_map(payload) ->
         cards = Enum.map(payload["cards"] || [], &normalize_remote_card(&1, project))
 
@@ -395,16 +386,27 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp column_for(%Issue{} = issue, labels, runtime_entry) do
-    accepted? = "symphony:accept" in labels
-    closed? = normalize_label(issue.state) in ["closed", "cancelled", "canceled", "done"]
+  # Migration off the retired label-as-acceptance rule. The Taskboard used to
+  # fabricate acceptance from the current `symphony:accept` label plus native
+  # closure, and the test suite asserted that forged behaviour. A label cannot
+  # carry the version information an acceptance decision needs (design 16.2), so
+  # no label selects a column. `Done` and `accepted` now require the versioned
+  # lifecycle fact the member journal derives from the plan contract: the flow is
+  # completed with its delivery accepted against the current manifest revision
+  # and with no remaining restriction (`closeable`). A natively closed Issue
+  # without that fact stays in Human Review as an unverified historical
+  # conclusion instead of a business Done.
+  defp lifecycle_accepted?(execution),
+    do: is_map(execution) and Map.get(execution, :closeable) == true
+
+  defp column_for(%Issue{} = issue, labels, runtime_entry, accepted?) do
     status = runtime_status(runtime_entry)
 
     cond do
-      closed? ->
-        closed_column(accepted?)
+      accepted? ->
+        "Done"
 
-      accepted? or human_review?(labels, status) ->
+      closed?(issue) or human_review?(labels, status) ->
         "Human Review"
 
       in_progress?(labels, status) ->
@@ -415,8 +417,8 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp closed_column(true), do: "Done"
-  defp closed_column(false), do: "Human Review"
+  defp closed?(%Issue{state: state}),
+    do: normalize_label(state) in ["closed", "cancelled", "canceled", "done"]
 
   defp human_review?(labels, status) do
     status == "blocked" or
@@ -427,22 +429,22 @@ defmodule SymphonyElixir.Taskboard do
     status in ["running", "retrying"] or "symphony:running" in labels
   end
 
-  defp agent_status("Done", _labels, _runtime), do: "accepted"
-  defp agent_status("Human Review", _labels, %{status: status}) when status in ["blocked"], do: "blocked"
+  defp agent_status("Done", _labels, _runtime, _issue), do: "accepted"
 
-  defp agent_status("Human Review", labels, _runtime) do
+  defp agent_status("Human Review", labels, runtime_entry, issue) do
     cond do
-      "symphony:accept" in labels -> "accepted; awaiting closure"
+      closed?(issue) -> "unverified closure"
+      runtime_status(runtime_entry) == "blocked" -> "blocked"
       "symphony:failed" in labels -> "failed"
       "symphony:review" in labels -> "review"
       true -> "waiting for human"
     end
   end
 
-  defp agent_status("In Progress", _labels, %{status: "retrying"}), do: "retrying"
-  defp agent_status("In Progress", _labels, %{status: "running"}), do: "running"
-  defp agent_status("In Progress", _labels, _runtime), do: "waiting to run"
-  defp agent_status(_column, _labels, _runtime), do: "idle"
+  defp agent_status("In Progress", _labels, %{status: "retrying"}, _issue), do: "retrying"
+  defp agent_status("In Progress", _labels, %{status: "running"}, _issue), do: "running"
+  defp agent_status("In Progress", _labels, _runtime, _issue), do: "waiting to run"
+  defp agent_status(_column, _labels, _runtime, _issue), do: "idle"
 
   defp public_runtime(nil), do: nil
 
@@ -460,13 +462,7 @@ defmodule SymphonyElixir.Taskboard do
     }
   end
 
-  defp delivery_hint(labels) do
-    cond do
-      "symphony:review" in labels -> "review pending"
-      "symphony:accept" in labels -> "accepted"
-      true -> nil
-    end
-  end
+  defp delivery_hint(labels), do: if("symphony:review" in labels, do: "review pending")
 
   defp sort_cards(cards) do
     Enum.sort_by(cards, fn card ->
@@ -495,7 +491,7 @@ defmodule SymphonyElixir.Taskboard do
     path =
       "/api/v1/taskboard/issues/#{Provider.encode(project.id)}/#{Provider.encode(identifier)}"
 
-    case remote_request(:get, project, path, %{}, nil, opts) do
+    case remote_request(project, path, opts) do
       {:ok, payload} when is_map(payload) -> {:ok, normalize_remote_detail(payload)}
       {:ok, _payload} -> {:error, :invalid_remote_taskboard_payload}
       error -> error
@@ -652,6 +648,7 @@ defmodule SymphonyElixir.Taskboard do
           blocker_reason: record["blocker_reason"],
           handoff: record["handoff"],
           workflow_state: get_in(record, ["workflow", "state"]),
+          closeable: get_in(record, ["workflow", "closeable"]) == true,
           acceptance_mode: get_in(record, ["workflow", "contract", "acceptance_mode"]),
           manifest: get_in(record, ["workflow", "manifest"]),
           delivery: record["delivery"],
@@ -733,16 +730,19 @@ defmodule SymphonyElixir.Taskboard do
   defp http_url?(url) when is_binary(url), do: String.match?(url, ~r/^https?:\/\//i)
   defp http_url?(_url), do: false
 
-  defp human_action("Human Review", labels, status, issue, artifacts, execution) do
-    accepted? = "symphony:accept" in labels
+  defp human_action("Human Review", _labels, status, issue, artifacts, execution) do
     acceptance_mode = execution[:acceptance_mode] || "separate"
 
     cond do
-      accepted? ->
+      closed?(issue) ->
         %{
-          required: false,
-          summary: "Acceptance is recorded; Symphony is waiting for the tracker to close the Issue.",
-          label: nil
+          required: true,
+          summary:
+            "This Issue is closed without a lifecycle acceptance bound to its current contract. " <>
+              "Symphony shows the historical conclusion as unverified and will not advance dependent work from it. " <>
+              "Reopen the Issue or record a versioned decision.",
+          label: nil,
+          issue_url: issue.url
         }
 
       status == "failed" ->
@@ -763,7 +763,7 @@ defmodule SymphonyElixir.Taskboard do
         %{
           required: true,
           summary: artifact_action(artifacts, acceptance_mode),
-          label: if(acceptance_mode == "merge", do: nil, else: "symphony:accept"),
+          label: nil,
           issue_url: issue.url
         }
 
@@ -795,14 +795,14 @@ defmodule SymphonyElixir.Taskboard do
       requests == [] ->
         review <>
           " This task has no MR; that is expected for its delivery type. " <>
-          "Add `symphony:accept` to the Issue if it meets the agreed criteria."
+          "Record a decision bound to the current delivery when it meets the agreed criteria."
 
       acceptance_mode == "merge" ->
         review <> " Merge the request when approved; Symphony will verify that delivery."
 
       true ->
         review <>
-          " Merge the request if approved, then add `symphony:accept` to the Issue."
+          " Merge the request if approved, then record a decision bound to the current delivery."
     end
   end
 
@@ -818,200 +818,21 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp detail_capabilities(project, settings, detail) do
-    enabled = ensure_write_enabled(project, settings) == :ok
-    issue = detail.issue
-    accepted? = "symphony:accept" in Enum.map(issue.labels, &normalize_label/1)
-
-    %{
-      comment: enabled and issue.state != "closed",
-      dispatch: enabled and issue.state != "closed",
-      retry: enabled,
-      rework: enabled and issue.state != "closed" and not accepted?,
-      accept: enabled and issue.state != "closed" and not accepted?,
-      pause: enabled and issue.state != "closed"
-    }
+  # The detail payload mirrors the read-only board and offers no write action.
+  defp detail_capabilities(_project, _settings, _detail) do
+    %{comment: false, dispatch: false, retry: false, rework: false, accept: false, pause: false}
   end
 
-  defp ensure_write_enabled(%{local: true} = project, settings) do
-    cond do
-      not settings.taskboard.enabled -> {:error, :taskboard_disabled}
-      not is_binary(settings.taskboard.control_token) -> {:error, :operator_control_token_not_configured}
-      not is_binary(settings.taskboard.provider_token) -> {:error, :operator_identity_not_configured}
-      not is_binary(project.settings.tracker.kind) -> {:error, :taskboard_tracker_not_configured}
-      true -> :ok
-    end
-  end
-
-  defp ensure_write_enabled(%{local: false} = project, _settings) do
-    if is_binary(project.token), do: :ok, else: {:error, :remote_operator_token_not_configured}
-  end
-
-  defp validate_create_attrs(attrs) do
-    title = attrs["title"] |> to_string() |> String.trim()
-    description = Map.get(attrs, "description", "") |> to_string()
-    labels = attrs["labels"] |> List.wrap() |> Enum.map(&to_string/1) |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.uniq()
-
-    if title == "" or String.length(title) > 240 do
-      {:error, :issue_title_required}
-    else
-      {:ok, %{"title" => title, "description" => description, "labels" => labels}}
-    end
-  end
-
-  defp validate_body(body) when is_binary(body) do
-    if String.trim(body) == "", do: {:error, :comment_body_required}, else: :ok
-  end
-
-  defp validate_body(_body), do: {:error, :comment_body_required}
-
-  defp write_create(%{local: true} = project, attrs, opts) do
-    with {:ok, provider} <- Provider.module_for(project.kind) do
-      provider.create_issue(operator_tracker_settings(project.settings), attrs, opts)
-    end
-  end
-
-  defp write_create(%{local: false} = project, attrs, opts) do
-    remote_request(:post, project, "/api/v1/taskboard/issues", %{}, %{"project_id" => project.id} |> Map.merge(attrs), opts)
-  end
-
-  defp write_comment(%{local: true} = project, identifier, body, opts) do
-    with {:ok, provider} <- Provider.module_for(project.kind) do
-      provider.comment(operator_tracker_settings(project.settings), identifier, body, opts)
-    end
-  end
-
-  defp write_comment(%{local: false} = project, identifier, body, opts) do
-    path =
-      "/api/v1/taskboard/issues/#{Provider.encode(project.id)}/#{Provider.encode(identifier)}/comments"
-
-    remote_request(:post, project, path, %{}, %{"body" => body}, opts)
-  end
-
-  defp action_card(_project, detail, opts) do
-    issue = detail.issue
-
-    runtime =
-      case Map.fetch(detail, :runtime_entry) do
-        {:ok, %{} = entry} -> entry
-        _ -> Keyword.get(opts, :runtime_entry) || local_runtime_entry(issue, opts)
-      end
-
-    {:ok, card_payload(issue, %{id: "detail", name: "detail", repo: "detail", kind: "github"}, runtime)}
-  end
-
-  defp validate_action("dispatch", %{column: "Todo"}), do: :ok
-  defp validate_action("pause", %{column: "In Progress"}), do: :ok
-  defp validate_action("retry", %{agent_status: "retrying"}), do: :ok
-
-  defp validate_action(action, %{agent_status: "accepted; awaiting closure"})
-       when action in ["dispatch", "pause", "rework", "accept"],
-       do: {:error, :invalid_taskboard_transition}
-
-  defp validate_action("rework", %{column: "Human Review"}), do: :ok
-  defp validate_action("accept", %{column: "Human Review"}), do: :ok
-  defp validate_action(action, _card) when action in ["dispatch", "pause", "retry", "rework", "accept"], do: {:error, :invalid_taskboard_transition}
-  defp validate_action(_action, _card), do: {:error, :unsupported_taskboard_action}
-
-  defp execute_action(%{local: true} = project, issue, action, attrs, opts) do
-    with {:ok, provider} <- Provider.module_for(project.kind) do
-      execute_local_action(
-        provider,
-        operator_tracker_settings(project.settings),
-        issue,
-        action,
-        attrs,
-        opts
-      )
-    end
-  end
-
-  defp execute_action(%{local: false} = project, issue, action, attrs, opts) do
-    path =
-      "/api/v1/taskboard/issues/#{Provider.encode(project.id)}/#{Provider.encode(issue.identifier)}/actions/#{Provider.encode(action)}"
-
-    remote_request(:post, project, path, %{}, attrs, opts)
-  end
-
-  defp execute_local_action(provider, settings, issue, "dispatch", _attrs, opts) do
-    with :ok <- provider.add_label(settings, issue.identifier, "symphony:ready", opts) do
-      {:ok, %{detail: "queued for dispatch", issue_identifier: issue.identifier}}
-    end
-  end
-
-  defp execute_local_action(provider, settings, issue, "pause", _attrs, opts) do
-    with :ok <- provider.remove_label(settings, issue.identifier, "symphony:ready", opts) do
-      {:ok, %{detail: "routing authorization removed", issue_identifier: issue.identifier}}
-    end
-  end
-
-  defp execute_local_action(_provider, _settings, issue, "retry", _attrs, opts) do
-    retry_now(issue, opts)
-  end
-
-  defp execute_local_action(provider, settings, issue, "rework", attrs, opts) do
-    with :ok <- maybe_comment(provider, settings, issue, attrs, opts),
-         :ok <- provider.remove_label(settings, issue.identifier, "symphony:rework", opts),
-         :ok <- provider.add_label(settings, issue.identifier, "symphony:rework", opts) do
-      {:ok, %{detail: "rework requested", issue_identifier: issue.identifier}}
-    end
-  end
-
-  defp execute_local_action(provider, settings, issue, "accept", attrs, opts) do
-    with :ok <- maybe_comment(provider, settings, issue, attrs, opts),
-         :ok <- provider.add_label(settings, issue.identifier, "symphony:accept", opts) do
-      {:ok, %{detail: "acceptance requested", issue_identifier: issue.identifier}}
-    end
-  end
-
-  defp maybe_comment(provider, settings, issue, attrs, opts) do
-    case Provider.present(attrs["comment"]) do
-      nil ->
-        :ok
-
-      body ->
-        case provider.comment(settings, issue.identifier, body, opts) do
-          {:ok, _comment} -> :ok
-          error -> error
-        end
-    end
-  end
-
-  defp retry_now(issue, opts) do
-    fun = Keyword.get(opts, :retry_fun, fn id -> Orchestrator.retry_now(id) end)
-
-    case fun.(issue.id) do
-      :ok -> {:ok, %{detail: "retry started", issue_identifier: issue.identifier}}
-      :not_retrying -> {:error, :issue_not_retrying}
-      :unavailable -> {:error, :orchestrator_unavailable}
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :retry_unavailable}
-    end
-  end
-
-  defp operator_tracker_settings(settings) do
-    provider =
-      settings.tracker.provider
-      |> Map.put("token", settings.taskboard.provider_token)
-      |> Map.put("api_key", settings.taskboard.provider_token)
-
-    %{settings.tracker | provider: provider}
-  end
-
-  defp remote_request(method, project, path, query, body, opts) do
+  defp remote_request(project, path, opts) do
     fun =
-      Keyword.get(opts, :remote_request_fun, fn method, url, body, headers ->
+      Keyword.get(opts, :remote_request_fun, fn url, headers ->
         request_options = [
           headers: headers,
-          params: query,
           connect_options: [timeout: @remote_timeout_ms],
           receive_timeout: @remote_timeout_ms
         ]
 
-        case method do
-          :get -> Req.get(url, request_options)
-          :post -> Req.post(url, Keyword.put(request_options, :json, body))
-        end
+        Req.get(url, request_options)
       end)
 
     headers =
@@ -1020,7 +841,7 @@ defmodule SymphonyElixir.Taskboard do
         _ -> []
       end
 
-    case fun.(method, project.url <> path, body, headers) do
+    case fun.(project.url <> path, headers) do
       {:ok, %{status: status, body: payload}} when status in 200..299 -> {:ok, payload}
       {:ok, %{status: status, body: payload}} -> {:error, {:remote_taskboard_status, status, payload}}
       {:error, reason} -> {:error, reason}
@@ -1029,15 +850,6 @@ defmodule SymphonyElixir.Taskboard do
   rescue
     error -> {:error, {:taskboard_request_failed, Exception.message(error)}}
   end
-
-  defp refresh_local(%{local: true}, opts) do
-    default = Application.get_env(:symphony_elixir, :taskboard_refresh_fun, fn -> Orchestrator.request_refresh() end)
-    fun = Keyword.get(opts, :refresh_fun, default)
-    if is_function(fun, 0), do: fun.()
-    :ok
-  end
-
-  defp refresh_local(_project, _opts), do: :ok
 
   defp format_error({:remote_taskboard_status, status, %{"error" => %{"message" => message}}}),
     do: "HTTP #{status}: #{message}"

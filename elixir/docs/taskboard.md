@@ -13,16 +13,17 @@ orchestrator snapshot provide runtime evidence, but neither becomes a second tas
 | `/api/v1/taskboard` | Aggregated Taskboard projection |
 | `/api/v1/taskboard/projects/:project_id` | One project projection used by remote aggregation |
 | `/api/v1/taskboard/issues/:project_id/:issue_identifier` | Issue detail, comments, deliveries, execution evidence, and capabilities |
-| `POST /api/v1/taskboard/issues` | Create a repository Issue after an operator-confirmed draft |
-| `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/comments` | Publish an operator comment |
-| `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/actions/:action` | Request a controlled state transition |
+| `POST /api/v1/taskboard/issues` | Retired: returns `410 taskboard_read_only` |
+| `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/comments` | Retired: returns `410 taskboard_read_only` |
+| `POST /api/v1/taskboard/issues/:project_id/:issue_identifier/actions/:action` | Retired: returns `410 taskboard_read_only` |
 | `/api/v1/state` | Original runtime JSON API |
 
 The projection and detail GET endpoints are readable without a Taskboard control token. Treat the
 HTTP port as a private operational surface. When the dashboard leaves loopback, restrict it to a
-trusted LAN or place it behind an authenticated reverse proxy. The Taskboard UI does not call the
-POST endpoints; issue operations happen in the native GitHub or GitLab issue page. Any other client
-using those APIs still requires the control token.
+trusted LAN or place it behind an authenticated reverse proxy. The Taskboard is a read-only
+projection; issue creation, comments, labels, review, acceptance and merge decisions happen in the
+native GitHub or GitLab issue page. The POST routes remain only as stable retired URLs and reject
+every authorized request with `410 taskboard_read_only`.
 
 ## Four-column projection
 
@@ -33,8 +34,8 @@ queue, native Goal state, and acceptance protocol remain authoritative.
 |---|---|
 | Todo | Open or active Issue that is not running, retrying, blocked, in review, or accepted |
 | In Progress | Runtime entry is running/retrying, or the engine's `symphony:running` label is present |
-| Human Review | Runtime blocked, `symphony:review`/`symphony:blocked`/`symphony:failed`, accepted but still open, or externally closed without acceptance |
-| Done | Tracker state is closed/cancelled/done **and** `symphony:accept` is present |
+| Human Review | Runtime blocked, `symphony:review`/`symphony:blocked`/`symphony:failed`, or a native closure without versioned acceptance |
+| Done | The versioned member journal reports `workflow.closeable == true`: completed, delivered against the current candidate and with no remaining restriction |
 
 When `tracker.assignee` is configured, the local projection includes only Issues whose normalized
 `assignee_id` matches that tracker identity. Managed Workspace workflows configure this field to
@@ -43,13 +44,14 @@ single normalized assignee stay off the personal board. Without `tracker.assigne
 keeps its project-wide behavior.
 
 The projection checks Done before any runtime state. This prevents a stale agent process or retry
-entry from moving a verified closed Issue back into execution. An open Issue with
-`symphony:accept` stays in Human Review with `accepted; awaiting closure`; it cannot be accepted or
-reworked again from the Taskboard. Close it through the normal tracker acceptance flow to finish
-the transition.
+entry from moving a delivered Issue back into execution. A label, a closed Issue, or a merged
+delivery alone never produces Done: a manually closed Issue with a stale `symphony:accept` label
+stays in Human Review as `unverified closure` until the execution journal proves the versioned
+lifecycle.
 
 A successful Agent turn, published pull/merge request, or merged delivery alone does not produce
-Done. The existing acceptance decision and native Issue closure remain required.
+Done. The member lifecycle must prove completion and delivery, and the engine closes the member
+Issue under the sealed plan authority only after that evidence exists.
 
 ## Navigation-only dashboard
 
@@ -57,15 +59,16 @@ Each Issue title opens the tracker-provided Issue URL in a new browser tab so th
 an independent status view. Linked MRs from the tracker and delivered reports from the execution
 manifest appear as separate links from the same card. For report-only work, the card states that no
 MR is expected instead of leaving an empty delivery area. Human Review cards also show the concrete
-decision the person must make, such as reviewing the report and adding `symphony:accept`.
+decision the person must make, such as inspecting the published report or the unverified native
+closure in the tracker.
 
 The board has no detail panel, comment composer, drag-and-drop gesture, or scheduler action. Issue
 creation, comments, labels, review, acceptance, and merge decisions happen in GitHub or GitLab,
 where the repository workflow and native history remain visible.
 
-The authenticated mutation APIs remain available for integrations that already use them. They
-re-read the current Issue before executing an action, reject invalid transitions, and never write
-orchestrator memory directly. Keeping those APIs does not make the dashboard an operator console.
+The mutation APIs are retired. They keep their routes and token check so older integrations receive
+an explicit `410 taskboard_read_only` instead of silently losing their request, but they never
+re-read or write a tracker and cannot mutate orchestrator memory.
 
 ## Identity model
 
@@ -73,7 +76,7 @@ Symphony separates two tracker identities:
 
 - The scheduler identity writes engine-owned state labels and runtime notices.
 - The human operator identity writes Issues, comments, `symphony:ready`, `symphony:rework`, and
-  `symphony:accept` when a person performs those actions in the tracker or through the API.
+  `symphony:accept` when a person performs those actions in the native tracker.
 
 The operator token is configured as `taskboard.provider_token` and should resolve from
 `$SYMPHONY_OPERATOR_TRACKER_TOKEN`. The scheduler keeps using its own adapter token. The control
@@ -130,5 +133,6 @@ the local project projection.
   is explicitly different from missing MR evidence.
 - Provider review enrichment is best effort; unsupported unresolved-thread queries are labelled
   unavailable instead of rendered as zero.
-- Closing an Issue without `symphony:accept` remains in Human Review.
+- A native closure without a versioned completed and delivered lifecycle remains in Human Review as
+  an unverified closure.
 - The scheduler's pause, resume, budget, versioned decision, and acceptance semantics are unchanged.
