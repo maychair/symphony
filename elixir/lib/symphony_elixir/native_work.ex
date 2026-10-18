@@ -232,6 +232,43 @@ defmodule SymphonyElixir.NativeWork do
     end
   end
 
+  @doc """
+  Request native closure of one Issue after a fresh scope and snapshot check.
+
+  The caller must persist its closure intent first and confirm the read-back
+  state before recording a receipt; a write response is never a closure proof.
+  """
+  @spec close(map(), keyword()) :: :sent | {:not_sent, term()} | {:uncertain, term()}
+  def close(snapshot, opts \\ []) do
+    with true <- valid_snapshot?(snapshot) or {:error, :invalid_native_closure},
+         catalog = Keyword.get_lazy(opts, :repositories, fn -> Config.settings!().tracker.provider["plan_repositories"] || [] end),
+         true <- snapshot.work["kind"] == "issue" or {:error, :expected_issue},
+         {:ok, repository} <- resolve(snapshot.work, catalog),
+         true <- snapshot.raw["state"] in ["open", "opened"] or {:error, :native_issue_not_open},
+         {:ok, current} <- read(snapshot.work, opts),
+         true <- snapshot_ref(current) == snapshot_ref(snapshot) or {:error, :native_snapshot_changed} do
+      write_close(repository, current.work, opts)
+    else
+      {:error, reason} -> {:not_sent, reason}
+    end
+  end
+
+  defp valid_snapshot?(snapshot), do: is_map(snapshot) and is_map(snapshot[:work]) and is_map(snapshot[:raw])
+
+  defp write_close(repository, work, opts) do
+    {method, body} = closure_body(repository)
+    writer = Keyword.get(opts, :write_request, &write_request/6)
+
+    case writer.(repository["provider"], method, issue_path(repository, work["number"]), %{}, body, settings(repository)) do
+      {:ok, %{status: status}} when status in [200, 201] -> :sent
+      {:ok, %{status: status}} when is_integer(status) -> {:uncertain, {:native_write_status, status}}
+      _ -> {:uncertain, :native_write_failed}
+    end
+  end
+
+  defp closure_body(%{"provider" => "github"}), do: {"PATCH", %{"state" => "closed"}}
+  defp closure_body(_), do: {"PUT", %{"state_event" => "close"}}
+
   @doc "Resolve exact host/provider/native-ID membership before making any request."
   @spec resolve(WorkRef.t(), term()) :: {:ok, map()} | {:error, atom()}
   def resolve(work, catalog) when is_list(catalog) do

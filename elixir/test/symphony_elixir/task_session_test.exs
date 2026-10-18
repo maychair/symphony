@@ -63,13 +63,23 @@ defmodule SymphonyElixir.TaskSessionTest do
     }
 
     state = start_supervised!({Agent, fn -> objects end})
+    close_writes = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
     request = fn "github", "GET", path, _, _ -> {:ok, %{status: 200, body: Agent.get(state, &Map.fetch!(&1, path))}} end
 
-    writer = fn "github", "POST", "/repos/team/repo/issues/2/comments" = path, _, %{"body" => body}, _ ->
-      Agent.get_and_update(state, fn objects ->
-        comment = note(body, 100 + length(objects[path])) |> Map.put("user", %{"id" => 99})
-        {{:ok, %{status: 201, body: comment}}, Map.update!(objects, path, &(&1 ++ [comment]))}
-      end)
+    writer = fn
+      "github", "POST", "/repos/team/repo/issues/2/comments" = path, _, %{"body" => body}, _ ->
+        Agent.get_and_update(state, fn objects ->
+          comment = note(body, 100 + length(objects[path])) |> Map.put("user", %{"id" => 99})
+          {{:ok, %{status: 201, body: comment}}, Map.update!(objects, path, &(&1 ++ [comment]))}
+        end)
+
+      "github", "PATCH", "/repos/team/repo/issues/2" = path, _, %{"state" => "closed"}, _ ->
+        Agent.update(close_writes, &(&1 + 1))
+
+        Agent.get_and_update(state, fn objects ->
+          issue = Map.put(objects[path], "state", "closed")
+          {{:ok, %{status: 200, body: issue}}, Map.put(objects, path, issue)}
+        end)
     end
 
     repository = Map.take(work, ~w(provider host repository_id)) |> Map.merge(%{"path" => "team/repo", "api_url" => "https://github.test/api/v3", "credential" => "$UNUSED_SESSION_FIXTURE"})
@@ -160,7 +170,16 @@ defmodule SymphonyElixir.TaskSessionTest do
         admitted.record
       end
 
-    scope = [root: root, work: work, parent: parent, plan: plan, state: state, registry: registry]
+    scope = [
+      root: root,
+      work: work,
+      parent: parent,
+      plan: plan,
+      state: state,
+      close_writes: close_writes,
+      registry: registry
+    ]
+
     {:ok, scope ++ [opts: opts, record: record, trace: trace, failure: failure, mode: mode]}
   end
 
@@ -261,10 +280,27 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert current(c)["native_stop_confirmed"]
     assert current(c)["retry_count"] == 0
     assert current(c)["execution_generation"] == 4
+    lock = Path.join(c.record["directory"], "executor.lock")
+    File.mkdir!(lock)
+    assert {:ok, [held]} = Tracker.fetch_issues_by_ids([job.id], opts)
+    assert held.native_ref["closure"] == "unconfirmed::member_closure_executor_locked"
+    assert held.native_ref["native_state"] == "open"
+    refute held.dispatchable
+    assert Agent.get(c.close_writes, & &1) == 0
+    File.rmdir!(lock)
     assert {:ok, [finished]} = Tracker.fetch_issues_by_ids([job.id], opts)
     refute finished.dispatchable
     assert finished.native_ref["lifecycle"]["closeable"]
-    assert Agent.get(c.state, & &1["/repos/team/repo/issues/2"]["state"]) == "open"
+    assert finished.native_ref["closure"] == "confirmed"
+    assert finished.native_ref["native_state"] == "closed"
+    assert Agent.get(c.state, & &1["/repos/team/repo/issues/2"]["state"]) == "closed"
+    journal = current(c)
+    assert journal["closure_status"] == "published"
+    assert journal["closure_confirmed"]["digest"] == journal["closure_intent"]["digest"]
+    assert Agent.get(c.close_writes, & &1) == 1
+    assert {:ok, [again]} = Tracker.fetch_issues_by_ids([job.id], opts)
+    assert again.native_ref["closure"] == "confirmed"
+    assert Agent.get(c.close_writes, & &1) == 1
     assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 4
   end
 

@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskPlanExecution do
   @moduledoc "Translate configured native plans into jobs for the existing scheduler; execution remains owned by the member worker."
-  alias SymphonyElixir.{AgentRunner, Config, ExecutionBackend, RunJournal, TaskExecution, TaskExecutionConfig, WorkRef}
+  alias SymphonyElixir.{AgentRunner, Config, ExecutionBackend, RunJournal}
+  alias SymphonyElixir.{TaskClosure, TaskExecution, TaskExecutionConfig, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @spec job?(term()) :: boolean()
@@ -52,11 +53,7 @@ defmodule SymphonyElixir.TaskPlanExecution do
         _ -> false
       end
 
-    flow =
-      case result do
-        {:ok, observation} -> observation.flow
-        {:error, reason} -> %{"dispatchable" => false, "error" => inspect(reason)}
-      end
+    {flow, closure} = outcome(result, configured.opts)
 
     %Issue{
       id: "member:" <> WorkRef.key(member.work),
@@ -66,13 +63,33 @@ defmodule SymphonyElixir.TaskPlanExecution do
       url: member.url,
       state: state,
       dispatchable: recovery or (flow["dispatchable"] == true and not File.exists?(Path.join(directory, "executor.lock"))),
-      native_ref: %{"execution_kind" => "plan_member", "work" => member.work, "parent" => parent, "native_state" => member.raw["state"], "lifecycle" => flow, "recovery_required" => recovery}
+      native_ref: %{
+        "execution_kind" => "plan_member",
+        "work" => member.work,
+        "parent" => parent,
+        "native_state" => native_state(member, closure),
+        "lifecycle" => flow,
+        "closure" => closure_name(closure),
+        "recovery_required" => recovery
+      }
     }
   rescue
     error -> blocked_member(parent, member, state, Exception.message(error))
   catch
     kind, reason -> blocked_member(parent, member, state, inspect({kind, reason}))
   end
+
+  # Native closure is reconciled from the same observation the projection uses;
+  # a member that cannot prove delivery stays open with its exact reason.
+  defp outcome({:ok, observation}, opts), do: {observation.flow, TaskClosure.reconcile(observation.record, observation.flow, opts)}
+  defp outcome({:error, reason}, _opts), do: {%{"dispatchable" => false, "error" => inspect(reason)}, :not_applicable}
+
+  defp closure_name({:ok, _record}), do: "confirmed"
+  defp closure_name(:not_applicable), do: "not_applicable"
+  defp closure_name({:error, reason}), do: "unconfirmed:" <> inspect(reason)
+
+  defp native_state(_member, {:ok, _record}), do: "closed"
+  defp native_state(member, _closure), do: member.raw["state"]
 
   defp blocked_member(parent, member, state, reason) do
     %Issue{
