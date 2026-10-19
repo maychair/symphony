@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Workflow do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Loads workflow configuration and prompt from WORKFLOW.md.
   """
@@ -9,7 +11,8 @@ defmodule SymphonyElixir.Workflow do
 
   @spec workflow_file_path() :: Path.t()
   def workflow_file_path do
-    Application.get_env(:symphony_elixir, :workflow_file_path) ||
+    (RuntimeContext.current() || %{})[:workflow] ||
+      Application.get_env(:symphony_elixir, :workflow_file_path) ||
       Path.join(File.cwd!(), @workflow_file_name)
   end
 
@@ -35,7 +38,7 @@ defmodule SymphonyElixir.Workflow do
 
   @spec current() :: {:ok, loaded_workflow()} | {:error, term()}
   def current do
-    case Process.whereis(WorkflowStore) do
+    case RuntimeContext.whereis(WorkflowStore) do
       pid when is_pid(pid) ->
         WorkflowStore.current()
 
@@ -114,7 +117,7 @@ defmodule SymphonyElixir.Workflow do
   end
 
   defp maybe_reload_store do
-    if Process.whereis(WorkflowStore) do
+    if RuntimeContext.whereis(WorkflowStore) do
       _ = WorkflowStore.force_reload()
     end
 

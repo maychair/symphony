@@ -26,6 +26,14 @@ defmodule SymphonyElixir.Taskboard do
 
   @spec snapshot(keyword()) :: map()
   def snapshot(opts \\ []) do
+    if SymphonyElixir.RepositoryService.aggregate?() do
+      SymphonyElixir.RepositoryService.taskboard_snapshot(opts)
+    else
+      repository_snapshot(opts)
+    end
+  end
+
+  defp repository_snapshot(opts) do
     settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!() end)
 
     projects =

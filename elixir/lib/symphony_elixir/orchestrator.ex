@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Orchestrator do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Polls the configured issue tracker and dispatches repository copies to Codex-backed workers.
   """
@@ -58,6 +60,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def init(opts) do
+    RuntimeContext.install(opts[:context])
+
     case Config.settings() do
       {:ok, config} ->
         now_ms = System.monotonic_time(:millisecond)
@@ -411,10 +415,13 @@ defmodule SymphonyElixir.Orchestrator do
       ids = state.running |> Enum.reject(fn {_, entry} -> TaskPlanExecution.job?(entry.issue) end) |> Enum.map(&elem(&1, 0)) |> MapSet.new()
 
       task =
-        Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-          SymphonyElixir.TaskReconciler.poll(ids)
-          :task_reconciled
-        end)
+        Task.Supervisor.async_nolink(
+          state.task_supervisor,
+          RuntimeContext.wrap(fn ->
+            SymphonyElixir.TaskReconciler.poll(ids)
+            :task_reconciled
+          end)
+        )
 
       %{state | task_reconcile_ref: task.ref}
     else
@@ -1120,9 +1127,12 @@ defmodule SymphonyElixir.Orchestrator do
     plan_options = if TaskPlanExecution.job?(issue), do: state.plan_options, else: []
     opts = Keyword.merge(plan_options, attempt: attempt, worker_host: worker_host, dispatch_token: token)
 
-    case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, opts)
-         end) do
+    case Task.Supervisor.start_child(
+           state.task_supervisor,
+           RuntimeContext.wrap(fn ->
+             AgentRunner.run(issue, recipient, opts)
+           end)
+         ) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
 
@@ -1567,24 +1577,28 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
-    request_refresh(__MODULE__)
+    request_refresh(RuntimeContext.server(__MODULE__))
   end
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
-    if Process.whereis(server) do
+    if GenServer.whereis(server) do
       GenServer.call(server, :request_refresh)
     else
-      :unavailable
+      if server == __MODULE__ and SymphonyElixir.RepositoryService.aggregate?() do
+        SymphonyElixir.RepositoryService.refresh()
+      else
+        :unavailable
+      end
     end
   end
 
   @spec retry_now(String.t()) :: :ok | :not_retrying | :unavailable
-  def retry_now(issue_id), do: retry_now(__MODULE__, issue_id)
+  def retry_now(issue_id), do: retry_now(RuntimeContext.server(__MODULE__), issue_id)
 
   @spec retry_now(GenServer.server(), String.t()) :: :ok | :not_retrying | :unavailable
   def retry_now(server, issue_id) when is_binary(issue_id) do
-    if Process.whereis(server) do
+    if GenServer.whereis(server) do
       GenServer.call(server, {:retry_now, issue_id})
     else
       :unavailable
@@ -1592,11 +1606,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @spec snapshot() :: map() | :timeout | :unavailable
-  def snapshot, do: snapshot(__MODULE__, 15_000)
+  def snapshot, do: snapshot(RuntimeContext.server(__MODULE__), 15_000)
 
   @spec snapshot(GenServer.server(), timeout()) :: map() | :timeout | :unavailable
   def snapshot(server, timeout) do
-    if Process.whereis(server) do
+    if GenServer.whereis(server) do
       try do
         GenServer.call(server, :snapshot, timeout)
       catch
@@ -1604,7 +1618,11 @@ defmodule SymphonyElixir.Orchestrator do
         :exit, _ -> :unavailable
       end
     else
-      :unavailable
+      if server == __MODULE__ and SymphonyElixir.RepositoryService.aggregate?() do
+        SymphonyElixir.RepositoryService.snapshot(timeout)
+      else
+        :unavailable
+      end
     end
   end
 

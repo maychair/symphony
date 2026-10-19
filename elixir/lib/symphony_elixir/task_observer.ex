@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.TaskObserver do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "One owner-linked, bounded native fact reader. Only the owning session applies its results."
   use GenServer
   alias SymphonyElixir.{Config, TaskExecution}
@@ -9,7 +10,7 @@ defmodule SymphonyElixir.TaskObserver do
     timeout = Keyword.get(opts, :observation_timeout_ms, 60_000)
 
     if is_integer(interval) and interval > 0 and is_integer(timeout) and timeout > 0,
-      do: GenServer.start_link(__MODULE__, {self(), record, executions, opts, interval, timeout}),
+      do: GenServer.start_link(__MODULE__, {self(), record, executions, Keyword.put(opts, :runtime_context, RuntimeContext.current()), interval, timeout}),
       else: {:error, :invalid_observation_timing}
   end
 
@@ -24,6 +25,7 @@ defmodule SymphonyElixir.TaskObserver do
 
   @impl true
   def init({owner, record, executions, opts, interval, timeout}) do
+    RuntimeContext.install(opts[:runtime_context])
     Process.flag(:trap_exit, true)
     context = %{owner: owner, record: record, executions: executions, opts: opts}
     runtime = %{active: false, task: nil, timer: nil, started: nil, result: :pending}
@@ -52,7 +54,7 @@ defmodule SymphonyElixir.TaskObserver do
 
   @impl true
   def handle_info(:observe, %{active: true, task: nil, result: :pending} = state) do
-    task = Task.async(fn -> TaskExecution.observe_running(state.record, state.executions, state.opts) end)
+    task = Task.async(RuntimeContext.wrap(fn -> TaskExecution.observe_running(state.record, state.executions, state.opts) end))
     timer = Process.send_after(self(), {:timeout, task.ref}, state.timeout)
     {:noreply, %{state | task: task, timer: timer, started: System.monotonic_time(:millisecond)}}
   end

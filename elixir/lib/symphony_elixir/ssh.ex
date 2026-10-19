@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.SSH do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc false
 
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
@@ -52,7 +53,7 @@ defmodule SymphonyElixir.SSH do
   defp maybe_put_line_option(port_opts, line_bytes), do: Keyword.put(port_opts, :line, line_bytes)
 
   defp maybe_put_config(args) do
-    case System.get_env("SYMPHONY_SSH_CONFIG") do
+    case RuntimeContext.get_env("SYMPHONY_SSH_CONFIG") do
       config_path when is_binary(config_path) and config_path != "" ->
         args ++ ["-F", config_path]
 

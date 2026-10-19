@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.AgentRuntimeSupervisor do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Supervises the scheduler authority together with its agent tasks.
   """
@@ -13,10 +15,14 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
 
   @impl true
   def init(opts) do
+    RuntimeContext.install(opts[:context])
+
     task_supervisor_name =
       Keyword.get(opts, :task_supervisor_name, SymphonyElixir.TaskSupervisor)
 
     orchestrator_name = Keyword.get(opts, :orchestrator_name, SymphonyElixir.Orchestrator)
+
+    worker_opts = [name: orchestrator_name, task_supervisor: task_supervisor_name, context: opts[:context]]
 
     children = [
       Supervisor.child_spec(
@@ -24,7 +30,7 @@ defmodule SymphonyElixir.AgentRuntimeSupervisor do
         id: task_supervisor_name
       ),
       Supervisor.child_spec(
-        {SymphonyElixir.Orchestrator, name: orchestrator_name, task_supervisor: task_supervisor_name},
+        {SymphonyElixir.Orchestrator, worker_opts},
         id: orchestrator_name
       )
     ]

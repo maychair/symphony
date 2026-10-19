@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.ReviewLane.Listener do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Scheduler-owned native discovery and durable MR review execution journal.
   The existing MR is the work item; the journal owns execution identities and receipts.
@@ -14,25 +16,26 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]) |> Keyword.put_new(:name, __MODULE__))
 
   @spec health() :: map()
-  def health, do: GenServer.call(__MODULE__, :health)
+  def health, do: GenServer.call(RuntimeContext.server(__MODULE__), :health)
 
   @spec issues() :: {:ok, [Issue.t()]} | {:error, term()}
-  def issues, do: GenServer.call(__MODULE__, :issues, 120_000)
+  def issues, do: GenServer.call(RuntimeContext.server(__MODULE__), :issues, 120_000)
 
   @spec begin_run(String.t()) :: {:ok, map(), map()} | {:error, term()}
-  def begin_run(id), do: GenServer.call(__MODULE__, {:begin, id}, 60_000)
+  def begin_run(id), do: GenServer.call(RuntimeContext.server(__MODULE__), {:begin, id}, 60_000)
 
   @spec checkpoint(String.t(), map() | nil, map()) :: :ok | {:error, term()}
-  def checkpoint(id, owner, changes), do: GenServer.call(__MODULE__, {:checkpoint, id, owner, changes}, 60_000)
+  def checkpoint(id, owner, changes), do: GenServer.call(RuntimeContext.server(__MODULE__), {:checkpoint, id, owner, changes}, 60_000)
 
   @spec submit(String.t(), map() | nil, map()) :: :ok | {:error, term()}
-  def submit(id, owner, arguments), do: GenServer.call(__MODULE__, {:submit, id, owner, arguments}, 120_000)
+  def submit(id, owner, arguments), do: GenServer.call(RuntimeContext.server(__MODULE__), {:submit, id, owner, arguments}, 120_000)
 
   @spec request_review(String.t(), pos_integer()) :: :ok | {:error, term()}
-  def request_review(project, iid), do: GenServer.call(__MODULE__, {:request_review, project, iid}, 120_000)
+  def request_review(project, iid), do: GenServer.call(RuntimeContext.server(__MODULE__), {:request_review, project, iid}, 120_000)
 
   @impl true
   def init(opts) do
+    RuntimeContext.install(opts[:context])
     Process.send_after(self(), :configure, 100)
 
     state = %{

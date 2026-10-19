@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.ReviewLane do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "Native repository review discovery using the existing Orchestrator admission and capacity."
   alias SymphonyElixir.ReviewLane.Listener
 
@@ -70,7 +71,7 @@ defmodule SymphonyElixir.ReviewLane do
   end
 
   @spec resolve(term()) :: term()
-  def resolve("$" <> name), do: System.get_env(name)
+  def resolve("$" <> name), do: RuntimeContext.get_env(name)
   def resolve(value) when is_map(value), do: Map.new(value, fn {key, entry} -> {key, resolve(entry)} end)
   def resolve(value) when is_list(value), do: Enum.map(value, &resolve/1)
   def resolve(value), do: value

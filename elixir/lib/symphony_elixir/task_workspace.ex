@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.TaskWorkspace do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "Generation-owned role workspaces and retained, fixed input files. No native session is started here."
   alias SymphonyElixir.{ArtifactFiles, ArtifactStore, Config, ReportArtifact, RunJournal}
   alias SymphonyElixir.{TaskExecution, TaskWorkflow, WorkRef}
@@ -335,7 +336,7 @@ defmodule SymphonyElixir.TaskWorkspace do
   defp git(path, args) do
     command = [
       "-i",
-      "PATH=" <> System.get_env("PATH", "/usr/bin:/bin"),
+      "PATH=" <> RuntimeContext.get_env("PATH", "/usr/bin:/bin"),
       "GIT_CONFIG_NOSYSTEM=1",
       "GIT_CONFIG_GLOBAL=/dev/null",
       "GIT_NO_REPLACE_OBJECTS=1",

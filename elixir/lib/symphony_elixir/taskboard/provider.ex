@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Taskboard.Provider do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Provider operations used by the Taskboard while keeping repository Issues as
   the only source of task data.
@@ -72,7 +74,7 @@ defmodule SymphonyElixir.Taskboard.Provider do
   @spec resolve_secret(term(), String.t()) :: String.t() | nil
   def resolve_secret("$" <> env_name, fallback) do
     if Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*$/, env_name) do
-      present(System.get_env(env_name) || fallback)
+      present(RuntimeContext.get_env(env_name) || fallback)
     end
   end
 

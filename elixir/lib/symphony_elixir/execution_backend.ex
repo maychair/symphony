@@ -1,10 +1,11 @@
 defmodule SymphonyElixir.ExecutionBackend do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "Project-selected execution transport. Tracker and delivery policy remain shared."
   alias SymphonyElixir.Config
   alias SymphonyElixir.RunJournal
 
   @spec kind() :: String.t()
-  def kind, do: System.get_env("SYMPHONY_EXECUTION_BACKEND") || Config.settings!().agent.backend
+  def kind, do: RuntimeContext.get_env("SYMPHONY_EXECUTION_BACKEND") || Config.settings!().agent.backend
 
   @spec module() :: module()
   def module do
@@ -18,7 +19,7 @@ defmodule SymphonyElixir.ExecutionBackend do
   @spec command() :: String.t()
   def command do
     case kind() do
-      "codex" -> System.get_env("SYMPHONY_CODEX_COMMAND") || Config.settings!().codex.command
+      "codex" -> RuntimeContext.get_env("SYMPHONY_CODEX_COMMAND") || Config.settings!().codex.command
       "omp" -> Config.settings!().omp.command
     end
   end
@@ -29,7 +30,7 @@ defmodule SymphonyElixir.ExecutionBackend do
 
   @spec config_hash() :: String.t() | nil
   def config_hash do
-    case System.get_env("SYMPHONY_BACKEND_CONFIG_FILES") do
+    case RuntimeContext.get_env("SYMPHONY_BACKEND_CONFIG_FILES") do
       nil ->
         nil
 

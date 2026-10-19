@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.GitHub.Client do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Thin GitHub REST client for repository issue polling.
   """
@@ -304,8 +306,8 @@ defmodule SymphonyElixir.GitHub.Client do
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
     api_url = provider["api_url"] || @default_api_url
-    repo = resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))
-    token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
+    repo = resolve_setting(provider["repo"], RuntimeContext.get_env("GITHUB_REPO"))
+    token = resolve_setting(provider["token"], RuntimeContext.get_env("GITHUB_TOKEN"))
 
     cond do
       not valid_api_url?(api_url) -> {:error, :invalid_github_api_url}
@@ -323,7 +325,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp resolve_setting("$" <> env_name, _fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name))
+      normalize_string(RuntimeContext.get_env(env_name))
     else
       nil
     end

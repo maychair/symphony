@@ -1,4 +1,6 @@
 defmodule SymphonyElixirWeb.ObservabilityApiController do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   JSON API for Symphony observability data.
   """
@@ -87,7 +89,10 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp orchestrator do
-    Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
+    case Endpoint.config(:orchestrator) do
+      value when value in [nil, SymphonyElixir.Orchestrator] -> RuntimeContext.server(SymphonyElixir.Orchestrator)
+      server -> server
+    end
   end
 
   defp snapshot_timeout_ms do

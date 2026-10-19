@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.GitLab.Client do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Thin GitLab REST client for project-scoped issue polling.
   """
@@ -315,9 +317,9 @@ defmodule SymphonyElixir.GitLab.Client do
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
     api_url = provider["api_url"] || @default_api_url
-    project_path = resolve_setting(provider["project_path"], System.get_env("GITLAB_PROJECT_PATH"))
+    project_path = resolve_setting(provider["project_path"], RuntimeContext.get_env("GITLAB_PROJECT_PATH"))
 
-    api_key = resolve_setting(provider["api_key"], System.get_env("GITLAB_PAT"))
+    api_key = resolve_setting(provider["api_key"], RuntimeContext.get_env("GITLAB_PAT"))
 
     cond do
       not (valid_api_url?(api_url) or (provider["allow_insecure_http"] == true and match?(%URI{scheme: "http", host: host} when is_binary(host), URI.parse(api_url)))) ->
@@ -349,7 +351,7 @@ defmodule SymphonyElixir.GitLab.Client do
 
   defp resolve_setting("$" <> env_name, _fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name))
+      normalize_string(RuntimeContext.get_env(env_name))
     else
       nil
     end

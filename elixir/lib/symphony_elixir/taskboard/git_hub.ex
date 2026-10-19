@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Taskboard.GitHub do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "GitHub Taskboard provider backed by repository Issues and pull requests."
 
   @behaviour SymphonyElixir.Taskboard.Provider
@@ -340,7 +341,7 @@ defmodule SymphonyElixir.Taskboard.GitHub do
 
   defp graphql_request(settings, query, variables) do
     provider = settings.provider
-    token = Provider.resolve_secret(provider["token"], System.get_env("GITHUB_TOKEN"))
+    token = Provider.resolve_secret(provider["token"], RuntimeContext.get_env("GITHUB_TOKEN"))
     url = provider["graphql_url"] || "https://api.github.com/graphql"
 
     if token do
@@ -421,7 +422,7 @@ defmodule SymphonyElixir.Taskboard.GitHub do
   defp label_name(name) when is_binary(name), do: name
   defp normalized_label(label), do: label |> String.trim() |> String.downcase()
 
-  defp repo(settings), do: settings.provider["repo"] || System.get_env("GITHUB_REPO") || ""
+  defp repo(settings), do: settings.provider["repo"] || RuntimeContext.get_env("GITHUB_REPO") || ""
   defp issues_path(settings), do: "/repos/#{repo(settings)}/issues"
   defp issue_path(settings, number), do: issues_path(settings) <> "/#{number}"
   defp pulls_path(settings), do: "/repos/#{repo(settings)}/pulls"

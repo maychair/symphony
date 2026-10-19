@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.AgentRunner do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Executes a single tracker work item in its workspace with Codex.
   """
@@ -390,9 +392,11 @@ defmodule SymphonyElixir.AgentRunner do
       owner = self()
 
       {pid, monitor} =
-        spawn_monitor(fn ->
-          send(owner, {:workflow_observation, self(), SymphonyElixir.TaskReconciler.observe(current)})
-        end)
+        spawn_monitor(
+          RuntimeContext.wrap(fn ->
+            send(owner, {:workflow_observation, self(), SymphonyElixir.TaskReconciler.observe(current)})
+          end)
+        )
 
       Process.put(:workflow_observer, {pid, monitor, now})
     end

@@ -1,4 +1,6 @@
 defmodule SymphonyElixirWeb.Presenter do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Shared projections for the observability API and dashboard.
   """
@@ -11,7 +13,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
-        %{
+        payload = %{
           generated_at: generated_at,
           build: SymphonyElixir.BuildInfo.identity(),
           backend: SymphonyElixir.ExecutionBackend.kind(),
@@ -28,6 +30,11 @@ defmodule SymphonyElixirWeb.Presenter do
           rate_limits: snapshot.rate_limits,
           review_lane_listener: review_lane_health()
         }
+
+        case SymphonyElixir.RepositoryService.repositories() do
+          [] -> payload
+          repositories -> Map.put(payload, :repositories, Enum.map(repositories, & &1.id))
+        end
 
       :timeout ->
         %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
@@ -77,8 +84,8 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp review_lane_health do
-    if Process.whereis(SymphonyElixir.ReviewLane.Listener) do
-      GenServer.call(SymphonyElixir.ReviewLane.Listener, :health, 100)
+    if RuntimeContext.whereis(SymphonyElixir.ReviewLane.Listener) do
+      GenServer.call(RuntimeContext.server(SymphonyElixir.ReviewLane.Listener), :health, 100)
     else
       %{health: :disabled}
     end

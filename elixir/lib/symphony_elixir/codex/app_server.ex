@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Codex.AppServer do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Minimal client for the Codex app-server JSON-RPC 2.0 stream over stdio.
   """
@@ -49,6 +51,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
 
     with {:ok, dynamic_tool_binding} <- DynamicTool.bind_session(opts),
+         dynamic_tool_binding = Map.update!(dynamic_tool_binding, :secret_environment_names, &Enum.uniq(&1 ++ SymphonyElixir.RepositoryService.secret_environment_names())),
          {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
       try do
@@ -473,7 +476,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp agent_environment(binding) do
-    Map.merge(binding.agent_environment, @shell_environment)
+    RuntimeContext.environment() |> Map.merge(binding.agent_environment) |> Map.merge(@shell_environment)
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do

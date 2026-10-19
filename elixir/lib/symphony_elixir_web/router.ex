@@ -6,6 +6,10 @@ defmodule SymphonyElixirWeb.Router do
   use Phoenix.Router
   import Phoenix.LiveView.Router
 
+  pipeline :repository do
+    plug(SymphonyElixirWeb.RepositoryScope)
+  end
+
   pipeline :browser do
     plug(:fetch_session)
     plug(:fetch_live_flash)
@@ -32,6 +36,8 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
+    pipe_through(:repository)
+
     post("/api/v1/webhooks/:provider", WebhookController, :receive_event)
     get("/api/v1/taskboard", TaskboardApiController, :state)
     get("/api/v1/taskboard/projects/:project_id", TaskboardApiController, :project)

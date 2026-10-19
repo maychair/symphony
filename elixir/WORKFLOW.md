@@ -366,3 +366,21 @@ Codex sessions disable shell snapshots and login shells on both new and resumed 
 Shell startup variables (`ZDOTDIR`, `BASH_ENV`, `ENV`) are pinned to `/dev/null`, and
 tracker secret names are excluded from tool environments. These constraints prevent automatic
 profile-based credential reinjection; they do not isolate readable host files from the same OS user.
+
+## Multiple repositories in one service
+
+A service Workflow may contain a `repositories` list of maps with `id`, `workflow`
+(relative to the service Workflow), and optional non-secret `environment`.
+One BEAM process and HTTP endpoint host repository-isolated OTP subtrees;
+concurrency remains per repository. Each repository owns its Workflow cache,
+Orchestrator, task supervisor, review listener, workspaces and execution journals.
+Repository IDs, native tracker scope and storage roots must not overlap.
+Membership/environment/storage/native ownership changes require a restart; other
+Workflow changes use the existing last-known-good reload.
+
+The service's normal tracker configuration is control-only (use an empty memory
+tracker). `/runtime`, `/api/v1/state` and the read-only Taskboard aggregate all
+repositories. Add `?repository=ID` for scoped API reads, refresh and webhooks.
+Ambiguous effects and journal lookups fail closed. Every Codex session excludes
+the credential environment names of all repositories in the shared process.
+Existing single-repository launch behavior is unchanged.

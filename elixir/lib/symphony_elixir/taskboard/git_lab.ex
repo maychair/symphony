@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Taskboard.GitLab do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "GitLab Taskboard provider backed by the repository Issues API."
 
   @behaviour SymphonyElixir.Taskboard.Provider
@@ -331,7 +332,7 @@ defmodule SymphonyElixir.Taskboard.GitLab do
 
   defp project_path(settings) do
     provider = settings.provider || %{}
-    path = Provider.resolve_secret(provider["project_path"], System.get_env("GITLAB_PROJECT_PATH"))
+    path = Provider.resolve_secret(provider["project_path"], RuntimeContext.get_env("GITLAB_PROJECT_PATH"))
     "/projects/" <> Provider.encode(path || "")
   end
 

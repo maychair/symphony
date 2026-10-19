@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Config.Schema do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc false
 
   use Ecto.Schema
@@ -511,10 +512,10 @@ defmodule SymphonyElixir.Config.Schema do
             |> Map.put_new("assignee", settings.tracker.assignee)
 
           resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+            resolve_secret_setting(linear_provider["api_key"], RuntimeContext.get_env("LINEAR_API_KEY"))
 
           resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+            resolve_secret_setting(linear_provider["assignee"], RuntimeContext.get_env("LINEAR_ASSIGNEE"))
 
           {
             resolved_api_key,
@@ -633,7 +634,7 @@ defmodule SymphonyElixir.Config.Schema do
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
       {:ok, env_name} ->
-        case System.get_env(env_name) do
+        case RuntimeContext.get_env(env_name) do
           nil -> fallback
           "" -> nil
           env_value -> env_value
@@ -671,7 +672,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp resolve_env_token(env_name) do
-    case System.get_env(env_name) do
+    case RuntimeContext.get_env(env_name) do
       nil -> :missing
       env_value -> env_value
     end

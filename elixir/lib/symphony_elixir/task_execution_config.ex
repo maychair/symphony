@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.TaskExecutionConfig do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "Resolve host execution policies and source locations for every member of a native approved plan."
   alias SymphonyElixir.{ArtifactFiles, Config, Execution, NativeWork, RunJournal}
   alias SymphonyElixir.{TaskLifecycle, TaskPlanPreflight, WorkRef}
@@ -63,6 +64,6 @@ defmodule SymphonyElixir.TaskExecutionConfig do
     end
   end
 
-  defp path("$" <> name), do: System.get_env(name)
+  defp path("$" <> name), do: RuntimeContext.get_env(name)
   defp path(value), do: value
 end

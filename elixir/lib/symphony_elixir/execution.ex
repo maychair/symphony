@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Execution do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "Durable native execution for repository Issues, independent of task storage."
   alias SymphonyElixir.{Config, ExecutionBackend, RunJournal, TaskReconciler, Tracker}
 
@@ -13,15 +14,21 @@ defmodule SymphonyElixir.Execution do
 
   @spec journal_root() :: Path.t()
   def journal_root do
-    configured = Config.settings!().agent.run_journal_dir
+    journal_root_for(Config.settings!())
+  end
+
+  @doc false
+  @spec journal_root_for(Config.Schema.t()) :: Path.t()
+  def journal_root_for(settings) do
+    configured = settings.agent.run_journal_dir
 
     value =
       case configured do
-        "$" <> name -> System.get_env(name)
+        "$" <> name -> RuntimeContext.get_env(name)
         other -> other
       end
 
-    value || System.get_env("SYMPHONY_RUN_JOURNAL_DIR") || Path.join(Config.settings!().workspace.root, ".runs")
+    value || RuntimeContext.get_env("SYMPHONY_RUN_JOURNAL_DIR") || Path.join(settings.workspace.root, ".runs")
   end
 
   @spec run_budget_ms(String.t()) :: pos_integer()

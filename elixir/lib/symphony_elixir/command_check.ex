@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.CommandCheck do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "Run a configured verifier command on a fixed Git artifact with durable process and output receipts."
   alias SymphonyElixir.{ExecutionBinding, RunJournal, TaskWorkflow, TaskWorkspace}
 
@@ -310,7 +311,7 @@ defmodule SymphonyElixir.CommandCheck do
   defp receipt_matches(_, _, _), do: {:error, :invalid_command_receipt}
 
   defp git(workspace, arguments) do
-    System.cmd("env", ["-i", "PATH=" <> System.get_env("PATH", "/usr/bin:/bin"), "git", "-c", "core.hooksPath=/dev/null", "-C", workspace | arguments], stderr_to_stdout: true)
+    System.cmd("env", ["-i", "PATH=" <> RuntimeContext.get_env("PATH", "/usr/bin:/bin"), "git", "-c", "core.hooksPath=/dev/null", "-C", workspace | arguments], stderr_to_stdout: true)
   end
 
   defp directory(record, id), do: Path.join([record["directory"], "checks", id])

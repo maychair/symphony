@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Tracker do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Adapter boundary for issue tracker reads and provider-native agent tools.
 
@@ -114,7 +116,7 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp review_issues do
-    if SymphonyElixir.ReviewLane.enabled?() and Process.whereis(SymphonyElixir.ReviewLane.Listener), do: Listener.issues(), else: {:ok, []}
+    if SymphonyElixir.ReviewLane.enabled?() and RuntimeContext.whereis(SymphonyElixir.ReviewLane.Listener), do: Listener.issues(), else: {:ok, []}
   end
 
   @doc """

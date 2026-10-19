@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Workspace do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Creates isolated per-issue workspaces for parallel Codex agents.
   """
@@ -14,7 +16,7 @@ defmodule SymphonyElixir.Workspace do
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
     if Config.settings!().tracker.provider["workbench_primary_checkout"] == true and is_nil(worker_host) do
-      primary = System.get_env("SYMPHONY_TARGET_REPO")
+      primary = RuntimeContext.get_env("SYMPHONY_TARGET_REPO")
 
       with true <- is_binary(primary) and File.dir?(primary),
            {top, 0} <- System.cmd("git", ["-C", primary, "rev-parse", "--show-toplevel"], stderr_to_stdout: false),
@@ -491,9 +493,15 @@ defmodule SymphonyElixir.Workspace do
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
-      Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, env: issue_context[:agent_environment] || [], stderr_to_stdout: true)
-      end)
+      Task.async(
+        RuntimeContext.wrap(fn ->
+          System.cmd("sh", ["-lc", command],
+            cd: workspace,
+            env: Map.to_list(Map.merge(RuntimeContext.environment(), Map.new(issue_context[:agent_environment] || []))),
+            stderr_to_stdout: true
+          )
+        end)
+      )
 
     case Task.yield(task, timeout_ms) do
       {:ok, cmd_result} ->
@@ -638,9 +646,11 @@ defmodule SymphonyElixir.Workspace do
   defp run_remote_command(worker_host, script, timeout_ms)
        when is_binary(worker_host) and is_binary(script) and is_integer(timeout_ms) and timeout_ms > 0 do
     task =
-      Task.async(fn ->
-        SSH.run(worker_host, script, stderr_to_stdout: true)
-      end)
+      Task.async(
+        RuntimeContext.wrap(fn ->
+          SSH.run(worker_host, script, stderr_to_stdout: true)
+        end)
+      )
 
     case Task.yield(task, timeout_ms) do
       {:ok, result} ->
