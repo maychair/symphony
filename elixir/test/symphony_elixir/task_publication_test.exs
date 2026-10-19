@@ -233,6 +233,86 @@ defmodule SymphonyElixir.TaskPublicationTest do
     f
   end
 
+  defp verified_report(f) do
+    {:ok, developer, _} = TaskPublication.publish(current(f), "candidate", f.payload, "Candidate report", f.opts)
+    {:ok, stopped} = RunJournal.checkpoint(developer, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    binding = %{stopped["execution_binding"] | "role" => "verifier", "candidate" => TaskWorkflow.digest(f.payload)}
+    {:ok, verifier} = RunJournal.admit(Path.dirname(stopped["directory"]), stopped["issue_id"], execution_binding: binding)
+    {:ok, verifier} = RunJournal.checkpoint(verifier, %{"thread_id" => "report-verifier-#{verifier["execution_generation"]}"})
+
+    verdict = %{
+      "candidate" => TaskWorkflow.digest(f.payload),
+      "inputs" => f.payload["inputs"],
+      "policy_sha" => TaskWorkflow.digest(f.opts[:policy]),
+      "checks" => [%{"id" => "test", "candidate" => TaskWorkflow.digest(f.payload), "result" => "passed", "rationale" => "Independent report review"}],
+      "findings" => []
+    }
+
+    {:ok, verifier, _} = TaskPublication.publish(verifier, "verification", verdict, "Verified report", f.opts)
+    {:ok, stopped} = RunJournal.checkpoint(verifier, %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    f
+  end
+
+  defp report_consumer(f, input) do
+    work = %{f.payload["work"] | "number" => 3}
+    binding = %{f.record["execution_binding"] | "work" => work, "contract_sha" => contract(work, f.parent)["contract_sha"], "inputs" => [input]}
+    {:ok, record} = RunJournal.admit(Path.dirname(f.record["directory"]), WorkRef.key(work), execution_binding: binding)
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "report-consumer"})
+    {:ok, report} = ReportArtifact.build(work, "output", "Consumer report")
+    payload = %{"work" => work, "contract_sha" => binding["contract_sha"], "inputs" => [input], "artifacts" => [report]}
+    child = String.replace(f.child, "/issues/2", "/issues/3")
+    notes = String.replace(f.notes, "/issues/2", "/issues/3")
+    %{f | record: record, payload: payload, child: child, notes: notes}
+  end
+
+  defp revised_report(f, body) do
+    previous = current(f)
+    binding = %{previous["execution_binding"] | "role" => "developer", "candidate" => TaskWorkflow.digest(f.payload)}
+    {:ok, record} = RunJournal.admit(Path.dirname(previous["directory"]), previous["issue_id"], execution_binding: binding)
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "report-revision"})
+    {:ok, report} = ReportArtifact.build(f.payload["work"], "output", body)
+    %{f | record: record, payload: Map.put(f.payload, "artifacts", [report])} |> verified_report()
+  end
+
+  defp confirmed_rework(f, superseded) do
+    {:ok, preflight} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    plan = preflight.plan
+
+    body = %{
+      "schema_version" => 2,
+      "plan_revision" => plan["revision"],
+      "criteria" => plan["criteria"],
+      "integration" => plan["integration"],
+      "members" => Enum.map(plan["members"], &Map.take(&1, ["work"]))
+    }
+
+    manifest = Map.put(body, "revision", TaskWorkflow.digest(body))
+    manifest_note = note(710, 99, "<!-- symphony-plan-manifest " <> Jason.encode!(manifest) <> " -->")
+    [entry] = TaskPlanManifest.manifests(%{notes: [manifest_note]})
+    decision = %{"action" => "rework", "manifest" => entry["source"], "revision" => manifest["revision"], "criteria" => ["result"]}
+    decision_note = note(711, 2, "<!-- symphony-plan-acceptance " <> Jason.encode!(decision) <> " -->")
+    decision_note = Map.merge(decision_note, %{"created_at" => "2026-10-17T00:00:01Z", "updated_at" => "2026-10-17T00:00:01Z"})
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [manifest_note, decision_note] end))
+
+    %{
+      "status" => "confirmed",
+      "source" => "issue:reopened",
+      "parent_source" => TaskDecision.source_ref(decision_note),
+      "manifest" => entry["source"],
+      "criteria" => ["result"],
+      "superseded" => superseded
+    }
+  end
+
+  defp persist_report_flow(observation) do
+    record = observation.record
+    {:ok, locked} = RunJournal.admit(Path.dirname(record["directory"]), record["issue_id"], execution_binding: record["execution_binding"])
+    {:ok, updated} = RunJournal.checkpoint(locked, %{"workflow" => observation.flow})
+    :ok = RunJournal.complete(updated, "completed")
+  end
+
   defp report_fixture(provider, stages) do
     f = fixture(provider, stages, "report", %{"test" => %{"kind" => "review"}})
     body = "# Findings\n\nThe cited experiment supports the conclusion.\n\nLimit: only the approved input was examined.\n<!-- reader note -->"
@@ -426,34 +506,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
 
     assert {:error, :pinned_input_unconfirmed} = TaskExecution.observe(f.parent, work, registry, f.opts)
 
-    {:ok, preflight} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
-    plan = preflight.plan
-
-    body = %{
-      "schema_version" => 2,
-      "plan_revision" => plan["revision"],
-      "criteria" => plan["criteria"],
-      "integration" => plan["integration"],
-      "members" => Enum.map(plan["members"], &Map.take(&1, ["work"]))
-    }
-
-    manifest = Map.put(body, "revision", TaskWorkflow.digest(body))
-    manifest_note = note(710, 99, "<!-- symphony-plan-manifest " <> Jason.encode!(manifest) <> " -->")
-    [entry] = TaskPlanManifest.manifests(%{notes: [manifest_note]})
-    decision = %{"action" => "rework", "manifest" => entry["source"], "revision" => manifest["revision"], "criteria" => ["result"]}
-    decision_note = note(711, 2, "<!-- symphony-plan-acceptance " <> Jason.encode!(decision) <> " -->")
-    decision_note = Map.merge(decision_note, %{"created_at" => "2026-10-17T00:00:01Z", "updated_at" => "2026-10-17T00:00:01Z"})
-
-    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [manifest_note, decision_note] end))
-
-    marker = %{
-      "status" => "confirmed",
-      "source" => "issue:reopened",
-      "parent_source" => TaskDecision.source_ref(decision_note),
-      "manifest" => entry["source"],
-      "criteria" => ["result"],
-      "superseded" => ["candidate", "verification"]
-    }
+    marker = confirmed_rework(f, ["candidate", "verification"])
 
     {:ok, stopped} = RunJournal.checkpoint(current(dependent), %{"rework" => marker, "native_stop_confirmed" => true})
     :ok = RunJournal.complete(stopped, "completed")
@@ -480,6 +533,69 @@ defmodule SymphonyElixir.TaskPublicationTest do
 
     assert {:ok, observation} = TaskExecution.observe(f.parent, work, registry, f.opts)
     assert observation.flow["inputs"] == [input]
+  end
+
+  test "an approved replacement restarts a previously completed dependent report" do
+    f = report_fixture("github", ["verified"]) |> verified_report()
+    {:ok, upstream} = dependencies(f, 3, nil, [f])
+    [input] = inputs(upstream)
+    dependent = report_consumer(f, input) |> verified_report()
+    work = dependent.payload["work"]
+    registry = executions([f, dependent])
+    assert {:ok, prior} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert prior.flow["phase"] == "completed"
+    persist_report_flow(prior)
+
+    revised = revised_report(f, "Upstream replacement")
+    assert {:ok, unchanged} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert unchanged.flow["phase"] == "completed"
+    assert unchanged.flow["inputs"] == [input]
+
+    [artifact] = revised.payload["artifacts"]
+    repin(revised, 3, artifact["version"])
+    assert {:ok, ready} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert ready.flow["dispatchable"]
+    assert ready.flow["action"] == "implement"
+    assert ready.flow["inputs"] != [input]
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    assert admitted.record["execution_binding"]["inputs"] == ready.flow["inputs"]
+  end
+
+  test "rework repins once and then retains the admitted inputs during ordinary polling" do
+    f = report_fixture("github", ["verified"]) |> verified_report()
+    {:ok, upstream} = dependencies(f, 3, nil, [f])
+    [input] = inputs(upstream)
+    dependent = report_consumer(f, input) |> verified_report()
+    work = dependent.payload["work"]
+    registry = executions([f, dependent])
+    assert {:ok, prior} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert prior.flow["phase"] == "completed"
+    persist_report_flow(prior)
+
+    superseded =
+      current(dependent)["publications"]
+      |> Map.values()
+      |> Enum.map(&get_in(&1, ["receipt", "source"]))
+      |> Enum.reject(&is_nil/1)
+
+    marker = confirmed_rework(f, superseded)
+    completed = current(dependent)
+    {:ok, locked} = RunJournal.admit(Path.dirname(completed["directory"]), completed["issue_id"], execution_binding: completed["execution_binding"])
+    {:ok, marked} = RunJournal.checkpoint(locked, %{"rework" => marker})
+    :ok = RunJournal.complete(marked, "completed")
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    assert admitted.record["execution_binding"]["inputs"] == [input]
+    assert admitted.flow["rework_source"] == marker["parent_source"]
+
+    revised_report(f, "A later upstream candidate")
+    assert {:ok, ordinary} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert ordinary.flow["inputs"] == [input]
+    assert ordinary.record["execution_binding"]["inputs"] == [input]
+
+    {:ok, active} = RunJournal.checkpoint(ordinary.record, %{"thread_id" => "reworked-dependent", "native_stop_confirmed" => false})
+    assert {:ok, running} = TaskExecution.observe_running(active, registry, f.opts)
+    assert running.flow["inputs"] == [input]
+    refute running.flow["stop_required"]
   end
 
   test "an explicit edge selection resolves only the approved upstream version and refuses any newer one" do

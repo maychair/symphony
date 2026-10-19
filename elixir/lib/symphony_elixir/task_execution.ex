@@ -39,7 +39,7 @@ defmodule SymphonyElixir.TaskExecution do
     binding = record["execution_binding"]
 
     cond do
-      TaskLifecycle.authorized_rework?(plan, work, record) ->
+      TaskLifecycle.rework_transition?(plan, work, record) ->
         nil
 
       is_map(binding) and not TaskPlan.compatible?(plan.plan, work, binding["plan_revision"], binding["inputs"]) ->

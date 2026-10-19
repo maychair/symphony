@@ -160,7 +160,9 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   defp baseline(flow, context) do
     previous = Map.take(flow, ~w(candidate verification outcome contract_sha))
-    previous = if authorized_rework?(context.plan, context.work, context.runtime), do: Map.merge(previous, %{"candidate" => nil, "outcome" => "open"}), else: previous
+    rework = rework_transition?(context.plan, context.work, context.runtime)
+    replacement = approved_input_change?(context.plan, context.work, context.runtime)
+    previous = if rework or replacement, do: Map.merge(previous, %{"candidate" => nil, "outcome" => "open"}), else: previous
     restrictions = Map.filter(flow["restrictions"], fn {id, item} -> id == "clock" or item["native"] == true end)
 
     flow =
@@ -178,6 +180,7 @@ defmodule SymphonyElixir.TaskLifecycle do
         "repair_signature" => nil,
         "restrictions" => restrictions,
         "previous" => previous,
+        "rework_source" => if(rework, do: get_in(context.runtime, ["rework", "parent_source"]), else: flow["rework_source"]),
         "contract" => Map.take(context.member.contract, ~w(criteria acceptance_mode acceptor))
       })
 
@@ -213,6 +216,23 @@ defmodule SymphonyElixir.TaskLifecycle do
       true
     else
       _ -> false
+    end
+  end
+
+  @doc "Apply a confirmed rework's input reset once, until its new flow is checkpointed."
+  @spec rework_transition?(map(), WorkRef.t(), map()) :: boolean()
+  def rework_transition?(preflight, work, runtime) do
+    authorized_rework?(preflight, work, runtime) and
+      get_in(runtime, ["workflow", "rework_source"]) != get_in(runtime, ["rework", "parent_source"])
+  end
+
+  defp approved_input_change?(preflight, work, runtime) do
+    case runtime["workflow"] do
+      %{"plan_revision" => revision, "inputs" => inputs} ->
+        not TaskPlan.compatible?(preflight.plan, work, revision, inputs)
+
+      _ ->
+        false
     end
   end
 
