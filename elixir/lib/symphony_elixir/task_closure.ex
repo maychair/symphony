@@ -81,7 +81,7 @@ defmodule SymphonyElixir.TaskClosure do
 
   defp closeable_flow?(flow) do
     flow["closeable"] == true and flow["phase"] == "completed" and flow["outcome"] == "delivered" and
-      flow["execution"] in ["idle", "stopped"]
+      flow["execution"] in ["idle", "stopped"] and flow["restrictions"] == %{}
   end
 
   defp valid_work?(record) do
@@ -245,7 +245,7 @@ defmodule SymphonyElixir.TaskClosure do
     with {:ok, current} <- NativeWork.read(work, opts),
          true <- current.raw["state"] == "closed" or {:error, :member_closure_unconfirmed},
          {:ok, assessment} <- reobserve(opts),
-         true <- conclusion(assessment.flow)["digest"] == intent["digest"] or {:error, :member_closure_conclusion_changed} do
+         :ok <- same_conclusion(assessment.flow, intent) do
       publish(record, intent, current)
     else
       {:error, :member_closure_conclusion_changed} -> inconsistent(record, :member_closure_conclusion_changed, opts)
@@ -428,8 +428,30 @@ defmodule SymphonyElixir.TaskClosure do
     end
   end
 
+  defp live?(%{"os_pid" => pid, "node" => owner_node, "vm_started_at" => started_at, "erlang_pid" => erlang_pid})
+       when is_binary(pid) and is_binary(owner_node) and is_integer(started_at) and is_binary(erlang_pid) do
+    pid == System.pid() and owner_node == to_string(node()) and started_at == :erlang.system_info(:start_time) and
+      local_process_status(erlang_pid) == :alive
+  end
+
+  # Old ownership records have no process identity. Preserve their existing
+  # conservative same-VM behavior rather than guessing that an owner died.
   defp live?(%{"os_pid" => pid}) when is_binary(pid), do: pid == System.pid()
   defp live?(_), do: false
+
+  defp local_process_status(pid) do
+    if pid |> String.to_charlist() |> :erlang.list_to_pid() |> Process.alive?(), do: :alive, else: :dead
+  rescue
+    ArgumentError -> :unknown
+  end
+
+  defp gone?(%{"os_pid" => pid, "node" => owner_node, "vm_started_at" => started_at, "erlang_pid" => erlang_pid})
+       when is_binary(pid) and is_binary(owner_node) and is_integer(started_at) and is_binary(erlang_pid) do
+    owner_node == to_string(node()) and
+      (not os_pid_alive?(pid) or
+         (pid == System.pid() and
+            (started_at != :erlang.system_info(:start_time) or local_process_status(erlang_pid) == :dead)))
+  end
 
   defp gone?(%{"node" => node, "os_pid" => pid}) when is_binary(node) and is_binary(pid) do
     node == to_string(node()) and not os_pid_alive?(pid)
@@ -460,6 +482,8 @@ defmodule SymphonyElixir.TaskClosure do
       "kind" => "closure-reconciler",
       "os_pid" => System.pid(),
       "node" => to_string(node()),
+      "vm_started_at" => :erlang.system_info(:start_time),
+      "erlang_pid" => self() |> :erlang.pid_to_list() |> to_string(),
       "attempt_id" => record["attempt_id"],
       "issue_id" => record["issue_id"],
       "started_at" => now()

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
   alias SymphonyElixir.Codex.DynamicTool
 
   alias SymphonyElixir.{
+    TaskExecution,
     TaskPlan,
     TaskPlanAssessment,
     TaskPlanExecution,
@@ -398,7 +399,16 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
   defp repo_object(_provider, url), do: %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => url}
 
   defp native_state(objects) do
-    %{objects: objects, manifest_mode: :ok, reopen_mode: :ok, posts: %{}, writes: [], drift: nil}
+    %{
+      objects: objects,
+      manifest_mode: :ok,
+      reopen_mode: :ok,
+      posts: %{},
+      writes: [],
+      drift: nil,
+      note_reads: 0,
+      close_note_reads: nil
+    }
   end
 
   defp journal_root do
@@ -430,7 +440,20 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
   # that exact path so a concurrent edit can be injected between two reads.
   defp read_native(state, path) do
     Agent.get_and_update(state, fn current ->
+      current =
+        if String.contains?(path, "/issues/1/") and (String.ends_with?(path, "/comments") or String.ends_with?(path, "/notes")),
+          do: %{current | note_reads: current.note_reads + 1},
+          else: current
+
       case current.drift do
+        %{"path" => ^path, "remaining" => remaining, "remove_note_id" => note_id} when remaining <= 1 ->
+          kept = Enum.reject(Map.fetch!(current.objects, path), &(&1["id"] == note_id))
+          {kept, %{current | objects: Map.put(current.objects, path, kept), drift: nil}}
+
+        %{"path" => ^path, "remaining" => remaining, "remove_note_id" => note_id} ->
+          body = Map.fetch!(current.objects, path)
+          {body, %{current | drift: %{"path" => path, "remaining" => remaining - 1, "remove_note_id" => note_id}}}
+
         %{"path" => ^path, "remaining" => remaining} when remaining <= 1 ->
           drifted = Map.put(Map.fetch!(current.objects, path), "updated_at", "2026-10-18T00:10:00Z")
           {drifted, %{current | objects: Map.put(current.objects, path, drifted), drift: nil}}
@@ -447,6 +470,11 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
 
   defp arm_drift(f, path, reads) do
     Agent.update(f.state, &%{&1 | drift: %{"path" => path, "remaining" => reads}})
+    f
+  end
+
+  defp arm_note_removal(f, reads, note_id) do
+    Agent.update(f.state, &%{&1 | drift: %{"path" => f.parent_notes, "remaining" => reads, "remove_note_id" => note_id}, note_reads: 0})
     f
   end
 
@@ -511,6 +539,7 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
 
   defp apply_state_write(state, kind, path, target, reopen) do
     state = logged(state, kind)
+    state = if kind == "close" and String.contains?(path, "/issues/1"), do: %{state | close_note_reads: state.note_reads}, else: state
     issue = Map.put(Map.fetch!(state.objects, path), "state", target)
     saved = %{state | objects: Map.put(state.objects, path, issue)}
 
@@ -847,7 +876,29 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
       accept_note(f, receipt)
       assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(configured(f), f.opts)
       assert issue_state(f, 1) == "closed"
+      assert {:ok, []} = TaskPlanExecution.discover(Keyword.merge(f.opts, roots: [f.parent], active_state: "Todo"))
     end
+  end
+
+  test "acceptance removed before the final parent snapshot cannot authorize close" do
+    baseline = native_fixture("github") |> verified() |> close_member()
+    assert {:ok, %{"manifest" => baseline_receipt}} = TaskPlanManifest.advance(configured(baseline), baseline.opts)
+    accept_note(baseline, baseline_receipt)
+    baseline_configured = configured(baseline)
+    Agent.update(baseline.state, &%{&1 | note_reads: 0})
+    assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(baseline_configured, baseline.opts)
+    reads_before_close = Agent.get(baseline.state, & &1.close_note_reads)
+    assert is_integer(reads_before_close) and reads_before_close > 1
+
+    f = native_fixture("github") |> verified() |> close_member()
+    assert {:ok, %{"manifest" => receipt}} = TaskPlanManifest.advance(configured(f), f.opts)
+    acceptance = accept_note(f, receipt)
+    configured = configured(f)
+    arm_note_removal(f, reads_before_close - 1, acceptance["id"])
+
+    assert {:error, :parent_acceptance_changed} = TaskPlanManifest.advance(configured, f.opts)
+    assert issue_state(f, 1) == "open"
+    assert writes(f, "close") == 1
   end
 
   test "publish recovers a lost write response by native readback instead of reposting" do
@@ -1027,7 +1078,14 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
     assert {:ok, %{"status" => "rework"}} = TaskPlanManifest.advance(configured(f), f.opts)
     assert issue_state(f, 2) == "open"
 
-    f = redeliver(f, "developer-2")
+    assert {:ok, observed} = TaskExecution.observe(f.parent, f.member, configured(f).executions, f.opts)
+    assert observed.flow["dispatchable"]
+    assert observed.flow["action"] == "implement"
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, f.member, configured(f).executions, f.opts)
+    assert admitted.flow["action"] == "implement"
+    {:ok, _} = RunJournal.checkpoint(admitted.record, %{"thread_id" => "developer-2"})
+
+    f = f |> verified("-developer-2") |> close_member()
     assert issue_state(f, 2) == "closed"
 
     assert {:ok, %{"status" => "awaiting_acceptance", "manifest" => receipt2}} = TaskPlanManifest.advance(configured(f), f.opts)

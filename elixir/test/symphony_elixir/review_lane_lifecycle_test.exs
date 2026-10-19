@@ -45,6 +45,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
         mode=faults.get(str(len(posts)))
         if mode=='edited':out['notes'][0]['body']='edited '+body
         if mode=='wrong_actor':out['notes'][0]['author']['id']=99
+        if mode=='no_actor':del out['notes'][0]['author']
         if mode=='reply':out['notes'].append({'id':900,'body':'请核对新增的边界条件','author':{'id':30},'created_at':'2026-01-02T00:00:00Z'})
         if mode!='drop':ds.append(out)
         if mode=='duplicate':ds.append({'id':'duplicate','notes':[dict(out['notes'][0],id=1000)]})
@@ -456,6 +457,98 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:ok, ^rounds} = Listener.issues()
   end
 
+  test "merge before a current review records a durable gap without publishing", c do
+    {:ok, [issue]} = Listener.issues()
+    responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => merged_mr(issue.native_ref, %{"sha" => String.duplicate("c", 40)})})
+
+    for _ <- 1..2 do
+      assert {:ok, [ended]} = Listener.issues()
+      assert ended.native_ref["phase"] == "ended"
+      assert ended.native_ref["eligibility"] == "merged"
+
+      assert ended.native_ref["review_gap"] == %{
+               "status" => "missing_current_review",
+               "head" => String.duplicate("c", 40),
+               "base" => issue.native_ref["base"],
+               "target_branch" => "main",
+               "completion" => nil
+             }
+
+      assert Jason.decode!(ended.description)["review_gap"] == ended.native_ref["review_gap"]
+
+      refute ended.dispatchable
+    end
+
+    assert saved_review(c, issue)["review_gap"]["status"] == "missing_current_review"
+    refute Map.has_key?(saved_review(c, issue), "publication")
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    assert {:ok, [restored]} = Listener.issues()
+    assert restored.native_ref["review_gap"]["status"] == "missing_current_review"
+    refute File.exists?(Path.join(c.root, "posts.json"))
+  end
+
+  test "a merged native review refuses a worker publication before the next poll", c do
+    {:ok, [issue]} = Listener.issues()
+    assert {:ok, _, _} = Listener.begin_run(issue.id)
+    responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => merged_mr(issue.native_ref)})
+
+    assert {:error, :review_not_open} = owned_submit(issue.id, %{"findings" => []})
+    refute File.exists?(Path.join(c.root, "posts.json"))
+    assert {:ok, [ended]} = Listener.issues()
+    assert ended.native_ref["review_gap"]["status"] == "missing_current_review"
+    refute ended.dispatchable
+  end
+
+  test "merge after fully published current review records no gap on repeated polls", c do
+    {:ok, [issue]} = Listener.issues()
+    assert {:ok, _, _} = Listener.begin_run(issue.id)
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
+    assert :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
+    assert length(posts(c)) == 1
+    assert saved_review(c, issue)["review_completion"]
+    responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => merged_mr(issue.native_ref)})
+
+    for _ <- 1..2 do
+      assert {:ok, [ended]} = Listener.issues()
+      assert ended.native_ref["phase"] == "ended"
+      assert ended.native_ref["eligibility"] == "merged"
+      assert ended.native_ref["review_gap"]["status"] == "none"
+      assert ended.native_ref["review_gap"]["completion"] == ended.native_ref["review_completion"]
+      assert Jason.decode!(ended.description)["review_gap"]["status"] == "none"
+      refute ended.dispatchable
+    end
+
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    assert {:ok, [restored]} = Listener.issues()
+    assert restored.native_ref["review_gap"]["status"] == "none"
+    assert length(posts(c)) == 1
+  end
+
+  test "published review cannot prove a merged head, base or target that changed", c do
+    {:ok, [issue]} = Listener.issues()
+    assert {:ok, _, _} = Listener.begin_run(issue.id)
+    assert :ok = owned_submit(issue.id, %{"findings" => []})
+    assert :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
+
+    for change <- [
+          %{"sha" => String.duplicate("c", 40)},
+          %{"diff_refs" => %{"base_sha" => String.duplicate("d", 40)}},
+          %{"target_branch" => "release"}
+        ] do
+      responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => merged_mr(issue.native_ref, change)})
+      assert {:ok, [ended]} = Listener.issues()
+      assert ended.native_ref["review_gap"]["status"] == "missing_current_review"
+      assert ended.native_ref["review_gap"]["completion"] == nil
+      refute ended.dispatchable
+    end
+
+    assert length(posts(c)) == 1
+  end
+
   test "POST response data alone never proves a comment was delivered", c do
     path = "projects/team%2Frepo/merge_requests/1/discussions"
 
@@ -562,6 +655,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   for {mode, reason} <- [
         {"edited", :review_publication_conflict},
         {"wrong_actor", :review_publication_conflict},
+        {"no_actor", :review_publication_conflict},
         {"duplicate", :review_publication_conflict},
         {"preempt_next", :unexpected_review_publication}
       ] do
@@ -676,6 +770,22 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
 
   defp saved_review(c, issue) do
     Jason.decode!(File.read!(Path.join(c.root, "state/review-lane.json")))["records"][String.replace_prefix(issue.id, "review:", "")]
+  end
+
+  defp merged_mr(record, changes \\ %{}) do
+    %{
+      "id" => 1001,
+      "project_id" => 10,
+      "iid" => record["iid"],
+      "state" => "merged",
+      "sha" => record["head"],
+      "diff_refs" => %{"base_sha" => record["base"]},
+      "target_branch" => record["target_branch"],
+      "author" => %{"id" => record["author_id"]},
+      "reviewers" => [%{"id" => 20}],
+      "web_url" => record["url"]
+    }
+    |> Map.merge(changes)
   end
 
   test "disabled, changed and legacy configurations cannot start native discovery", c do

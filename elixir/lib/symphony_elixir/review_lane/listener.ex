@@ -401,8 +401,27 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       record["phase"] in ~w(queued running publishing completed failed fenced ended superseded) and
       is_list(record["findings"]) and Enum.all?(record["findings"], &is_map/1) and
       Enum.all?(~w(head base), &valid_sha?(record[&1])) and Enum.all?(~w(policy_sha response_sha), &digest?(record[&1])) and
-      (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"]))
+      auxiliary_fields?(record)
   end
+
+  defp auxiliary_fields?(record) do
+    (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"])) and
+      completion?(record) and review_gap?(record)
+  end
+
+  defp completion?(%{"review_completion" => completion} = record) when is_map(completion) do
+    completion == completion_proof(record) and published_review?(record)
+  end
+
+  defp completion?(record), do: is_nil(record["review_completion"])
+
+  defp review_gap?(%{"review_gap" => gap}) when is_map(gap) do
+    gap["status"] in ["none", "missing_current_review"] and
+      Enum.all?(~w(head base), &valid_sha?(gap[&1])) and target_branch?(gap["target_branch"]) and
+      (is_nil(gap["completion"]) or is_map(gap["completion"]))
+  end
+
+  defp review_gap?(record), do: is_nil(record["review_gap"])
 
   defp digest?(value), do: is_binary(value) and Regex.match?(~r/^[a-f0-9]{64}$/, value)
 
@@ -563,6 +582,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp reconcile_native(state, record, mr, path) do
+    if mr["state"] == "merged" do
+      put_record(state, merged_review(record, mr))
+    else
+      reconcile_unmerged(state, record, mr, path)
+    end
+  end
+
+  defp reconcile_unmerged(state, record, mr, path) do
     case lane_assignment(state.config, record["project"], record["iid"], mr) do
       {:ok, true} ->
         reconcile_assigned(state, record, mr, path)
@@ -575,6 +602,37 @@ defmodule SymphonyElixir.ReviewLane.Listener do
         put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
     end
   end
+
+  defp merged_review(record, mr) do
+    current =
+      published_review?(record) and record["review_completion"] == completion_proof(record) and
+        is_nil(record["publication_error"]) and mr["sha"] == record["head"] and
+        mr["diff_refs"]["base_sha"] == record["base"] and not target_changed?(record, mr)
+
+    gap = %{
+      "status" => if(current, do: "none", else: "missing_current_review"),
+      "head" => mr["sha"],
+      "base" => mr["diff_refs"]["base_sha"],
+      "target_branch" => mr["target_branch"],
+      "completion" => if(current, do: record["review_completion"])
+    }
+
+    record |> Map.put("eligibility", "merged") |> Map.put("phase", "ended") |> Map.put("review_gap", gap)
+  end
+
+  defp completion_proof(record) do
+    %{
+      "head" => record["head"],
+      "base" => record["base"],
+      "target_branch" => record["target_branch"],
+      "publication_sha" => TaskWorkflow.digest(record["publication"])
+    }
+  end
+
+  defp published_review?(%{"publication" => %{"entries" => entries}}) when is_list(entries),
+    do: entries != [] and Enum.all?(entries, &(&1["status"] == "published" and is_map(&1["receipt"])))
+
+  defp published_review?(_), do: false
 
   defp reconcile_assigned(state, record, mr, path) do
     findings = findings_for(state, record)
@@ -634,7 +692,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       kind: :review,
       identifier: "review-#{String.slice(record["id"], 0, 16)}",
       title: "Review #{record["project"]}#{separator}#{record["iid"]}",
-      description: Jason.encode!(Map.take(record, ["project", "iid", "head", "base", "round"])),
+      description: Jason.encode!(Map.take(record, ["project", "iid", "head", "base", "round", "review_gap"])),
       state: if(active, do: hd(SymphonyElixir.Config.settings!().tracker.active_states), else: "closed"),
       native_ref: Map.put(record, "execution_kind", "review_lane"),
       labels: SymphonyElixir.Config.settings!().tracker.required_labels,
@@ -675,7 +733,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
     case Publication.publish(record, state.config, &put_record(state, &1), guard) do
       {:ok, current} ->
-        current = current |> Map.put("phase", "completed") |> Map.delete("publication_error")
+        current = current |> Map.put("phase", "completed") |> Map.delete("publication_error") |> Map.put("review_completion", completion_proof(current))
         {:ok, put_record(state, current)}
 
       {:error, reason, current} ->
@@ -723,8 +781,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp same_review?(mr, record, config) do
-    valid_mr?(mr, record["project"], record["iid"], config) and
-      mr["sha"] == record["head"] and not target_changed?(record, mr) and
+    mr["sha"] == record["head"] and not target_changed?(record, mr) and
       get_in(mr, ["diff_refs", "base_sha"]) == record["base"] and
       policy_sha(config) == record["policy_sha"]
   end
@@ -736,6 +793,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
     with true <- current_config?(state) || {:error, :review_lane_configuration_changed_restart_required},
          {:ok, mr} <- read_mr(config, record["project"], record["iid"]),
+         true <- valid_mr?(mr, record["project"], record["iid"], config) || {:error, :mr_head_changed},
+         true <- mr["state"] == "opened" || {:error, :review_not_open},
          true <- same_review?(mr, record, config) || {:error, :mr_head_changed},
          :ok <- require_assignment(lane_assignment(config, record["project"], record["iid"], mr)),
          {:ok, user} <- module.request(config, "GET", "user"),

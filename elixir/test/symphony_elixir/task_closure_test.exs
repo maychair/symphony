@@ -9,6 +9,7 @@ defmodule SymphonyElixir.TaskClosureTest do
         "phase" => "completed",
         "outcome" => "delivered",
         "execution" => "idle",
+        "restrictions" => %{},
         "candidate" => TaskWorkflow.digest("candidate"),
         "contract_sha" => binding["contract_sha"],
         "plan_revision" => binding["plan_revision"],
@@ -120,7 +121,15 @@ defmodule SymphonyElixir.TaskClosureTest do
 
   defp owner_record(record, overrides \\ %{}) do
     Map.merge(
-      %{"kind" => "closure-reconciler", "os_pid" => System.pid(), "node" => to_string(node()), "attempt_id" => record["attempt_id"], "issue_id" => record["issue_id"]},
+      %{
+        "kind" => "closure-reconciler",
+        "os_pid" => System.pid(),
+        "node" => to_string(node()),
+        "vm_started_at" => :erlang.system_info(:start_time),
+        "erlang_pid" => self() |> :erlang.pid_to_list() |> to_string(),
+        "attempt_id" => record["attempt_id"],
+        "issue_id" => record["issue_id"]
+      },
       overrides
     )
   end
@@ -289,6 +298,25 @@ defmodule SymphonyElixir.TaskClosureTest do
     assert after_write["closure_current"]["state"] == "closed"
   end
 
+  test "post-write restrictions or lost closeability leave the closed fact without a business receipt" do
+    for {provider, drifted} <- [
+          {"github", %{"closeable" => false}},
+          {"gitlab", %{"restrictions" => %{"native:pause" => %{"kind" => "pause", "native" => true}}}}
+        ] do
+      f = fixture(provider)
+      opts = Keyword.put(f.opts, :reobserve, counting_assess(f, [%{}, drifted]))
+
+      assert {:error, :member_closure_conclusion_changed} = TaskClosure.reconcile(f.record, flow(f.binding), opts)
+      assert object(f)["state"] == "closed"
+      assert length(writes(f)) == 1
+
+      after_write = current(f)
+      assert after_write["closure_status"] == "inconsistent"
+      assert after_write["closure_current"]["state"] == "closed"
+      refute after_write["closure_confirmed"]
+    end
+  end
+
   test "an uncertain send keeps the durable intent without recording closure" do
     f = fixture("github")
 
@@ -368,6 +396,37 @@ defmodule SymphonyElixir.TaskClosureTest do
     refute File.exists?(Path.join(f.record["directory"], "executor.lock"))
   end
 
+  test "a killed reconciler in the same VM releases its fence for read-back recovery" do
+    f = fixture("github")
+    pending = lost_write(f, true)
+    parent = self()
+
+    {owner, monitor} =
+      spawn_monitor(fn ->
+        TaskClosure.with_fence(pending, f.opts, fn ->
+          send(parent, {:fence_held, self()})
+
+          receive do
+            :release -> :ok
+          end
+        end)
+      end)
+
+    assert_receive {:fence_held, ^owner}
+    assert {:error, :member_closure_executor_locked} = TaskClosure.reconcile(pending, flow(f.binding), with_assess(f))
+
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}
+
+    assert {:ok, %{record: confirmed, closure: closure}} =
+             TaskClosure.reconcile(pending, flow(f.binding), with_assess(f))
+
+    assert confirmed["closure_status"] == "published"
+    assert closure["status"] == "confirmed"
+    assert writes(f) == []
+    refute File.exists?(Path.join(f.record["directory"], "executor.lock"))
+  end
+
   test "a fence whose owner is live or unprovable is never taken over" do
     f = fixture("github")
     lock = locked(f.record)
@@ -383,6 +442,17 @@ defmodule SymphonyElixir.TaskClosureTest do
     assert {:error, :member_closure_owner_unconfirmed} =
              TaskClosure.reconcile(f.record, flow(f.binding), with_assess(f))
 
+    assert writes(f) == []
+  end
+
+  test "a malformed local Erlang PID cannot prove the fence owner has died" do
+    f = fixture("github")
+    lock = locked(f.record, %{"erlang_pid" => "not-a-pid"})
+
+    assert {:error, :member_closure_owner_unconfirmed} =
+             TaskClosure.with_fence(f.record, f.opts, fn -> flunk("malformed owner took the fence") end)
+
+    assert File.exists?(Path.join(lock, "reconcile-owner.json"))
     assert writes(f) == []
   end
 

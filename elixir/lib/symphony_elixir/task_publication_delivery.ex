@@ -69,6 +69,8 @@ defmodule SymphonyElixir.TaskPublicationDelivery do
     receipt = %{
       "artifact" => artifact["id"],
       "version" => artifact["version"],
+      "source_version" => artifact["version"],
+      "delivered_version" => artifact["version"],
       "candidate" => candidate["digest"],
       "target" => target(work, artifact),
       "note_id" => note["id"],

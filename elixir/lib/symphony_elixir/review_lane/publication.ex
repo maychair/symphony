@@ -128,8 +128,7 @@ defmodule SymphonyElixir.ReviewLane.Publication do
       else: {:error, :review_publication_conflict}
   end
 
-  defp actor?(%{"author" => %{"id" => actor}}, actor), do: true
-  defp actor?(_, _), do: false
+  defp actor?(note, actor), do: get_in(note, ["author", "id"]) == actor
 
   defp discussions?(discussions) do
     Enum.all?(discussions, fn discussion ->

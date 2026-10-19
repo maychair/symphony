@@ -398,6 +398,7 @@ defmodule SymphonyElixir.TaskSessionTest do
       identifier: "GH-2",
       title: "Delivered member",
       state: "closed",
+      url: "https://github.test/team/repo/issues/2",
       native_ref: %{"number" => 2, "repo" => "team/repo"},
       labels: []
     }

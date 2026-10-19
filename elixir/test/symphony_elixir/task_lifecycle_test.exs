@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskLifecycleTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.{ExecutionBinding, RunJournal, TaskDecision, TaskLifecycle, TaskPlan, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{ExecutionBinding, RunJournal, TaskDecision, TaskLifecycle}
+  alias SymphonyElixir.{TaskPlan, TaskPlanManifest, TaskWorkflow, WorkRef}
 
   defp fixture(opts \\ []) do
     parent = %{"provider" => "github", "host" => "github.test", "repository_id" => "1", "kind" => "issue", "number" => 1}
@@ -170,6 +171,70 @@ defmodule SymphonyElixir.TaskLifecycleTest do
 
   defp with_finding(context, finding \\ finding()), do: put_in(context.evidence["verification"]["findings"], [finding])
   defp persist(context, flow), do: put_in(context.runtime["workflow"], flow)
+
+  test "a confirmed native parent rework admits the reopened original member" do
+    completed = fixture() |> candidate() |> verified() |> delivered()
+    completed_flow = assess(completed)
+    assert completed_flow["phase"] == "completed"
+    completed = persist(completed, completed_flow)
+
+    body = %{
+      "schema_version" => 2,
+      "plan_revision" => completed.plan.plan["revision"],
+      "criteria" => completed.plan.plan["criteria"],
+      "integration" => completed.work,
+      "members" => [%{"work" => completed.work}]
+    }
+
+    manifest = Map.put(body, "revision", TaskWorkflow.digest(body))
+
+    manifest_note = %{
+      "id" => 10,
+      "body" => "<!-- symphony-plan-manifest " <> Jason.encode!(manifest) <> " -->",
+      "author" => %{"id" => 99},
+      "created_at" => "2026-10-16T00:00:01Z",
+      "updated_at" => "2026-10-16T00:00:01Z"
+    }
+
+    [entry] = TaskPlanManifest.manifests(%{notes: [manifest_note]})
+
+    decision_note = %{
+      "id" => 11,
+      "body" =>
+        "<!-- symphony-plan-acceptance " <>
+          Jason.encode!(%{"action" => "rework", "manifest" => entry["source"], "revision" => manifest["revision"], "criteria" => ["result"]}) <>
+          " -->",
+      "author" => %{"id" => 1},
+      "created_at" => "2026-10-16T00:00:02Z",
+      "updated_at" => "2026-10-16T00:00:02Z"
+    }
+
+    marker = %{
+      "status" => "confirmed",
+      "source" => "issue:reopened",
+      "parent_source" => TaskDecision.source_ref(decision_note),
+      "manifest" => entry["source"],
+      "criteria" => ["result"],
+      "superseded" => ["candidate", "verification"]
+    }
+
+    reopened =
+      completed
+      |> put_in([:runtime, "rework"], marker)
+      |> put_in([:evidence, "candidate"], nil)
+      |> put_in([:evidence, "verification"], nil)
+      |> put_in([:evidence, "deliveries"], [])
+      |> put_in([:plan, :parent, :work], completed.plan.plan["parent"])
+      |> put_in([:plan, :parent, :description], nil)
+      |> put_in([:plan, :parent, :notes], completed.plan.parent.notes ++ [manifest_note, decision_note])
+
+    assert %{"phase" => "ready", "action" => "implement", "dispatchable" => true, "restrictions" => restrictions} = assess(reopened)
+    refute Map.has_key?(restrictions, "candidate_source_missing")
+    refute Map.has_key?(restrictions, "conclusion_changed")
+
+    forged = put_in(reopened.runtime["rework"]["parent_source"], "note:forged")
+    assert %{"dispatchable" => false} = assess(forged)
+  end
 
   test "a sealed approval drives developer, independent verifier and delivery without child acceptance" do
     context = fixture()

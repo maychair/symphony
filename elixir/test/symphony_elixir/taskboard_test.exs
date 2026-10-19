@@ -591,6 +591,46 @@ defmodule SymphonyElixir.TaskboardTest do
     assert stale_card.artifacts == []
   end
 
+  test "an Issue on another host cannot inherit a same-path repository journal" do
+    root = Path.join(System.tmp_dir!(), "symphony-taskboard-host-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    host_a = member_repository("github")
+    host_b = %{host_a | "host" => "other.github.test", "repository_id" => "20", "api_url" => "https://other.github.test/api/v3"}
+    work_a = member_work("github")
+    record = write_member_journal(root, work_a, %{})
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    path = Workflow.workflow_file_path()
+
+    path
+    |> File.read!()
+    |> String.replace("tracker:\n", "tracker:\n  provider: " <> Jason.encode!(%{"plan_repositories" => [host_a, host_b]}) <> "\n")
+    |> then(&File.write!(path, &1))
+
+    :ok = WorkflowStore.force_reload()
+    issue_b = %{member_issue("github") | url: "https://other.github.test/team/repo/issues/2"}
+
+    for candidate <- [
+          issue_b,
+          %{issue_b | url: nil},
+          %{issue_b | url: "https://other.github.test/team/repo/issues/3"},
+          %{issue_b | native_ref: Map.put(issue_b.native_ref, "repository_id", "999")}
+        ] do
+      snapshot =
+        Taskboard.snapshot(
+          settings: Config.settings!(),
+          issues_fun: fn _states -> [candidate] end,
+          runtime_snapshot_fun: fn -> %{} end,
+          journal_root: root
+        )
+
+      assert [card] = snapshot.cards
+      refute is_map(card.projection) and card.projection.directory == record["directory"]
+      refute card.column == "Done"
+    end
+  end
+
   defp member_work("github"), do: %{"provider" => "github", "host" => "github.test", "repository_id" => "10", "kind" => "issue", "number" => 2}
   defp member_work("gitlab"), do: %{"provider" => "gitlab", "host" => "gitlab.test", "repository_id" => "10", "kind" => "issue", "number" => 2}
 
@@ -606,11 +646,11 @@ defmodule SymphonyElixir.TaskboardTest do
   end
 
   defp member_issue("github") do
-    %{issue("2", "GH-2", "Delivered member", "closed", ["symphony:ready"]) | native_ref: %{"number" => 2, "repo" => "team/repo"}}
+    %{issue("2", "GH-2", "Delivered member", "closed", ["symphony:ready"]) | url: "https://github.test/team/repo/issues/2", native_ref: %{"number" => 2, "repo" => "team/repo"}}
   end
 
   defp member_issue("gitlab") do
-    %{issue("2", "GL-2", "Delivered member", "closed", ["symphony:ready"]) | native_ref: %{"iid" => 2, "project_path" => "team/repo"}}
+    %{issue("2", "GL-2", "Delivered member", "closed", ["symphony:ready"]) | url: "https://gitlab.test/team/repo/-/issues/2", native_ref: %{"iid" => 2, "project_path" => "team/repo"}}
   end
 
   # The member journal is written through the production journal API into the

@@ -199,6 +199,18 @@ defmodule SymphonyElixir.ReviewFindingTest do
       inconsistent = %{"publication" => %{"version" => 1, "actor" => 20, "entries" => []}, "submission" => 42}
       refute Publication.valid?(inconsistent, 20)
     end
+
+    test "publication validity refuses malformed entries and missing published receipts" do
+      assert {:ok, prepared} = Publication.prepare(publication_record(%{}), %{"findings" => [], "responses" => []}, 20)
+      assert Publication.valid?(prepared, 20)
+
+      [entry] = prepared["publication"]["entries"]
+      refute Publication.valid?(put_in(prepared["publication"]["entries"], [nil]), 20)
+      refute Publication.valid?(put_in(prepared["publication"]["entries"], [%{entry | "status" => "corrupt"}]), 20)
+
+      missing_receipt = entry |> Map.put("status", "published") |> Map.put("receipt", nil)
+      refute Publication.valid?(put_in(prepared["publication"]["entries"], [missing_receipt]), 20)
+    end
   end
 
   describe "listener integration" do

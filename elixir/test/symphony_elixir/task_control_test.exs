@@ -302,6 +302,17 @@ defmodule SymphonyElixir.TaskControlTest do
     %{note(fixture, :parent, "authorize", id) | "body" => body}
   end
 
+  defp question_note(fixture, label, id, work) do
+    payload = %{
+      "label" => label,
+      "revision" => fixture.plan["revision"],
+      "authorizer" => "1",
+      "data" => %{"work" => work}
+    }
+
+    %{note(fixture, :parent, "authorize", id) | "body" => "问题 #{label}\n" <> SymphonyElixir.TaskDecision.candidate_block(payload)}
+  end
+
   defp reply(fixture, body, id), do: %{note(fixture, :parent, "authorize", id) | "body" => body}
 
   test "readable approval binds native candidate evidence and survives receipt replay" do
@@ -365,6 +376,94 @@ defmodule SymphonyElixir.TaskControlTest do
     assert {:clarify, _} = TaskControl.bind_reply(root, reply(f, "Q2 是否采用方案 B？", 3), "1")
     missing = %{human | "body" => nil}
     assert {:error, :needs_clarification} = TaskControl.parent_decisions(%{root | notes: root.notes ++ [missing]}, "1")
+  end
+
+  test "observe releases only the answered member question and keeps unrelated controls" do
+    f = fixture()
+    approval = note(f, :parent, "authorize", 1)
+    first = question_note(f, "Q1", 2, child(f))
+    second = question_note(f, "Q2", 3, child(f))
+    pause = note(f, :parent, "pause", 4)
+    f = parent_notes(f, [approval, first, second, pause])
+    assert {:ok, authority} = TaskControl.authority(f.parent, f.plan)
+    assert {:ok, pending} = observe(f)
+    assert Enum.sort(Enum.map(pending.restrictions, & &1["kind"])) == ~w(decision decision pause)
+    q2 = Enum.find(pending.restrictions, &(&1["source"] == SymphonyElixir.TaskDecision.source_ref(second)))
+    q1 = Enum.find(pending.restrictions, &(&1["source"] == SymphonyElixir.TaskDecision.source_ref(first)))
+
+    answer = reply(f, "Q2：采用方案 B", 5)
+    f = parent_notes(f, f.parent.notes ++ [answer])
+    assert {:ok, answered} = observe(f, pending.receipts)
+    assert Enum.sort(Enum.map(answered.restrictions, & &1["source"])) == Enum.sort([q1["source"], hd(Enum.filter(pending.restrictions, &(&1["kind"] == "pause")))["source"]])
+    assert [%{"id" => id, "restriction_source" => source, "source" => answer_source}] = answered.releases
+    assert id == q2["id"]
+    assert source == q2["source"]
+    assert is_binary(answer_source)
+    assert {:ok, ^authority} = TaskControl.authority(f.parent, f.plan)
+    assert {:ok, ^answered} = observe(f, answered.receipts)
+  end
+
+  test "ambiguous answers and removed question sources cannot release a member decision" do
+    f = fixture()
+    first = question_note(f, "Q1", 1, child(f))
+    second = question_note(f, "Q2", 2, child(f))
+    f = parent_notes(f, [first, second])
+    assert {:ok, pending} = observe(f)
+
+    for body <- ["采用方案 B", "Q1 Q2 采用方案 B"] do
+      changed = parent_notes(f, [first, second, reply(f, body, 3)])
+      assert {:error, :needs_clarification} = observe(changed, pending.receipts)
+    end
+
+    edited = %{second | "body" => "修订问题 Q2\n" <> List.last(String.split(second["body"], "\n", parts: 2))}
+    assert {:error, :control_source_unconfirmed} = observe(parent_notes(f, [first, edited]), pending.receipts)
+
+    foreign = question_note(f, "Q3", 4, %{child(f) | "number" => 99})
+    assert {:error, :unconfirmed_question_candidate} = observe(parent_notes(f, [first, second, foreign]))
+
+    answered = parent_notes(f, [first, second, reply(f, "Q2：采用方案 B", 3)])
+    assert {:ok, receipt} = observe(answered, pending.receipts)
+
+    assert {:error, :ambiguous_question_answer} =
+             observe(parent_notes(f, answered.parent.notes ++ [reply(f, "Q2：采用方案 C", 4)]), pending.receipts)
+
+    assert {:error, :ambiguous_question_candidate} =
+             observe(parent_notes(f, [first, second, question_note(f, "Q2", 4, child(f))]), pending.receipts)
+
+    assert {:error, :control_source_unconfirmed} = observe(parent_notes(answered, [first]), receipt.receipts)
+    assert {:error, :needs_clarification} = observe(parent_notes(answered, [first, reply(f, "Q2：采用方案 B", 3)]), pending.receipts)
+  end
+
+  test "one bound answer clears its question on replay without affecting a sibling" do
+    f = fixture()
+    target = child(f)
+    sibling = %{target | "number" => 2}
+    member = %{hd(Map.values(f.members)) | work: sibling}
+    f = put_in(f.members[WorkRef.key(sibling)], member)
+    approval = note(f, :parent, "authorize", 1)
+    question = question_note(f, "Q2", 2, target)
+    f = parent_notes(f, [approval, question])
+
+    assert {:ok, %{restrictions: [%{"kind" => "decision"}]} = pending} = TaskControl.observe(f, target)
+    assert {:ok, %{restrictions: [], releases: []}} = TaskControl.observe(f, sibling)
+
+    f = parent_notes(f, [approval, question, reply(f, "Q2：采用方案 B", 3)])
+    assert {:ok, %{restrictions: [], releases: [_]} = answered} = TaskControl.observe(f, target, pending.receipts)
+    assert {:ok, ^answered} = TaskControl.observe(f, target, answered.receipts)
+    assert {:ok, %{restrictions: [], releases: []}} = TaskControl.observe(f, sibling)
+  end
+
+  test "an answered question remains released after a new approved plan revision" do
+    f = fixture()
+    question = question_note(f, "Q2", 1, child(f))
+    answer = reply(f, "Q2：采用方案 B", 2)
+    f = parent_notes(f, [question, answer])
+    assert {:ok, old} = observe(f)
+    assert old.restrictions == []
+
+    f = put_in(f.plan["revision"], TaskWorkflow.digest("plan v2"))
+    f = parent_notes(f, [question, answer, note(f, :parent, "authorize", 3)])
+    assert {:ok, %{restrictions: [], releases: [_]}} = observe(f, old.receipts)
   end
 
   test "a new manifest cannot receive an old acceptance even after a restart" do

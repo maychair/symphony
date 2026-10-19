@@ -7,9 +7,9 @@ defmodule SymphonyElixir.TaskControl do
 
   Short versions use published `symphony-candidate` notes containing `label`,
   `revision`, `authorizer` and the complete candidate `data`. Manifest data lists
-  `acceptance_items` for rework. Publishers must keep labels unique within the
-  Issue. Consumers persist `parent_decisions/3` receipts and call `read_binding/2`
-  with a fresh native snapshot before acting. This module performs no remote writes.
+  `acceptance_items` for rework; question data names the affected member `work`.
+  Publishers must keep labels unique within the Issue. `observe/3` reads question
+  sources and answers with persisted receipts. This module performs no remote writes.
   """
   alias SymphonyElixir.{TaskDecision, TaskWorkflow, WorkRef}
 
@@ -220,15 +220,20 @@ defmodule SymphonyElixir.TaskControl do
   def observe(preflight, work, previous \\ %{}) do
     with :ok <- WorkRef.validate(work),
          {:ok, events} <- applicable(preflight, work),
+         {:ok, questions} <- question_events(preflight),
+         {events, questions} <- relevant_questions(events, questions, work),
          {:ok, released} <- releases(events),
+         {:ok, answered} <- answered_questions(events, questions),
+         events = events ++ questions,
+         released = released ++ Enum.map(answered, & &1["restriction_source"]),
          true <- Enum.all?(events, &(historical?(&1, released) or current?(&1, preflight, work))) or {:error, :control_revision_mismatch},
          receipts = Map.new(events, &{&1["id"], &1["source"]}),
          true <- receipts?(previous) or {:error, :invalid_control_receipts},
          true <- Enum.all?(previous, fn {id, source} -> receipts[id] == source end) or {:error, :control_source_unconfirmed} do
       restrictions =
         events
-        |> Enum.filter(&(&1["action"] in ["pause", "cancel"] and &1["source"] not in released))
-        |> Enum.map(&%{"id" => &1["id"], "kind" => &1["action"], "source" => &1["source"], "scope" => "task"})
+        |> Enum.filter(&(&1["action"] in ~w(pause cancel question) and &1["source"] not in released))
+        |> Enum.map(&%{"id" => &1["id"], "kind" => if(&1["action"] == "question", do: "decision", else: &1["action"]), "source" => &1["source"], "scope" => "task"})
 
       releases =
         events
@@ -238,7 +243,7 @@ defmodule SymphonyElixir.TaskControl do
           %{"id" => prior["id"], "restriction_source" => prior["source"], "source" => event["source"]}
         end)
 
-      {:ok, %{restrictions: restrictions, releases: releases, sources: Map.values(receipts), receipts: receipts}}
+      {:ok, %{restrictions: restrictions, releases: releases ++ answered, sources: Map.values(receipts), receipts: receipts}}
     end
   end
 
@@ -286,8 +291,82 @@ defmodule SymphonyElixir.TaskControl do
   defp applicable(preflight, work) do
     with {:ok, root} <- decisions(preflight.parent, preflight.plan["authorizer"], :parent),
          {:ok, member} <- member_decisions(preflight, work) do
-      {:ok, Enum.filter(root, &(&1["action"] in ~w(pause cancel resume))) ++ member}
+      {:ok, Enum.filter(root, &(&1["action"] in ~w(pause cancel resume answer))) ++ member}
     end
+  end
+
+  defp question_events(preflight) do
+    candidates = preflight.parent.notes |> Enum.flat_map(&short_candidate/1) |> Enum.filter(&String.starts_with?(&1["label"], "Q"))
+
+    if length(Enum.uniq_by(candidates, & &1["label"])) != length(candidates) do
+      {:error, :ambiguous_question_candidate}
+    else
+      collect_question_events(candidates, preflight)
+    end
+  end
+
+  defp collect_question_events(candidates, preflight) do
+    Enum.reduce_while(candidates, {:ok, []}, fn candidate, {:ok, acc} ->
+      case question_event(candidate, preflight) do
+        {:ok, event} -> {:cont, {:ok, [event | acc]}}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp question_event(candidate, preflight) do
+    target = get_in(candidate, ["data", "work"])
+    note = candidate["note"]
+
+    with :ok <- WorkRef.validate(target),
+         %{work: ^target} <- preflight.members[WorkRef.key(target)],
+         true <- unchanged?(note) do
+      {:ok,
+       %{
+         "action" => "question",
+         "id" => WorkRef.key(preflight.parent.work) <> ":note:" <> to_string(note["id"]),
+         "source" => TaskDecision.source_ref(note),
+         "candidate_digest" => TaskWorkflow.digest(Map.delete(candidate, "note")),
+         "label" => candidate["label"],
+         "actor" => candidate["authorizer"],
+         "revision" => candidate["revision"],
+         "work" => preflight.parent.work,
+         "target" => target
+       }}
+    else
+      _ -> {:error, :unconfirmed_question_candidate}
+    end
+  end
+
+  defp relevant_questions(events, questions, work) do
+    questions = Enum.filter(questions, &(&1["target"] == work))
+    sources = MapSet.new(questions, & &1["source"])
+    events = Enum.reject(events, &(&1["action"] == "answer" and not MapSet.member?(sources, &1["candidate_source"])))
+    {events, questions}
+  end
+
+  defp answered_questions(events, questions) do
+    Enum.reduce_while(questions, {:ok, []}, fn question, {:ok, acc} ->
+      answers = Enum.filter(events, &answer_for?(&1, question))
+
+      case answers do
+        [] ->
+          {:cont, {:ok, acc}}
+
+        [answer] ->
+          release = %{"id" => question["id"], "restriction_source" => question["source"], "source" => answer["source"]}
+          {:cont, {:ok, [release | acc]}}
+
+        _ ->
+          {:halt, {:error, :ambiguous_question_answer}}
+      end
+    end)
+  end
+
+  defp answer_for?(answer, question) do
+    answer["action"] == "answer" and answer["candidate_source"] == question["source"] and
+      answer["candidate_digest"] == question["candidate_digest"] and answer["label"] == question["label"] and
+      answer["revision"] == question["revision"]
   end
 
   defp member_decisions(%{plan: %{"parent" => work}}, work), do: {:ok, []}
@@ -301,13 +380,13 @@ defmodule SymphonyElixir.TaskControl do
 
   defp current?(event, preflight, work) do
     event["revision"] == preflight.plan["revision"] and
+      (event["action"] != "question" or event["actor"] == preflight.plan["authorizer"]) and
       (event["work"] == preflight.plan["parent"] or event["contract_sha"] == preflight.members[WorkRef.key(work)].contract["contract_sha"])
   end
 
-  # A released restriction and the resume that released it are history, not live
-  # controls: an older plan revision cannot keep blocking a later authorized one
-  # through a pair the corresponding authorizer already closed.
-  defp historical?(event, released), do: event["source"] in released or event["action"] == "resume"
+  # A released restriction and its resume or answer are history, not live
+  # controls: an older plan revision cannot keep blocking a later authorized one.
+  defp historical?(event, released), do: event["source"] in released or event["action"] in ~w(resume answer)
 
   defp decisions(snapshot, actor, scope) do
     marker = Map.fetch!(@markers, scope)

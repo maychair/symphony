@@ -19,7 +19,7 @@ defmodule SymphonyElixir.TaskPlan do
   authored. An absent slot in a v2 edge is rejected, never downgraded to v1.
   """
 
-  alias SymphonyElixir.{TaskDecision, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{TaskControl, TaskDecision, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @fields ~w(schema_version parent contract_sha authorizer criteria members dependencies integration budget_ms revision)
@@ -191,7 +191,7 @@ defmodule SymphonyElixir.TaskPlan do
         is_integer(get_in(note, ["author", "id"])) and get_in(note, ["author", "id"]) > 0 and
         TaskDecision.source_ref(note) == grant["source"] and
         to_string(get_in(note, ["author", "id"])) == grant["actor"] and
-        authorization?(note, grant["revision"])
+        authorization?(note, grant, notes)
     end)
   end
 
@@ -199,13 +199,29 @@ defmodule SymphonyElixir.TaskPlan do
   # revision it claims, not merely a note that shares the recorded source and
   # actor. Mirror TaskControl's strict marker parse so a forged or unrelated note
   # cannot resurrect a stale binding.
-  defp authorization?(note, revision) do
+  defp authorization?(note, grant, notes) do
+    revision = grant["revision"]
+
     with {:ok, payload} <- decision_payload(note),
          %{"action" => "authorize", "revision" => ^revision} <- payload,
          true <- Enum.sort(Map.keys(payload)) == ~w(action revision) do
       true
     else
-      _ -> false
+      _ -> human_authorization?(note, grant, notes)
+    end
+  end
+
+  defp human_authorization?(note, grant, notes) do
+    snapshot = %{work: grant["work"], notes: notes}
+
+    case TaskControl.bind_reply(snapshot, note, grant["actor"]) do
+      {:ok, %{"action" => "authorize", "revision" => revision} = event} ->
+        revision == grant["revision"] and event["note_source"] == grant["source"] and
+          event["candidate_source"] == grant["candidate_source"] and
+          event["candidate_digest"] == grant["candidate_digest"]
+
+      _ ->
+        false
     end
   end
 

@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskPlanTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.{Execution, TaskPlan, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{Execution, TaskControl, TaskPlan, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   defp work(repo, number, provider \\ "github"),
@@ -155,6 +155,50 @@ defmodule SymphonyElixir.TaskPlanTest do
       forged_prior = %{prior | "source" => SymphonyElixir.TaskDecision.source_ref(wrong)}
       refute TaskPlan.compatible_binding?(current, latest, %{binding | "authority" => forged_prior}, member["work"], [wrong])
     end
+  end
+
+  test "a native short-version authorization remains a compatible historical grant" do
+    initial = %{draft() | "authorizer" => "1"}
+    assert {:ok, old} = TaskPlan.seal(initial)
+    assert {:ok, current} = TaskPlan.seal(%{initial | "budget_ms" => 501})
+    member = hd(current["members"])
+
+    candidate = %{
+      "id" => 6,
+      "body" =>
+        "计划版本 P1\n<!-- symphony-candidate " <>
+          Jason.encode!(%{"label" => "P1", "revision" => old["revision"], "authorizer" => "1", "data" => %{}}) <> " -->",
+      "author" => %{"id" => 99},
+      "created_at" => "2026-10-18T00:00:00Z",
+      "updated_at" => "2026-10-18T00:00:00Z"
+    }
+
+    reply = %{
+      "id" => 7,
+      "body" => "按 P1 执行",
+      "author" => %{"id" => 1},
+      "created_at" => "2026-10-18T00:00:01Z",
+      "updated_at" => "2026-10-18T00:00:01Z"
+    }
+
+    notes = [candidate, reply]
+    assert {:ok, event} = TaskControl.bind_reply(%{work: old["parent"], notes: notes}, reply, "1")
+
+    prior = %{
+      "work" => old["parent"],
+      "actor" => "1",
+      "revision" => old["revision"],
+      "source" => event["note_source"],
+      "candidate_source" => event["candidate_source"],
+      "candidate_digest" => event["candidate_digest"]
+    }
+
+    latest = %{prior | "revision" => current["revision"], "source" => "note:8"}
+    binding = %{"work" => member["work"], "contract_sha" => member["contract_sha"], "authority" => prior, "plan_revision" => old["revision"], "inputs" => []}
+
+    assert TaskPlan.compatible_binding?(current, latest, binding, member["work"], notes)
+    refute TaskPlan.compatible_binding?(current, latest, binding, member["work"], [%{reply | "body" => "P1 approved"}, candidate])
+    refute TaskPlan.compatible_binding?(current, latest, %{binding | "authority" => %{prior | "candidate_source" => "forged"}}, member["work"], notes)
   end
 
   defp plan_decision_note(id, actor, payload) do

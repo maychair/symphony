@@ -2,7 +2,8 @@ defmodule SymphonyElixir.TaskDeliveryPublicationTest do
   use ExUnit.Case, async: true
   alias SymphonyElixir.{ArtifactStore, GitArtifact, GitArtifactFixture, RunJournal}
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.{TaskDecision, TaskDelivery, TaskDependencies, TaskEvidence, TaskPlan}
+  alias SymphonyElixir.{TaskDecision, TaskDelivery, TaskDependencies, TaskEvidence}
+  alias SymphonyElixir.{TaskExecution, TaskLifecycle, TaskPlan}
   alias SymphonyElixir.{TaskPlanPreflight, TaskPublicationDelivery, TaskTools, TaskWorkflow, WorkRef}
 
   defp contract(work, parent, kind) do
@@ -324,6 +325,30 @@ defmodule SymphonyElixir.TaskDeliveryPublicationTest do
 
       assert {:ok, [observation]} = TaskDelivery.read_candidate(work, evidence.candidate, Keyword.put(f.opts, :runtime, current(f)))
       assert observation.status == "delivered"
+    end
+  end
+
+  test "a readback publication receipt completes its producer through the public lifecycle" do
+    for provider <- ["github", "gitlab"] do
+      f = fixture(provider, [], "publication") |> git_artifact() |> verified()
+      work = f.payload["work"]
+      [artifact] = f.payload["artifacts"]
+      {:ok, stopped} = RunJournal.checkpoint(current(f), %{"native_stop_confirmed" => true})
+      :ok = RunJournal.complete(stopped, "completed")
+
+      assert {:ok, observed} = TaskExecution.observe(f.parent, work, executions([f]), f.opts)
+      [receipt] = observed.evidence["deliveries"]
+      assert receipt["source_version"] == artifact["version"]
+      assert receipt["delivered_version"] == artifact["version"]
+      assert observed.flow["phase"] == "completed"
+      assert observed.flow["outcome"] == "delivered"
+      assert observed.flow["action"] == "close"
+
+      evidence = put_in(observed.evidence, ["deliveries"], [Map.drop(receipt, ~w(source_version delivered_version))])
+      context = %{plan: observed.plan, work: work, runtime: observed.record, policy: observed.policy, evidence: evidence}
+      assert {:ok, without_versions} = TaskLifecycle.assess(context, System.system_time(:millisecond))
+      assert without_versions["phase"] == "delivering"
+      assert without_versions["outcome"] == "open"
     end
   end
 

@@ -783,8 +783,8 @@ defmodule SymphonyElixir.Taskboard do
 
   # Resolve the member identity a native Issue reports for a configured plan
   # repository. Nothing is inferred from a display name or a number alone: the
-  # repository path must match the configured entry, and the constructed identity
-  # must pass the same validation that produces the journal key.
+  # repository path and native URL host must match the configured entry, and the
+  # constructed identity must pass the same validation that produces the journal key.
   defp work_ref_for(%Issue{} = issue, settings) do
     number = Provider.issue_number(issue)
     catalog = settings.tracker.provider |> then(&(&1 || %{})) |> Map.get("plan_repositories")
@@ -811,10 +811,24 @@ defmodule SymphonyElixir.Taskboard do
       "number" => number
     }
 
-    if repository_path(provider, issue) == path and WorkRef.validate(work) == :ok, do: work
+    same_repository = repository_path(provider, issue) == path and native_location?(issue, entry, number)
+    if same_repository and WorkRef.validate(work) == :ok, do: work
   end
 
   defp candidate_work(_entry, _issue, _number), do: nil
+
+  defp native_location?(%Issue{url: url, native_ref: ref}, entry, number) when is_binary(url) and is_map(ref) do
+    uri = URI.parse(url)
+    path = String.trim_leading(entry["path"], "/")
+    suffix = if entry["provider"] == "github", do: "/issues/#{number}", else: "/-/issues/#{number}"
+    repository_id = ref["repository_id"] || ref["project_id"]
+
+    is_binary(uri.host) and is_binary(entry["host"]) and String.downcase(uri.host) == String.downcase(entry["host"]) and
+      uri.path == "/" <> path <> suffix and
+      (is_nil(repository_id) or to_string(repository_id) == to_string(entry["repository_id"]))
+  end
+
+  defp native_location?(_, _, _), do: false
 
   defp repository_path("github", %Issue{native_ref: ref}) when is_map(ref), do: ref["repo"]
   defp repository_path("gitlab", %Issue{native_ref: ref}) when is_map(ref), do: ref["project_path"]

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.TaskLifecycle do
   being closed, an agent exit or an author-supplied boolean as verification.
   A projection is not a replacement task store or permission to perform an effect.
   """
-  alias SymphonyElixir.{ExecutionBinding, TaskControl, TaskDecision, TaskPlan, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{ExecutionBinding, TaskControl, TaskDecision, TaskPlan, TaskPlanManifest, TaskWorkflow, WorkRef}
 
   @stages %{"verified" => 1, "delivered" => 2, "published" => 3}
 
@@ -160,6 +160,7 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   defp baseline(flow, context) do
     previous = Map.take(flow, ~w(candidate verification outcome contract_sha))
+    previous = if authorized_rework?(context), do: Map.merge(previous, %{"candidate" => nil, "outcome" => "open"}), else: previous
     restrictions = Map.filter(flow["restrictions"], fn {id, item} -> id == "clock" or item["native"] == true end)
 
     flow =
@@ -185,6 +186,30 @@ defmodule SymphonyElixir.TaskLifecycle do
     flow = Enum.reduce(context.evidence["restrictions"], flow, &native_restriction(&2, &1, context))
     flow = if context.plan.parent.raw["state"] in ["open", "opened"], do: flow, else: restrict(flow, "parent_closed", "evidence")
     if context.member.raw["state"] in ["open", "opened"], do: flow, else: restrict(flow, "native_closed", "evidence")
+  end
+
+  defp authorized_rework?(context) do
+    marker = context.runtime["rework"]
+    parent = context.plan.parent
+    plan = context.plan.plan
+
+    with %{
+           "status" => "confirmed",
+           "source" => source,
+           "parent_source" => decision_source,
+           "manifest" => manifest_source,
+           "criteria" => criteria
+         } <- marker,
+         true <- is_binary(source) and is_binary(decision_source) and is_binary(manifest_source) and is_list(criteria),
+         true <- context.member.raw["state"] in ["open", "opened"],
+         %{"source" => ^manifest_source} = manifest <-
+           Enum.find(TaskPlanManifest.manifests(parent), &(&1["source"] == manifest_source)),
+         {:ok, %{"action" => "rework", "source" => ^decision_source, "criteria" => ^criteria}} <-
+           TaskPlanManifest.decision(parent, plan, manifest) do
+      true
+    else
+      _ -> false
+    end
   end
 
   defp control_receipts(flow, %{evidence: evidence, runtime: runtime}) do

@@ -577,6 +577,7 @@ defmodule SymphonyElixir.TaskPlanManifest do
          :ok <- hold(configured, fresh, manifest),
          {:ok, snapshot} <- NativeWork.read(parent, opts),
          true <- snapshot.raw["state"] in ["open", "opened"] or {:error, :parent_not_open},
+         :ok <- current_acceptance(snapshot, fresh.plan.plan, receipt, decision),
          intent = close_intent(fresh, snapshot, receipt, decision),
          {:ok, sending} <- RunJournal.checkpoint(record, %{"parent_close_intent" => intent}) do
       case NativeWork.close(snapshot, opts) do
@@ -587,6 +588,19 @@ defmodule SymphonyElixir.TaskPlanManifest do
         _ ->
           recover_close(sending, intent, manifest, receipt, decision, opts)
       end
+    end
+  end
+
+  defp current_acceptance(snapshot, plan, receipt, decision) do
+    expected_manifest = receipt["source"]
+    expected_acceptance = decision["source"]
+
+    case {List.last(manifests(snapshot)), decision(snapshot, plan, receipt)} do
+      {%{"source" => ^expected_manifest}, {:ok, %{"action" => "accept", "source" => ^expected_acceptance}}} ->
+        :ok
+
+      _ ->
+        {:error, :parent_acceptance_changed}
     end
   end
 
