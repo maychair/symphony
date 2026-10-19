@@ -23,7 +23,7 @@ defmodule SymphonyElixir.TaskControl do
     Enum.filter(snapshot.notes, fn note ->
       note["system"] != true and
         (String.contains?(note["body"] || "", "<!-- symphony-") or
-           control_note?(note, :parent, @markers.parent, questions))
+           control_note?(note, :parent, @markers.parent, questions, snapshot))
     end)
   end
 
@@ -407,7 +407,7 @@ defmodule SymphonyElixir.TaskControl do
     questions = snapshot.notes |> Enum.flat_map(&short_candidate/1) |> Enum.filter(&String.starts_with?(&1["label"], "Q"))
 
     snapshot.notes
-    |> Enum.filter(&control_note?(&1, scope, marker, questions))
+    |> Enum.filter(&control_note?(&1, scope, marker, questions, snapshot))
     |> Enum.reduce_while({:ok, []}, fn note, {:ok, acc} ->
       case native_decision(snapshot, note, actor, scope, marker) do
         {:ok, event} -> {:cont, {:ok, [event | acc]}}
@@ -419,21 +419,38 @@ defmodule SymphonyElixir.TaskControl do
     |> bind_resumes()
   end
 
-  defp control_note?(note, scope, marker, questions) do
+  defp control_note?(note, scope, marker, questions, snapshot) do
     body = note["body"] || ""
 
     note["system"] != true and
       (String.contains?(body, "<!-- " <> marker) or
          (scope == :parent and not String.contains?(body, "<!--") and
-            (question_precedes?(questions, note) or Regex.match?(~r/\b[PMQ][1-9][0-9]*\b/u, body) or human_action(body) != {:ok, "answer"})))
+            (question_precedes?(questions, note, snapshot) or Regex.match?(~r/\b[PMQ][1-9][0-9]*\b/u, body) or human_action(body) != {:ok, "answer"})))
   end
 
-  defp question_precedes?(questions, reply) do
+  defp question_precedes?(questions, reply, snapshot) do
     at = TaskDecision.timestamp(reply["created_at"])
 
     Enum.any?(questions, fn question ->
       question_at = TaskDecision.timestamp(question["note"]["created_at"])
-      is_integer(question_at) and (not is_integer(at) or question_at <= at)
+
+      question["authorizer"] == to_string(get_in(reply, ["author", "id"])) and
+        is_integer(question_at) and (not is_integer(at) or question_at <= at) and
+        not answered_before?(snapshot, question, at)
+    end)
+  end
+
+  defp answered_before?(snapshot, question, at) do
+    snapshot.notes
+    |> Enum.filter(fn note ->
+      previous = TaskDecision.timestamp(note["created_at"])
+      is_integer(previous) and is_integer(at) and previous < at
+    end)
+    |> Enum.any?(fn note ->
+      case bind_reply(snapshot, note, question["authorizer"]) do
+        {:ok, %{"action" => "answer", "candidate_source" => source}} -> source == TaskDecision.source_ref(question["note"])
+        _ -> false
+      end
     end)
   end
 

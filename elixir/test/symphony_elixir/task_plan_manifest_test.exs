@@ -1777,6 +1777,28 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
     end
   end
 
+  test "ordinary discussion after an answered question preserves completion" do
+    for provider <- ["github", "gitlab"] do
+      f = native_fixture(provider)
+      question = %{"label" => "Q1", "revision" => f.plan["revision"], "authorizer" => "1", "data" => %{"work" => f.member}}
+      append_parent_note(f, note(8001, 99, candidate_block(question), "2026-10-18T00:00:01Z"))
+      append_parent_note(f, note(8002, 1, "Q1：采用方案 B", "2026-10-18T00:00:02Z"))
+      f = f |> verified() |> close_member()
+      {:ok, %{"manifest" => manifest}} = TaskPlanManifest.advance(configured(f), f.opts)
+      accept_note(f, manifest)
+      assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(configured(f), f.opts)
+
+      for actor <- [1, 2, 3] do
+        append_parent_note(f, note(9000 + actor, actor, "已收到成果，谢谢。", "2026-10-18T00:01:00Z"))
+      end
+
+      assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.recover_closed(f.parent, f.opts)
+      assert {:ok, detail} = completed_detail(f)
+      assert detail.card.column == "Done"
+      assert detail.execution.projection.status == "current"
+    end
+  end
+
   test "old completion receipts retain exact source checks rather than inventing migration evidence" do
     f = native_fixture("github") |> verified() |> close_member()
     {:ok, %{"manifest" => manifest}} = TaskPlanManifest.advance(configured(f), f.opts)
