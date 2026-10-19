@@ -80,6 +80,8 @@ defmodule SymphonyElixir.ReviewLaneGitHubTest do
     }
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
+    assert "GITLAB_PAT" in ReviewLane.binding().secret_environment_names
+    assert "GITLAB_ACCESS_TOKEN" in ReviewLane.binding().secret_environment_names
     assert "GITHUB_TOKEN" in ReviewLane.secret_environment_names(%{"provider" => "github"})
     assert "GH_TOKEN" in ReviewLane.secret_environment_names(%{"provider" => "github"})
     assert "GH_ENTERPRISE_TOKEN" in ReviewLane.binding().secret_environment_names

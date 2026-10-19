@@ -499,3 +499,5 @@ Codex sessions disable shell snapshots and login shells on both new and resumed 
 Shell startup variables (`ZDOTDIR`, `BASH_ENV`, `ENV`) are pinned to `/dev/null`, and
 tracker secret names are excluded from tool environments. These constraints prevent automatic
 profile-based credential reinjection; they do not isolate readable host files from the same OS user.
+
+Standalone review sessions reuse the GitLab and GitHub credential-name lists for the same environment boundary.

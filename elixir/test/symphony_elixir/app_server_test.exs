@@ -10,7 +10,7 @@ defmodule SymphonyElixir.AppServerTest do
     profile = Path.join(root, "reinject.sh")
     File.write!(profile, "export GITLAB_PAT=regression-sentinel\n")
 
-    for name <- ["BASH_ENV", "ENV", "ZDOTDIR"] do
+    for name <- ["BASH_ENV", "ENV", "ZDOTDIR", "GITLAB_PAT", "GITLAB_ACCESS_TOKEN"] do
       previous = System.get_env(name)
       System.put_env(name, profile)
       on_exit(fn -> restore_env(name, previous) end)
@@ -19,6 +19,7 @@ defmodule SymphonyElixir.AppServerTest do
     File.write!(binary, """
     #!/usr/bin/env python3
     import json,os,subprocess,sys
+    assert all(not os.environ.get(k) for k in ['GITLAB_PAT','GITLAB_ACCESS_TOKEN'])
     assert all(os.environ.get(k)=='/dev/null' for k in ['BASH_ENV','ENV','ZDOTDIR'])
     assert not subprocess.check_output(['bash','-c','printf %s "${GITLAB_PAT:-}"'])
     for line in sys.stdin:
@@ -40,17 +41,18 @@ defmodule SymphonyElixir.AppServerTest do
 
     File.chmod!(binary, 0o755)
     write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
-    binding = %{tool_specs: [], secret_environment_names: ["GITLAB_PAT"], agent_environment: %{"BASH_ENV" => profile}}
+    binding = %{tool_specs: [], secret_environment_names: ["GITLAB_PAT", "GITLAB_ACCESS_TOKEN"], agent_environment: %{"BASH_ENV" => profile}}
 
-    for opts <- [[], [review_only: true], [resume_thread_id: "isolated"], [resume_thread_id: "isolated", inspect_only: true]] do
+    for opts <- [[], [review_only: true], [resume_thread_id: "isolated"], [resume_thread_id: "isolated", inspect_only: true]],
+        binding <- [binding, SymphonyElixir.ReviewLane.binding()] do
       assert {:ok, session} = AppServer.start_session(workspace, Keyword.put(opts, :dynamic_tool_binding, binding))
       assert :ok = AppServer.stop_session(session)
     end
 
     methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
-    assert Enum.count(methods, &(&1 == "thread/start")) == 2
-    assert Enum.count(methods, &(&1 == "thread/resume")) == 1
-    assert Enum.count(methods, &(&1 == "thread/read")) == 1
+    assert Enum.count(methods, &(&1 == "thread/start")) == 4
+    assert Enum.count(methods, &(&1 == "thread/resume")) == 2
+    assert Enum.count(methods, &(&1 == "thread/read")) == 2
   end
 
   test "bound execution sessions advertise only role tools and reject legacy mutation calls on the real protocol" do

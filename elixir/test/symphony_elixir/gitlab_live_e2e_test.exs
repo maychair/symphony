@@ -235,7 +235,7 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     end
   end
 
-  defp gitlab_request!(method, path, token, body, query \\ %{}) do
+  defp gitlab_request!(method, path, token, body, query) do
     case gitlab_request(method, path, token, body, query) do
       {:ok, %{status: status} = response} when status in 200..299 -> response
       {:ok, %{status: status}} -> flunk("GitLab request failed with HTTP #{status}")

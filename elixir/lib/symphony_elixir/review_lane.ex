@@ -76,8 +76,13 @@ defmodule SymphonyElixir.ReviewLane do
   def resolve(value), do: value
 
   @spec secret_environment_names(map()) :: [String.t()]
-  def secret_environment_names(_settings),
-    do: ~w(GITLAB_TOKEN GLAB_TOKEN GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN)
+  def secret_environment_names(settings) do
+    Enum.uniq(
+      ["GLAB_TOKEN"] ++
+        SymphonyElixir.GitLab.Client.secret_environment_names(settings) ++
+        SymphonyElixir.GitHub.Client.secret_environment_names(settings)
+    )
+  end
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs do
