@@ -1485,3 +1485,34 @@ The lifecycle projection is the single business interpretation used by the
 board and reporting. Cleanup independently rechecks current sources and local
 file safety. It preserves artifacts still referenced by live dependencies or
 pending manifests, without requiring all worktrees to remain forever.
+
+## Lifecycle write and retention boundaries
+
+Scoped parent rework re-reads the current plan, authority, manifest and exact
+native rework decision under the member fence, including after the native member
+snapshot check immediately before a reopen write. Deleted or edited decisions,
+new controls or plan changes cannot inherit the old preflight's authority.
+
+Completed-plan receipts fingerprint sealed contracts and business/control notes,
+not ordinary progress discussion. Parent/member acknowledgements preserve valid
+completion; changed authorization, verification, manifests, acceptance or controls
+still invalidate it. Historical raw closure sources remain recorded alongside this
+semantic evidence fingerprint. Old receipts without the fingerprint retain their
+strict original source checks rather than receiving invented migration evidence.
+
+Standalone review's actual Runner selects each provider's repository, change and
+discussion adapters and fixed pull/MR ref. GitHub review webhooks authenticate
+against the review lane and persist repository-scoped hints independently of the
+task tracker's provider. Polling continues to compensate for missing events.
+
+The Workspace caller can retire completed v2 role workspaces after reading the
+current shared assessment and independently checking stop, generation ownership,
+fixed inputs, Git contents and commit archives. It preserves journals and the
+separate retained artifact store. Neither an Issue closure nor a cleanup receipt
+alone proves that a current business conclusion is still valid.
+
+The standalone executable supports `symphony WORKFLOW.md --preflight [--issue ID]`
+without starting the scheduler. The Workspace build command retains a self-contained
+engine package (escript, pinned runtime selection and evidence exporter) independently
+of its source checkout. Explicit package selection does not authorize deployment
+or overlapping ownership transfer; those operational checks remain mandatory.

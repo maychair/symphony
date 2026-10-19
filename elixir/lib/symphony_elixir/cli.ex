@@ -6,7 +6,13 @@ defmodule SymphonyElixir.CLI do
   alias SymphonyElixir.LogFile
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
+  @switches [
+    {@acknowledgement_switch, :boolean},
+    {:logs_root, :string},
+    {:port, :integer},
+    {:preflight, :boolean},
+    {:issue, :string}
+  ]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
   @type deps :: %{
@@ -29,31 +35,58 @@ defmodule SymphonyElixir.CLI do
       :ok ->
         wait_for_shutdown()
 
+      {:ok, :preflight} ->
+        System.halt(0)
+
       {:error, message} ->
         IO.puts(:stderr, message)
         System.halt(1)
     end
   end
 
-  @spec evaluate([String.t()], deps()) :: :ok | {:error, String.t()}
+  @spec evaluate([String.t()], deps()) :: :ok | {:ok, :preflight} | {:error, String.t()}
   def evaluate(args, deps \\ runtime_deps()) do
     case OptionParser.parse(args, strict: @switches) do
       {opts, [], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
-          run(Path.expand("WORKFLOW.md"), deps)
-        end
+        evaluate_workflow(Path.expand("WORKFLOW.md"), opts, deps)
 
       {opts, [workflow_path], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
-          run(workflow_path, deps)
-        end
+        evaluate_workflow(workflow_path, opts, deps)
 
       _ ->
         {:error, usage_message()}
+    end
+  end
+
+  defp evaluate_workflow(path, opts, deps) do
+    if opts[:preflight] do
+      preflight(path, opts[:issue], deps)
+    else
+      with true <- is_nil(opts[:issue]) or {:error, usage_message()},
+           :ok <- require_guardrails_acknowledgement(opts),
+           :ok <- maybe_set_logs_root(opts, deps),
+           :ok <- maybe_set_server_port(opts, deps) do
+        run(path, deps)
+      end
+    end
+  end
+
+  defp preflight(path, issue, deps) do
+    expanded = Path.expand(path)
+
+    if deps.file_regular?.(expanded) do
+      :ok = deps.set_workflow_file_path.(expanded)
+
+      case Map.get(deps, :preflight, &SymphonyElixir.Preflight.run/1).(issue) do
+        {:ok, count} ->
+          IO.puts("Repository tracker preflight passed (#{count} Issues read; no dispatch).")
+          {:ok, :preflight}
+
+        {:error, reason} ->
+          {:error, "Repository tracker preflight failed: #{inspect(reason)}"}
+      end
+    else
+      {:error, "Workflow file not found: #{expanded}"}
     end
   end
 
@@ -78,7 +111,7 @@ defmodule SymphonyElixir.CLI do
 
   @spec usage_message() :: String.t()
   defp usage_message do
-    "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
+    "Usage: symphony [--logs-root <path>] [--port <port>] [--preflight [--issue <id>]] [path-to-WORKFLOW.md]"
   end
 
   @spec runtime_deps() :: deps()

@@ -4,7 +4,7 @@ defmodule SymphonyElixirWeb.WebhookController do
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
 
-  alias SymphonyElixir.ReviewLane.{GitLab, Listener}
+  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Listener}
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
   def read_body(conn, opts) do
     case Conn.read_body(conn, opts) do
@@ -20,12 +20,21 @@ defmodule SymphonyElixirWeb.WebhookController do
   def receive_event(conn, %{"provider" => provider}) do
     config = SymphonyElixir.ReviewLane.config()
 
-    if config && provider == config["provider"] && conn.body_params["object_kind"] in ["merge_request", "note"] do
+    if config && provider == config["provider"] && review_event?(conn, provider) do
       receive_review(conn, provider, config)
     else
       receive_tracker(conn, provider)
     end
   end
+
+  defp review_event?(conn, "github") do
+    event = List.first(Conn.get_req_header(conn, "x-github-event"))
+
+    event in ~w(pull_request pull_request_review pull_request_review_comment pull_request_review_thread issue_comment) and
+      (is_map(conn.body_params["pull_request"]) or is_map(get_in(conn.body_params, ["issue", "pull_request"])))
+  end
+
+  defp review_event?(conn, "gitlab"), do: conn.body_params["object_kind"] in ["merge_request", "note"]
 
   defp receive_tracker(conn, provider) do
     settings = Config.settings!().tracker
@@ -40,6 +49,25 @@ defmodule SymphonyElixirWeb.WebhookController do
       conn |> put_status(202) |> json(%{accepted: true})
     else
       _ -> conn |> put_status(403) |> json(%{error: "webhook_rejected"})
+    end
+  end
+
+  defp receive_review(conn, "github", config) do
+    repository = conn.body_params["repository"] || %{}
+    project = repository["full_name"]
+    number = get_in(conn.body_params, ["pull_request", "number"]) || get_in(conn.body_params, ["issue", "number"])
+    secret = config["webhook_secret"]
+
+    with true <- is_binary(secret) and byte_size(secret) >= 32,
+         :ok <- authenticate(conn, "github", secret, conn.assigns[:webhook_body] || ""),
+         true <- is_binary(project) and Map.has_key?(config["projects"], project),
+         true <- GitHub.repository?(repository, config, project),
+         true <- is_integer(number) and number > 0,
+         :ok <- Listener.request_review(project, number) do
+      Orchestrator.request_refresh()
+      conn |> put_status(202) |> json(%{accepted: true})
+    else
+      _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end
   end
 

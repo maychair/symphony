@@ -284,7 +284,8 @@ defmodule SymphonyElixir.NativeWork do
          {:ok, repository} <- resolve(snapshot.work, catalog),
          true <- snapshot.raw["state"] == "closed" or {:error, :native_issue_not_closed},
          {:ok, current} <- read(snapshot.work, opts),
-         true <- snapshot_ref(current) == snapshot_ref(snapshot) or {:error, :native_snapshot_changed} do
+         true <- snapshot_ref(current) == snapshot_ref(snapshot) or {:error, :native_snapshot_changed},
+         :ok <- Keyword.get(opts, :before_reopen, fn -> :ok end).() do
       write_reopen(repository, current.work, opts)
     else
       {:error, reason} -> {:not_sent, reason}

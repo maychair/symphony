@@ -142,10 +142,20 @@ defmodule SymphonyElixir.TaskPlanPreflight do
 
   defp stable_parent(root, intent) do
     cond do
-      intent["source"] != "issue:" <> NativeWork.snapshot_ref(root) -> {:error, :parent_close_source_changed}
-      intent["parent_description"] != TaskWorkflow.digest(root.description) -> {:error, :parent_description_changed}
-      intent["parent_notes"] != note_sources(root.notes) -> {:error, :parent_decisions_changed}
-      true -> :ok
+      is_binary(intent["parent_evidence"]) ->
+        if intent["parent_evidence"] == TaskPlanManifest.completion_source(root), do: :ok, else: {:error, :parent_close_source_changed}
+
+      intent["source"] != "issue:" <> NativeWork.snapshot_ref(root) ->
+        {:error, :parent_close_source_changed}
+
+      intent["parent_description"] != TaskWorkflow.digest(root.description) ->
+        {:error, :parent_description_changed}
+
+      intent["parent_notes"] != note_sources(root.notes) ->
+        {:error, :parent_decisions_changed}
+
+      true ->
+        :ok
     end
   end
 
@@ -175,7 +185,13 @@ defmodule SymphonyElixir.TaskPlanPreflight do
   end
 
   defp same_member_source?({key, member}, sources) do
-    sources[key] == %{"work" => member.work, "source" => NativeWork.snapshot_ref(member)}
+    case sources[key] do
+      %{"work" => work, "evidence" => evidence} when is_binary(evidence) ->
+        work == member.work and member.raw["state"] == "closed" and evidence == TaskPlanManifest.completion_source(member)
+
+      value ->
+        value == %{"work" => member.work, "source" => NativeWork.snapshot_ref(member)}
+    end
   end
 
   defp matching_member_count?(sources, members), do: is_map(sources) and map_size(sources) == map_size(members)

@@ -14,6 +14,25 @@ defmodule SymphonyElixir.TaskPlanManifest do
   @manifest ~r/<!-- symphony-plan-manifest (\{[^\n]*\}) -->/
   @decision ~r/<!-- symphony-plan-acceptance (\{[^\n]*\}) -->/
 
+  @doc "Fingerprint the sealed scope and business evidence, independently of ordinary Issue discussion."
+  @spec completion_source(map()) :: String.t()
+  def completion_source(snapshot) do
+    contract = TaskReconciler.description_contract(snapshot.description)
+
+    plan =
+      case TaskPlan.parse(snapshot.description) do
+        {:ok, value} -> value
+        _ -> nil
+      end
+
+    TaskWorkflow.digest(%{
+      "work" => snapshot.work,
+      "contract" => contract,
+      "plan" => plan,
+      "notes" => snapshot |> TaskControl.evidence_notes() |> decision_sources()
+    })
+  end
+
   @doc "Assemble a fixed manifest only when every member has a current closure proof."
   @spec assemble(map(), map()) :: {:ok, map()} | {:incomplete, [String.t()]}
   def assemble(plan, projection) do
@@ -54,7 +73,7 @@ defmodule SymphonyElixir.TaskPlanManifest do
             "artifacts" => Enum.map(candidate["artifacts"], &Map.take(&1, ~w(id kind version source target_branch))),
             "deliveries" => Enum.map(evidence["deliveries"], & &1["source"]) |> Enum.sort(),
             "inputs" => flow["inputs"],
-            "closure" => closure["source"]
+            "closure" => get_in(closure, ["receipt", "source"]) || closure["source"]
           }
 
           Map.merge(proof, %{"work" => work, "criteria" => member["criteria"], "status" => "completed", "evidence" => TaskWorkflow.digest(proof)})
@@ -613,11 +632,12 @@ defmodule SymphonyElixir.TaskPlanManifest do
       "manifest" => receipt["source"],
       "revision" => receipt["payload"]["revision"],
       "acceptance" => decision["source"],
+      "parent_evidence" => completion_source(snapshot),
       "parent_description" => TaskWorkflow.digest(snapshot.description),
       "parent_notes" => decision_sources(snapshot.notes),
       "members" =>
         Map.new(fresh.plan.members, fn {key, member} ->
-          {key, %{"work" => member.work, "source" => NativeWork.snapshot_ref(member)}}
+          {key, %{"work" => member.work, "source" => NativeWork.snapshot_ref(member), "evidence" => completion_source(member)}}
         end)
     }
   end
@@ -687,8 +707,12 @@ defmodule SymphonyElixir.TaskPlanManifest do
 
   defp stable_intent?(intent, closed, opts) do
     same_parent =
-      TaskWorkflow.digest(closed.description) == intent["parent_description"] and
-        decision_sources(closed.notes) == intent["parent_notes"]
+      if is_binary(intent["parent_evidence"]) do
+        completion_source(closed) == intent["parent_evidence"]
+      else
+        TaskWorkflow.digest(closed.description) == intent["parent_description"] and
+          decision_sources(closed.notes) == intent["parent_notes"]
+      end
 
     same_members = Enum.all?(intent["members"], fn {_key, member} -> member_source?(member, opts) end)
     same_parent and same_members and parent_source?(closed, opts)
@@ -696,7 +720,7 @@ defmodule SymphonyElixir.TaskPlanManifest do
 
   defp parent_source?(snapshot, opts) do
     case NativeWork.read(snapshot.work, opts) do
-      {:ok, current} -> NativeWork.snapshot_ref(current) == NativeWork.snapshot_ref(snapshot)
+      {:ok, current} -> current.raw["state"] == snapshot.raw["state"] and completion_source(current) == completion_source(snapshot)
       _ -> false
     end
   end
@@ -708,10 +732,20 @@ defmodule SymphonyElixir.TaskPlanManifest do
     |> Enum.sort()
   end
 
-  defp member_source?(%{"work" => work, "source" => source}, opts) do
+  defp member_source?(%{"work" => work, "source" => source} = member, opts) do
     case NativeWork.read(work, opts) do
-      {:ok, current} -> NativeWork.snapshot_ref(current) == source
-      _ -> false
+      {:ok, current} ->
+        same =
+          if is_binary(member["evidence"]) do
+            completion_source(current) == member["evidence"]
+          else
+            NativeWork.snapshot_ref(current) == source
+          end
+
+        current.raw["state"] == "closed" and same
+
+      _ ->
+        false
     end
   end
 
@@ -789,12 +823,29 @@ defmodule SymphonyElixir.TaskPlanManifest do
 
     with {:ok, %{} = record} <- RunJournal.read(directory),
          true <- record["issue_id"] == WorkRef.key(work) or {:error, :member_rework_identity_changed} do
-      TaskClosure.with_fence(record, opts, fn -> reopen_owned(record, work, receipt, decision, opts) end)
+      guarded = Keyword.put(opts, :before_reopen, fn -> current_rework(configured, receipt, decision, opts) end)
+      TaskClosure.with_fence(record, guarded, fn -> reopen_owned(record, work, receipt, decision, guarded) end)
+    end
+  end
+
+  defp current_rework(configured, receipt, decision, opts) do
+    with {:ok, fresh} <- TaskExecutionConfig.prepare(configured.plan.plan["parent"], opts),
+         true <- fresh.plan.plan == configured.plan.plan and fresh.plan.authority == configured.plan.authority,
+         true <- fresh.plan.controls.restrictions == [],
+         %{"source" => source, "payload" => payload} <- List.last(manifests(fresh.plan.parent)),
+         true <- source == receipt["source"] and payload == receipt["payload"],
+         {:ok, current} <- decision(fresh.plan.parent, fresh.plan.plan, receipt),
+         true <- current == decision,
+         :ok <- rework_window(fresh) do
+      :ok
+    else
+      _ -> {:error, :member_rework_authority_changed}
     end
   end
 
   defp reopen_owned(record, work, receipt, decision, opts) do
-    with {:ok, %{} = current} <- RunJournal.read(record["directory"]),
+    with :ok <- Keyword.fetch!(opts, :before_reopen).(),
+         {:ok, %{} = current} <- RunJournal.read(record["directory"]),
          true <- current["issue_id"] == WorkRef.key(work) or {:error, :member_rework_identity_changed},
          {:ok, snapshot} <- NativeWork.read(work, opts) do
       reopen_intent(current, snapshot, work, receipt, decision, opts)

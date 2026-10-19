@@ -1235,7 +1235,7 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
     configured = configured(f)
     # The Issue is edited between the rework snapshot and the pre-write read-back,
     # so NativeWork.reopen refuses to send and reports :not_sent instead of writing.
-    f = arm_drift(f, f.prefix <> "/issues/2", 3)
+    f = arm_drift(f, f.prefix <> "/issues/2", 5)
 
     assert {:error, {:member_rework_not_sent, :native_snapshot_changed}} = TaskPlanManifest.advance(configured, f.opts)
     assert issue_state(f, 2) == "closed"
@@ -1518,7 +1518,7 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
     _receipt = seed_rework(f, manifest)
 
     configured = configured(f)
-    f = arm_drift(f, f.prefix <> "/issues/2", 3)
+    f = arm_drift(f, f.prefix <> "/issues/2", 5)
     assert {:error, {:member_rework_not_sent, :native_snapshot_changed}} = TaskPlanManifest.advance(configured, f.opts)
     assert current(f)["rework"]["status"] == "prepared"
 
@@ -1709,5 +1709,94 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
       assert {:ok, %{"status" => "inconsistent"}} = TaskPlanManifest.recover_closed(f.parent, opts)
       assert current(f)["parent_close_intent"]["status"] == "inconsistent"
     end
+  end
+
+  test "rework source loss after preflight prevents native reopening on both providers" do
+    for provider <- ["github", "gitlab"], change <- [:delete, :edit] do
+      f = native_fixture(provider) |> verified() |> close_member()
+      {_, manifest} = manifest_for(f)
+      seed_rework(f, manifest)
+      prepared = configured(f)
+
+      Agent.update(f.state, fn state ->
+        update_in(state.objects[f.parent_notes], fn notes ->
+          if change == :delete, do: Enum.drop(notes, -1), else: List.update_at(notes, -1, &Map.put(&1, "updated_at", "2026-10-18T00:01:00Z"))
+        end)
+      end)
+
+      assert {:error, :member_rework_authority_changed} = TaskPlanManifest.advance(prepared, f.opts)
+      assert issue_state(f, 2) == "closed"
+      assert writes(f, "reopen") == 0
+    end
+  end
+
+  test "rework authority is read again after the final native member check" do
+    f = native_fixture("github") |> verified() |> close_member()
+    {_, manifest} = manifest_for(f)
+    seed_rework(f, manifest)
+    prepared = configured(f)
+    request = f.opts[:request]
+
+    opts =
+      Keyword.put(f.opts, :request, fn provider, method, path, query, settings ->
+        if path == f.prefix <> "/issues/2" and get_in(current(f), ["rework", "status"]) == "sending" do
+          Agent.update(f.state, fn state -> update_in(state.objects[f.parent_notes], &Enum.reject(&1, fn note -> String.contains?(note["body"], "symphony-plan-acceptance") end)) end)
+        end
+
+        request.(provider, method, path, query, settings)
+      end)
+
+    result = TaskPlanManifest.advance(prepared, opts)
+    assert {:error, {:member_rework_not_sent, :member_rework_authority_changed}} = result
+    assert issue_state(f, 2) == "closed"
+    assert writes(f, "reopen") == 0
+  end
+
+  test "ordinary parent and member discussion preserves accepted completion" do
+    for provider <- ["github", "gitlab"] do
+      f = native_fixture(provider) |> verified() |> close_member()
+      {:ok, %{"manifest" => receipt}} = TaskPlanManifest.advance(configured(f), f.opts)
+      accept_note(f, receipt)
+      assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(configured(f), f.opts)
+
+      for actor <- [1, 2, 3] do
+        append_parent_note(f, note(9000 + actor, actor, "已收到成果，谢谢。", "2026-10-18T00:01:00Z"))
+      end
+
+      Agent.update(f.state, fn state -> update_in(state.objects[f.member_notes], &(&1 ++ [note(9999, 3, "Progress link added.", "2026-10-18T00:01:00Z")])) end)
+      assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.recover_closed(f.parent, f.opts)
+      assert {:ok, detail} = completed_detail(f)
+      assert detail.card.column == "Done"
+      assert detail.execution.projection.status == "current"
+      assert detail.execution.closeable
+      # A real decision still invalidates the current completion proof.
+      append_parent_note(f, note(10_001, 1, block("plan-decision", %{"action" => "pause", "revision" => f.plan["revision"]}), "2026-10-18T00:02:00Z"))
+      assert {:ok, changed} = completed_detail(f)
+      refute changed.execution.closeable
+      assert {:ok, %{"status" => "inconsistent"}} = TaskPlanManifest.recover_closed(f.parent, f.opts)
+    end
+  end
+
+  test "old completion receipts retain exact source checks rather than inventing migration evidence" do
+    f = native_fixture("github") |> verified() |> close_member()
+    {:ok, %{"manifest" => manifest}} = TaskPlanManifest.advance(configured(f), f.opts)
+    accept_note(f, manifest)
+    {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(configured(f), f.opts)
+    intent = current(f)["parent_close_intent"] |> Map.delete("parent_evidence")
+    intent = Map.update!(intent, "members", &Map.new(&1, fn {key, member} -> {key, Map.delete(member, "evidence")} end))
+    fenced_checkpoint(f, %{"parent_close_intent" => intent})
+    assert {:ok, _} = TaskExecutionConfig.prepare(f.parent, Keyword.put(f.opts, :completed_plan_read, true))
+    assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.recover_closed(f.parent, f.opts)
+    baseline = current(f)["parent_close_intent"]
+
+    for field <- ~w(source parent_description parent_notes) do
+      bad = Map.put(baseline, field, if(field == "parent_notes", do: [], else: "changed"))
+      fenced_checkpoint(f, %{"parent_close_intent" => bad})
+      assert {:error, _} = TaskExecutionConfig.prepare(f.parent, Keyword.put(f.opts, :completed_plan_read, true))
+    end
+
+    fenced_checkpoint(f, %{"parent_close_intent" => baseline})
+    append_parent_note(f, note(9000, 3, "Ordinary discussion", "2026-10-18T00:01:00Z"))
+    assert {:ok, %{"status" => "inconsistent"}} = TaskPlanManifest.recover_closed(f.parent, f.opts)
   end
 end

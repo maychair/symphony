@@ -136,4 +136,26 @@ defmodule SymphonyElixir.CLITest do
 
     assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
   end
+
+  test "standalone preflight never starts the scheduler or needs the unsafe execution acknowledgement" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _ -> true end,
+      set_workflow_file_path: fn _ -> :ok end,
+      preflight: fn issue ->
+        send(parent, {:checked, issue})
+        {:ok, 0}
+      end,
+      ensure_all_started: fn -> flunk("preflight started the scheduler") end
+    }
+
+    assert {:ok, :preflight} = CLI.evaluate(["--preflight", "--issue", "2", "WORKFLOW.md"], deps)
+    assert_received {:checked, "2"}
+    assert {:error, message} = CLI.evaluate(["--preflight"], %{deps | preflight: fn _ -> {:error, :offline} end})
+    assert message =~ "offline"
+    assert {:error, missing} = CLI.evaluate(["--preflight"], %{deps | file_regular?: fn _ -> false end})
+    assert missing =~ "Workflow file not found"
+    assert {:error, _} = CLI.evaluate([@ack_flag, "--issue", "2"], deps)
+  end
 end

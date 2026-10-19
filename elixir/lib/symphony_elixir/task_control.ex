@@ -15,6 +15,18 @@ defmodule SymphonyElixir.TaskControl do
 
   @markers %{parent: "symphony-plan-decision", member: "symphony-task-decision", acceptance: "symphony-task-acceptance"}
 
+  @doc "Select native evidence and control notes, excluding ordinary progress discussion."
+  @spec evidence_notes(map()) :: [map()]
+  def evidence_notes(snapshot) do
+    questions = snapshot.notes |> Enum.flat_map(&short_candidate/1) |> Enum.filter(&String.starts_with?(&1["label"], "Q"))
+
+    Enum.filter(snapshot.notes, fn note ->
+      note["system"] != true and
+        (String.contains?(note["body"] || "", "<!-- symphony-") or
+           control_note?(note, :parent, @markers.parent, questions))
+    end)
+  end
+
   @doc "Bind an unchanged native reply to one published short version; retained receipts make replay a no-op."
   @spec bind_reply(map(), map(), String.t(), map()) :: {:ok, map() | nil} | {:clarify, map()}
   def bind_reply(snapshot, note, actor, receipts \\ %{}) do
