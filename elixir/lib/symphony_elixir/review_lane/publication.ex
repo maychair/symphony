@@ -1,16 +1,20 @@
 defmodule SymphonyElixir.ReviewLane.Publication do
   @moduledoc "Durable, version-bound review comments. Only native readback confirms delivery; uncertain sends are never repeated."
-  alias SymphonyElixir.ReviewLane.{GitLab, Policy}
+  alias SymphonyElixir.ReviewLane.{Finding, GitHub, GitLab, Policy}
   alias SymphonyElixir.{TaskDecision, TaskWorkflow}
 
-  @spec prepare(map(), [String.t()], pos_integer()) :: {:ok, map()} | {:error, atom()}
-  def prepare(record, findings, actor) do
+  @spec prepare(map(), map(), pos_integer()) :: {:ok, map()} | {:error, atom()}
+  def prepare(record, submission, actor) do
     case record["submission"] do
       nil ->
-        record = Map.put(record, "submission", findings)
-        {:ok, Map.put(record, "publication", %{"version" => 1, "actor" => actor, "context" => context(record), "entries" => entries(record)})}
+        record = Map.put(record, "submission", submission)
+        prepared = entries(record)
 
-      ^findings ->
+        if Enum.all?(prepared, &provider(record).comment_body?(&1["body"])),
+          do: {:ok, Map.put(record, "publication", %{"version" => 1, "actor" => actor, "context" => context(record), "entries" => prepared})},
+          else: {:error, :invalid_review_publication_body}
+
+      ^submission ->
         if valid?(record, actor), do: {:ok, record}, else: {:error, :invalid_review_publication}
 
       _ ->
@@ -20,21 +24,28 @@ defmodule SymphonyElixir.ReviewLane.Publication do
 
   @spec valid?(map(), pos_integer()) :: boolean()
   def valid?(%{"publication" => %{"version" => 1, "actor" => actor, "entries" => saved}} = record, actor) when is_list(saved) do
-    record["publication"]["context"] == context(record) and
-      is_list(record["submission"]) and length(record["submission"]) <= 50 and Enum.all?(record["submission"], &is_binary/1) and
+    valid_submission?(record["submission"]) and record["publication"]["context"] == context(record) and
       length(saved) == length(entries(record)) and
       Enum.zip(saved, entries(record)) |> Enum.all?(fn {entry, expected} -> valid_entry?(entry, expected, record, actor) end)
   end
 
   def valid?(record, _actor), do: is_nil(record["publication"]) and is_nil(record["submission"])
 
+  # Journals written before the structured protocol stay readable and publishable;
+  # the tool boundary is what refuses an unsupported new submission (§13.1).
+  defp valid_submission?(%{"findings" => findings, "responses" => responses}) when is_list(findings) and is_list(responses),
+    do: length(findings) <= 50 and Enum.all?(findings, &is_map/1) and Enum.all?(responses, &is_map/1)
+
+  defp valid_submission?(submission) when is_list(submission), do: length(submission) <= 50 and Enum.all?(submission, &is_binary/1)
+  defp valid_submission?(_), do: false
+
   @doc "Read every recorded intent, retaining confirmed partial receipts even when another intent is uncertain."
   @spec recover(map(), map(), (map() -> any())) :: {:ok, map()} | {:error, term(), map()}
   def recover(record, config, checkpoint) do
     with true <- (is_map(record["publication"]) and valid?(record, config["publisher_id"])) or {:error, :invalid_review_publication},
-         {:ok, repository} <- GitLab.request(config, "GET", "projects/" <> URI.encode_www_form(record["project"])),
-         true <- GitLab.repository?(repository, config, record["project"]) or {:error, :review_repository_mismatch},
-         {:ok, discussions} <- GitLab.discussions(config, GitLab.mr_path(record["project"], record["iid"])),
+         {:ok, repository} <- native(config).request(config, "GET", repository_path(config, record["project"])),
+         true <- native(config).repository?(repository, config, record["project"]) or {:error, :review_repository_mismatch},
+         {:ok, discussions} <- native(config).discussions(config, native(config).mr_path(record["project"], record["iid"])),
          true <- discussions?(discussions) or {:error, :invalid_review_discussions} do
       recover_entries(record, discussions, checkpoint)
     else
@@ -61,9 +72,8 @@ defmodule SymphonyElixir.ReviewLane.Publication do
 
       entry ->
         sending = put_entry(record, Map.put(entry, "status", "sending"), checkpoint)
-        path = GitLab.mr_path(record["project"], record["iid"]) <> "/discussions"
         # A return value, including a successful POST, is not a native receipt.
-        GitLab.request(config, "POST", path, %{"body" => entry["body"]})
+        post(config, record, entry["body"])
         publish(sending, config, checkpoint, guard)
     end
   end
@@ -129,7 +139,7 @@ defmodule SymphonyElixir.ReviewLane.Publication do
   end
 
   defp valid_entry?(%{} = entry, expected, record, actor) do
-    Map.take(entry, ~w(index kind body)) == Map.take(expected, ~w(index kind body)) and GitLab.comment_body?(entry["body"]) and
+    Map.take(entry, ~w(index kind body)) == Map.take(expected, ~w(index kind body)) and provider(record).comment_body?(entry["body"]) and
       case entry["status"] do
         "published" -> receipt?(entry["receipt"], entry, record, actor)
         status when status in ["prepared", "sending"] -> is_nil(entry["receipt"])
@@ -149,11 +159,34 @@ defmodule SymphonyElixir.ReviewLane.Publication do
   defp text?(value), do: is_binary(value) and value != ""
   defp context(record), do: Map.take(record, ~w(work round head base response_sha policy_sha))
 
-  defp entries(record) do
-    findings = Enum.map(record["submission"], &{"finding", &1})
-    summary = if findings == [], do: "本轮评审未发现有充分证据支持的问题。", else: "本轮评审完成，发现 #{length(findings)} 个有证据支持的问题，详见本轮评论。"
+  defp native(%{"provider" => "github"}), do: GitHub
+  defp native(_config), do: GitLab
+  defp provider(%{"work" => %{"provider" => "github"}}), do: GitHub
+  defp provider(_record), do: GitLab
+  defp repository_path(%{"provider" => "github"}, project), do: "repos/" <> project
+  defp repository_path(_config, project), do: "projects/" <> URI.encode_www_form(project)
 
-    (findings ++ [{"conclusion", summary}])
+  defp post(config, record, body) do
+    module = native(config)
+    path = module.mr_path(record["project"], record["iid"])
+
+    case config["provider"] do
+      "github" ->
+        module.request(config, "POST", path <> "/reviews", %{"body" => body, "event" => "COMMENT", "commit_id" => record["head"]})
+
+      _ ->
+        module.request(config, "POST", path <> "/discussions", %{"body" => body})
+    end
+  end
+
+  defp entries(%{"submission" => %{"findings" => findings}} = record), do: render(record, Enum.map(findings, &Finding.render/1))
+  defp entries(%{"submission" => submission} = record), do: render(record, submission)
+
+  defp render(record, finding_bodies) do
+    findings = Enum.map(finding_bodies, &{"finding", &1})
+    conclusion = {"conclusion", conclusion(record, length(findings))}
+
+    (findings ++ [conclusion])
     |> Enum.with_index()
     |> Enum.map(fn {{kind, text}, index} ->
       version = "评审轮次：#{record["round"]}；范围：`#{record["base"]}` → `#{record["head"]}`。"
@@ -161,6 +194,23 @@ defmodule SymphonyElixir.ReviewLane.Publication do
       %{"index" => index, "kind" => kind, "body" => body, "status" => "prepared"}
     end)
   end
+
+  # The round conclusion shows advisories and required conditions separately so
+  # only a violated agreed standard can withhold technical pass (§17.1).
+  defp conclusion(record, count) do
+    verdict = record["verdict"] || Finding.verdict(record["finding_register"])
+    pending = if verdict["decision_required"], do: "存在需要人工裁定的问题。", else: nil
+    resolved = if verdict["resolved"] == [], do: nil, else: "已解决：" <> Enum.join(verdict["resolved"], "、") <> "。"
+    advised = if verdict["suggestions"] == [], do: nil, else: "建议性改善（不阻止技术通过）：" <> Enum.join(verdict["suggestions"], "、") <> "。"
+    headline = if count == 0, do: "本轮评审未发现有充分证据支持的问题。", else: "本轮评审完成，发现 #{count} 个有证据支持的问题，详见本轮评论。"
+
+    [headline, withheld(verdict["required_open"]), pending, advised, resolved]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" ")
+  end
+
+  defp withheld([]), do: nil
+  defp withheld(ids), do: "阻止技术通过：必需项 " <> Enum.join(ids, "、") <> " 仍未解决。"
 
   defp put_entry(record, entry, checkpoint) do
     updated = put_in(record["publication"]["entries"], List.replace_at(record["publication"]["entries"], entry["index"], entry))

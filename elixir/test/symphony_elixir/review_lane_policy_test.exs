@@ -20,11 +20,12 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     }
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
+    assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => %{config | "provider" => "github"}}})
     assert {:error, :mail_review_retired_migration_required} = ReviewLane.validate_config(%{provider: %{"mail_review" => config}})
 
     for {key, value, reason} <- [
           {"host", "invalid/host", :review_lane_host_required},
-          {"provider", "github", :review_lane_provider_unsupported},
+          {"provider", "unknown", :review_lane_provider_unsupported},
           {"reviewer_id", 0, :review_lane_reviewer_id_required},
           {"publisher_id", nil, :review_lane_publisher_id_required},
           {"projects", %{}, :review_lane_projects_required},

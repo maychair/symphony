@@ -37,6 +37,16 @@ defmodule SymphonyElixir.ArtifactStore do
     end
   end
 
+  @doc "Pin already retained report bytes for a new consumer without trusting or rewriting the native report body."
+  @spec retain_existing_report(Path.t(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def retain_existing_report(root, work, report, owner, opts) do
+    with true <- owner?(owner, work) or {:error, :invalid_artifact_reference},
+         {:ok, artifact} <- read_report(root, work, report, opts),
+         :ok <- reference(root, artifact.receipt, owner) do
+      {:ok, artifact}
+    end
+  end
+
   @doc "Read a fixed retained report without native requests or trusting its filename as proof."
   @spec read_report(Path.t(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def read_report(root, work, report, opts) do

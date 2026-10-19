@@ -8,7 +8,8 @@ defmodule SymphonyElixir.CommandCheckTest do
   end
 
   defp fixture(command, timeout \\ 2_000, overrides \\ %{}) do
-    root = Path.join(System.tmp_dir!(), "command-check-#{System.unique_integer([:positive])}")
+    token = System.pid() <> "-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+    root = Path.join(System.tmp_dir!(), "command-check-#{token}")
     primary = Path.join(root, "source")
     workspace = Path.join(root, "developer")
     File.mkdir_p!(primary)

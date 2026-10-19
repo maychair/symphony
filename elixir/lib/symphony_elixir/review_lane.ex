@@ -24,7 +24,7 @@ defmodule SymphonyElixir.ReviewLane do
     config = resolve(raw)
 
     checks = [
-      {config["provider"] == "gitlab", :review_lane_provider_unsupported},
+      {config["provider"] in ["gitlab", "github"], :review_lane_provider_unsupported},
       {valid_host?(config["host"]), :review_lane_host_required},
       {positive?(config["reviewer_id"]), :review_lane_reviewer_id_required},
       {positive?(config["publisher_id"]), :review_lane_publisher_id_required},
@@ -76,7 +76,8 @@ defmodule SymphonyElixir.ReviewLane do
   def resolve(value), do: value
 
   @spec secret_environment_names(map()) :: [String.t()]
-  def secret_environment_names(_settings), do: ["GITLAB_TOKEN", "GLAB_TOKEN"]
+  def secret_environment_names(_settings),
+    do: ~w(GITLAB_TOKEN GLAB_TOKEN GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN)
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs do
@@ -84,15 +85,60 @@ defmodule SymphonyElixir.ReviewLane do
       %{
         "name" => "review_submit",
         "description" =>
-          "Submit substantiated Chinese findings; the scheduler validates the fixed MR head and posts discussions. An empty list explicitly completes a no-findings review. Do not include slash-command lines, even in examples.",
+          "Submit substantiated Chinese findings as structured objects; the scheduler validates the fixed MR head, the finding identity and posts discussions. " <>
+            "An empty findings list explicitly completes a no-findings review. Mark required=true only for a violated agreed criterion or delivery condition; advice is required=false. " <>
+            "Resolve an earlier open finding only through responses with an independent verification conclusion and evidence. Do not include slash-command lines, even in examples.",
         "inputSchema" => %{
           "type" => "object",
           "additionalProperties" => false,
           "required" => ["findings"],
-          "properties" => %{"findings" => %{"type" => "array", "maxItems" => 50, "items" => %{"type" => "string", "maxLength" => 16_384}}}
+          "properties" => %{
+            "findings" => %{"type" => "array", "maxItems" => 50, "items" => finding_schema()},
+            "responses" => %{"type" => "array", "maxItems" => 50, "items" => response_schema()}
+          }
         }
       }
     ]
+  end
+
+  defp finding_schema do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ~w(schema_version id required criterion version location evidence impact resolution regression_of),
+      "properties" => %{
+        "schema_version" => %{"type" => "integer", "enum" => [1]},
+        "id" => %{"type" => "string", "maxLength" => 32, "description" => "Stable finding identity; reuse the same id when the same problem persists across rounds."},
+        "required" => %{"type" => "boolean", "description" => "true only when an agreed criterion or delivery condition is violated."},
+        "criterion" => %{"type" => "string", "maxLength" => 256},
+        "version" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "required" => ~w(head base target),
+          "properties" => %{"head" => %{"type" => "string"}, "base" => %{"type" => "string"}, "target" => %{"type" => "string"}}
+        },
+        "location" => %{"type" => "string", "maxLength" => 256},
+        "evidence" => %{"type" => "string", "maxLength" => 4096},
+        "impact" => %{"type" => "string", "maxLength" => 4096},
+        "resolution" => %{"type" => "string", "maxLength" => 4096},
+        "regression_of" => %{"type" => ["string", "null"], "description" => "Identity of the earlier fixed finding this one regresses; null otherwise."}
+      }
+    }
+  end
+
+  defp response_schema do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ~w(finding status evidence rationale verified_by),
+      "properties" => %{
+        "finding" => %{"type" => "string", "description" => "Identity of an existing finding in this MR."},
+        "status" => %{"type" => "string", "enum" => ~w(fixed not_substantiated still_valid undecidable)},
+        "evidence" => %{"type" => ["string", "null"], "description" => "Required for fixed and still_valid."},
+        "rationale" => %{"type" => ["string", "null"], "description" => "Required for not_substantiated and undecidable."},
+        "verified_by" => %{"type" => "string", "enum" => ["reviewer"], "description" => "The independent reviewer; a developer cannot resolve a required finding."}
+      }
+    }
   end
 
   @spec execute_agent_tool(String.t(), term(), keyword()) :: map()

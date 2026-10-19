@@ -30,6 +30,30 @@ defmodule SymphonyElixir.TaskPlanTest do
     }
   end
 
+  defp pinned_draft(selects) do
+    plan = draft()
+    [a, b, c | _] = Enum.map(plan["members"], & &1["work"])
+
+    dependencies =
+      Enum.map(plan["dependencies"], fn
+        %{"from" => ^a, "to" => ^b} = edge -> Map.put(edge, "selects", "b1")
+        %{"from" => ^a, "to" => ^c} = edge -> Map.put(edge, "selects", selects)
+        edge -> edge
+      end)
+
+    %{plan | "dependencies" => dependencies}
+  end
+
+  defp explicit_schema_one_selection do
+    plan = pinned_draft("b1")
+    Map.put(plan, "schema_version", 1)
+  end
+
+  defp reseal(plan) do
+    plan = Map.delete(plan, "revision")
+    Map.put(plan, "revision", TaskWorkflow.digest(plan))
+  end
+
   test "parent Issues are coordination work even with a ready label or a malformed plan" do
     assert {:ok, plan} = TaskPlan.seal(draft())
     block = "<!-- symphony-plan\n" <> Jason.encode!(plan) <> "\n-->"
@@ -88,6 +112,59 @@ defmodule SymphonyElixir.TaskPlanTest do
     assert {:ok, []} = TaskPlan.affected(plan, [])
     assert {:ok, [^b, ^integration]} = TaskPlan.affected(plan, [b, b])
     assert {:error, :not_plan_member} = TaskPlan.affected(plan, [work("missing", 9)])
+  end
+
+  test "unchanged member evidence survives a new plan grant only while the old native grant is intact" do
+    initial = %{draft() | "authorizer" => "1"}
+    assert {:ok, old} = TaskPlan.seal(initial)
+    assert {:ok, current} = TaskPlan.seal(%{initial | "budget_ms" => 501})
+    member = hd(current["members"])
+
+    note = plan_decision_note(7, 1, %{"action" => "authorize", "revision" => old["revision"]})
+
+    prior = %{"work" => current["parent"], "actor" => "1", "revision" => old["revision"], "source" => SymphonyElixir.TaskDecision.source_ref(note)}
+    latest = %{prior | "revision" => current["revision"], "source" => "note:8"}
+
+    binding = %{
+      "work" => member["work"],
+      "contract_sha" => member["contract_sha"],
+      "authority" => prior,
+      "plan_revision" => old["revision"],
+      "inputs" => []
+    }
+
+    assert TaskPlan.compatible_binding?(current, latest, binding, member["work"], [note])
+    refute TaskPlan.compatible_binding?(current, latest, binding, member["work"], [%{note | "body" => "edited"}])
+    refute TaskPlan.compatible_binding?(current, latest, %{binding | "contract_sha" => TaskWorkflow.digest("changed")}, member["work"], [note])
+    changed_input = %{binding | "inputs" => [%{"work" => member["work"], "artifact" => "wrong"}]}
+    refute TaskPlan.compatible_binding?(current, latest, changed_input, member["work"], [note])
+
+    # A note that shares the recorded native source and actor but is not a
+    # genuine authorization for the bound revision must not resurrect the stale
+    # grant (§17 historical-grant tightening).
+    for wrong <- [
+          %{note | "body" => "P1 approved"},
+          plan_decision_note(7, 1, %{"action" => "pause", "revision" => old["revision"]}),
+          plan_decision_note(7, 1, %{"action" => "authorize", "revision" => current["revision"]}),
+          plan_decision_note(7, 1, %{"action" => "authorize", "revision" => old["revision"], "extra" => "x"}),
+          %{note | "body" => "<!-- symphony-plan-decision {invalid} -->"},
+          %{note | "created_at" => "2026-10-18T00:00:01Z"},
+          %{note | "id" => 0},
+          %{note | "author" => %{"id" => "1"}}
+        ] do
+      forged_prior = %{prior | "source" => SymphonyElixir.TaskDecision.source_ref(wrong)}
+      refute TaskPlan.compatible_binding?(current, latest, %{binding | "authority" => forged_prior}, member["work"], [wrong])
+    end
+  end
+
+  defp plan_decision_note(id, actor, payload) do
+    %{
+      "id" => id,
+      "body" => "<!-- symphony-plan-decision " <> Jason.encode!(payload) <> " -->",
+      "author" => %{"id" => actor},
+      "created_at" => "2026-10-18T00:00:00Z",
+      "updated_at" => "2026-10-18T00:00:00Z"
+    }
   end
 
   test "cycles and disconnected integration cannot authorize a partial graph" do
@@ -210,5 +287,92 @@ defmodule SymphonyElixir.TaskPlanTest do
 
     assert {:error, :invalid_work_ref} = WorkRef.validate(nil)
     assert_raise ArgumentError, fn -> WorkRef.key(%{}) end
+  end
+
+  test "requires_plan_lifecycle? returns false for non-plan Issue" do
+    refute TaskPlan.requires_plan_lifecycle?(%SymphonyElixir.Tracker.Issue{id: "raw:1"})
+  end
+
+  test "compatible? handles invalid input list elements and non-list inputs" do
+    assert {:ok, plan} = TaskPlan.seal(draft())
+    member = hd(plan["members"])
+    work = member["work"]
+
+    refute TaskPlan.compatible?(plan, work, "different_revision", [%{"work" => "not_a_map", "artifact" => "art"}])
+    refute TaskPlan.compatible?(plan, work, "different_revision", "not_a_list")
+  end
+
+  test "compatible? compares declared dependencies against input pairs" do
+    assert {:ok, plan} = TaskPlan.seal(draft())
+    [a, b | _] = Enum.map(plan["members"], & &1["work"])
+
+    # In draft(), b depends on a with artifact: "code"
+    matching_inputs = [%{"work" => a, "artifact" => "code"}]
+    assert TaskPlan.compatible?(plan, b, "different_revision", matching_inputs)
+
+    non_matching_inputs = [%{"work" => a, "artifact" => "other"}]
+    refute TaskPlan.compatible?(plan, b, "different_revision", non_matching_inputs)
+  end
+
+  test "an explicit edge selection seals a schema v2 plan while legacy drafts keep schema v1" do
+    assert {:ok, legacy} = TaskPlan.seal(draft())
+    assert legacy["schema_version"] == 1
+    refute Enum.any?(legacy["dependencies"], &Map.has_key?(&1, "selects"))
+
+    assert {:ok, pinned} = TaskPlan.seal(pinned_draft("b1"))
+    assert pinned["schema_version"] == 2
+    assert Enum.map(pinned["dependencies"], & &1["selects"]) == ["b1", "b1", nil, nil]
+    assert :ok = TaskPlan.validate(Jason.decode!(Jason.encode!(pinned)))
+    assert pinned["revision"] != legacy["revision"]
+
+    assert {:ok, declared} = TaskPlan.seal(Map.put(draft(), "schema_version", 2))
+    assert declared["schema_version"] == 2
+    assert Enum.all?(declared["dependencies"], &(&1["selects"] == nil))
+  end
+
+  test "conflicting or unusable selection shapes are rejected instead of being ignored" do
+    assert {:error, :invalid_plan_dependencies} = TaskPlan.seal(explicit_schema_one_selection())
+
+    for unusable <- ["", " ", 5, []] do
+      assert {:error, :invalid_plan_dependencies} = TaskPlan.seal(pinned_draft(unusable))
+    end
+
+    malformed = pinned_draft("b1") |> Map.put("schema_version", 2) |> Map.put("dependencies", [nil])
+    assert {:error, :invalid_plan_dependencies} = TaskPlan.seal(malformed)
+
+    assert {:ok, pinned} = TaskPlan.seal(pinned_draft("b1"))
+    [dropped | rest] = pinned["dependencies"]
+    incomplete = reseal(%{pinned | "dependencies" => [Map.delete(dropped, "selects") | rest]})
+    assert {:error, :invalid_plan_dependencies} = TaskPlan.validate(incomplete)
+
+    assert {:error, :invalid_plan_schema} = TaskPlan.validate(reseal(%{pinned | "schema_version" => 3}))
+    assert {:error, :invalid_plan_schema} = TaskPlan.seal(Map.put(draft(), "schema_version", 3))
+  end
+
+  test "a changed selection invalidates only the repinned consumer while an independent sibling stays reusable" do
+    assert {:ok, old} = TaskPlan.seal(pinned_draft("b1"))
+    assert {:ok, new} = TaskPlan.seal(pinned_draft("b2"))
+    [a, b, c, integration] = Enum.map(old["members"], & &1["work"])
+    b1 = [%{"work" => a, "artifact" => "code", "version" => "b1"}]
+    b2 = [%{"work" => a, "artifact" => "code", "version" => "b2"}]
+
+    refute new["revision"] == old["revision"]
+    assert TaskPlan.compatible?(old, c, "previous_revision", b1)
+    refute TaskPlan.compatible?(new, c, "previous_revision", b1)
+    assert TaskPlan.compatible?(new, c, "previous_revision", b2)
+    refute TaskPlan.compatible?(new, c, "previous_revision", [%{"work" => a, "artifact" => "code"}])
+
+    # The independent sibling keeps the selection it already recorded.
+    assert TaskPlan.compatible?(old, b, "previous_revision", b1)
+    assert TaskPlan.compatible?(new, b, "previous_revision", b1)
+
+    # An intentionally unpinned edge accepts whatever version the upstream produced.
+    unpinned = [%{"work" => b, "artifact" => "code", "version" => "i1"}, %{"work" => c, "artifact" => "code", "version" => "i2"}]
+    assert TaskPlan.compatible?(new, integration, "previous_revision", unpinned)
+
+    # A legacy v1 edge stays version-agnostic instead of pinning a revision.
+    assert {:ok, legacy} = TaskPlan.seal(draft())
+    assert TaskPlan.compatible?(legacy, b, "previous_revision", [%{"work" => a, "artifact" => "code", "version" => "b9"}])
+    assert TaskPlan.compatible?(new, a, "previous_revision", [])
   end
 end

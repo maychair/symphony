@@ -8,7 +8,7 @@ defmodule SymphonyElixir.TaskEvidence do
   """
   alias SymphonyElixir.ArtifactStore
   alias SymphonyElixir.{CommandCheck, ExecutionBinding, GitArtifact, NativeWork, TaskPublication, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{TaskControl, TaskPlanPreflight}
+  alias SymphonyElixir.{TaskControl, TaskPlan, TaskPlanPreflight}
 
   @doc "Read a member's current native results; never replace unavailable current evidence with an older success."
   @spec read_member(map(), map(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -25,7 +25,7 @@ defmodule SymphonyElixir.TaskEvidence do
          {:ok, controls} <- TaskControl.observe(current_plan, work, TaskControl.recorded(runtime)),
          {:ok, acceptance} <- TaskControl.acceptance(snapshot, member.contract),
          {:ok, results} <- TaskPublication.observe(runtime, snapshot, policy["engine_actor"]),
-         current = Enum.filter(results, &scope?(&1.envelope, plan, member, policy)),
+         current = Enum.filter(results, &(scope?(&1.envelope, plan, member, policy) and not superseded?(runtime, &1.receipt))),
          {:ok, selected} <- select_candidate(current, opts),
          {:ok, candidate, artifacts} <- candidate(selected, runtime, work, opts),
          {:ok, selected} <- select_verification(current, candidate, policy, opts),
@@ -95,8 +95,12 @@ defmodule SymphonyElixir.TaskEvidence do
 
   defp scope?(%{"binding" => binding} = envelope, plan, member, policy) do
     binding["work"] == member.work and binding["contract_sha"] == member.contract["contract_sha"] and
-      binding["authority"] == plan.authority and binding["plan_revision"] == plan.plan["revision"] and envelope["actor"] == policy["engine_actor"]
+      TaskPlan.compatible_binding?(plan.plan, plan.authority, binding, member.work, plan.parent.notes) and
+      envelope["actor"] == policy["engine_actor"]
   end
+
+  defp superseded?(runtime, %{"source" => source}), do: source in (get_in(runtime, ["rework", "superseded"]) || [])
+  defp superseded?(_runtime, _receipt), do: false
 
   defp latest(results, kind) do
     candidates = Enum.filter(results, &(&1.envelope["kind"] == kind))

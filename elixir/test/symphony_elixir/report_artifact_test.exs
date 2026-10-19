@@ -40,8 +40,11 @@ defmodule SymphonyElixir.ReportArtifactTest do
     assert {:error, :invalid_artifact_file} = ArtifactStore.read(root, work, report["version"], opts)
     consumer = %{owner | "kind" => "dependency", "work" => %{work | "number" => 3}}
     assert {:ok, ^saved} = ArtifactStore.retain_report(root, work, report, consumer, opts)
+    manifest = %{owner | "kind" => "manifest", "work" => %{work | "number" => 4}}
+    assert {:ok, ^saved} = ArtifactStore.retain_existing_report(root, work, Map.drop(report, ["body"]), manifest, opts)
+    assert {:error, :invalid_artifact_reference} = ArtifactStore.retain_existing_report(root, work, report, %{}, opts)
     assert {:ok, owners} = ArtifactStore.report_references(root, work, report, opts)
-    assert Enum.sort(owners) == Enum.sort([owner, consumer])
+    assert Enum.sort(owners) == Enum.sort([owner, consumer, manifest])
     assert {:error, :invalid_artifact_reference} = ArtifactStore.retain_report(root, work, report, %{}, opts)
     assert {:error, :artifact_storage_limit} = ArtifactStore.retain_report(root, work, report, owner, Keyword.put(opts, :artifact_max_bytes, 1))
     assert {:error, :artifact_storage_limit} = ArtifactStore.read_report(root, work, report, Keyword.put(opts, :artifact_max_bytes, 1))
@@ -50,6 +53,7 @@ defmodule SymphonyElixir.ReportArtifactTest do
     data = Jason.decode!(File.read!(path)) |> Map.update!("files", &Enum.map(&1, fn file -> Map.put(file, "content", Base.encode64("changed")) end))
     File.write!(path, Jason.encode!(data))
     assert {:error, :invalid_stored_report} = ArtifactStore.read_report(root, work, report, opts)
+    assert {:error, :invalid_stored_report} = ArtifactStore.retain_existing_report(root, work, report, manifest, opts)
     assert {:error, :artifact_publication_conflict} = ArtifactStore.retain_report(root, work, report, owner, opts)
   end
 end

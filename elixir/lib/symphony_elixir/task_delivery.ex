@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskDelivery do
   @moduledoc "Resolve native delivery versions without treating merge intent or old-head verification as delivered evidence."
-  alias SymphonyElixir.{GitArtifact, NativeWork, ReportArtifact, TaskPublication, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{GitArtifact, NativeWork, ReportArtifact, TaskPublication, TaskPublicationDelivery}
+  alias SymphonyElixir.{TaskWorkflow, WorkRef}
 
   @doc "Check the frozen change target belongs to the output's owning repository. This is read scope, never merge permission."
   @spec target?(map(), map()) :: boolean()
@@ -45,6 +46,9 @@ defmodule SymphonyElixir.TaskDelivery do
     end
   end
 
+  def read(work, %{"kind" => "publication"} = artifact, opts),
+    do: TaskPublicationDelivery.read(work, artifact, opts)
+
   def read(_, artifact, _), do: {:ok, %{artifact: artifact["id"], status: "unsupported", snapshot: nil, receipt: nil}}
 
   defp report_delivery(work, artifact, %{"source" => source, "actor" => actor} = candidate, opts) do
@@ -78,6 +82,8 @@ defmodule SymphonyElixir.TaskDelivery do
       _ -> false
     end
   end
+
+  def current?(%{publication: true} = snapshot, opts), do: TaskPublicationDelivery.current?(snapshot, opts)
 
   def current?(snapshot, opts), do: NativeWork.read_change(snapshot.work, opts) == {:ok, snapshot}
 

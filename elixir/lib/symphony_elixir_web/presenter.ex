@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, WorkflowCapability, Workspace}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -15,6 +15,7 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           build: SymphonyElixir.BuildInfo.identity(),
           backend: SymphonyElixir.ExecutionBackend.kind(),
+          workflow_capability: workflow_capability_payload(),
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
@@ -34,6 +35,15 @@ defmodule SymphonyElixirWeb.Presenter do
       :unavailable ->
         %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
     end
+  end
+
+  @spec workflow_capability_payload() :: map()
+  def workflow_capability_payload do
+    %{
+      version: WorkflowCapability.version(),
+      layers: WorkflowCapability.layers(),
+      migration: WorkflowCapability.migration()
+    }
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}

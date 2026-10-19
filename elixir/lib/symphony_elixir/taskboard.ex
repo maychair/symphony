@@ -5,12 +5,14 @@ defmodule SymphonyElixir.Taskboard do
   The Taskboard is a view over tracker Issues and execution observations. It
   keeps no task database and never mutates a tracker: every write stays in the
   native GitHub or GitLab Issue. `Done` and `accepted` come from the versioned
-  member lifecycle, never from a `symphony:accept` label.
+  member lifecycle recomputed at read time for the member's native identity,
+  never from a `symphony:accept` label and never from a boolean cached in an
+  execution journal.
   """
 
   require Logger
 
-  alias SymphonyElixir.{Config, Execution, Orchestrator, RunJournal}
+  alias SymphonyElixir.{Config, Execution, Orchestrator, RunJournal, TaskPlanExecution, WorkRef}
   alias SymphonyElixir.Taskboard.Provider
   alias SymphonyElixir.Tracker.Issue
 
@@ -102,7 +104,7 @@ defmodule SymphonyElixir.Taskboard do
 
     with {:ok, project} <- find_project(project_id, settings, opts),
          {:ok, detail} <- fetch_detail(project, identifier, opts) do
-      detail = attach_local_execution(project, detail, identifier)
+      detail = attach_local_execution(project, detail, opts)
 
       card =
         if project.local do
@@ -176,8 +178,9 @@ defmodule SymphonyElixir.Taskboard do
   @spec card_payload(Issue.t(), map(), map() | nil, map() | nil, [map()]) :: map()
   def card_payload(%Issue{} = issue, project, runtime_entry, execution \\ nil, deliveries \\ []) do
     labels = Enum.map(issue.labels, &normalize_label/1)
-    column = column_for(issue, labels, runtime_entry, lifecycle_accepted?(execution))
-    status = agent_status(column, labels, runtime_entry, issue)
+    fact = acceptance_fact(execution)
+    column = column_for(issue, labels, runtime_entry, fact)
+    status = agent_status(column, labels, runtime_entry, issue, fact)
     artifacts = card_artifacts(execution, deliveries, project)
 
     %{
@@ -200,7 +203,8 @@ defmodule SymphonyElixir.Taskboard do
       runtime: public_runtime(runtime_entry),
       delivery: delivery_hint(labels),
       artifacts: artifacts,
-      human_action: human_action(column, labels, status, issue, artifacts, execution),
+      projection: Map.get(execution || %{}, :projection),
+      human_action: human_action(column, labels, status, issue, artifacts, execution, fact),
       updated_at: Provider.iso8601(issue.updated_at),
       created_at: Provider.iso8601(issue.created_at)
     }
@@ -261,6 +265,7 @@ defmodule SymphonyElixir.Taskboard do
     with {:ok, provider} <- Provider.module_for(project.kind),
          {:ok, issues} <- provider.list_issues(project.settings.tracker, opts) do
       runtime = local_runtime_snapshot(opts)
+      projections = member_projections(project.settings, opts)
 
       cards =
         issues
@@ -271,7 +276,7 @@ defmodule SymphonyElixir.Taskboard do
               issue,
               project,
               runtime_entry(issue, runtime),
-              local_execution(issue.id, issue.identifier),
+              local_execution(issue, project.settings, projections, opts),
               provider_delivery_summaries(provider, project.settings.tracker, issue, opts)
             )
 
@@ -386,25 +391,36 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  # Migration off the retired label-as-acceptance rule. The Taskboard used to
-  # fabricate acceptance from the current `symphony:accept` label plus native
-  # closure, and the test suite asserted that forged behaviour. A label cannot
-  # carry the version information an acceptance decision needs (design 16.2), so
-  # no label selects a column. `Done` and `accepted` now require the versioned
-  # lifecycle fact the member journal derives from the plan contract: the flow is
-  # completed with its delivery accepted against the current manifest revision
-  # and with no remaining restriction (`closeable`). A natively closed Issue
-  # without that fact stays in Human Review as an unverified historical
-  # conclusion instead of a business Done.
-  defp lifecycle_accepted?(execution),
-    do: is_map(execution) and Map.get(execution, :closeable) == true
+  # Migration off the retired label-as-acceptance rule. `Done` and `accepted`
+  # require the versioned lifecycle fact recomputed at read time for the member's
+  # native identity, never a cached boolean: a `symphony:accept` label carries no
+  # version information, and a journal's stored `closeable` was derived from a
+  # contract revision that may since have changed. A member whose current
+  # projection cannot be confirmed keeps its historical execution as a stale
+  # fact in Human Review, so no dependent work and no cleanup advance from it.
+  defp acceptance_fact(execution) when is_map(execution) do
+    case get_in(execution, [:projection, :status]) do
+      "current" -> if Map.get(execution, :closeable) == true, do: :accepted, else: :none
+      "stale" -> :stale
+      "restricted" -> :restricted
+      _ -> :none
+    end
+  end
 
-  defp column_for(%Issue{} = issue, labels, runtime_entry, accepted?) do
+  defp acceptance_fact(_execution), do: :none
+
+  defp column_for(%Issue{} = issue, labels, runtime_entry, fact) do
     status = runtime_status(runtime_entry)
 
     cond do
-      accepted? ->
+      fact == :accepted ->
         "Done"
+
+      fact == :stale ->
+        "Human Review"
+
+      fact == :restricted ->
+        "Human Review"
 
       closed?(issue) or human_review?(labels, status) ->
         "Human Review"
@@ -429,9 +445,12 @@ defmodule SymphonyElixir.Taskboard do
     status in ["running", "retrying"] or "symphony:running" in labels
   end
 
-  defp agent_status("Done", _labels, _runtime, _issue), do: "accepted"
+  defp agent_status("Done", _labels, _runtime, _issue, _fact), do: "accepted"
 
-  defp agent_status("Human Review", labels, runtime_entry, issue) do
+  defp agent_status("Human Review", _labels, _runtime, _issue, :stale), do: "stale projection"
+  defp agent_status("Human Review", _labels, _runtime, _issue, :restricted), do: "restricted member"
+
+  defp agent_status("Human Review", labels, runtime_entry, issue, _fact) do
     cond do
       closed?(issue) -> "unverified closure"
       runtime_status(runtime_entry) == "blocked" -> "blocked"
@@ -441,10 +460,10 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp agent_status("In Progress", _labels, %{status: "retrying"}, _issue), do: "retrying"
-  defp agent_status("In Progress", _labels, %{status: "running"}, _issue), do: "running"
-  defp agent_status("In Progress", _labels, _runtime, _issue), do: "waiting to run"
-  defp agent_status(_column, _labels, _runtime, _issue), do: "idle"
+  defp agent_status("In Progress", _labels, %{status: "retrying"}, _issue, _fact), do: "retrying"
+  defp agent_status("In Progress", _labels, %{status: "running"}, _issue, _fact), do: "running"
+  defp agent_status("In Progress", _labels, _runtime, _issue, _fact), do: "waiting to run"
+  defp agent_status(_column, _labels, _runtime, _issue, _fact), do: "idle"
 
   defp public_runtime(nil), do: nil
 
@@ -498,14 +517,16 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp attach_local_execution(%{local: true} = _project, detail, identifier) do
-    case local_execution(detail.issue.id, identifier) do
+  defp attach_local_execution(%{local: true} = project, detail, opts) do
+    projections = member_projections(project.settings, opts)
+
+    case local_execution(detail.issue, project.settings, projections, opts) do
       nil -> detail
       execution -> Map.put(detail, :execution, execution)
     end
   end
 
-  defp attach_local_execution(_project, detail, _identifier), do: detail
+  defp attach_local_execution(_project, detail, _opts), do: detail
 
   defp normalize_remote_card(card, project) when is_map(card) do
     %{
@@ -528,6 +549,7 @@ defmodule SymphonyElixir.Taskboard do
       runtime: card["runtime"],
       delivery: card["delivery"],
       artifacts: List.wrap(card["artifacts"]),
+      projection: card["projection"],
       human_action: card["human_action"],
       updated_at: card["updated_at"],
       created_at: card["created_at"]
@@ -555,6 +577,7 @@ defmodule SymphonyElixir.Taskboard do
       runtime: nil,
       delivery: nil,
       artifacts: [],
+      projection: nil,
       human_action: nil,
       updated_at: nil,
       created_at: nil
@@ -627,40 +650,192 @@ defmodule SymphonyElixir.Taskboard do
     }
   end
 
-  defp local_execution(identifier, fallback_identifier) do
-    if Execution.enabled?() do
-      [identifier, fallback_identifier, native_issue_id(identifier), native_issue_id(fallback_identifier)]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.uniq()
-      |> Enum.find_value(&read_local_execution/1)
+  # A card's execution fact is resolved from the member's native identity when the
+  # configured plan repositories can resolve one: the journal is read from that
+  # `WorkRef`'s own directory, and the business conclusion is the projection
+  # recomputed at read time from the same native sources the closure reconciler
+  # consumes. The old numeric/`GH-N` addressing remains only as a labeled
+  # historical fallback for work that has no plan identity, and it never grants
+  # acceptance on its own.
+  defp local_execution(%Issue{} = issue, settings, projections, opts) do
+    case work_ref_for(issue, settings) do
+      {:ok, work} -> member_execution(issue, work, projections, opts)
+      :error -> legacy_local_execution(issue, opts)
     end
   end
 
-  defp read_local_execution(identifier) do
-    case RunJournal.read(RunJournal.directory(Execution.journal_root(), identifier)) do
-      {:ok, %{} = record} ->
-        %{
-          phase: record["phase"],
-          attempt_id: record["attempt_id"],
-          attempt_count: record["attempt_count"],
-          thread_id: record["thread_id"],
-          turn_id: record["turn_id"],
-          blocker_reason: record["blocker_reason"],
-          handoff: record["handoff"],
-          workflow_state: get_in(record, ["workflow", "state"]),
-          closeable: get_in(record, ["workflow", "closeable"]) == true,
-          acceptance_mode: get_in(record, ["workflow", "contract", "acceptance_mode"]),
-          manifest: get_in(record, ["workflow", "manifest"]),
-          delivery: record["delivery"],
-          intermediate: get_in(record, ["workflow", "intermediate"]),
-          stage_results: record["stage_results"],
-          updated_at: record["updated_at"],
-          events: record["events"] |> List.wrap() |> Enum.take(-20)
-        }
+  defp member_execution(issue, work, projections, opts) do
+    key = WorkRef.key(work)
+    record = read_journal(key, opts)
+    member = Map.get(projections, key)
+
+    cond do
+      is_map(member) and is_binary(member[:restricted]) -> restricted_execution(record, work, member)
+      is_map(member) -> projected_execution(record, member)
+      is_map(record) and record["issue_id"] == key -> stale_execution(record, work)
+      true -> legacy_local_execution(issue, opts)
+    end
+  end
+
+  # A member whose approved contract no longer matches its native Issue is
+  # blocked with its current reason; its history is kept and never grants Done.
+  defp restricted_execution(record, work, member) do
+    (record || %{})
+    |> journal_execution()
+    |> Map.put(:closeable, false)
+    |> Map.put(:projection, %{
+      status: "restricted",
+      reason: member.restricted,
+      work: work,
+      directory: member[:directory] || (record || %{})["directory"],
+      observed_at: now()
+    })
+  end
+
+  defp projected_execution(record, member) do
+    (record || %{})
+    |> journal_execution()
+    |> Map.put(:closeable, member.closeable == true)
+    |> Map.put(:closure, member.closure)
+    |> Map.put(:projection, %{
+      status: "current",
+      source: "plan_member_projection",
+      work: member.work,
+      directory: member.directory,
+      closure: Map.get(member.closure, "status"),
+      native_state: Map.get(member.closure, "native_state"),
+      observed_at: now()
+    })
+  end
+
+  # A journal that proves a member execution but has no confirmable current
+  # projection keeps its history and loses its claim: `closeable` is dropped, the
+  # card stays in Human Review, and the fact carries its own source and time.
+  defp stale_execution(record, work) do
+    record
+    |> journal_execution()
+    |> Map.put(:closeable, false)
+    |> Map.put(:projection, %{
+      status: "stale",
+      reason: "member_projection_unavailable",
+      source: "plan_member_projection",
+      work: work,
+      directory: record["directory"],
+      observed_at: now()
+    })
+  end
+
+  defp legacy_local_execution(%Issue{} = issue, opts) do
+    if Execution.enabled?() do
+      [issue.id, issue.identifier, native_issue_id(issue.id), native_issue_id(issue.identifier)]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.find_value(&legacy_local_execution(issue, &1, opts))
+    end
+  end
+
+  defp legacy_local_execution(_issue, identifier, opts) do
+    case read_journal(identifier, opts) do
+      %{} = record ->
+        record
+        |> journal_execution()
+        |> Map.put(:projection, %{
+          status: "journal",
+          source: "execution_journal",
+          directory: record["directory"],
+          observed_at: now()
+        })
 
       _ ->
         nil
     end
+  end
+
+  defp read_journal(identifier, opts) do
+    case RunJournal.read(RunJournal.directory(journal_root(opts), identifier)) do
+      {:ok, %{} = record} -> record
+      _ -> nil
+    end
+  end
+
+  defp journal_root(opts), do: Keyword.get_lazy(opts, :journal_root, &Execution.journal_root/0)
+
+  defp journal_execution(record) when is_map(record) do
+    %{
+      phase: record["phase"],
+      attempt_id: record["attempt_id"],
+      attempt_count: record["attempt_count"],
+      thread_id: record["thread_id"],
+      turn_id: record["turn_id"],
+      blocker_reason: record["blocker_reason"],
+      handoff: record["handoff"],
+      workflow_state: get_in(record, ["workflow", "state"]),
+      closeable: get_in(record, ["workflow", "closeable"]) == true,
+      acceptance_mode: get_in(record, ["workflow", "contract", "acceptance_mode"]),
+      manifest: get_in(record, ["workflow", "manifest"]),
+      delivery: record["delivery"],
+      intermediate: get_in(record, ["workflow", "intermediate"]),
+      stage_results: record["stage_results"],
+      updated_at: record["updated_at"],
+      events: record["events"] |> List.wrap() |> Enum.take(-20)
+    }
+  end
+
+  # Resolve the member identity a native Issue reports for a configured plan
+  # repository. Nothing is inferred from a display name or a number alone: the
+  # repository path must match the configured entry, and the constructed identity
+  # must pass the same validation that produces the journal key.
+  defp work_ref_for(%Issue{} = issue, settings) do
+    number = Provider.issue_number(issue)
+    catalog = settings.tracker.provider |> then(&(&1 || %{})) |> Map.get("plan_repositories")
+
+    catalog
+    |> List.wrap()
+    |> Enum.find_value(&candidate_work(&1, issue, number))
+    |> case do
+      %{} = work -> {:ok, work}
+      _ -> :error
+    end
+  end
+
+  # A catalog entry only describes a member when the native Issue reports the
+  # configured repository and the constructed identity passes the same
+  # validation that produces the journal key.
+  defp candidate_work(%{"provider" => provider, "path" => path} = entry, issue, number)
+       when provider in ["github", "gitlab"] and is_binary(path) and is_integer(number) do
+    work = %{
+      "provider" => provider,
+      "host" => entry["host"],
+      "repository_id" => entry["repository_id"],
+      "kind" => "issue",
+      "number" => number
+    }
+
+    if repository_path(provider, issue) == path and WorkRef.validate(work) == :ok, do: work
+  end
+
+  defp candidate_work(_entry, _issue, _number), do: nil
+
+  defp repository_path("github", %Issue{native_ref: ref}) when is_map(ref), do: ref["repo"]
+  defp repository_path("gitlab", %Issue{native_ref: ref}) when is_map(ref), do: ref["project_path"]
+  defp repository_path(_provider, _issue), do: nil
+
+  defp member_projections(settings, opts) do
+    provider = settings.tracker.provider || %{}
+
+    plan_opts =
+      opts
+      |> put_new(:roots, provider["plan_roots"] || [])
+      |> put_new(:repositories, provider["plan_repositories"] || [])
+
+    case TaskPlanExecution.projection(plan_opts) do
+      {:ok, projections} when is_map(projections) -> projections
+      _ -> %{}
+    end
+  end
+
+  defp put_new(opts, key, value) do
+    if Keyword.get(opts, key) == nil, do: Keyword.put(opts, key, value), else: opts
   end
 
   defp native_issue_id(identifier) when is_binary(identifier) do
@@ -730,10 +905,34 @@ defmodule SymphonyElixir.Taskboard do
   defp http_url?(url) when is_binary(url), do: String.match?(url, ~r/^https?:\/\//i)
   defp http_url?(_url), do: false
 
-  defp human_action("Human Review", _labels, status, issue, artifacts, execution) do
+  defp human_action("Human Review", _labels, status, issue, artifacts, execution, fact) do
     acceptance_mode = execution[:acceptance_mode] || "separate"
 
     cond do
+      fact == :restricted ->
+        %{
+          required: true,
+          summary:
+            "This member's approved contract no longer matches its native Issue, so Symphony blocked it and every " <>
+              "member that consumes its results (" <>
+              to_string(get_in(execution, [:projection, :reason])) <>
+              "). " <>
+              "Publish a new approval that binds this member's current contract before execution resumes.",
+          label: nil,
+          issue_url: issue.url
+        }
+
+      fact == :stale ->
+        %{
+          required: true,
+          summary:
+            "This member's current plan projection cannot be confirmed, so Symphony keeps its last execution as a " <>
+              "stale fact and will not advance dependent work from it. Confirm the plan and its native sources, " <>
+              "then read the current decision again.",
+          label: nil,
+          issue_url: issue.url
+        }
+
       closed?(issue) ->
         %{
           required: true,
@@ -777,7 +976,7 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp human_action(_column, _labels, _status, _issue, _artifacts, _execution), do: nil
+  defp human_action(_column, _labels, _status, _issue, _artifacts, _execution, _fact), do: nil
 
   defp artifact_action(artifacts, acceptance_mode) do
     reports = Enum.filter(artifacts, &(&1.kind == "report"))

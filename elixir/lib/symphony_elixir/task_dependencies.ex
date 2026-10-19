@@ -62,6 +62,7 @@ defmodule SymphonyElixir.TaskDependencies do
          assessment = %{plan: context.plan, work: edge["from"], runtime: runtime, policy: policy, evidence: evidence},
          {:ok, artifacts} <- TaskLifecycle.verified_artifacts(assessment),
          %{} = artifact <- Enum.find(artifacts, &(&1["id"] == edge["artifact"])),
+         true <- selected?(edge, artifact) or {:error, :dependency_selection_unconfirmed},
          delivery_context = %{context | opts: Keyword.merge(context.opts, candidate: candidate, runtime: runtime)},
          {:ok, proof, changes} <- delivery_proof(delivery_context, edge, artifact, facts.verification),
          :ok <- retain(context, edge, proof, runtime, artifact),
@@ -75,7 +76,7 @@ defmodule SymphonyElixir.TaskDependencies do
 
   defp delivery_proof(_context, %{"stage" => "verified"} = edge, artifact, verification), do: {:ok, proof(edge, artifact, verification), []}
 
-  defp delivery_proof(_, %{"stage" => "published"}, %{"kind" => kind}, _) when kind != "report",
+  defp delivery_proof(_, %{"stage" => "published"}, %{"kind" => kind}, _) when kind not in ["report", "publication"],
     do: {:error, :dependency_delivery_evidence_unavailable}
 
   defp delivery_proof(context, edge, artifact, verification) do
@@ -126,6 +127,10 @@ defmodule SymphonyElixir.TaskDependencies do
       "stage" => "verified"
     }
   end
+
+  # An edge that declares an explicit selection yields only that exact upstream
+  # version; a newer candidate may not silently replace the approved input (§9.2).
+  defp selected?(edge, artifact), do: Map.get(edge, "selects") in [nil, artifact["version"]]
 
   defp retain(context, edge, proof, runtime, artifact) do
     revision = TaskWorkflow.digest(%{"plan_revision" => context.plan.plan["revision"], "input" => proof})

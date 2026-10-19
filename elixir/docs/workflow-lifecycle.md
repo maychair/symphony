@@ -5,31 +5,18 @@ standalone review. Repository Issues remain the only task source. PRs/MRs own
 code and review facts. Symphony owns execution identity, recovery and derived
 projections; Codex owns native agent sessions.
 
-The current implementation validates sealed plan graphs and classifies parent
-Issues as coordination work. The existing GitLab task path also binds label
-decisions to unchanged native candidate notes and rejects unversioned acceptance.
-Configured parents now receive complete native scope/approval preflight on
-tracker reads, including GitHub/GitLab repository identity and member contracts.
-Native execution generation fencing is available for role separation and recovery.
-The member lifecycle reducer now selects roles from resolved evidence and applies
-candidate, verification, delivery, control and cumulative accounting constraints.
-Role-bound Issue evidence publication now has durable intent and native readback
-for GitHub and GitLab, including recovery after an uncertain send. Bound Codex
-sessions now expose dedicated developer/verifier tools for native context,
-retained candidates, configured host checks and independent verification.
-Git-backed command checks now run in isolated verifier worktrees and produce
-host-owned process/output receipts that the publisher attests.
-Native result selection now checks journal/native identities, retrieves and retains
-fixed Git snapshots and re-attests actual command results before returning member evidence.
-Native parent/member pause, cancel and source-bound resume decisions now feed
-member evidence and fence fresh result publication; remembered source loss blocks
-resumption after restart. Configured native members now dispatch and continue through
-the existing scheduler. Parent coordination, automatic crash recovery, retention
-cleanup and the remaining lifecycle below are not yet complete. Preflight success alone is not execution eligibility. A parent must never run
-as a coding task while coordination support is incomplete. Version 2 and unknown
-contract schemas, parent-linked contracts and malformed contract blocks are
-also fenced at legacy tracker projection and executor admission; legacy routing
-labels cannot bypass the native plan admission path, even when goal mode is disabled.
+The implementation validates sealed plan graphs, native approval and member
+contracts across GitHub and GitLab. Configured members enter the scheduler with
+role-bound Codex sessions, retained inputs, independent host verification,
+native evidence publication and cumulative budgets. Parent coordination derives
+complete member proofs, publishes fixed manifests to the native parent Issue,
+binds acceptance to one manifest, and reopens affected members for scoped rework.
+The Taskboard projects parent and member lifecycle facts. Native writes use
+durable intent and readback; uncertain outcomes remain restricted. Preflight
+success alone does not grant execution eligibility. Unknown contract schemas,
+parent-linked contracts and malformed blocks are fenced at tracker projection
+and executor admission. Runtime migration, orphan recovery and retention cleanup
+still require explicit operational validation before deployment.
 
 ## Observable requirements
 
@@ -86,7 +73,8 @@ is preparation, not approval or permission to create Issues.
 
 The plan fields are:
 
-- `schema_version`: currently 1; unsupported versions are rejected.
+- `schema_version`: 1 for existing plans or 2 for explicit edge selection;
+  unsupported versions are rejected.
 - `parent`: the native parent Issue's WorkRef.
 - `contract_sha`: checksum of the parent goal, scope and acceptance contract;
   changing parent requirements cannot inherit approval of an unchanged graph.
@@ -97,6 +85,11 @@ The plan fields are:
   contain the goal, non-goals, technical criteria, outputs and delivery rules.
 - `dependencies`: edges with `from`, `to`, `artifact`, required `stage`
   (`verified`, `delivered`, `published`) and the producer's technical `criteria`.
+  Version 2 requires a `selects` field on every edge: a fixed artifact version
+  or null while the first consumer input is unresolved. Once a consumer has
+  recorded its input, later producer candidates do not replace it. Selecting
+  a different version requires a newly approved plan revision and invalidates
+  only the affected consumers and their descendants.
 - `integration`: a member responsible for whole-result integration. Every other
   member must reach it through the dependency graph.
 - `budget_ms`: optional total cap, stored as null if absent. Each member still
@@ -761,12 +754,56 @@ also excludes replacement after scheduler restart. Automatic takeover and recove
 of that interrupted native execution are not implemented by this adapter.
 
 Member workspaces are retained as execution/input evidence, including during
-terminal cleanup. A verified report can become closeable; this scheduling path
-does not accept a parent, merge a change or close an Issue. Real OTP scheduler
+terminal cleanup. A verified report can become closeable; the discovery reconciler
+then checks the stopped member and its current native evidence before closing its
+Issue. Real OTP scheduler
 and local app-server tests exercise development, rejection, repair, independent
 re-verification, finite no-progress retries, pauses, forged completion messages,
 active-lock polling and crash/restart exclusion. These tests do not perform live
 provider writes or live acceptance.
+
+## Parent manifest, acceptance and scoped rework
+
+After every required member has a current, confirmed native closure and the
+integration member is complete, discovery assembles a fixed parent manifest from
+the plan revision and each member's immutable artifact versions, pinned inputs,
+candidate, verification, delivery and closure sources. The parent comment
+includes a readable result list as well as the machine-checkable manifest.
+Before that comment is sent, each result is verified in the retained artifact
+store and pinned under a parent-manifest owner keyed by the exact manifest
+revision. A missing or damaged artifact prevents publication.
+It publishes `M1`, `M2`, and later versions as native parent Issue comments. A
+lost publication response is resolved by reading the native note; an unchanged
+manifest is not posted twice. A human can accept or reject only the referenced
+manifest. An older `accept(M1)` never authorizes a later `M2`. A parent lifecycle
+card exposes incomplete, awaiting-acceptance, rework and clarification states;
+the parent projection treats a native manifest without the matching durable
+publication receipt, or whose member evidence has since changed, as unconfirmed.
+
+Acceptance rechecks the approved plan, every member's current lifecycle and the
+manifest digest before requesting native parent closure. The close response alone
+is not proof: the parent state is read back, then parent and member snapshots are
+checked again. A concurrent change yields an inconsistent result for operator
+reconciliation.
+
+A rejection must name existing criteria. The plan graph maps those criteria to
+one minimal affected root per criterion and its consumers; ambiguous independent
+roots request clarification without reopening either branch. The reconciler
+requires remaining member budget and records one rework
+intent under each original member's execution fence, reopens a closed original
+Issue, and confirms the native state by readback. On a lost response it recovers
+the same intent by reading; it does not issue another write while the first is
+uncertain. Historical publications remain in the journal but are excluded from
+new candidate and verification selection. Original contracts, Issues and budget
+accounting remain in force; new results produce a new manifest. A confirmed
+earlier rework stays historical after the member is reclosed, allowing the new
+M2 to be assembled and accepted.
+
+The capability payload exposes protocol versions and migration boundaries. It
+does not transfer ownership from an active older process. An old journal without
+verifiable execution and decision sources remains blocked pending explicit
+reconciliation. Publication delivery currently targets the owning Issue; other
+native publication targets require an additional scoped protocol.
 
 ## Native evidence publication
 
@@ -1267,10 +1304,10 @@ requests for changes and merges remain outside this tool.
 A legacy `mail-review.json` beside it blocks startup rather than importing old
 execution authority. Migration still requires reconciling old native executions
 and publication receipts before activating the new deployment. This change does
-not itself restart an existing service. GitHub review discovery, complete native
-assignment history, target-branch refresh, automatic uncertain-stop recovery,
-task-owned review deduplication remain
-necessary for the full lifecycle described below.
+not itself restart an existing service. GitHub PR discovery, reviewer timeline
+reconciliation, native comment publication and target-branch refresh are wired
+through the review lane. Automatic uncertain-stop recovery after VM loss and
+live-provider deployment validation remain necessary for the full lifecycle.
 
 ## Review publication receipts
 

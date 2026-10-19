@@ -7,7 +7,7 @@ defmodule SymphonyElixir.TaskPublication do
   approval, merge, Issue creation or closure operation is exposed here.
   """
   alias SymphonyElixir.{ExecutionBinding, NativeWork, RunJournal, TaskDecision, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{ReportArtifact, TaskControl, TaskPlanPreflight}
+  alias SymphonyElixir.{ReportArtifact, TaskControl, TaskPlan, TaskPlanPreflight}
 
   @marker "<!-- symphony-evidence "
 
@@ -220,7 +220,8 @@ defmodule SymphonyElixir.TaskPublication do
     binding = entry["binding"]
 
     with {:ok, plan} <- TaskPlanPreflight.inspect_plan(binding["authority"]["work"], opts),
-         true <- plan.authority == binding["authority"] and plan.plan["revision"] == binding["plan_revision"],
+         true <-
+           TaskPlan.compatible_binding?(plan.plan, plan.authority, binding, binding["work"], plan.parent.notes),
          %{} = member <- plan.members[WorkRef.key(entry["work"])],
          true <- member.contract["contract_sha"] == binding["contract_sha"],
          true <- member.raw["state"] in ["open", "opened"],

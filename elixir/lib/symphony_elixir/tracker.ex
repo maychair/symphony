@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.{Config, TaskPlan, TaskPlanExecution, TaskPlanPreflight}
-  alias SymphonyElixir.ReviewLane.Listener
+  alias SymphonyElixir.ReviewLane.{Listener, Ownership}
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
@@ -72,6 +72,8 @@ defmodule SymphonyElixir.Tracker do
          {:ok, reviews} <- review_issues(),
          {:ok, members} <- TaskPlanExecution.discover(opts) do
       parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
+      {members, reviews} = Ownership.converge(reviews, members, opts)
+      {parents, members} = parent_lifecycle(parents, members)
       {:ok, parents ++ Enum.filter(reviews ++ members, &(&1.state in states))}
     end
   end
@@ -85,8 +87,30 @@ defmodule SymphonyElixir.Tracker do
          {:ok, reviews} <- review_issues(),
          {:ok, members} <- TaskPlanExecution.discover(opts) do
       parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
+      {members, reviews} = Ownership.converge(reviews, members, opts)
+      {parents, members} = parent_lifecycle(parents, members)
       {:ok, parents ++ Enum.filter(reviews, &(&1.id in review_ids)) ++ Enum.filter(members, &(&1.id in plan_ids))}
     end
+  end
+
+  defp parent_lifecycle(parents, members) do
+    lifecycle = Map.new(members, fn issue -> {get_in(issue.native_ref, ["work"]), issue} end)
+
+    parents =
+      Enum.map(parents, fn issue ->
+        work = get_in(issue.native_ref, ["plan", "parent"])
+
+        case lifecycle[work] do
+          %Issue{kind: :plan, native_ref: %{"plan_lifecycle" => state}} ->
+            %{issue | native_ref: Map.put(issue.native_ref, "plan_lifecycle", state)}
+
+          _ ->
+            issue
+        end
+      end)
+
+    owned = MapSet.new(parents, &get_in(&1.native_ref, ["plan", "parent"]))
+    {parents, Enum.reject(members, &(&1.kind == :plan and MapSet.member?(owned, &1.native_ref["work"])))}
   end
 
   defp review_issues do

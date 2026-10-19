@@ -1,8 +1,19 @@
 defmodule SymphonyElixir.TaskSessionTest do
   use SymphonyElixir.TestSupport, runtime: false
   alias SymphonyElixir.Codex.DynamicTool
-  alias SymphonyElixir.{RunJournal, TaskExecution, TaskObserver, TaskPlan, TaskSession, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.TaskPlanExecution
+
+  alias SymphonyElixir.{
+    RunJournal,
+    Taskboard,
+    TaskExecution,
+    TaskObserver,
+    TaskPlan,
+    TaskPlanExecution,
+    TaskPlanManifest,
+    TaskSession,
+    TaskWorkflow,
+    WorkRef
+  }
 
   defp contract(work, parent) do
     data = %{
@@ -71,6 +82,24 @@ defmodule SymphonyElixir.TaskSessionTest do
         Agent.get_and_update(state, fn objects ->
           comment = note(body, 100 + length(objects[path])) |> Map.put("user", %{"id" => 99})
           {{:ok, %{status: 201, body: comment}}, Map.update!(objects, path, &(&1 ++ [comment]))}
+        end)
+
+      "github", "POST", "/repos/team/repo/issues/1/comments" = path, _, %{"body" => body}, _ ->
+        Agent.get_and_update(state, fn objects ->
+          comment = note(body, 100 + length(objects[path])) |> Map.put("user", %{"id" => 99})
+          {{:ok, %{status: 201, body: comment}}, Map.update!(objects, path, &(&1 ++ [comment]))}
+        end)
+
+      "github", "PATCH", "/repos/team/repo/issues/1" = path, _, %{"state" => "closed"}, _ ->
+        Agent.get_and_update(state, fn objects ->
+          issue = Map.put(objects[path], "state", "closed")
+          {{:ok, %{status: 200, body: issue}}, Map.put(objects, path, issue)}
+        end)
+
+      "github", "PATCH", "/repos/team/repo/issues/2" = path, _, %{"state" => "open"}, _ ->
+        Agent.get_and_update(state, fn objects ->
+          issue = Map.put(objects[path], "state", "open")
+          {{:ok, %{status: 200, body: issue}}, Map.put(objects, path, issue)}
         end)
 
       "github", "PATCH", "/repos/team/repo/issues/2" = path, _, %{"state" => "closed"}, _ ->
@@ -242,6 +271,54 @@ defmodule SymphonyElixir.TaskSessionTest do
   end
 
   @tag :unadmitted
+  test "member and board projections fail closed when roots or a member contract cannot be resolved", c do
+    opts = scheduler_options(c)
+    assert {:error, :invalid_plan_roots} = TaskPlanExecution.projection(roots: [:invalid])
+    assert {:ok, %{}} = TaskPlanExecution.projection(roots: [c.parent], repositories: [])
+
+    assert [current, parent_state] = TaskPlanExecution.discover(opts) |> elem(1)
+    assert parent_state.native_ref["plan_lifecycle"]["status"] == "incomplete"
+    assert current.native_ref["closure_projection"]["native_state"] == "open"
+
+    Agent.update(c.state, fn objects ->
+      update_in(objects["/repos/team/repo/issues/2"]["body"], &String.replace(&1, "Produce the approved report", "Changed goal"))
+    end)
+
+    assert {:ok, [blocked, parent_state]} = TaskPlanExecution.discover(opts)
+    assert blocked.native_ref["restricted"] == true
+    assert blocked.native_ref["lifecycle"]["restricted"] == "incomplete_sealed_scope"
+    assert parent_state.native_ref["plan_lifecycle"]["status"] == "incomplete"
+  end
+
+  @tag :unadmitted
+  test "tracker attaches the parent lifecycle to its native Issue without a duplicate plan card", c do
+    previous = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:symphony_elixir, :memory_tracker_issues),
+        else: Application.put_env(:symphony_elixir, :memory_tracker_issues, previous)
+    end)
+
+    parent_body = Agent.get(c.state, & &1["/repos/team/repo/issues/1"]["body"])
+
+    parent_issue = %SymphonyElixir.Tracker.Issue{
+      id: "1",
+      identifier: "GH-1",
+      title: "Approved parent plan",
+      description: parent_body,
+      state: "Todo",
+      native_ref: %{}
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [parent_issue])
+    assert {:ok, issues} = Tracker.fetch_issues_by_states(["Todo"], scheduler_options(c))
+    assert [parent] = Enum.filter(issues, &(&1.kind == :plan))
+    assert parent.id == "1"
+    assert parent.native_ref["plan_lifecycle"]["status"] == "incomplete"
+  end
+
+  @tag :unadmitted
   test "the existing scheduler discovers a configured plan and continues through independent repair roles", c do
     owner = self()
 
@@ -253,12 +330,21 @@ defmodule SymphonyElixir.TaskSessionTest do
       :ok
     end
 
-    opts = scheduler_options(c) |> Keyword.put(:on_ready, ready)
+    base_opts = scheduler_options(c)
+
+    lost_manifest_response = fn provider, method, path, query, body, settings ->
+      result = base_opts[:write_request].(provider, method, path, query, body, settings)
+      if path == "/repos/team/repo/issues/1/comments" and method == "POST", do: {:error, :transport_lost}, else: result
+    end
+
+    opts = base_opts |> Keyword.put(:on_ready, ready) |> Keyword.put(:write_request, lost_manifest_response)
     path = Workflow.workflow_file_path()
     File.write!(path, String.replace(File.read!(path), "agent:\n", "agent:\n  goal_mode: true\n  run_budget_ms: 1\n"))
     WorkflowStore.force_reload()
     assert SymphonyElixir.Execution.run_budget_ms("legacy") == 1
-    assert {:ok, [job]} = Tracker.fetch_issues_by_states(["Todo"], opts)
+    assert {:ok, jobs} = Tracker.fetch_issues_by_states(["Todo"], opts)
+    assert [job] = Enum.filter(jobs, &TaskPlanExecution.job?/1)
+    assert Enum.any?(jobs, &(&1.kind == :plan and &1.native_ref["plan_lifecycle"]["status"] == "incomplete"))
     assert job.dispatchable
     assert TaskPlanExecution.job?(job)
     refute File.exists?(c.record["directory"])
@@ -283,7 +369,8 @@ defmodule SymphonyElixir.TaskSessionTest do
     lock = Path.join(c.record["directory"], "executor.lock")
     File.mkdir!(lock)
     assert {:ok, [held]} = Tracker.fetch_issues_by_ids([job.id], opts)
-    assert held.native_ref["closure"] == "unconfirmed::member_closure_executor_locked"
+    assert held.native_ref["closure"] == "unconfirmed:member_closure_owner_unconfirmed"
+    assert held.native_ref["closure_projection"]["status"] == "unconfirmed"
     assert held.native_ref["native_state"] == "open"
     refute held.dispatchable
     assert Agent.get(c.close_writes, & &1) == 0
@@ -302,6 +389,89 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert again.native_ref["closure"] == "confirmed"
     assert Agent.get(c.close_writes, & &1) == 1
     assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 4
+
+    # The board consumes the same conclusion: the member card is driven by the
+    # journal the reconciler wrote under its own `WorkRef` directory and by the
+    # business projection recomputed from the native fixture at read time.
+    member_issue = %SymphonyElixir.Tracker.Issue{
+      id: "2",
+      identifier: "GH-2",
+      title: "Delivered member",
+      state: "closed",
+      native_ref: %{"number" => 2, "repo" => "team/repo"},
+      labels: []
+    }
+
+    board = fn issue ->
+      Taskboard.snapshot(
+        settings: Config.settings!(),
+        issues_fun: fn _states -> [issue] end,
+        runtime_snapshot_fun: fn -> %{} end,
+        request: c.opts[:request],
+        journal_root: Path.dirname(c.record["directory"])
+      )
+    end
+
+    assert [done_card] = board.(member_issue).cards
+    assert done_card.column == "Done"
+    assert done_card.agent_status == "accepted"
+    assert done_card.projection.status == "current"
+    assert done_card.projection.directory == c.record["directory"]
+    assert done_card.projection.closure == "confirmed"
+    assert done_card.projection.native_state == "closed"
+
+    # A manual reopen is the current native fact: the historical receipt never
+    # keeps the card accepted.
+    Agent.update(c.state, &put_in(&1["/repos/team/repo/issues/2"]["state"], "open"))
+    assert [reopened] = board.(%{member_issue | state: "open"}).cards
+    refute reopened.column == "Done"
+    assert reopened.projection.status == "current"
+    assert reopened.projection.closure == "reopened"
+    assert reopened.projection.native_state == "open"
+
+    Agent.update(c.state, &put_in(&1["/repos/team/repo/issues/2"]["state"], "closed"))
+
+    # A member contract that changed after the journal fact was written no longer
+    # verifies against its own seal, so the member is restricted and the stored
+    # `closeable` never advances the board.
+    body = Agent.get(c.state, & &1["/repos/team/repo/issues/2"]["body"])
+    drifted = String.replace(body, "Produce the approved report", "Produce a different report")
+    Agent.update(c.state, &put_in(&1["/repos/team/repo/issues/2"]["body"], drifted))
+    assert [stale_card] = board.(member_issue).cards
+    refute stale_card.column == "Done"
+    assert stale_card.projection.status == "restricted"
+    assert stale_card.projection.reason == "incomplete_sealed_scope"
+    assert stale_card.agent_status == "restricted member"
+    assert stale_card.needs_human
+    assert journal["workflow"]["closeable"] == true
+    assert Agent.get(c.close_writes, & &1) == 1
+
+    Agent.update(c.state, &put_in(&1["/repos/team/repo/issues/2"]["body"], body))
+    parent_notes = Agent.get(c.state, & &1["/repos/team/repo/issues/1/comments"])
+    assert length(parent_notes) == 2
+    assert String.contains?(List.last(parent_notes)["body"], "验收清单 M1")
+    assert [manifest] = TaskPlanManifest.manifests(%{notes: Enum.map(parent_notes, &Map.put(&1, "author", &1["user"]))})
+    assert manifest["label"] == "M1"
+
+    acceptance = %{"action" => "accept", "manifest" => manifest["source"], "revision" => manifest["payload"]["revision"]}
+
+    accepted_note =
+      note(block("plan-acceptance", acceptance), 200)
+      |> Map.put("user", %{"id" => 2})
+      |> Map.put("created_at", "2026-10-18T00:00:01Z")
+      |> Map.put("updated_at", "2026-10-18T00:00:01Z")
+
+    Agent.update(c.state, &update_in(&1["/repos/team/repo/issues/1/comments"], fn notes -> notes ++ [accepted_note] end))
+
+    lost_response = fn provider, method, path, query, body, settings ->
+      result = opts[:write_request].(provider, method, path, query, body, settings)
+      if path == "/repos/team/repo/issues/1" and method == "PATCH", do: {:error, :transport_lost}, else: result
+    end
+
+    assert {:ok, [_]} = Tracker.fetch_issues_by_ids([job.id], Keyword.put(opts, :write_request, lost_response))
+    assert Agent.get(c.state, & &1["/repos/team/repo/issues/1"]["state"]) == "closed"
+    assert {:ok, []} = Tracker.fetch_issues_by_ids([job.id], opts)
+    assert Agent.get(c.close_writes, & &1) == 1
   end
 
   @tag :unadmitted
@@ -625,7 +795,8 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert {:ok, [blocked]} = TaskPlanExecution.discover(missing_policy)
     assert blocked.native_ref["plan_preflight"]["reason"] =~ "missing_repository_execution_policy"
     refute File.exists?(c.record["directory"])
-    assert {:ok, [job]} = TaskPlanExecution.discover(opts)
+    assert {:ok, [job, parent_state]} = TaskPlanExecution.discover(opts)
+    assert parent_state.native_ref["plan_lifecycle"]["status"] == "incomplete"
     token = make_ref()
     unrouted = Keyword.merge(opts, roots: [], dispatch_token: token)
     assert :ok = AgentRunner.run(job, self(), unrouted)
@@ -638,7 +809,8 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert :ok = AgentRunner.run(job, self(), Keyword.put(opts, :dispatch_token, token))
     assert_receive {:member_worker_result, _, _, ^token, waiting = {:waiting, _}}
     assert {:ok, %{outcome: "waiting"}} = TaskPlanExecution.completed_result(job, waiting)
-    assert {:ok, [paused]} = TaskPlanExecution.discover(opts)
+    assert {:ok, [paused, parent_state]} = TaskPlanExecution.discover(opts)
+    assert parent_state.native_ref["plan_lifecycle"]["status"] == "incomplete"
     refute paused.dispatchable
     refute File.exists?(Path.join(c.record["directory"], "executor.lock"))
     refute File.exists?(c.trace)
@@ -675,9 +847,15 @@ defmodule SymphonyElixir.TaskSessionTest do
         end
       end
 
-      assert {:ok, [blocked]} = TaskPlanExecution.discover(Keyword.put(opts, :request, failing))
+      assert {:ok, [blocked | others]} = TaskPlanExecution.discover(Keyword.put(opts, :request, failing))
       refute blocked.dispatchable
       assert blocked.native_ref["lifecycle"]["error"]
+
+      assert Enum.all?(others, fn issue ->
+               issue.kind == :plan and
+                 (get_in(issue.native_ref, ["plan_preflight", "status"]) == "blocked" or
+                    get_in(issue.native_ref, ["plan_lifecycle", "status"]) == "incomplete")
+             end)
     end
 
     missing = fn
@@ -697,7 +875,8 @@ defmodule SymphonyElixir.TaskSessionTest do
     opts = scheduler_options(c)
     File.mkdir_p!(Path.join(c.record["directory"], "run.json"))
 
-    assert {:ok, [job]} = TaskPlanExecution.discover(opts)
+    assert {:ok, [job, parent_state]} = TaskPlanExecution.discover(opts)
+    assert parent_state.native_ref["plan_lifecycle"]["status"] == "incomplete"
     refute job.kind == :plan
     refute job.dispatchable
     refute job.native_ref["recovery_required"]

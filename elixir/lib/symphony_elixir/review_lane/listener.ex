@@ -6,7 +6,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   """
   use GenServer
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitLab, Journal, Owner, Policy, Publication}
+  alias SymphonyElixir.ReviewLane.{Finding, GitHub, GitLab, Journal, Owner, Policy, Publication}
 
   @worker_fields ~w(thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
@@ -389,6 +389,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp record?(id, %{} = record, config) do
     valid_subject?(record, config) and record_shape?(record) and Publication.valid?(record, config["publisher_id"]) and
       target_branch?(record["target_branch"]) and
+      (is_nil(record["finding_register"]) or Finding.register?(record["finding_register"])) and
       record["work"] == work(config, record["project"], record["iid"]) and
       id == record["id"] and id == round_id(record["work"], record["round"], config)
   end
@@ -422,7 +423,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     state = %{state | health: :listening, error: nil}
 
     Enum.reduce(Map.keys(state.config["projects"]) |> Enum.sort(), state, fn project, current ->
-      case GitLab.assigned(state.config, project) do
+      case native(state.config).assigned(state.config, project) do
         {:ok, numbers} -> Enum.reduce(numbers, current, &discovered(&2, project, &1))
         {:error, reason} -> %{current | health: :degraded, error: inspect(reason)}
       end
@@ -446,18 +447,31 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp candidate(state, {:ok, project, iid}) do
-    path = GitLab.mr_path(project, iid)
-
-    with {:ok, mr} <- GitLab.request(state.config, "GET", path),
-         true <- valid_mr?(mr, project, iid, state.config),
-         true <- Policy.requested_reviewer?(mr, state.config["reviewer_id"]) do
+    with {:ok, mr} <- read_mr(state.config, project, iid),
+         true <- valid_mr?(mr, project, iid, state.config) or {:error, :invalid_native_review},
+         {:ok, true} <- lane_assignment(state.config, project, iid, mr) do
       previous = state.records |> Map.values() |> Enum.filter(&(&1["project"] == project and &1["iid"] == iid))
       if previous == [], do: queue(state, project, iid, mr, 1), else: {:ok, state}
     else
-      false -> {:ok, state}
+      {:ok, false} -> {:ok, state}
       error -> error
     end
   end
+
+  # GitLab merges expose `opened/closed/merged` plus a durable reviewer list.
+  # GitHub drops a submitted reviewer from `requested_reviewers`, so an absent
+  # current request is resolved from the latest native timeline event. Missing
+  # timeline evidence fails closed instead of treating automatic removal as an
+  # explicit withdrawal.
+  defp lane_assignment(%{"provider" => "github"} = config, project, iid, mr) do
+    cond do
+      mr["state"] != "opened" -> {:ok, false}
+      Policy.requested_reviewer?(mr, config["reviewer_id"]) -> {:ok, true}
+      true -> GitHub.review_assignment(config, project, iid, config["reviewer_id"])
+    end
+  end
+
+  defp lane_assignment(config, _project, _iid, mr), do: {:ok, Policy.requested_reviewer?(mr, config["reviewer_id"])}
 
   defp valid_mr?(mr, project, iid, config) when is_map(mr) do
     mr["iid"] == iid and mr["project_id"] == config["projects"][project]["id"] and
@@ -478,12 +492,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp valid_sha?(sha), do: is_binary(sha) and Regex.match?(~r/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/, sha)
 
   defp valid_mr_url?(url, project, iid, config) do
-    GitLab.web_url?(url, config, "/#{project}/-/merge_requests/#{iid}")
+    native(config).web_url?(url, config, web_url_path(config, project, iid))
   end
 
   defp queue(state, project, iid, mr, round, response_sha \\ TaskWorkflow.digest([])) do
     work = work(state.config, project, iid)
     id = round_id(work, round, state.config)
+    register = carried_register(state, project, iid, round)
 
     record = %{
       "id" => id,
@@ -497,6 +512,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       "response_sha" => response_sha,
       "policy_sha" => policy_sha(state.config),
       "eligibility" => "current",
+      "finding_register" => register,
+      "verdict" => Finding.verdict(register),
       "author_id" => mr["author"]["id"],
       "url" => mr["web_url"],
       "findings" => [],
@@ -506,8 +523,20 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     {:ok, put_record(state, record)}
   end
 
-  defp work(config, project, iid),
-    do: %{"provider" => "gitlab", "host" => config["host"], "repository_id" => to_string(config["projects"][project]["id"]), "kind" => "mr", "number" => iid}
+  # Findings keep their identity across rounds of the same MR; a later round
+  # inherits every conclusion an earlier round recorded (§17.1).
+  defp carried_register(state, project, iid, round) do
+    state.records
+    |> Map.values()
+    |> Enum.filter(&(&1["project"] == project and &1["iid"] == iid and &1["round"] < round))
+    |> Enum.sort_by(& &1["round"])
+    |> Enum.reduce(%{}, fn record, acc -> Map.merge(acc, record["finding_register"] || %{}) end)
+  end
+
+  defp work(config, project, iid) do
+    kind = if config["provider"] == "github", do: "pr", else: "mr"
+    %{"provider" => config["provider"], "host" => config["host"], "repository_id" => to_string(config["projects"][project]["id"]), "kind" => kind, "number" => iid}
+  end
 
   defp round_id(work, round, config), do: TaskWorkflow.digest(%{"work" => work, "round" => round, "reviewer" => config["reviewer_id"]})
 
@@ -523,9 +552,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp reconcile_record(state, record) do
-    path = GitLab.mr_path(record["project"], record["iid"])
+    path = native(state.config).mr_path(record["project"], record["iid"])
 
-    with {:ok, mr} <- GitLab.request(state.config, "GET", path),
+    with {:ok, mr} <- read_mr(state.config, record["project"], record["iid"]),
          true <- valid_mr?(mr, record["project"], record["iid"], state.config) or {:error, :invalid_native_review} do
       reconcile_native(state, record, mr, path)
     else
@@ -534,17 +563,25 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp reconcile_native(state, record, mr, path) do
-    if Policy.requested_reviewer?(mr, state.config["reviewer_id"]) do
-      reconcile_assigned(state, record, mr, path)
-    else
-      reason = if mr["state"] in ["closed", "merged"], do: mr["state"], else: "unassigned"
-      put_record(state, record |> Map.put("eligibility", reason) |> Map.put("phase", "ended"))
+    case lane_assignment(state.config, record["project"], record["iid"], mr) do
+      {:ok, true} ->
+        reconcile_assigned(state, record, mr, path)
+
+      {:ok, false} ->
+        reason = if mr["state"] in ["closed", "merged"], do: mr["state"], else: "unassigned"
+        put_record(state, record |> Map.put("eligibility", reason) |> Map.put("phase", "ended"))
+
+      {:error, reason} ->
+        put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
     end
   end
 
   defp reconcile_assigned(state, record, mr, path) do
-    with {:ok, discussions} <- GitLab.discussions(state.config, path),
-         {:ok, responses} <- Policy.response_digest(findings_for(state, record), discussions, record["author_id"]),
+    findings = findings_for(state, record)
+
+    with {:ok, discussions} <- native(state.config).discussions(state.config, path),
+         discussions = bind_replies(state.config, findings, discussions, record["author_id"]),
+         {:ok, responses} <- Policy.response_digest(findings, discussions, record["author_id"]),
          true <- publications_verified?(state, record) or {:error, :review_publication_unverified} do
       changed = changed_inputs?(state.config, record, mr, responses)
 
@@ -590,12 +627,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp issue(record) do
     active = record["phase"] in ["queued", "running"] or (record["phase"] == "completed" and not stopped?(record))
+    separator = if record["work"]["provider"] == "github", do: "#", else: "!"
 
     %Issue{
       id: "review:" <> record["id"],
       kind: :review,
       identifier: "review-#{String.slice(record["id"], 0, 16)}",
-      title: "Review #{record["project"]}!#{record["iid"]}",
+      title: "Review #{record["project"]}#{separator}#{record["iid"]}",
       description: Jason.encode!(Map.take(record, ["project", "iid", "head", "base", "round"])),
       state: if(active, do: hd(SymphonyElixir.Config.settings!().tracker.active_states), else: "closed"),
       native_ref: Map.put(record, "execution_kind", "review_lane"),
@@ -605,30 +643,29 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     }
   end
 
-  defp publish(state, id, %{"findings" => findings}) when is_list(findings) and length(findings) <= 50 do
+  defp publish(state, id, %{"findings" => _findings} = arguments) do
     record = state.records[record_key(id)]
 
-    if publishable?(record, findings) do
-      case Publication.prepare(record, findings, state.config["publisher_id"]) do
-        {:ok, record} ->
-          record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")
-          state = put_record(state, record)
-          finish_publication(state, record, :worker)
-
-        {:error, reason} ->
-          {:error, reason, state}
-      end
+    with true <- publishable?(record),
+         {:ok, submission} <- Finding.validate(arguments, record),
+         record = register(record, submission),
+         {:ok, record} <- Publication.prepare(record, submission, state.config["publisher_id"]) do
+      record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")
+      finish_publication(put_record(state, record), record, :worker)
     else
-      {:error, :invalid_review_submission, state}
+      {:error, reason} -> {:error, reason, state}
+      false -> {:error, :invalid_review_submission, state}
     end
   end
 
   defp publish(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
-  defp publishable?(record, findings), do: record["phase"] in ["running", "publishing", "completed"] and Enum.all?(findings, &valid_finding?/1)
+  defp publishable?(record), do: is_map(record) and record["phase"] in ["running", "publishing", "completed"]
 
-  defp valid_finding?(finding) do
-    is_binary(finding) and byte_size(finding) in 1..16_384 and
-      Regex.match?(~r/[\x{4e00}-\x{9fff}]/u, finding) and not String.contains?(finding, "<!-- symphony-review:") and GitLab.comment_body?(finding)
+  # Only the independent reviewer channel resolves a finding; the register is
+  # advanced before the publication intent is stored.
+  defp register(record, submission) do
+    register = Finding.advance(record["finding_register"], submission, record["round"])
+    record |> Map.put("finding_register", register) |> Map.put("verdict", Finding.verdict(register))
   end
 
   defp finish_publication(state, record, mode \\ :recovery) do
@@ -689,30 +726,78 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     valid_mr?(mr, record["project"], record["iid"], config) and
       mr["sha"] == record["head"] and not target_changed?(record, mr) and
       get_in(mr, ["diff_refs", "base_sha"]) == record["base"] and
-      policy_sha(config) == record["policy_sha"] and Policy.requested_reviewer?(mr, config["reviewer_id"])
+      policy_sha(config) == record["policy_sha"]
   end
 
   defp publication_scope(record, state) do
     config = state.config
-    path = GitLab.mr_path(record["project"], record["iid"])
+    module = native(config)
+    path = module.mr_path(record["project"], record["iid"])
 
     with true <- current_config?(state) || {:error, :review_lane_configuration_changed_restart_required},
-         {:ok, mr} <- GitLab.request(config, "GET", path),
+         {:ok, mr} <- read_mr(config, record["project"], record["iid"]),
          true <- same_review?(mr, record, config) || {:error, :mr_head_changed},
-         {:ok, user} <- GitLab.request(config, "GET", "user"),
-         true <- user["id"] == config["publisher_id"] || {:error, :gitlab_identity_mismatch},
-         {:ok, discussions} <- GitLab.discussions(config, path) do
-      same_responses(record, discussions)
+         :ok <- require_assignment(lane_assignment(config, record["project"], record["iid"], mr)),
+         {:ok, user} <- module.request(config, "GET", "user"),
+         true <- user["id"] == config["publisher_id"] || {:error, identity_mismatch(config)},
+         {:ok, discussions} <- module.discussions(config, path) do
+      same_responses(record, discussions, config)
     end
   end
 
-  defp same_responses(record, discussions) do
+  defp same_responses(record, discussions, config) do
     expected = record["response_sha"]
+    findings = record["response_findings"] ++ record["findings"]
+    discussions = bind_replies(config, findings, discussions, record["author_id"])
 
-    case Policy.response_digest(record["response_findings"] ++ record["findings"], discussions, record["author_id"]) do
+    case Policy.response_digest(findings, discussions, record["author_id"]) do
       {:ok, ^expected} -> :ok
       _ -> {:error, :review_responses_changed}
     end
+  end
+
+  defp native(%{"provider" => "github"}), do: GitHub
+  defp native(_config), do: GitLab
+
+  defp read_mr(%{"provider" => "github"} = config, project, iid), do: GitHub.read_pull(config, project, iid)
+
+  defp read_mr(config, project, iid),
+    do: native(config).request(config, "GET", native(config).mr_path(project, iid))
+
+  defp web_url_path(%{"provider" => "github"}, project, iid), do: "/#{project}/pull/#{iid}"
+  defp web_url_path(_config, project, iid), do: "/#{project}/-/merge_requests/#{iid}"
+
+  defp identity_mismatch(%{"provider" => "github"}), do: :github_identity_mismatch
+  defp identity_mismatch(_config), do: :gitlab_identity_mismatch
+  defp require_assignment({:ok, true}), do: :ok
+  defp require_assignment({:ok, false}), do: {:error, :review_assignment_withdrawn}
+  defp require_assignment({:error, _reason} = error), do: error
+
+  # GitHub stores review bodies and issue comments as separate native objects
+  # without a shared discussion ID. Bind author notes conservatively to every
+  # open finding in the reviewed round; Policy still filters by author and time.
+  defp bind_replies(%{"provider" => "github"}, findings, discussions, author_id),
+    do: merge_replies(findings, discussions, author_id)
+
+  defp bind_replies(_config, _findings, discussions, _author_id), do: discussions
+
+  defp merge_replies([], discussions, _author_id), do: discussions
+
+  defp merge_replies(findings, discussions, author_id) do
+    own = findings |> Enum.map(& &1["discussion_id"]) |> MapSet.new()
+
+    replies =
+      for discussion <- discussions,
+          not MapSet.member?(own, discussion["id"]),
+          note <- discussion["notes"] || [],
+          get_in(note, ["author", "id"]) == author_id,
+          do: note
+
+    Enum.map(discussions, fn discussion ->
+      if MapSet.member?(own, discussion["id"]),
+        do: Map.update(discussion, "notes", replies, &(&1 ++ replies)),
+        else: discussion
+    end)
   end
 
   defp record_key("review:" <> key), do: key

@@ -37,7 +37,7 @@ defmodule SymphonyElixir.TaskLifecycleTest do
         "budget_ms" => 10_000
       })
 
-    note = %{"id" => 1, "body" => "Approved plan", "author" => %{"id" => 1}, "created_at" => "2026-10-16T00:00:00Z"}
+    note = plan_decision(1, plan["revision"], "2026-10-16T00:00:00Z")
     authority = %{"work" => parent, "actor" => "1", "revision" => plan["revision"], "source" => TaskDecision.source_ref(note)}
 
     %{
@@ -79,6 +79,26 @@ defmodule SymphonyElixir.TaskLifecycleTest do
     changed = update_in(context.runtime["execution_history"], &Enum.map(&1, fn r -> put_in(r["execution_binding"]["plan_revision"], TaskWorkflow.digest("old")) end))
     assert {:error, :invalid_persisted_execution_binding} = TaskLifecycle.verified_artifacts(changed)
     assert {:error, :incomplete_verification_policy} = TaskLifecycle.verified_artifacts(%{context | policy: %{}})
+  end
+
+  test "a newly approved plan reuses verified evidence only for an unchanged member and fixed inputs" do
+    old = fixture() |> candidate() |> verified()
+    assert {:ok, revised} = TaskPlan.seal(%{old.plan.plan | "budget_ms" => 10_001})
+    note = plan_decision(2, revised["revision"], "2026-10-17T00:00:00Z")
+    authority = %{"work" => revised["parent"], "actor" => "1", "revision" => revised["revision"], "source" => TaskDecision.source_ref(note)}
+    plan = %{old.plan | plan: revised, authority: authority, parent: %{old.plan.parent | notes: old.plan.parent.notes ++ [note]}}
+    current = %{old | plan: plan}
+
+    assert {:ok, artifacts} = TaskLifecycle.verified_artifacts(current)
+    assert artifacts == old.evidence["candidate"]["artifacts"]
+
+    changed = put_in(current.plan.parent.notes, [note])
+    assert {:error, :dependency_not_verified} = TaskLifecycle.verified_artifacts(changed)
+  end
+
+  defp plan_decision(id, revision, at) do
+    body = "<!-- symphony-plan-decision " <> Jason.encode!(%{"action" => "authorize", "revision" => revision}) <> " -->"
+    %{"id" => id, "body" => body, "author" => %{"id" => 1}, "created_at" => at, "updated_at" => at}
   end
 
   defp candidate(context) do

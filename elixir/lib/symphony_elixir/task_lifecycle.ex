@@ -245,7 +245,8 @@ defmodule SymphonyElixir.TaskLifecycle do
   end
 
   defp dependency?(proof, edge, context) do
-    text?(proof["version"]) and source?(context, proof["verification"]) and source?(context, proof["retrieval"]) and
+    text?(proof["version"]) and Map.get(edge, "selects") in [nil, proof["version"]] and
+      source?(context, proof["verification"]) and source?(context, proof["retrieval"]) and
       is_list(proof["criteria"]) and Enum.all?(edge["criteria"], &(&1 in proof["criteria"])) and
       Map.get(@stages, proof["stage"], 0) >= @stages[edge["stage"]]
   end
@@ -307,7 +308,8 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   defp receipt_binding?(binding, role, candidate, flow, context) when is_map(binding) do
     binding["work"] == context.work and binding["role"] == role and binding["contract_sha"] == flow["contract_sha"] and
-      binding["authority"] == flow["authority"] and binding["plan_revision"] == flow["plan_revision"] and binding["inputs"] == flow["inputs"] and
+      TaskPlan.compatible_binding?(context.plan.plan, flow["authority"], binding, context.work, context.plan.parent.notes) and
+      binding["inputs"] == flow["inputs"] and
       (is_nil(candidate) or binding["candidate"] == candidate) and current_policy?(binding, role, context)
   end
 

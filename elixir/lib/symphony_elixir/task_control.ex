@@ -4,10 +4,196 @@ defmodule SymphonyElixir.TaskControl do
 
   Only unchanged decisions by the corresponding sealed authorizer are interpreted.
   Observed source receipts survive restart; absence never means implicit resume.
+
+  Short versions use published `symphony-candidate` notes containing `label`,
+  `revision`, `authorizer` and the complete candidate `data`. Manifest data lists
+  `acceptance_items` for rework. Publishers must keep labels unique within the
+  Issue. Consumers persist `parent_decisions/3` receipts and call `read_binding/2`
+  with a fresh native snapshot before acting. This module performs no remote writes.
   """
   alias SymphonyElixir.{TaskDecision, TaskWorkflow, WorkRef}
 
   @markers %{parent: "symphony-plan-decision", member: "symphony-task-decision", acceptance: "symphony-task-acceptance"}
+
+  @doc "Bind an unchanged native reply to one published short version; retained receipts make replay a no-op."
+  @spec bind_reply(map(), map(), String.t(), map()) :: {:ok, map() | nil} | {:clarify, map()}
+  def bind_reply(snapshot, note, actor, receipts \\ %{}) do
+    with :ok <- WorkRef.validate(snapshot.work),
+         true <- receipts?(receipts),
+         true <- reply_actor?(note, actor) or {:error, :actor_mismatch},
+         true <- unchanged?(note) or {:error, :unconfirmed_reply},
+         {:ok, action} <- human_action(note["body"]),
+         {:ok, candidate} <- reply_candidate(snapshot.notes, note, action, actor),
+         {:ok, event} <- bound_reply(snapshot.work, note, candidate, action),
+         true <- not Map.has_key?(receipts, event["id"]) or receipts[event["id"]] == event["source"] do
+      {:ok, if(Map.has_key?(receipts, event["id"]), do: nil, else: event)}
+    else
+      {:error, reason} -> {:clarify, clarification(snapshot, note, reason)}
+      _ -> {:clarify, clarification(snapshot, note, :source_changed)}
+    end
+  end
+
+  @doc "Return new parent decisions with stable native receipts, including answers and manifest decisions."
+  @spec parent_decisions(map(), String.t(), map()) :: {:ok, map()} | {:error, atom()}
+  def parent_decisions(snapshot, actor, previous \\ %{}) do
+    with {:ok, events} <- decisions(snapshot, actor, :parent),
+         true <- receipts?(previous) or {:error, :invalid_control_receipts},
+         receipts = Map.new(events, &{&1["id"], &1["source"]}),
+         true <-
+           Enum.all?(previous, fn {id, source} -> receipts[id] == source end) or
+             {:error, :control_source_unconfirmed} do
+      {:ok, %{decisions: Enum.reject(events, &Map.has_key?(previous, &1["id"])), receipts: receipts}}
+    end
+  end
+
+  @doc "Verify a binding against a newly read native snapshot before consuming its decision."
+  @spec read_binding(map(), map()) :: {:ok, map()} | {:clarify, map()}
+  def read_binding(snapshot, binding) do
+    note = Enum.find(snapshot.notes, &(WorkRef.key(snapshot.work) <> ":note:" <> to_string(&1["id"]) == binding["id"]))
+
+    with %{} <- note,
+         {:ok, events} <- decisions(snapshot, binding["actor"], :parent),
+         true <- binding in events do
+      {:ok, binding}
+    else
+      _ -> {:clarify, clarification(snapshot, note || %{}, :source_changed)}
+    end
+  end
+
+  defp reply_actor?(note, actor) do
+    native = get_in(note, ["author", "id"])
+    is_integer(native) and native > 0 and to_string(native) == actor
+  end
+
+  defp clarification(snapshot, note, reason) do
+    candidates = Enum.flat_map(snapshot.notes, &short_candidate/1)
+
+    %{
+      "target" => snapshot.work,
+      "evidence" => TaskDecision.source_ref(note),
+      "candidates" => Enum.map(candidates, &candidate_evidence/1),
+      "reason" => clarification_reason(reason),
+      "decision" => "请由授权人明确引用一个 P/M/Q 短版本；返工请列出未满足的验收项。",
+      "next" => "核实原生回复和候选材料后，仅推进该版本对应的动作。"
+    }
+  end
+
+  defp candidate_evidence(candidate) do
+    candidate
+    |> Map.take(~w(label revision authorizer))
+    |> Map.put("source", TaskDecision.source_ref(candidate["note"]))
+    |> Map.put("digest", TaskWorkflow.digest(Map.delete(candidate, "note")))
+  end
+
+  defp clarification_reason(:ambiguous_candidate), do: "候选版本不唯一或回复未指明待回答的问题。"
+  defp clarification_reason(:actor_mismatch), do: "原生回复的主体与授权人不匹配。"
+  defp clarification_reason(:missing_acceptance_items), do: "返工必须明确列出候选材料中的未满足验收项。"
+  defp clarification_reason(_), do: "无法核实原生来源、明确意图或候选与决定的事件顺序。"
+
+  defp unchanged?(note) do
+    is_integer(note["id"]) and note["id"] > 0 and is_binary(note["body"]) and
+      is_integer(TaskDecision.timestamp(note["created_at"])) and note["created_at"] == note["updated_at"] and
+      note["system"] != true
+  end
+
+  defp human_action(body) when is_binary(body) do
+    actions = [
+      {"authorize", ~r/^(?:按\s*P\d+\s*执行|批准(?:执行)?(?:\s*P\d+)?|approve(?:\s+P\d+)?)[。.!]?$/iu},
+      {"pause", ~r/^(?:P\d+\s*)?(?:暂停(?:这个计划|计划|执行)?|pause)(?:\s*P\d+)?[。.!]?$/iu},
+      {"resume", ~r/^(?:P\d+\s*)?(?:恢复(?:执行)?|resume)(?:\s*P\d+)?[。.!]?$/iu},
+      {"cancel", ~r/^(?:P\d+\s*)?(?:取消(?:这个计划|计划|执行)?|cancel)(?:\s*P\d+)?[。.!]?$/iu},
+      {"accept", ~r/^(?:M\d+\s*(?:验收)?通过|accept\s+M\d+)[。.!]?$/iu},
+      {"rework", ~r/^(?:M\d+\s*)?(?:验收项\s*)?(?:C\d+(?:[、,，\s]+C\d+)*\s*未满足[，,；;：:\s]*)?(?:请)?(?:修复|返工|rework)[。.!]?$/iu}
+    ]
+
+    case Enum.find(actions, fn {_, pattern} -> Regex.match?(pattern, body) end) do
+      {action, _} -> explicit_intent(action, body)
+      nil -> explicit_intent("answer", body)
+    end
+  end
+
+  defp explicit_intent(action, body) do
+    answer = body |> String.replace(~r/\bQ[1-9][0-9]*\b/u, "") |> String.trim("：") |> String.trim()
+    negative = action != "answer" and Regex.match?(~r/不|否|未通过|勿|别|\bnot\b|don't/iu, body)
+    question = Regex.match?(~r/是否|吗|[?？]/u, body)
+
+    if negative or question or (action == "answer" and answer == ""),
+      do: {:error, :unclear_intent},
+      else: {:ok, action}
+  end
+
+  defp reply_candidate(notes, reply, action, actor) do
+    prefix = if action in ~w(accept rework), do: "M", else: if(action == "answer", do: "Q", else: "P")
+    labels = Regex.scan(~r/\b[PMQ][1-9][0-9]*\b/u, reply["body"]) |> List.flatten() |> Enum.uniq()
+    candidates = notes |> Enum.flat_map(&short_candidate/1) |> Enum.filter(&String.starts_with?(&1["label"], prefix))
+    selected = if labels == [], do: candidates, else: Enum.filter(candidates, &(&1["label"] in labels))
+
+    case selected do
+      [candidate] -> confirm_candidate(candidate, reply, actor, labels)
+      _ -> {:error, :ambiguous_candidate}
+    end
+  end
+
+  defp short_candidate(note) do
+    case Regex.run(~r/<!-- symphony-candidate\s+(\{.*?\})\s*-->\s*$/s, note["body"] || "") do
+      [_, json] -> decode_short_candidate(note, Jason.decode(json))
+      _ -> []
+    end
+  end
+
+  defp decode_short_candidate(note, {:ok, %{"label" => label} = payload}) do
+    revision = payload["revision"]
+    actor = payload["authorizer"]
+
+    if is_binary(label) and Regex.match?(~r/^[PMQ][1-9][0-9]*$/, label) and
+         text?(revision) and text?(actor) and is_map(payload["data"]),
+       do: [Map.put(payload, "note", note)],
+       else: []
+  end
+
+  defp decode_short_candidate(_, _), do: []
+
+  defp confirm_candidate(candidate, reply, actor, labels) do
+    if unchanged?(candidate["note"]) and candidate["authorizer"] == actor and length(labels) <= 1 and
+         TaskDecision.timestamp(candidate["note"]["created_at"]) < TaskDecision.timestamp(reply["created_at"]),
+       do: {:ok, candidate},
+       else: {:error, :unconfirmed_candidate}
+  end
+
+  defp bound_reply(work, note, candidate, action) do
+    items = Regex.scan(~r/\bC[1-9][0-9]*\b/u, note["body"]) |> List.flatten() |> Enum.uniq()
+    allowed = get_in(candidate, ["data", "acceptance_items"]) || []
+
+    if action == "rework" and (items == [] or not is_list(allowed) or not Enum.all?(items, &(&1 in allowed))) do
+      {:error, :missing_acceptance_items}
+    else
+      binding = %{
+        "candidate_source" => TaskDecision.source_ref(candidate["note"]),
+        "candidate_digest" => TaskWorkflow.digest(Map.delete(candidate, "note")),
+        "revision" => candidate["revision"],
+        "label" => candidate["label"],
+        "actor" => candidate["authorizer"],
+        "action" => action,
+        "items" => items
+      }
+
+      reply_event(work, note, binding)
+    end
+  end
+
+  defp reply_event(work, note, binding) do
+    note_source = TaskDecision.source_ref(note)
+    source = "control:" <> TaskWorkflow.digest(%{"work" => work, "source" => note_source, "binding" => binding})
+
+    {:ok,
+     Map.merge(binding, %{
+       "id" => WorkRef.key(work) <> ":note:" <> to_string(note["id"]),
+       "source" => source,
+       "note_source" => note_source,
+       "at" => TaskDecision.timestamp(note["created_at"]),
+       "work" => work
+     })}
+  end
 
   @doc "Resolve the latest explicit parent approval without treating a pause or resume as a new grant."
   @spec authority(map(), map()) :: {:ok, map()} | {:error, atom()}
@@ -16,7 +202,16 @@ defmodule SymphonyElixir.TaskControl do
          {:ok, events} <- decisions(root, plan["authorizer"], :parent),
          {:ok, event} <- latest_authorization(events),
          true <- event["revision"] == plan["revision"] or {:error, :plan_decision_revision_mismatch} do
-      {:ok, %{"work" => root.work, "source" => event["note_source"], "actor" => plan["authorizer"], "revision" => plan["revision"]}}
+      proof = Map.take(event, ~w(candidate_source candidate_digest label))
+
+      grant = %{
+        "work" => root.work,
+        "source" => event["note_source"],
+        "actor" => plan["authorizer"],
+        "revision" => plan["revision"]
+      }
+
+      {:ok, Map.merge(proof, grant)}
     end
   end
 
@@ -91,7 +286,7 @@ defmodule SymphonyElixir.TaskControl do
   defp applicable(preflight, work) do
     with {:ok, root} <- decisions(preflight.parent, preflight.plan["authorizer"], :parent),
          {:ok, member} <- member_decisions(preflight, work) do
-      {:ok, Enum.reject(root, &(&1["action"] == "authorize")) ++ member}
+      {:ok, Enum.filter(root, &(&1["action"] in ~w(pause cancel resume))) ++ member}
     end
   end
 
@@ -116,17 +311,65 @@ defmodule SymphonyElixir.TaskControl do
 
   defp decisions(snapshot, actor, scope) do
     marker = Map.fetch!(@markers, scope)
+    questions = Enum.any?(Enum.flat_map(snapshot.notes, &short_candidate/1), &String.starts_with?(&1["label"], "Q"))
 
     snapshot.notes
-    |> Enum.filter(&(&1["system"] != true and String.contains?(&1["body"], "<!-- " <> marker)))
+    |> Enum.filter(&control_note?(&1, scope, marker, questions))
     |> Enum.reduce_while({:ok, []}, fn note, {:ok, acc} ->
-      case decision(note, snapshot.work, actor, scope, marker) do
+      case native_decision(snapshot, note, actor, scope, marker) do
         {:ok, event} -> {:cont, {:ok, [event | acc]}}
         :foreign -> {:cont, {:ok, acc}}
         error -> {:halt, error}
       end
     end)
     |> unique()
+    |> bind_resumes()
+  end
+
+  defp control_note?(note, scope, marker, questions) do
+    body = note["body"] || ""
+
+    note["system"] != true and
+      (String.contains?(body, "<!-- " <> marker) or
+         (scope == :parent and not String.contains?(body, "<!--") and
+            (questions or Regex.match?(~r/\b[PMQ][1-9][0-9]*\b/u, body) or human_action(body) != {:ok, "answer"})))
+  end
+
+  defp native_decision(snapshot, note, actor, scope, marker) do
+    cond do
+      String.contains?(note["body"] || "", "<!-- " <> marker) -> decision(note, snapshot.work, actor, scope, marker)
+      to_string(get_in(note, ["author", "id"])) != actor -> :foreign
+      true -> native_reply(snapshot, note, actor)
+    end
+  end
+
+  defp native_reply(snapshot, note, actor) do
+    case bind_reply(snapshot, note, actor) do
+      {:ok, event} -> {:ok, event}
+      {:clarify, _} -> {:error, :needs_clarification}
+    end
+  end
+
+  defp bind_resumes({:ok, events}) do
+    {:ok, Enum.map(events, &resume_binding(&1, events))}
+  end
+
+  defp bind_resumes(error), do: error
+
+  defp resume_binding(%{"action" => "resume"} = event, events) do
+    pauses = Enum.filter(events, &resume_target?(&1, event))
+
+    case {event["restriction"], pauses} do
+      {nil, [pause]} -> Map.put(event, "restriction", pause["source"])
+      _ -> event
+    end
+  end
+
+  defp resume_binding(event, _), do: event
+
+  defp resume_target?(prior, event) do
+    prior["action"] == "pause" and prior["revision"] == event["revision"] and
+      prior["work"] == event["work"] and prior["at"] < event["at"]
   end
 
   defp decision(note, work, actor, scope, marker) do
@@ -171,6 +414,9 @@ defmodule SymphonyElixir.TaskControl do
   defp payload?(_, _), do: false
 
   defp unique({:ok, events}) do
+    {human, exact} = Enum.split_with(events, &is_binary(&1["candidate_source"]))
+    events = Enum.uniq(human) ++ exact
+
     if length(Enum.uniq_by(events, & &1["id"])) == length(events),
       do: {:ok, events},
       else: {:error, :duplicate_control_source}

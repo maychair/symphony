@@ -414,6 +414,60 @@ defmodule SymphonyElixir.TaskPublicationTest do
     assert again.flow["inputs"] == [input]
   end
 
+  test "an explicit edge selection resolves only the approved upstream version and refuses any newer one" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+
+    pinned = repin(f, 3, f.git.revision)
+    assert {:ok, facts} = dependencies(pinned, 3, nil, [pinned])
+    [proof] = facts.dependencies
+    assert proof["version"] == f.git.revision
+    assert {:ok, ^facts} = dependencies(pinned, 3, inputs(facts), [pinned])
+
+    repinned = repin(f, 3, String.duplicate("b", 40))
+    assert {:error, :dependency_selection_unconfirmed} = dependencies(repinned, 3, nil, [repinned])
+    assert {:error, :dependency_selection_unconfirmed} = dependencies(repinned, 3, inputs(facts), [repinned])
+
+    # An explicitly unpinned edge still consumes the current verified upstream,
+    # so the refusal above comes from the declared selection, not from refusing
+    # every explicit selection. A consumer that already recorded b1 keeps it
+    # rather than being silently re-pointed (§9.2).
+    unpinned = repin(f, 3, nil)
+    assert {:ok, ^facts} = dependencies(unpinned, 3, inputs(facts), [unpinned])
+    assert {:ok, current} = dependencies(unpinned, 3, nil, [unpinned])
+    assert hd(current.dependencies)["version"] == f.git.revision
+  end
+
+  test "a re-authorized selection change invalidates only the repinned consumer grant" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    {:ok, original} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    consumer = %{f.payload["work"] | "number" => 3}
+    assert {:ok, facts} = dependencies(f, 3, nil, [f])
+
+    producer = binding_for(original, f.payload["work"], [])
+    claimed = binding_for(original, consumer, inputs(facts))
+    assert TaskPlan.compatible_binding?(original.plan, original.authority, claimed, consumer, original.parent.notes)
+
+    changed = repin(f, 3, String.duplicate("c", 40))
+    {:ok, repinned} = TaskPlanPreflight.inspect_plan(changed.parent, changed.opts)
+    assert repinned.plan["schema_version"] == 2
+
+    assert TaskPlan.compatible_binding?(repinned.plan, repinned.authority, producer, f.payload["work"], repinned.parent.notes)
+    refute TaskPlan.compatible_binding?(repinned.plan, repinned.authority, claimed, consumer, repinned.parent.notes)
+  end
+
+  test "a selection change only takes effect under a fresh authorization" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    {:ok, original} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+
+    repinned = author_plan(f, 3, f.git.revision)
+    refute repinned["revision"] == original.plan["revision"]
+    assert {:error, :plan_decision_revision_mismatch} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+
+    assert authorize_plan(f, repinned["revision"]) == f
+    assert {:ok, authorized} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    assert authorized.plan["revision"] == repinned["revision"]
+  end
+
   test "native unavailability at the final fence or after lock acquisition never starts an executor" do
     f = report_fixture("github", []) |> fresh_execution()
     registry = executions([f])
@@ -1011,6 +1065,65 @@ defmodule SymphonyElixir.TaskPublicationTest do
         opts: Keyword.put(f.opts, :dependency_executions, executions(producers)),
         child: String.replace(f.child, "/issues/2", "/issues/#{number}"),
         notes: String.replace(f.notes, "/issues/2", "/issues/#{number}")
+    }
+  end
+
+  # Re-author the parent plan with an explicit per-edge upstream selection. The
+  # changed selection participates in the revision, so it needs a later
+  # authorization while the earlier approval keeps untouched grants
+  # native-verifiable (§12 scenario 5).
+  defp author_plan(f, number, version) do
+    {:ok, preflight} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    parent_path = parent_path(f)
+    issue = Agent.get(f.state, &Map.fetch!(&1.objects, parent_path))
+
+    draft =
+      preflight.plan
+      |> Map.drop(["schema_version", "revision"])
+      |> Map.update!("dependencies", fn edges -> Enum.map(edges, &selected_edge(&1, number, version)) end)
+
+    {:ok, repinned} = TaskPlan.seal(draft)
+    body = Regex.replace(~r/<!--\s*symphony-plan\s+\{.*?\}\s*-->/s, issue["body"], fn _ -> plan_block(repinned) end)
+    Agent.update(f.state, &put_in(&1.objects[parent_path]["body"], body))
+    repinned
+  end
+
+  defp repin(f, number, version) do
+    authorize_plan(f, author_plan(f, number, version)["revision"])
+  end
+
+  defp authorize_plan(f, revision) do
+    Agent.update(f.state, fn state ->
+      notes = state.objects[f.parent_notes] ++ [reauthorization(revision)]
+      %{state | objects: Map.put(state.objects, f.parent_notes, notes)}
+    end)
+
+    f
+  end
+
+  defp parent_path(f), do: String.replace_suffix(f.child, "/issues/2", "") <> "/issues/1"
+
+  defp selected_edge(%{"to" => %{"number" => to}} = edge, number, version) when to == number,
+    do: Map.put(edge, "selects", version)
+
+  defp selected_edge(edge, _number, _version), do: edge
+
+  defp plan_block(plan), do: "<!-- symphony-plan " <> Jason.encode!(plan) <> " -->"
+
+  defp reauthorization(revision) do
+    body = "<!-- symphony-plan-decision " <> Jason.encode!(%{"action" => "authorize", "revision" => revision}) <> " -->"
+    id = 900 + System.unique_integer([:positive, :monotonic])
+    at = DateTime.add(~U[2026-10-17T00:00:00Z], id, :second) |> DateTime.to_iso8601()
+    note(id, 1, body) |> Map.merge(%{"created_at" => at, "updated_at" => at})
+  end
+
+  defp binding_for(preflight, work, inputs) do
+    %{
+      "work" => work,
+      "contract_sha" => preflight.members[WorkRef.key(work)].contract["contract_sha"],
+      "authority" => preflight.authority,
+      "plan_revision" => preflight.plan["revision"],
+      "inputs" => inputs
     }
   end
 

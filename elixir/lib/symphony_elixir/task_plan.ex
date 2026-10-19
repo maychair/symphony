@@ -5,15 +5,31 @@ defmodule SymphonyElixir.TaskPlan do
   The plan is native Issue content, not a task database. This module validates
   its complete shape before any member may be admitted and computes the affected
   subgraph. It neither schedules executions nor grants merge/creation authority.
+
+  Plans are versioned. Schema v1 edges are version-agnostic: the edge names the
+  required upstream artifact and stage, and the consumer records the exact
+  version it consumed, so a later upstream candidate restricts the member
+  instead of silently re-pointing an existing conclusion.
+
+  Schema v2 requires every edge to declare a `selects` slot. A version string
+  pins that exact upstream version: `TaskDependencies` resolves only that
+  version, and `compatible?/4` refuses to reuse input evidence recorded against
+  any other version. A `null` selection states that the edge is intentionally
+  unpinned because its upstream artifact does not exist when the plan is
+  authored. An absent slot in a v2 edge is rejected, never downgraded to v1.
   """
 
-  alias SymphonyElixir.{TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{TaskDecision, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @fields ~w(schema_version parent contract_sha authorizer criteria members dependencies integration budget_ms revision)
   @member_fields ~w(work contract_sha criteria budget_ms human_gate)
   @edge_fields ~w(from to artifact stage criteria)
+  @selection "selects"
+  @edge_fields_v2 @edge_fields ++ [@selection]
+  @schemas [1, 2]
   @marker ~r/<!--\s*symphony-plan(?=\s|-->|$)/
+  @decision ~r/(?:^|\n)<!--\s*symphony-plan-decision\s+(\{.*?\})\s*-->\s*$/s
 
   @doc "Project a parent Issue as coordination work; malformed plans never fall through to execution."
   @spec project(Issue.t()) :: Issue.t()
@@ -68,7 +84,13 @@ defmodule SymphonyElixir.TaskPlan do
   @doc "Seal a complete draft. Every member and edge participates in the revision."
   @spec seal(map()) :: {:ok, map()} | {:error, atom()}
   def seal(draft) when is_map(draft) do
-    plan = draft |> Map.delete("revision") |> Map.put_new("schema_version", 1) |> Map.put_new("budget_ms", nil)
+    plan =
+      draft
+      |> Map.delete("revision")
+      |> Map.put_new("budget_ms", nil)
+      |> default_schema()
+      |> normalize_edges()
+
     plan = Map.put(plan, "revision", TaskWorkflow.digest(plan))
     with :ok <- validate(plan), do: {:ok, plan}
   end
@@ -77,7 +99,7 @@ defmodule SymphonyElixir.TaskPlan do
   @spec validate(term()) :: :ok | {:error, atom()}
   def validate(plan) when is_map(plan) do
     cond do
-      Enum.sort(Map.keys(plan)) != Enum.sort(@fields) or plan["schema_version"] != 1 ->
+      Enum.sort(Map.keys(plan)) != Enum.sort(@fields) or plan["schema_version"] not in @schemas ->
         {:error, :invalid_plan_schema}
 
       plan["revision"] != TaskWorkflow.digest(Map.delete(plan, "revision")) ->
@@ -129,6 +151,130 @@ defmodule SymphonyElixir.TaskPlan do
     end
   end
 
+  @doc """
+  Whether a result produced under `revision` still applies to this approved plan.
+
+  An unaffected member keeps its evidence across a newly approved revision; a
+  member whose declared input set changed must be redone before its conclusions
+  are reused (§9.1.7, §12 scenario 5).
+  """
+  @spec compatible?(map(), WorkRef.t(), term(), term()) :: boolean()
+  def compatible?(plan, work, revision, inputs) do
+    revision == plan["revision"] or selections_match?(declared_inputs(plan, work), input_pairs(inputs))
+  end
+
+  @doc "Reuse a prior member result only when its old grant remains native-verifiable and the member scope still matches."
+  @spec compatible_binding?(map(), map(), map(), WorkRef.t(), [map()]) :: boolean()
+  def compatible_binding?(plan, authority, binding, work, notes) do
+    prior = binding["authority"]
+    member = Enum.find(plan["members"], &(&1["work"] == work))
+
+    is_map(prior) and is_map(member) and binding["work"] == work and
+      binding["contract_sha"] == member["contract_sha"] and
+      compatible_authority?(plan, authority, binding, prior, work, notes)
+  end
+
+  defp compatible_authority?(plan, authority, binding, prior, work, notes) do
+    exact = prior == authority and binding["plan_revision"] == plan["revision"]
+
+    historical =
+      binding["plan_revision"] != plan["revision"] and prior["work"] == authority["work"] and
+        prior["actor"] == authority["actor"] and prior["revision"] == binding["plan_revision"] and
+        native_grant?(prior, notes) and compatible?(plan, work, binding["plan_revision"], binding["inputs"])
+
+    exact or historical
+  end
+
+  defp native_grant?(grant, notes) do
+    Enum.any?(notes, fn note ->
+      is_binary(grant["revision"]) and note["system"] != true and
+        is_integer(get_in(note, ["author", "id"])) and get_in(note, ["author", "id"]) > 0 and
+        TaskDecision.source_ref(note) == grant["source"] and
+        to_string(get_in(note, ["author", "id"])) == grant["actor"] and
+        authorization?(note, grant["revision"])
+    end)
+  end
+
+  # A historical grant must be a genuine sealed-plan authorization for the exact
+  # revision it claims, not merely a note that shares the recorded source and
+  # actor. Mirror TaskControl's strict marker parse so a forged or unrelated note
+  # cannot resurrect a stale binding.
+  defp authorization?(note, revision) do
+    with {:ok, payload} <- decision_payload(note),
+         %{"action" => "authorize", "revision" => ^revision} <- payload,
+         true <- Enum.sort(Map.keys(payload)) == ~w(action revision) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp decision_payload(note) do
+    with true <- is_binary(note["body"]),
+         true <- is_integer(note["id"]) and note["id"] > 0,
+         at when is_integer(at) <- TaskDecision.timestamp(note["created_at"]),
+         true <- at == TaskDecision.timestamp(note["updated_at"]),
+         [[_, json]] <- Regex.scan(@decision, note["body"]),
+         {:ok, payload} <- Jason.decode(json) do
+      {:ok, payload}
+    else
+      _ -> :error
+    end
+  end
+
+  defp declared_inputs(plan, work) do
+    plan["dependencies"]
+    |> Enum.filter(&(&1["to"] == work))
+    |> Enum.map(&{WorkRef.key(&1["from"]), &1["artifact"], Map.get(&1, @selection)})
+    |> Enum.sort()
+  end
+
+  defp input_pairs(inputs) when is_list(inputs) do
+    pairs =
+      Enum.map(inputs, fn
+        %{"work" => work, "artifact" => artifact} = input when is_map(work) ->
+          {WorkRef.key(work), artifact, Map.get(input, "version")}
+
+        _ ->
+          :invalid
+      end)
+
+    if :invalid in pairs, do: :invalid, else: Enum.sort(pairs)
+  end
+
+  defp input_pairs(_), do: :invalid
+
+  defp selections_match?(declared, recorded) when is_list(recorded) and length(declared) == length(recorded) do
+    index = Map.new(recorded, fn {key, artifact, version} -> {{key, artifact}, version} end)
+
+    Enum.all?(declared, fn {key, artifact, selection} ->
+      case Map.fetch(index, {key, artifact}) do
+        {:ok, version} -> is_nil(selection) or selection == version
+        :error -> false
+      end
+    end)
+  end
+
+  defp selections_match?(_, _), do: false
+
+  defp default_schema(%{"schema_version" => _} = plan), do: plan
+
+  defp default_schema(plan),
+    do: Map.put(plan, "schema_version", if(selection_declared?(plan), do: 2, else: 1))
+
+  defp selection_declared?(%{"dependencies" => edges}) when is_list(edges),
+    do: Enum.any?(edges, &(is_map(&1) and Map.has_key?(&1, @selection)))
+
+  defp selection_declared?(_), do: false
+
+  defp normalize_edges(%{"schema_version" => 2, "dependencies" => edges} = plan) when is_list(edges),
+    do: Map.put(plan, "dependencies", Enum.map(edges, &declared_edge/1))
+
+  defp normalize_edges(plan), do: plan
+
+  defp declared_edge(%{} = edge), do: Map.put_new(edge, @selection, nil)
+  defp declared_edge(edge), do: edge
+
   defp members?(%{"members" => members, "criteria" => criteria, "parent" => parent})
        when is_list(members) and members != [] do
     Enum.all?(members, &valid_member?(&1, criteria, parent)) and
@@ -157,18 +303,29 @@ defmodule SymphonyElixir.TaskPlan do
       positive?(member["budget_ms"]) and is_boolean(member["human_gate"])
   end
 
-  defp dependencies?(%{"dependencies" => edges, "members" => members}) when is_list(edges) do
+  defp dependencies?(%{"dependencies" => edges, "members" => members} = plan) when is_list(edges) do
     works = Enum.map(members, & &1["work"])
+    fields = edge_fields(plan)
 
-    Enum.all?(edges, fn edge ->
-      is_map(edge) and Enum.sort(Map.keys(edge)) == Enum.sort(@edge_fields) and
-        edge["from"] in works and edge["to"] in works and edge["from"] != edge["to"] and
-        nonempty?(edge["artifact"]) and edge["stage"] in ["verified", "delivered", "published"] and
-        names?(edge["criteria"])
-    end) and distinct?(edges, &{&1["from"], &1["to"], &1["artifact"]})
+    Enum.all?(edges, &valid_edge?(&1, works, fields)) and
+      distinct?(edges, &{&1["from"], &1["to"], &1["artifact"]})
   end
 
   defp dependencies?(_), do: false
+
+  defp valid_edge?(edge, works, fields) do
+    is_map(edge) and Enum.sort(Map.keys(edge)) == Enum.sort(fields) and
+      edge["from"] in works and edge["to"] in works and edge["from"] != edge["to"] and
+      nonempty?(edge["artifact"]) and edge["stage"] in ["verified", "delivered", "published"] and
+      names?(edge["criteria"]) and selection?(edge)
+  end
+
+  defp edge_fields(%{"schema_version" => 2}), do: @edge_fields_v2
+  defp edge_fields(_), do: @edge_fields
+
+  defp selection?(%{@selection => nil}), do: true
+  defp selection?(%{@selection => version}), do: nonempty?(version)
+  defp selection?(edge), do: not Map.has_key?(edge, @selection)
 
   defp budget?(plan) do
     is_nil(plan["budget_ms"]) or

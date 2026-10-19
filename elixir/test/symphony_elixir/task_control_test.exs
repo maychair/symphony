@@ -289,4 +289,154 @@ defmodule SymphonyElixir.TaskControlTest do
       "body" => "Acceptance\n<!-- symphony-task-acceptance " <> Jason.encode!(payload) <> " -->"
     }
   end
+
+  defp short_note(fixture, label, id) do
+    payload = %{
+      "label" => label,
+      "revision" => fixture.plan["revision"],
+      "authorizer" => "1",
+      "data" => %{"acceptance_items" => ["C2"]}
+    }
+
+    body = "候选 #{label}\n" <> SymphonyElixir.TaskDecision.candidate_block(payload)
+    %{note(fixture, :parent, "authorize", id) | "body" => body}
+  end
+
+  defp reply(fixture, body, id), do: %{note(fixture, :parent, "authorize", id) | "body" => body}
+
+  test "readable approval binds native candidate evidence and survives receipt replay" do
+    f = fixture()
+    candidate = short_note(f, "P1", 1)
+    human = reply(f, "按 P1 执行", 2)
+    root = %{f.parent | notes: [candidate, human]}
+    assert {:ok, event} = TaskControl.bind_reply(root, human, "1")
+    assert event["revision"] == f.plan["revision"]
+    assert event["work"] == root.work
+    assert event["candidate_source"] == SymphonyElixir.TaskDecision.source_ref(candidate)
+    assert is_binary(event["candidate_digest"])
+    assert {:ok, nil} = TaskControl.bind_reply(root, human, "1", %{event["id"] => event["source"]})
+    assert {:clarify, _} = TaskControl.bind_reply(root, human, "1", %{event["id"] => "changed"})
+    assert {:ok, authority} = TaskControl.authority(root, f.plan)
+    assert authority["candidate_source"] == event["candidate_source"]
+    assert {:ok, %{restrictions: []}} = observe(%{f | parent: root})
+    assert {:ok, ^event} = TaskControl.read_binding(root, event)
+    assert {:clarify, _} = TaskControl.read_binding(%{root | notes: [candidate]}, event)
+    edited = %{human | "body" => "批准 P1"}
+    assert {:clarify, _} = TaskControl.read_binding(%{root | notes: [candidate, edited]}, event)
+    duplicate = %{root | notes: [candidate, human, human]}
+    assert {:ok, %{decisions: [^event], receipts: receipts}} = TaskControl.parent_decisions(duplicate, "1")
+    assert {:ok, %{decisions: []}} = TaskControl.parent_decisions(duplicate, "1", receipts)
+    assert {:error, :invalid_control_receipts} = TaskControl.parent_decisions(root, "1", [])
+    assert {:error, :control_source_unconfirmed} = TaskControl.parent_decisions(root, "1", %{event["id"] => "old"})
+  end
+
+  test "replacement material never inherits an earlier reply and ambiguity asks a concrete decision" do
+    f = fixture()
+    human = reply(f, "按 P1 执行", 2)
+    first = short_note(f, "P1", 1)
+    second = short_note(f, "P1", 3)
+
+    tied = %{first | "created_at" => human["created_at"], "updated_at" => human["created_at"]}
+
+    for notes <- [[second], [first, second], [%{first | "updated_at" => second["created_at"]}], [tied]] do
+      root = %{f.parent | notes: notes ++ [human]}
+      assert {:clarify, block} = TaskControl.bind_reply(root, human, "1")
+      assert block["target"] == root.work
+      assert Enum.all?(~w(evidence reason decision next), &is_binary(block[&1]))
+      assert {:error, :needs_clarification} = TaskControl.authority(root, f.plan)
+    end
+  end
+
+  test "answers require one question and never grant execution" do
+    f = fixture()
+    first = short_note(f, "Q1", 1)
+    second = short_note(f, "Q2", 2)
+    root = %{f.parent | notes: [first, second]}
+    human = reply(f, "采用方案 B", 3)
+    assert {:clarify, _} = TaskControl.bind_reply(root, human, "1")
+    assert {:error, :needs_clarification} = TaskControl.parent_decisions(%{root | notes: root.notes ++ [human]}, "1")
+    explicit = reply(f, "Q2：采用方案 B", 3)
+    assert {:ok, %{"action" => "answer", "label" => "Q2"}} = TaskControl.bind_reply(root, explicit, "1")
+    assert {:ok, %{"action" => "answer"}} = TaskControl.bind_reply(%{root | notes: [second]}, human, "1")
+    answered = %{root | notes: [first, second, explicit]}
+    assert {:error, :missing_plan_authorization} = TaskControl.authority(answered, f.plan)
+    assert {:clarify, _} = TaskControl.bind_reply(root, reply(f, "Q1 Q2 采用方案 B", 3), "1")
+    assert {:clarify, _} = TaskControl.bind_reply(root, reply(f, "Q2", 3), "1")
+    assert {:clarify, _} = TaskControl.bind_reply(root, reply(f, "Q2 是否采用方案 B？", 3), "1")
+    missing = %{human | "body" => nil}
+    assert {:error, :needs_clarification} = TaskControl.parent_decisions(%{root | notes: root.notes ++ [missing]}, "1")
+  end
+
+  test "a new manifest cannot receive an old acceptance even after a restart" do
+    f = fixture()
+    first = short_note(f, "M1", 1)
+    human = reply(f, "M1 验收通过", 2)
+    root = %{f.parent | notes: [first, human]}
+    assert {:ok, %{decisions: [event], receipts: receipts}} = TaskControl.parent_decisions(root, "1")
+    second = short_note(f, "M2", 3)
+    changed = %{root | notes: [second, human]}
+    assert {:clarify, _} = TaskControl.read_binding(changed, event)
+    assert {:error, :needs_clarification} = TaskControl.parent_decisions(changed, "1", receipts)
+    assert {:ok, %{decisions: []}} = TaskControl.parent_decisions(root, "1", receipts)
+  end
+
+  test "acceptance and rework carry manifest and enumerated unmet criteria without becoming controls" do
+    f = fixture()
+    root = %{f.parent | notes: [short_note(f, "M2", 1)]}
+    accepted = reply(f, "M2 验收通过", 2)
+    assert {:ok, %{"action" => "accept", "label" => "M2"}} = TaskControl.bind_reply(root, accepted, "1")
+    repair = reply(f, "M2 验收项 C2 未满足，请修复", 3)
+    assert {:ok, %{"action" => "rework", "items" => ["C2"]}} = TaskControl.bind_reply(root, repair, "1")
+    assert {:ok, %{restrictions: []}} = observe(%{f | parent: %{root | notes: root.notes ++ [accepted, repair]}})
+    assert {:clarify, _} = TaskControl.bind_reply(root, reply(f, "M2 请修复", 3), "1")
+    unknown = reply(f, "M2 验收项 C3 未满足，请修复", 3)
+    assert {:clarify, _} = TaskControl.bind_reply(root, unknown, "1")
+    mixed = reply(f, "M2 验收项 C2 未满足，请修复并验收通过", 3)
+    assert {:clarify, _} = TaskControl.bind_reply(root, mixed, "1")
+  end
+
+  test "readable controls preserve separate pause identities and require a unique resume target" do
+    f = fixture()
+    candidate = short_note(f, "P1", 1)
+    pause = reply(f, "暂停这个计划", 2)
+    resume = reply(f, "恢复执行", 3)
+    f = parent_notes(f, [candidate, pause, resume])
+    assert {:ok, %{restrictions: [], releases: [_]}} = observe(f)
+    assert {:error, :unresolved_control_release} = observe(parent_notes(f, [candidate, resume]))
+
+    assert {:error, :unresolved_control_release} =
+             observe(parent_notes(f, [candidate, pause, reply(f, "暂停", 3), reply(f, "恢复执行", 4)]))
+
+    cancelled = parent_notes(f, [candidate, reply(f, "取消", 4)])
+    assert {:ok, %{restrictions: [%{"kind" => "cancel"}]}} = observe(cancelled)
+  end
+
+  test "invalid actor, edited reply, missing or malformed material and mixed intents fail closed" do
+    f = fixture()
+    candidate = short_note(f, "P1", 1)
+    human = reply(f, "按 P1 执行", 2)
+    root = %{f.parent | notes: [candidate]}
+
+    for invalid <- [
+          put_in(human, ["author", "id"], 9),
+          %{human | "id" => 0},
+          %{human | "updated_at" => candidate["created_at"]},
+          Map.put(human, "system", true),
+          %{human | "body" => nil},
+          %{human | "body" => "P1 批准并取消"}
+        ] do
+      assert {:clarify, _} = TaskControl.bind_reply(root, invalid, "1")
+    end
+
+    assert {:clarify, _} = TaskControl.bind_reply(%{root | work: %{}}, human, "1")
+    assert {:clarify, _} = TaskControl.bind_reply(root, human, "1", [])
+    assert {:clarify, _} = TaskControl.bind_reply(root, human, "9")
+    assert {:clarify, _} = TaskControl.bind_reply(root, reply(f, "不要按 P1 执行", 2), "1")
+
+    malformed = "<!-- symphony-candidate {\"label\":false,\"revision\":\"x\",\"authorizer\":\"1\"} -->"
+
+    for body <- ["<!-- symphony-candidate {bad} -->", "<!-- symphony-candidate {} -->", malformed] do
+      assert {:clarify, _} = TaskControl.bind_reply(%{root | notes: [%{candidate | "body" => body}]}, human, "1")
+    end
+  end
 end

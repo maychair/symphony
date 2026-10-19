@@ -3,7 +3,7 @@ defmodule SymphonyElixir.TaskboardTest do
 
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Config.Schema.Taskboard, as: TaskboardSchema
-  alias SymphonyElixir.{Execution, RunJournal}
+  alias SymphonyElixir.{Execution, RunJournal, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Taskboard
 
   setup do
@@ -471,7 +471,176 @@ defmodule SymphonyElixir.TaskboardTest do
            }
   end
 
-  test "Done follows the versioned lifecycle and ignores a stale accept label with no evidence", %{
+  test "a plan member card reads its own WorkRef journal and never grants Done from a cached fact" do
+    journal_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-taskboard-lifecycle-#{System.pid()}-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(journal_root) end)
+
+    for provider <- ["github", "gitlab"] do
+      work = member_work(provider)
+      repository = member_repository(provider)
+
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+      plan_path = Workflow.workflow_file_path()
+
+      plan_path
+      |> File.read!()
+      |> String.replace(
+        "tracker:\n",
+        "tracker:\n  provider: " <> Jason.encode!(%{"plan_repositories" => [repository]}) <> "\n"
+      )
+      |> then(&File.write!(plan_path, &1))
+
+      :ok = WorkflowStore.force_reload()
+
+      record =
+        write_member_journal(journal_root, work, %{
+          "workflow" => %{
+            "state" => "waiting",
+            "phase" => "completed",
+            "closeable" => true,
+            "restrictions" => %{},
+            "used_ms" => 0,
+            "clock_at" => 0,
+            "charging" => false,
+            "contract" => %{"acceptance_mode" => "technical"},
+            "manifest" => %{
+              "items" => [
+                %{"id" => "report", "kind" => "report", "url" => "https://example.invalid/member-report", "version" => "v1"}
+              ]
+            }
+          }
+        })
+
+      # The retired numeric address must never drive a member card: this decoy
+      # journal is complete, closeable and carries its own artifact.
+      decoy = RunJournal.directory(journal_root, "2")
+      File.mkdir_p!(decoy)
+
+      File.write!(
+        Path.join(decoy, "run.json"),
+        Jason.encode!(%{
+          "phase" => "decoy",
+          "issue_id" => "2",
+          "workflow" => %{"closeable" => true, "manifest" => %{"items" => [%{"id" => "decoy", "kind" => "report", "url" => "https://example.invalid/decoy"}]}}
+        })
+      )
+
+      snapshot =
+        Taskboard.snapshot(
+          settings: Config.settings!(),
+          issues_fun: fn _states -> [member_issue(provider)] end,
+          runtime_snapshot_fun: fn -> %{} end,
+          journal_root: journal_root
+        )
+
+      assert [card] = snapshot.cards
+      assert card.projection.status == "stale"
+      assert card.projection.directory == record["directory"]
+      assert card.projection.work == work
+      assert card.column == "Human Review"
+      assert card.agent_status == "stale projection"
+      assert card.needs_human
+      assert card.human_action.required and card.human_action.summary =~ "stale fact"
+      assert Enum.map(card.artifacts, & &1.url) == ["https://example.invalid/member-report"]
+      assert {:ok, current} = RunJournal.read(record["directory"])
+      assert get_in(current, ["workflow", "closeable"]) == true
+
+      empty =
+        Taskboard.snapshot(
+          settings: Config.settings!(),
+          issues_fun: fn _states -> [member_issue(provider)] end,
+          runtime_snapshot_fun: fn -> %{} end,
+          journal_root: Path.join(journal_root, "empty")
+        )
+
+      assert [unobserved] = empty.cards
+      refute unobserved.column == "Done"
+    end
+
+    configured = Config.settings!()
+    tracker = %{configured.tracker | provider: %{"plan_roots" => [:invalid], "plan_repositories" => [nil]}}
+    malformed = %{configured | tracker: tracker}
+
+    assert [_] =
+             Taskboard.snapshot(
+               settings: malformed,
+               issues_fun: fn _states -> [member_issue("github")] end,
+               runtime_snapshot_fun: fn -> %{} end,
+               journal_root: journal_root
+             ).cards
+
+    stale = issue("41", "MOCK-41", "Stale label", "closed", ["symphony:ready", "symphony:accept"])
+
+    snapshot =
+      Taskboard.snapshot(
+        settings: Config.settings!(),
+        issues_fun: fn _states -> [stale] end,
+        runtime_snapshot_fun: fn -> %{} end
+      )
+
+    assert [stale_card] = snapshot.cards
+    assert stale_card.column == "Human Review"
+    assert stale_card.agent_status == "unverified closure"
+    assert stale_card.needs_human
+    assert stale_card.artifacts == []
+  end
+
+  defp member_work("github"), do: %{"provider" => "github", "host" => "github.test", "repository_id" => "10", "kind" => "issue", "number" => 2}
+  defp member_work("gitlab"), do: %{"provider" => "gitlab", "host" => "gitlab.test", "repository_id" => "10", "kind" => "issue", "number" => 2}
+
+  defp member_repository(provider) do
+    work = member_work(provider)
+
+    Map.take(work, ~w(provider host repository_id))
+    |> Map.merge(%{
+      "path" => "team/repo",
+      "api_url" => "https://" <> work["host"] <> if(provider == "github", do: "/api/v3", else: "/api/v4"),
+      "credential" => "$UNUSED_TASKBOARD_FIXTURE"
+    })
+  end
+
+  defp member_issue("github") do
+    %{issue("2", "GH-2", "Delivered member", "closed", ["symphony:ready"]) | native_ref: %{"number" => 2, "repo" => "team/repo"}}
+  end
+
+  defp member_issue("gitlab") do
+    %{issue("2", "GL-2", "Delivered member", "closed", ["symphony:ready"]) | native_ref: %{"iid" => 2, "project_path" => "team/repo"}}
+  end
+
+  # The member journal is written through the production journal API into the
+  # directory the reconciler uses: RunJournal.directory(root, WorkRef.key(work)).
+  defp write_member_journal(root, work, changes) do
+    authority = %{
+      "work" => Map.put(work, "number", work["number"] + 1),
+      "source" => "note:1",
+      "actor" => "1",
+      "revision" => TaskWorkflow.digest("plan")
+    }
+
+    binding = %{
+      "work" => work,
+      "role" => "developer",
+      "plan_revision" => authority["revision"],
+      "contract_sha" => TaskWorkflow.digest("contract"),
+      "authority" => authority,
+      "inputs" => [],
+      "candidate" => nil,
+      "policy_sha" => TaskWorkflow.digest("policy")
+    }
+
+    {:ok, record} = RunJournal.admit(root, WorkRef.key(work), execution_binding: binding)
+    {:ok, record} = RunJournal.checkpoint(record, changes)
+    :ok = RunJournal.complete(record, "completed")
+    record
+  end
+
+  test "the retired numeric journal address no longer drives the board", %{
     settings: _settings
   } do
     journal_root =
@@ -494,10 +663,10 @@ defmodule SymphonyElixir.TaskboardTest do
     :ok = WorkflowStore.force_reload()
     on_exit(fn -> File.rm_rf(journal_root) end)
 
-    accepted = issue("40", "MOCK-40", "Delivered child", "closed", ["symphony:ready"])
     stale = issue("41", "MOCK-41", "Stale label", "closed", ["symphony:ready", "symphony:accept"])
+    fabricated = issue("40", "MOCK-40", "Numeric journal", "closed", ["symphony:ready"])
 
-    directory = RunJournal.directory(Execution.journal_root(), accepted.id)
+    directory = RunJournal.directory(Execution.journal_root(), fabricated.id)
     File.mkdir_p!(directory)
 
     File.write!(
@@ -505,7 +674,7 @@ defmodule SymphonyElixir.TaskboardTest do
       Jason.encode!(%{
         "phase" => "completed",
         "attempt_id" => "accepted-attempt",
-        "issue_id" => accepted.id,
+        "issue_id" => fabricated.id,
         "updated_at" => "2026-10-17T01:00:00Z",
         "workflow" => %{
           "state" => "waiting",
@@ -520,15 +689,17 @@ defmodule SymphonyElixir.TaskboardTest do
     snapshot =
       Taskboard.snapshot(
         settings: Config.settings!(),
-        issues_fun: fn _states -> [accepted, stale] end,
+        issues_fun: fn _states -> [fabricated, stale] end,
         runtime_snapshot_fun: fn -> %{} end
       )
 
     by_id = Map.new(snapshot.cards, &{&1.issue_identifier, &1})
 
-    assert by_id["MOCK-40"].column == "Done"
-    assert by_id["MOCK-40"].agent_status == "accepted"
-    refute by_id["MOCK-40"].needs_human
+    # Without a plan identity there is no current projection, so a journal that
+    # claims `closeable` stays a historical fact in Human Review.
+    assert by_id["MOCK-40"].column == "Human Review"
+    assert by_id["MOCK-40"].agent_status == "unverified closure"
+    assert by_id["MOCK-40"].needs_human
 
     assert by_id["MOCK-41"].column == "Human Review"
     assert by_id["MOCK-41"].agent_status == "unverified closure"

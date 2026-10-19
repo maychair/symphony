@@ -1,8 +1,19 @@
 defmodule SymphonyElixir.TaskPlanPreflight do
   @moduledoc "Resolve the whole sealed plan and its native approval before any member can be considered for execution."
 
-  alias SymphonyElixir.{Config, NativeWork, TaskControl, TaskDecision, TaskPlan, TaskReconciler, TaskWorkflow, WorkRef}
+  alias SymphonyElixir.{Config, NativeWork, TaskControl, TaskDecision, TaskPlan, TaskPlanManifest}
+  alias SymphonyElixir.{TaskReconciler, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Tracker.Issue
+
+  # Resolving a configured repository is a deployment capability, not a member
+  # fact, so these failures still stop the whole plan rather than restricting a
+  # single branch.
+  @repository_failures [
+    :invalid_plan_repositories,
+    :invalid_plan_repository,
+    :unregistered_plan_repository,
+    :ambiguous_plan_repository
+  ]
 
   @doc "Discover and check configured parents even when they have no execution journal."
   @spec project([Issue.t()], keyword()) :: [Issue.t()]
@@ -15,7 +26,7 @@ defmodule SymphonyElixir.TaskPlanPreflight do
     status =
       if plan["parent"] in roots do
         case inspect_plan(plan["parent"], opts) do
-          {:ok, evidence} -> projection(issue, plan, evidence)
+          {:ok, evidence} -> projection(issue, plan, evidence, opts)
           {:error, reason} -> %{"status" => "blocked", "reason" => reason_name(reason)}
         end
       else
@@ -34,15 +45,36 @@ defmodule SymphonyElixir.TaskPlanPreflight do
     end
   end
 
-  defp projection(issue, plan, evidence) do
+  defp projection(issue, plan, evidence, opts) do
     if issue.url == evidence.parent.url and plan["revision"] == evidence.plan["revision"] do
       restrictions = Enum.map(evidence.controls.restrictions, & &1["kind"]) |> Enum.uniq() |> Enum.sort()
-      status = if restrictions == [], do: "approved", else: "restricted"
-      %{"status" => status, "restrictions" => restrictions, "revision" => evidence.plan["revision"], "authority" => evidence.authority, "members" => map_size(evidence.members)}
+      blocked = blocked(evidence)
+      status = if restrictions == [] and blocked == [], do: "approved", else: "restricted"
+
+      %{
+        "status" => status,
+        "restrictions" => restrictions,
+        "revision" => evidence.plan["revision"],
+        "authority" => evidence.authority,
+        "members" => map_size(evidence.members),
+        "blocked" => blocked,
+        "manifest" => TaskPlanManifest.facts(evidence.parent, evidence.plan, opts)
+      }
     else
       %{"status" => "blocked", "reason" => "parent_projection_changed"}
     end
   end
+
+  # A member that cannot be re-derived restricts itself and its transitive
+  # consumers without blocking independent branches of the same approved plan.
+  defp blocked(evidence) do
+    evidence.restricted
+    |> Enum.map(fn {key, entry} -> %{"work" => key, "reason" => reason_label(entry.reason)} end)
+    |> Enum.sort_by(& &1["work"])
+  end
+
+  defp reason_label({reason, _}), do: reason_label(reason)
+  defp reason_label(reason) when is_atom(reason), do: Atom.to_string(reason)
 
   defp reason_name({reason, _}), do: reason_name(reason)
   defp reason_name(reason) when is_atom(reason), do: Atom.to_string(reason)
@@ -58,22 +90,58 @@ defmodule SymphonyElixir.TaskPlanPreflight do
          true <- Enum.sort(contract["criteria"]) == Enum.sort(plan["criteria"]) or {:error, :parent_criteria_changed},
          true <- plan["budget_ms"] == contract["budget_ms"] or {:error, :parent_budget_changed},
          {:ok, authority} <- TaskControl.authority(root, plan),
-         {:ok, members} <- members(plan, opts),
+         {:ok, {members, restricted}} <- members(plan, opts),
          :ok <- edges(plan, members),
          {:ok, current} <- NativeWork.read(parent, opts),
-         true <- snapshot_version(current) == snapshot_version(root) or {:error, :parent_changed_during_preflight} do
-      result = %{plan: plan, authority: authority, parent: root, members: members}
+         true <-
+           snapshot_version(current) == snapshot_version(root) or
+             {:error, :parent_changed_during_preflight} do
+      result = %{
+        plan: plan,
+        authority: authority,
+        parent: root,
+        members: members,
+        restricted: restrict(plan, restricted)
+      }
+
       with {:ok, controls} <- TaskControl.observe(result, parent), do: {:ok, Map.put(result, :controls, controls)}
     end
   end
 
+  # One drifted or unavailable member restricts itself and its consumers; the
+  # remaining branches of the approved plan stay independently executable.
+  # A repository the deployment cannot resolve is a capability gap rather than a
+  # member-level fact, so it still fails the whole preflight.
   defp members(plan, opts) do
-    Enum.reduce_while(plan["members"], {:ok, %{}}, fn member, {:ok, found} ->
+    Enum.reduce_while(plan["members"], {:ok, {%{}, %{}}}, fn member, {:ok, {found, restricted}} ->
       case read_member(member, plan["parent"], opts) do
-        {:ok, snapshot} -> {:cont, {:ok, Map.put(found, WorkRef.key(member["work"]), snapshot)}}
-        {:error, reason} -> {:halt, {:error, {reason, member["work"]}}}
+        {:ok, snapshot} ->
+          {:cont, {:ok, {Map.put(found, WorkRef.key(member["work"]), snapshot), restricted}}}
+
+        {:error, reason} when reason in @repository_failures ->
+          {:halt, {:error, {reason, member}}}
+
+        {:error, reason} ->
+          restricted = Map.put(restricted, WorkRef.key(member["work"]), %{work: member["work"], reason: reason})
+          {:cont, {:ok, {found, restricted}}}
       end
     end)
+  end
+
+  # Inputs that can no longer be proven against the approved plan cannot unlock a
+  # consumer; an inactive branch keeps its own restriction instead.
+  defp restrict(plan, restricted) do
+    expanded =
+      Enum.reduce(plan["dependencies"], restricted, fn edge, acc ->
+        from = WorkRef.key(edge["from"])
+        to = WorkRef.key(edge["to"])
+
+        if Map.has_key?(acc, from) and not Map.has_key?(acc, to),
+          do: Map.put(acc, to, %{work: edge["to"], reason: {:dependency_restricted, from}}),
+          else: acc
+      end)
+
+    if expanded == restricted, do: restricted, else: restrict(plan, expanded)
   end
 
   defp read_member(member, parent, opts) do
@@ -140,13 +208,19 @@ defmodule SymphonyElixir.TaskPlanPreflight do
   defp assigned_authorizer?(_, _), do: false
 
   defp edges(plan, members) do
-    valid = Enum.all?(plan["dependencies"], &edge?(&1, members))
+    valid =
+      Enum.all?(plan["dependencies"], fn edge ->
+        case members[WorkRef.key(edge["from"])] do
+          %{contract: contract} -> edge?(edge, contract)
+          _ -> true
+        end
+      end)
+
     if valid, do: :ok, else: {:error, :unresolved_dependency_artifact}
   end
 
-  defp edge?(edge, members) do
-    producer = members[WorkRef.key(edge["from"])].contract
-    artifact = Enum.find(producer["deliverables"], &(&1["id"] == edge["artifact"]))
+  defp edge?(edge, contract) do
+    artifact = Enum.find(contract["deliverables"], &(&1["id"] == edge["artifact"]))
     is_map(artifact) and Enum.all?(edge["criteria"], &(&1 in artifact["criteria"]))
   end
 
