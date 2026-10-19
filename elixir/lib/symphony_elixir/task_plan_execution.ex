@@ -165,10 +165,34 @@ defmodule SymphonyElixir.TaskPlanExecution do
 
     with true <- ExecutionBackend.kind() == "codex" or {:error, :unsupported_task_session_transport},
          true <- (is_binary(state) and state != "") or {:error, :plan_active_state_required},
-         {:ok, configured} <- TaskExecutionConfig.prepare(parent, opts) do
-      projection_of(configured)
+         {:ok, configured} <- projection_config(parent, opts) do
+      projection = projection_of(configured)
+      if configured.opts[:completed_plan_read], do: completed_projection(configured, projection), else: projection
     else
       {:error, _reason} -> %{}
+    end
+  end
+
+  defp projection_config(parent, opts) do
+    case TaskExecutionConfig.prepare(parent, opts) do
+      {:error, :parent_not_open} -> TaskExecutionConfig.prepare(parent, Keyword.put(opts, :completed_plan_read, true))
+      result -> result
+    end
+  end
+
+  defp completed_projection(configured, projection) do
+    parent = configured.plan.parent
+    plan = configured.plan.plan
+    manifest = List.last(TaskPlanManifest.manifests(parent))
+    directory = configured.executions[WorkRef.key(plan["integration"])].directory
+
+    with %{"source" => source, "payload" => %{"revision" => revision}} <- manifest,
+         {:ok, %{"parent_manifest_intent" => %{"status" => "confirmed", "source" => ^source, "revision" => ^revision}}} <-
+           RunJournal.read(directory),
+         {:ok, %{"revision" => ^revision}} <- TaskPlanManifest.assemble(plan, projection) do
+      projection
+    else
+      _ -> %{}
     end
   end
 

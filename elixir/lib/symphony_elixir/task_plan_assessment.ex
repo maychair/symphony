@@ -14,7 +14,19 @@ defmodule SymphonyElixir.TaskPlanAssessment do
   def assess(parent, member, configured) do
     with {:ok, observation} <- TaskExecution.observe(parent, member.work, configured.executions, configured.opts) do
       snapshot = observation.plan.members[WorkRef.key(member.work)]
-      {:ok, %{flow: observation.flow, record: observation.record, snapshot: snapshot, evidence: observation.evidence}}
+      flow = completed_flow(observation.flow, snapshot, configured.opts)
+      {:ok, %{flow: flow, record: observation.record, snapshot: snapshot, evidence: observation.evidence}}
     end
   end
+
+  defp completed_flow(flow, %{raw: %{"state" => "closed"}}, opts) do
+    if opts[:completed_plan_read] == true do
+      restrictions = Map.drop(flow["restrictions"], ~w(parent_closed native_closed))
+      Map.merge(flow, %{"restrictions" => restrictions, "closeable" => flow["phase"] == "completed" and restrictions == %{}})
+    else
+      flow
+    end
+  end
+
+  defp completed_flow(flow, _snapshot, _opts), do: flow
 end

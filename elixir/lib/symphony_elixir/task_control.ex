@@ -196,9 +196,11 @@ defmodule SymphonyElixir.TaskControl do
   end
 
   @doc "Resolve the latest explicit parent approval without treating a pause or resume as a new grant."
-  @spec authority(map(), map()) :: {:ok, map()} | {:error, atom()}
-  def authority(root, plan) do
-    with true <- root.raw["state"] in ["open", "opened"] or {:error, :parent_not_open},
+  @spec authority(map(), map(), :dispatch | :completed_read) :: {:ok, map()} | {:error, atom()}
+  def authority(root, plan, mode \\ :dispatch) do
+    with true <-
+           root.raw["state"] in ["open", "opened"] or (mode == :completed_read and root.raw["state"] == "closed") or
+             {:error, :parent_not_open},
          {:ok, events} <- decisions(root, plan["authorizer"], :parent),
          {:ok, event} <- latest_authorization(events),
          true <- event["revision"] == plan["revision"] or {:error, :plan_decision_revision_mismatch} do

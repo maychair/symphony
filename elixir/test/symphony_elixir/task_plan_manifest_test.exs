@@ -1,11 +1,17 @@
 defmodule SymphonyElixir.TaskPlanManifestTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.{ArtifactStore, ReportArtifact, RunJournal, TaskClosure, TaskDecision, TaskExecutionConfig}
   alias SymphonyElixir.Codex.DynamicTool
 
   alias SymphonyElixir.{
+    ArtifactStore,
+    ReportArtifact,
+    RunJournal,
+    Taskboard,
+    TaskClosure,
+    TaskDecision,
     TaskExecution,
+    TaskExecutionConfig,
     TaskPlan,
     TaskPlanAssessment,
     TaskPlanExecution,
@@ -15,6 +21,8 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
     TaskWorkflow,
     WorkRef
   }
+
+  alias SymphonyElixir.Tracker.Issue
 
   @criterion "C1"
   @decision_at "2026-10-18T00:00:30Z"
@@ -900,6 +908,126 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
       assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(configured(f), f.opts)
       assert issue_state(f, 1) == "closed"
       assert {:ok, []} = TaskPlanExecution.discover(Keyword.merge(f.opts, roots: [f.parent], active_state: "Todo"))
+      assert {:error, :parent_not_open} = TaskExecutionConfig.prepare(f.parent, f.opts)
+      assert {:ok, projection} = TaskPlanExecution.projection(Keyword.merge(f.opts, roots: [f.parent], active_state: "Todo"))
+      assert projection[WorkRef.key(f.member)].closeable
+      assert {:ok, %{"revision" => revision}} = TaskPlanManifest.assemble(f.plan, projection)
+      assert revision == receipt["payload"]["revision"]
+
+      assert %{"status" => "confirmed", "manifest" => source, "revision" => ^revision, "acceptance" => acceptance, "members" => members} =
+               current(f)["parent_close_intent"]
+
+      assert source == receipt["source"]
+      assert is_binary(acceptance)
+
+      assert members[WorkRef.key(f.member)]["source"] ==
+               String.trim_leading(projection[WorkRef.key(f.member)].closure["source"], "issue:")
+
+      assert {:ok, detail} = completed_detail(f)
+      assert detail.card.column == "Done"
+      assert detail.execution.projection.status == "current"
+      assert detail.execution.closeable
+
+      parent_record = current(f)
+      journal_path = Path.join(parent_record["directory"], "run.json")
+      File.write!(journal_path, Jason.encode!(put_in(parent_record, ["parent_close_intent"], Map.delete(parent_record["parent_close_intent"], "members"))))
+      assert {:ok, %{}} = TaskPlanExecution.projection(Keyword.merge(f.opts, roots: [f.parent], active_state: "Todo"))
+      File.write!(journal_path, Jason.encode!(parent_record))
+
+      File.write!(journal_path, Jason.encode!(Map.put(parent_record, "closure_confirmed", nil)))
+      assert {:ok, %{}} = TaskPlanExecution.projection(Keyword.merge(f.opts, roots: [f.parent], active_state: "Todo"))
+      File.write!(journal_path, Jason.encode!(parent_record))
+
+      original = Agent.get(f.state, & &1.objects)
+
+      Agent.update(f.state, fn state ->
+        %{state | objects: Map.update!(state.objects, f.member_notes, &List.update_at(&1, -1, fn note -> Map.update!(note, "body", fn body -> body <> " edited" end) end))}
+      end)
+
+      assert {:ok, changed} = completed_detail(f)
+      assert changed.card.column == "Human Review"
+      assert changed.execution.projection.status == "stale"
+      refute changed.execution.closeable
+      Agent.update(f.state, &%{&1 | objects: original})
+
+      Agent.update(f.state, fn state ->
+        %{state | objects: Map.update!(state.objects, f.parent_notes, &Enum.drop(&1, -1))}
+      end)
+
+      assert {:ok, changed} = completed_detail(f)
+      assert changed.execution.projection.status == "stale"
+      refute changed.execution.closeable
+    end
+  end
+
+  defp completed_detail(f) do
+    provider = f.provider
+
+    tracker = %{
+      kind: provider,
+      project_slug: "team/repo",
+      active_states: ["open"],
+      terminal_states: ["closed"],
+      provider: %{
+        "repo" => "team/repo",
+        "project_path" => "team/repo",
+        "api_url" => "https://" <> provider <> ".test/api/" <> if(provider == "github", do: "v3", else: "v4"),
+        "token" => "fixture",
+        "api_key" => "fixture",
+        "plan_roots" => [f.parent],
+        "plan_repositories" => f.opts[:repositories]
+      }
+    }
+
+    issue_fun = fn _ ->
+      raw = Agent.get(f.state, &Map.fetch!(&1.objects, f.prefix <> "/issues/2"))
+
+      issue = %Issue{
+        id: "2",
+        identifier: if(provider == "github", do: "GH-2", else: "GL-2"),
+        title: "Member",
+        description: raw["body"] || raw["description"],
+        url: raw["html_url"] || raw["web_url"],
+        state: raw["state"],
+        labels: [],
+        native_ref: %{"number" => 2, "iid" => 2, "repo" => "team/repo", "project_path" => "team/repo", "repository_id" => "10", "project_id" => 10}
+      }
+
+      {:ok, [issue]}
+    end
+
+    request_fun = fn "GET", path, _query, nil, _settings ->
+      {:ok, %{status: 200, body: Agent.get(f.state, &Map.get(&1.objects, path, []))}}
+    end
+
+    settings = %{tracker: tracker, taskboard: %{projects: [], enabled: true, control_token: nil, provider_token: nil}}
+
+    opts =
+      Keyword.merge(f.opts,
+        settings: settings,
+        roots: [f.parent],
+        active_state: "Todo",
+        issue_fun: issue_fun,
+        request_fun: request_fun,
+        runtime_snapshot_fun: fn -> %{} end
+      )
+
+    Taskboard.issue_detail(provider <> "-team-repo", if(provider == "github", do: "GH-2", else: "GL-2"), opts)
+  end
+
+  test "manual parent closure cannot produce a completed plan projection" do
+    for provider <- ["github", "gitlab"] do
+      f = native_fixture(provider) |> verified() |> close_member()
+      parent_path = f.prefix <> "/issues/1"
+
+      Agent.update(f.state, fn state ->
+        %{state | objects: Map.update!(state.objects, parent_path, &Map.put(&1, "state", "closed"))}
+      end)
+
+      assert {:ok, %{}} = TaskPlanExecution.projection(Keyword.merge(f.opts, roots: [f.parent], active_state: "Todo"))
+      assert {:ok, detail} = completed_detail(f)
+      assert detail.execution.projection.status == "stale"
+      refute detail.execution.closeable
     end
   end
 

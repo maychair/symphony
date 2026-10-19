@@ -208,7 +208,8 @@ defmodule SymphonyElixir.TaskExecution do
 
     with {:ok, current} <- admission_observation(parent, work, executions, opts),
          true <- Map.take(current.record, @identity) == Map.take(record, @identity),
-         changes = %{"workflow" => current.flow, "control_receipts" => current.evidence["control_receipts"], "issue_url" => current.plan.members[WorkRef.key(work)].url},
+         flow = checkpoint_flow(action, current.flow, record),
+         changes = %{"workflow" => flow, "control_receipts" => current.evidence["control_receipts"], "issue_url" => current.plan.members[WorkRef.key(work)].url},
          {:ok, record} <- RunJournal.checkpoint(current.record, changes) do
       conclude_admission(action, %{current | record: record, flow: record["workflow"]})
     else
@@ -216,6 +217,11 @@ defmodule SymphonyElixir.TaskExecution do
       _ -> {:error, :execution_admission_changed}
     end
   end
+
+  defp checkpoint_flow(:start, flow, _record), do: flow
+
+  defp checkpoint_flow(:wait, flow, record),
+    do: Map.put(flow, "rework_source", get_in(record, ["workflow", "rework_source"]))
 
   defp conclude_admission(:start, current) do
     with {:ok, flow} <- TaskLifecycle.start(current.flow, current.record, System.system_time(:millisecond)),

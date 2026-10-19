@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.TaskPlanPreflight do
   @moduledoc "Resolve the whole sealed plan and its native approval before any member can be considered for execution."
 
-  alias SymphonyElixir.{Config, NativeWork, TaskControl, TaskDecision, TaskPlan, TaskPlanManifest}
+  alias SymphonyElixir.{Config, Execution, NativeWork, RunJournal}
+  alias SymphonyElixir.{TaskControl, TaskDecision, TaskPlan, TaskPlanManifest}
   alias SymphonyElixir.{TaskReconciler, TaskWorkflow, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
@@ -89,8 +90,10 @@ defmodule SymphonyElixir.TaskPlanPreflight do
          true <- (contract["contract_sha"] == plan["contract_sha"] and contract["authorizer"] == plan["authorizer"]) or {:error, :parent_contract_changed},
          true <- Enum.sort(contract["criteria"]) == Enum.sort(plan["criteria"]) or {:error, :parent_criteria_changed},
          true <- plan["budget_ms"] == contract["budget_ms"] or {:error, :parent_budget_changed},
-         {:ok, authority} <- TaskControl.authority(root, plan),
+         :ok <- completed_parent(root, plan, opts),
+         {:ok, authority} <- TaskControl.authority(root, plan, authority_mode(opts)),
          {:ok, {members, restricted}} <- members(plan, opts),
+         :ok <- completed_members(root, plan, members, restricted, opts),
          :ok <- edges(plan, members),
          {:ok, current} <- NativeWork.read(parent, opts),
          true <-
@@ -106,6 +109,86 @@ defmodule SymphonyElixir.TaskPlanPreflight do
 
       with {:ok, controls} <- TaskControl.observe(result, parent), do: {:ok, Map.put(result, :controls, controls)}
     end
+  end
+
+  defp completed_parent(%{raw: %{"state" => state}}, _plan, opts) when state in ["open", "opened"] do
+    if opts[:completed_plan_read] == true, do: {:error, :parent_not_closed}, else: :ok
+  end
+
+  defp completed_parent(root, plan, opts) do
+    if opts[:completed_plan_read] == true and root.raw["state"] == "closed",
+      do: verify_completed_parent(root, plan, opts),
+      else: {:error, :parent_not_open}
+  end
+
+  defp verify_completed_parent(root, plan, opts) do
+    directory = close_directory(plan, opts)
+
+    with {:ok, %{"parent_close_intent" => %{"status" => "confirmed"} = intent, "parent_manifest_intent" => %{"status" => "confirmed", "source" => published, "revision" => revision}}} <-
+           RunJournal.read(directory),
+         :ok <- stable_parent(root, intent),
+         %{"source" => ^published, "payload" => %{"revision" => ^revision}} = manifest <-
+           List.last(TaskPlanManifest.manifests(root)),
+         true <- manifest["payload"]["plan_revision"] == plan["revision"] or {:error, :parent_manifest_changed},
+         {:ok, %{"action" => "accept", "source" => acceptance}} <- TaskPlanManifest.decision(root, plan, manifest),
+         true <- accepted_intent?(intent, published, revision, acceptance) or {:error, :parent_acceptance_changed},
+         :ok <- TaskPlanManifest.current_acceptance(root, plan, manifest, %{"source" => acceptance}) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :parent_close_unconfirmed}
+    end
+  end
+
+  defp stable_parent(root, intent) do
+    cond do
+      intent["source"] != "issue:" <> NativeWork.snapshot_ref(root) -> {:error, :parent_close_source_changed}
+      intent["parent_description"] != TaskWorkflow.digest(root.description) -> {:error, :parent_description_changed}
+      intent["parent_notes"] != note_sources(root.notes) -> {:error, :parent_decisions_changed}
+      true -> :ok
+    end
+  end
+
+  defp accepted_intent?(intent, published, revision, acceptance) do
+    intent["manifest"] == published and intent["revision"] == revision and intent["acceptance"] == acceptance
+  end
+
+  defp completed_members(root, plan, members, restricted, opts) do
+    if opts[:completed_plan_read] == true do
+      verify_completed_members(root, plan, members, restricted, opts)
+    else
+      :ok
+    end
+  end
+
+  defp verify_completed_members(root, plan, members, restricted, opts) do
+    with true <- map_size(restricted) == 0 or {:error, :completed_member_unavailable},
+         {:ok, %{"parent_close_intent" => %{"members" => sources}}} <- RunJournal.read(close_directory(plan, opts)),
+         true <- matching_member_count?(sources, members) or {:error, :parent_member_sources_changed},
+         true <- Enum.all?(members, &same_member_source?(&1, sources)) or {:error, :parent_member_sources_changed},
+         true <- root.raw["state"] == "closed" or {:error, :parent_not_closed} do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :parent_member_sources_changed}
+    end
+  end
+
+  defp same_member_source?({key, member}, sources) do
+    sources[key] == %{"work" => member.work, "source" => NativeWork.snapshot_ref(member)}
+  end
+
+  defp matching_member_count?(sources, members), do: is_map(sources) and map_size(sources) == map_size(members)
+
+  defp close_directory(plan, opts) do
+    root = Keyword.get_lazy(opts, :journal_root, &Execution.journal_root/0)
+    RunJournal.directory(root, WorkRef.key(plan["integration"]))
+  end
+
+  defp authority_mode(opts), do: if(opts[:completed_plan_read] == true, do: :completed_read, else: :dispatch)
+
+  defp note_sources(notes) do
+    notes |> Enum.reject(&(&1["system"] == true)) |> Enum.map(&TaskDecision.source_ref/1) |> Enum.sort()
   end
 
   # One drifted or unavailable member restricts itself and its consumers; the

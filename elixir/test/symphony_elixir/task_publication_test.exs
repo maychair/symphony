@@ -271,7 +271,7 @@ defmodule SymphonyElixir.TaskPublicationTest do
     previous = current(f)
     binding = %{previous["execution_binding"] | "role" => "developer", "candidate" => TaskWorkflow.digest(f.payload)}
     {:ok, record} = RunJournal.admit(Path.dirname(previous["directory"]), previous["issue_id"], execution_binding: binding)
-    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "report-revision"})
+    {:ok, record} = RunJournal.checkpoint(record, %{"thread_id" => "report-revision-#{record["execution_generation"]}"})
     {:ok, report} = ReportArtifact.build(f.payload["work"], "output", body)
     %{f | record: record, payload: Map.put(f.payload, "artifacts", [report])} |> verified_report()
   end
@@ -595,6 +595,53 @@ defmodule SymphonyElixir.TaskPublicationTest do
     {:ok, active} = RunJournal.checkpoint(ordinary.record, %{"thread_id" => "reworked-dependent", "native_stop_confirmed" => false})
     assert {:ok, running} = TaskExecution.observe_running(active, registry, f.opts)
     assert running.flow["inputs"] == [input]
+    refute running.flow["stop_required"]
+  end
+
+  test "a paused waiting checkpoint leaves dependent rework available for resumed admission" do
+    f = report_fixture("github", ["verified"]) |> verified_report()
+    {:ok, upstream} = dependencies(f, 3, nil, [f])
+    [old_input] = inputs(upstream)
+    dependent = report_consumer(f, old_input) |> verified_report()
+    work = dependent.payload["work"]
+    registry = executions([f, dependent])
+    assert {:ok, prior} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    persist_report_flow(prior)
+
+    revised = revised_report(f, "Reworked upstream result")
+    {:ok, newer} = dependencies(f, 3, nil, [revised])
+    [new_input] = inputs(newer)
+
+    superseded =
+      current(dependent)["publications"]
+      |> Map.values()
+      |> Enum.map(&get_in(&1, ["receipt", "source"]))
+      |> Enum.reject(&is_nil/1)
+
+    marker = confirmed_rework(f, superseded)
+    completed = current(dependent)
+    {:ok, locked} = RunJournal.admit(Path.dirname(completed["directory"]), completed["issue_id"], execution_binding: completed["execution_binding"])
+    {:ok, marked} = RunJournal.checkpoint(locked, %{"rework" => marker})
+    :ok = RunJournal.complete(marked, "completed")
+
+    pause = control(f, :parent, "pause", 810)
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [pause] end))
+    assert {:waiting, paused} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    assert paused.record["execution_binding"]["inputs"] == [old_input]
+    assert paused.flow["inputs"] == [new_input]
+    assert paused.record["workflow"]["rework_source"] != marker["parent_source"]
+
+    pause_source = hd(Map.values(paused.record["control_receipts"]))
+    resume = control(f, :parent, "resume", 811, %{"restriction" => pause_source})
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [resume] end))
+    assert {:ok, admitted} = TaskExecution.admit(f.parent, work, registry, f.opts)
+    assert admitted.record["execution_binding"]["inputs"] == [new_input]
+    assert admitted.flow["rework_source"] == marker["parent_source"]
+
+    revised_report(revised, "A still later upstream result")
+    {:ok, active} = RunJournal.checkpoint(admitted.record, %{"thread_id" => "resumed-dependent", "native_stop_confirmed" => false})
+    assert {:ok, running} = TaskExecution.observe_running(active, registry, f.opts)
+    assert running.flow["inputs"] == [new_input]
     refute running.flow["stop_required"]
   end
 
