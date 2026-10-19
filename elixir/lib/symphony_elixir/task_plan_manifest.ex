@@ -576,6 +576,7 @@ defmodule SymphonyElixir.TaskPlanManifest do
     with {:ok, fresh} <- TaskExecutionConfig.prepare(parent, opts),
          :ok <- hold(configured, fresh, manifest),
          {:ok, snapshot} <- NativeWork.read(parent, opts),
+         :ok <- final_parent(fresh, snapshot),
          true <- snapshot.raw["state"] in ["open", "opened"] or {:error, :parent_not_open},
          :ok <- current_acceptance(snapshot, fresh.plan.plan, receipt, decision),
          intent = close_intent(fresh, snapshot, receipt, decision),
@@ -591,7 +592,9 @@ defmodule SymphonyElixir.TaskPlanManifest do
     end
   end
 
-  defp current_acceptance(snapshot, plan, receipt, decision) do
+  @doc "Check that a native parent snapshot still carries the exact manifest acceptance selected for closure."
+  @spec current_acceptance(map(), map(), map(), map()) :: :ok | {:error, :parent_acceptance_changed}
+  def current_acceptance(snapshot, plan, receipt, decision) do
     expected_manifest = receipt["source"]
     expected_acceptance = decision["source"]
 
@@ -655,8 +658,20 @@ defmodule SymphonyElixir.TaskPlanManifest do
   defp hold(configured, fresh, manifest) do
     cond do
       configured.plan.plan["revision"] != fresh.plan.plan["revision"] -> {:error, :parent_plan_revision_changed}
+      configured.plan.authority != fresh.plan.authority -> {:error, :parent_authority_changed}
+      fresh.plan.controls.restrictions != [] -> {:error, :parent_plan_restricted}
       map_size(fresh.plan.restricted) != 0 -> {:error, :parent_plan_restricted}
       true -> same_manifest(fresh, manifest)
+    end
+  end
+
+  defp final_parent(fresh, snapshot) do
+    with true <- NativeWork.snapshot_ref(snapshot) == NativeWork.snapshot_ref(fresh.plan.parent) or {:error, :parent_changed_after_prepare},
+         {:ok, authority} <- TaskControl.authority(snapshot, fresh.plan.plan),
+         true <- authority == fresh.plan.authority or {:error, :parent_authority_changed},
+         {:ok, controls} <- TaskControl.observe(%{fresh.plan | parent: snapshot}, snapshot.work),
+         true <- controls.restrictions == [] or {:error, :parent_plan_restricted} do
+      :ok
     end
   end
 

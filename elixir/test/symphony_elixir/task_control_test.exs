@@ -378,6 +378,31 @@ defmodule SymphonyElixir.TaskControlTest do
     assert {:error, :needs_clarification} = TaskControl.parent_decisions(%{root | notes: root.notes ++ [missing]}, "1")
   end
 
+  test "publishing a question does not reinterpret earlier ordinary authorizer comments" do
+    f = fixture()
+    candidate = short_note(f, "P1", 1)
+    approval = reply(f, "按 P1 执行", 2)
+    thanks = reply(f, "Thanks for the plan.", 3)
+    question = question_note(f, "Q2", 4, child(f))
+    f = parent_notes(f, [candidate, approval, thanks, question])
+
+    assert {:ok, authority} = TaskControl.authority(f.parent, f.plan)
+    assert {:ok, pending} = observe(f)
+    assert [%{"kind" => "decision", "source" => source}] = pending.restrictions
+    assert source == SymphonyElixir.TaskDecision.source_ref(question)
+
+    f = parent_notes(f, f.parent.notes ++ [reply(f, "Q2：采用方案 B", 5)])
+    assert {:ok, ^authority} = TaskControl.authority(f.parent, f.plan)
+    assert {:ok, %{restrictions: [], releases: [%{"restriction_source" => ^source}]} = answered} = observe(f, pending.receipts)
+    assert {:ok, ^answered} = observe(f, answered.receipts)
+
+    for body <- ["Thanks for the plan?", "Q2", "Q2 是否采用方案 B？"] do
+      invalid = parent_notes(f, f.parent.notes ++ [reply(f, body, 6)])
+      assert {:error, :needs_clarification} = TaskControl.authority(invalid.parent, invalid.plan)
+      assert {:error, :needs_clarification} = observe(invalid, answered.receipts)
+    end
+  end
+
   test "observe releases only the answered member question and keeps unrelated controls" do
     f = fixture()
     approval = note(f, :parent, "authorize", 1)

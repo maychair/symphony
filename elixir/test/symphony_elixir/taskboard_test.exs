@@ -597,15 +597,18 @@ defmodule SymphonyElixir.TaskboardTest do
 
     host_a = member_repository("github")
     host_b = %{host_a | "host" => "other.github.test", "repository_id" => "20", "api_url" => "https://other.github.test/api/v3"}
+    host_c = %{host_a | "host" => "github.test:8443", "api_url" => "https://github.test:8443/api/v3"}
     work_a = member_work("github")
     record = write_member_journal(root, work_a, %{})
+    work_c = %{work_a | "host" => "github.test:8443"}
+    record_c = write_member_journal(root, work_c, %{})
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     path = Workflow.workflow_file_path()
 
     path
     |> File.read!()
-    |> String.replace("tracker:\n", "tracker:\n  provider: " <> Jason.encode!(%{"plan_repositories" => [host_a, host_b]}) <> "\n")
+    |> String.replace("tracker:\n", "tracker:\n  provider: " <> Jason.encode!(%{"plan_repositories" => [host_a, host_b, host_c]}) <> "\n")
     |> then(&File.write!(path, &1))
 
     :ok = WorkflowStore.force_reload()
@@ -629,6 +632,20 @@ defmodule SymphonyElixir.TaskboardTest do
       refute is_map(card.projection) and card.projection.directory == record["directory"]
       refute card.column == "Done"
     end
+
+    port_issue = %{member_issue("github") | url: "https://github.test:8443/team/repo/issues/2"}
+
+    port_snapshot =
+      Taskboard.snapshot(
+        settings: Config.settings!(),
+        issues_fun: fn _states -> [port_issue] end,
+        runtime_snapshot_fun: fn -> %{} end,
+        journal_root: root
+      )
+
+    assert [port_card] = port_snapshot.cards
+    assert port_card.projection.directory == record_c["directory"]
+    refute port_card.projection.directory == record["directory"]
   end
 
   defp member_work("github"), do: %{"provider" => "github", "host" => "github.test", "repository_id" => "10", "kind" => "issue", "number" => 2}

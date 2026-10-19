@@ -10,6 +10,8 @@ defmodule SymphonyElixir.ExecutionBinding do
   alias SymphonyElixir.{TaskWorkflow, WorkRef}
 
   @fields ~w(work role plan_revision contract_sha authority inputs candidate policy_sha)
+  @authority_fields ~w(work source actor revision)
+  @natural_authority_fields @authority_fields ++ ~w(candidate_source candidate_digest label)
   @input_fields ~w(work artifact version verification)
   @binding_fields ~w(execution_binding execution_binding_sha execution_generation execution_history)
   @native_fields ~w(thread_id turn_id thread_allocation_intent native_stop_confirmed goal_thread_id goal_status execution_mode recovery native_stop_recovery workspace task_workspace task_source task_session_id task_session_phase task_observation_error)
@@ -130,10 +132,21 @@ defmodule SymphonyElixir.ExecutionBinding do
   end
 
   defp valid_authority?(%{"work" => work, "source" => source, "actor" => actor, "revision" => revision} = authority, revision) do
-    map_size(authority) == 4 and WorkRef.validate(work) == :ok and work["kind"] == "issue" and text?(source) and text?(actor)
+    keys = Enum.sort(Map.keys(authority))
+
+    (keys == Enum.sort(@authority_fields) or
+       (keys == Enum.sort(@natural_authority_fields) and natural_authority?(authority))) and
+      WorkRef.validate(work) == :ok and work["kind"] == "issue" and text?(source) and text?(actor)
   end
 
   defp valid_authority?(_, _), do: false
+
+  defp natural_authority?(authority) do
+    is_binary(authority["candidate_source"]) and
+      Regex.match?(~r/\Anote:[1-9][0-9]*@[0-9a-f]{64}\z/, authority["candidate_source"]) and
+      digest?(authority["candidate_digest"]) and
+      is_binary(authority["label"]) and Regex.match?(~r/\AP[1-9][0-9]*\z/, authority["label"])
+  end
 
   defp inputs?(inputs) when is_list(inputs) do
     Enum.all?(inputs, fn

@@ -2,7 +2,7 @@ defmodule SymphonyElixir.TaskExecution do
   @moduledoc "Resolve native member evidence and admit the derived role under its owning execution journal lock."
   alias SymphonyElixir.CommandCheck
   alias SymphonyElixir.{ExecutionBinding, NativeWork, RunJournal, TaskControl, TaskDelivery, TaskDependencies}
-  alias SymphonyElixir.{TaskEvidence, TaskLifecycle, TaskPlanPreflight, WorkRef}
+  alias SymphonyElixir.{TaskEvidence, TaskLifecycle, TaskPlan, TaskPlanPreflight, WorkRef}
 
   @identity ~w(directory issue_id attempt_id execution_binding execution_generation)
   @running_identity @identity ++ ~w(workspace task_workspace task_session_id thread_id)
@@ -21,7 +21,7 @@ defmodule SymphonyElixir.TaskExecution do
          {:ok, stored} <- RunJournal.read(directory),
          {:ok, record} <- runtime(stored, directory, work),
          {:ok, facts} <- TaskEvidence.read_member(plan, work, record, policy, opts),
-         inputs = get_in(record, ["execution_binding", "inputs"]),
+         inputs = selected_inputs(plan, work, record),
          {:ok, dependencies} <- TaskDependencies.read(plan, work, inputs, executions, opts),
          {:ok, deliveries} <- TaskDelivery.read_candidate(work, facts.candidate, Keyword.put(opts, :runtime, record)),
          evidence = evidence(facts, dependencies, deliveries, opts[:active] == true),
@@ -32,6 +32,21 @@ defmodule SymphonyElixir.TaskExecution do
     else
       {:error, _} = error -> error
       _ -> {:error, :member_execution_unavailable}
+    end
+  end
+
+  defp selected_inputs(plan, work, record) do
+    binding = record["execution_binding"]
+
+    cond do
+      TaskLifecycle.authorized_rework?(plan, work, record) ->
+        nil
+
+      is_map(binding) and not TaskPlan.compatible?(plan.plan, work, binding["plan_revision"], binding["inputs"]) ->
+        nil
+
+      true ->
+        get_in(record, ["execution_binding", "inputs"])
     end
   end
 

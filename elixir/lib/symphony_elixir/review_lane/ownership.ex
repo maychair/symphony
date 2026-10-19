@@ -76,7 +76,7 @@ defmodule SymphonyElixir.ReviewLane.Ownership do
          %{"policy" => %{"engine_actor" => actor} = policy} <- repository["execution"],
          true <- is_binary(actor) and actor != "",
          {:ok, journal} <- journal(work, opts),
-         {:ok, %{} = journal} <- present_journal(journal),
+         {:ok, %{} = journal} <- present_journal(journal, snapshot, actor),
          true <- journal["issue_id"] == WorkRef.key(work),
          {:ok, ^journal} <- ExecutionBinding.bind(journal, journal["execution_binding"]),
          {:ok, results} <- TaskPublication.observe(journal, snapshot, actor),
@@ -107,8 +107,14 @@ defmodule SymphonyElixir.ReviewLane.Ownership do
     RunJournal.read(RunJournal.directory(root, WorkRef.key(work)))
   end
 
-  defp present_journal(nil), do: {:no_publication, nil}
-  defp present_journal(journal), do: {:ok, journal}
+  defp present_journal(nil, snapshot, actor) do
+    case TaskPublication.observe(%{}, snapshot, actor) do
+      {:ok, []} -> {:no_publication, nil}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp present_journal(journal, _, _), do: {:ok, journal}
 
   defp current_candidate(results, journal, plan, grant, contract, notes, policy, work) do
     candidates = Enum.filter(results, &(&1.envelope["kind"] == "candidate"))

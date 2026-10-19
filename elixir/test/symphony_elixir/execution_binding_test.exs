@@ -113,6 +113,41 @@ defmodule SymphonyElixir.ExecutionBindingTest do
     refute current["execution_binding"]
   end
 
+  test "natural P1 authority remains intact while old structured grants still normalize", %{root: root} do
+    old = fixture_binding()
+    assert {:ok, ^old} = ExecutionBinding.normalize(old)
+
+    natural =
+      put_in(
+        old,
+        ["authority"],
+        Map.merge(old["authority"], %{
+          "candidate_source" => "note:4@" <> TaskWorkflow.digest("published candidate"),
+          "candidate_digest" => TaskWorkflow.digest("sealed candidate"),
+          "label" => "P1"
+        })
+      )
+
+    assert {:ok, ^natural} = ExecutionBinding.normalize(natural)
+    assert {:ok, admitted} = RunJournal.admit(root, "2", execution_binding: natural)
+    assert admitted["execution_binding"]["authority"] == natural["authority"]
+    assert :ok = RunJournal.complete(admitted, "completed")
+    assert {:ok, resumed} = RunJournal.admit(root, "2", execution_binding: natural)
+    assert resumed["execution_generation"] == 1
+
+    for authority <- [
+          Map.delete(natural["authority"], "candidate_source"),
+          %{natural["authority"] | "candidate_source" => nil},
+          %{natural["authority"] | "candidate_source" => ""},
+          %{natural["authority"] | "candidate_source" => "unverified"},
+          %{natural["authority"] | "candidate_digest" => "forged"},
+          %{natural["authority"] | "label" => "M1"},
+          Map.put(natural["authority"], "extra", "unverified")
+        ] do
+      assert {:error, :invalid_execution_binding} = ExecutionBinding.normalize(%{natural | "authority" => authority})
+    end
+  end
+
   test "malformed and ambiguous bindings fail before admission changes durable state", %{root: root} do
     base = fixture_binding()
     input = %{"work" => base["work"], "artifact" => "a", "version" => "v", "verification" => "proof"}

@@ -390,7 +390,7 @@ defmodule SymphonyElixir.TaskControl do
 
   defp decisions(snapshot, actor, scope) do
     marker = Map.fetch!(@markers, scope)
-    questions = Enum.any?(Enum.flat_map(snapshot.notes, &short_candidate/1), &String.starts_with?(&1["label"], "Q"))
+    questions = snapshot.notes |> Enum.flat_map(&short_candidate/1) |> Enum.filter(&String.starts_with?(&1["label"], "Q"))
 
     snapshot.notes
     |> Enum.filter(&control_note?(&1, scope, marker, questions))
@@ -411,7 +411,16 @@ defmodule SymphonyElixir.TaskControl do
     note["system"] != true and
       (String.contains?(body, "<!-- " <> marker) or
          (scope == :parent and not String.contains?(body, "<!--") and
-            (questions or Regex.match?(~r/\b[PMQ][1-9][0-9]*\b/u, body) or human_action(body) != {:ok, "answer"})))
+            (question_precedes?(questions, note) or Regex.match?(~r/\b[PMQ][1-9][0-9]*\b/u, body) or human_action(body) != {:ok, "answer"})))
+  end
+
+  defp question_precedes?(questions, reply) do
+    at = TaskDecision.timestamp(reply["created_at"])
+
+    Enum.any?(questions, fn question ->
+      question_at = TaskDecision.timestamp(question["note"]["created_at"])
+      is_integer(question_at) and (not is_integer(at) or question_at <= at)
+    end)
   end
 
   defp native_decision(snapshot, note, actor, scope, marker) do

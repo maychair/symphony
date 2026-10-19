@@ -86,6 +86,17 @@ defmodule SymphonyElixir.ReviewConvergenceTest do
     assert resolved.native_ref["ownership"]["owner"] == "review"
   end
 
+  test "a lost journal does not release a native task publication to standalone review" do
+    f = fixture() |> then(&publish(&1, &1.record, 201))
+    File.rm!(Path.join(f.record["directory"], "run.json"))
+
+    assert {[member], [resolved]} = Ownership.converge([review()], [member()], f.opts)
+    refute member.dispatchable
+    refute resolved.dispatchable
+    assert member.native_ref["ownership"]["reason"] == "candidate_ownership_unconfirmed"
+    assert resolved.native_ref["ownership"]["owner"] == "unknown"
+  end
+
   test "a published candidate for an old head does not own the current review" do
     f = fixture() |> then(&publish(&1, &1.record, 201))
     path = "/projects/team%2Frepo/merge_requests/7"

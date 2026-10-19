@@ -160,7 +160,7 @@ defmodule SymphonyElixir.TaskLifecycle do
 
   defp baseline(flow, context) do
     previous = Map.take(flow, ~w(candidate verification outcome contract_sha))
-    previous = if authorized_rework?(context), do: Map.merge(previous, %{"candidate" => nil, "outcome" => "open"}), else: previous
+    previous = if authorized_rework?(context.plan, context.work, context.runtime), do: Map.merge(previous, %{"candidate" => nil, "outcome" => "open"}), else: previous
     restrictions = Map.filter(flow["restrictions"], fn {id, item} -> id == "clock" or item["native"] == true end)
 
     flow =
@@ -188,10 +188,13 @@ defmodule SymphonyElixir.TaskLifecycle do
     if context.member.raw["state"] in ["open", "opened"], do: flow, else: restrict(flow, "native_closed", "evidence")
   end
 
-  defp authorized_rework?(context) do
-    marker = context.runtime["rework"]
-    parent = context.plan.parent
-    plan = context.plan.plan
+  @doc "Verify a persisted rework marker against the current parent decision and reopened native member."
+  @spec authorized_rework?(map(), WorkRef.t(), map()) :: boolean()
+  def authorized_rework?(preflight, work, runtime) do
+    marker = runtime["rework"]
+    parent = preflight.parent
+    plan = preflight.plan
+    member = preflight.members[WorkRef.key(work)]
 
     with %{
            "status" => "confirmed",
@@ -201,7 +204,8 @@ defmodule SymphonyElixir.TaskLifecycle do
            "criteria" => criteria
          } <- marker,
          true <- is_binary(source) and is_binary(decision_source) and is_binary(manifest_source) and is_list(criteria),
-         true <- context.member.raw["state"] in ["open", "opened"],
+         %{raw: %{"state" => state}} <- member,
+         true <- state in ["open", "opened"],
          %{"source" => ^manifest_source} = manifest <-
            Enum.find(TaskPlanManifest.manifests(parent), &(&1["source"] == manifest_source)),
          {:ok, %{"action" => "rework", "source" => ^decision_source, "criteria" => ^criteria}} <-

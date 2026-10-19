@@ -445,27 +445,45 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
           do: %{current | note_reads: current.note_reads + 1},
           else: current
 
-      case current.drift do
-        %{"path" => ^path, "remaining" => remaining, "remove_note_id" => note_id} when remaining <= 1 ->
-          kept = Enum.reject(Map.fetch!(current.objects, path), &(&1["id"] == note_id))
-          {kept, %{current | objects: Map.put(current.objects, path, kept), drift: nil}}
-
-        %{"path" => ^path, "remaining" => remaining, "remove_note_id" => note_id} ->
-          body = Map.fetch!(current.objects, path)
-          {body, %{current | drift: %{"path" => path, "remaining" => remaining - 1, "remove_note_id" => note_id}}}
-
-        %{"path" => ^path, "remaining" => remaining} when remaining <= 1 ->
-          drifted = Map.put(Map.fetch!(current.objects, path), "updated_at", "2026-10-18T00:10:00Z")
-          {drifted, %{current | objects: Map.put(current.objects, path, drifted), drift: nil}}
-
-        %{"path" => ^path, "remaining" => remaining} ->
-          body = Map.fetch!(current.objects, path)
-          {body, %{current | drift: %{"path" => path, "remaining" => remaining - 1}}}
-
-        _ ->
-          {Map.fetch!(current.objects, path), current}
+      if match?(%{"path" => ^path, "append_note" => _}, current.drift) do
+        append_native_note(current, path)
+      else
+        read_native_drift(current, path)
       end
     end)
+  end
+
+  defp append_native_note(%{drift: %{"path" => path, "remaining" => remaining, "append_note" => added}} = current, path)
+       when remaining <= 1 do
+    notes = Map.fetch!(current.objects, path) ++ [added]
+    {notes, %{current | objects: Map.put(current.objects, path, notes), drift: nil}}
+  end
+
+  defp append_native_note(%{drift: %{"path" => path, "remaining" => remaining, "append_note" => added}} = current, path) do
+    {Map.fetch!(current.objects, path), %{current | drift: %{"path" => path, "remaining" => remaining - 1, "append_note" => added}}}
+  end
+
+  defp read_native_drift(current, path) do
+    case current.drift do
+      %{"path" => ^path, "remaining" => remaining, "remove_note_id" => note_id} when remaining <= 1 ->
+        kept = Enum.reject(Map.fetch!(current.objects, path), &(&1["id"] == note_id))
+        {kept, %{current | objects: Map.put(current.objects, path, kept), drift: nil}}
+
+      %{"path" => ^path, "remaining" => remaining, "remove_note_id" => note_id} ->
+        body = Map.fetch!(current.objects, path)
+        {body, %{current | drift: %{"path" => path, "remaining" => remaining - 1, "remove_note_id" => note_id}}}
+
+      %{"path" => ^path, "remaining" => remaining} when remaining <= 1 ->
+        drifted = Map.put(Map.fetch!(current.objects, path), "updated_at", "2026-10-18T00:10:00Z")
+        {drifted, %{current | objects: Map.put(current.objects, path, drifted), drift: nil}}
+
+      %{"path" => ^path, "remaining" => remaining} ->
+        body = Map.fetch!(current.objects, path)
+        {body, %{current | drift: %{"path" => path, "remaining" => remaining - 1}}}
+
+      _ ->
+        {Map.fetch!(current.objects, path), current}
+    end
   end
 
   defp arm_drift(f, path, reads) do
@@ -475,6 +493,11 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
 
   defp arm_note_removal(f, reads, note_id) do
     Agent.update(f.state, &%{&1 | drift: %{"path" => f.parent_notes, "remaining" => reads, "remove_note_id" => note_id}, note_reads: 0})
+    f
+  end
+
+  defp arm_note_append(f, reads, added) do
+    Agent.update(f.state, &%{&1 | drift: %{"path" => f.parent_notes, "remaining" => reads, "append_note" => added}, note_reads: 0})
     f
   end
 
@@ -896,9 +919,76 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
     configured = configured(f)
     arm_note_removal(f, reads_before_close - 1, acceptance["id"])
 
-    assert {:error, :parent_acceptance_changed} = TaskPlanManifest.advance(configured, f.opts)
+    assert {:error, :parent_changed_after_prepare} = TaskPlanManifest.advance(configured, f.opts)
     assert issue_state(f, 1) == "open"
     assert writes(f, "close") == 1
+  end
+
+  test "current acceptance distinguishes an exact manifest from a later native publication" do
+    f = native_fixture("github") |> verified() |> close_member()
+    assert {:ok, %{"manifest" => receipt}} = TaskPlanManifest.advance(configured(f), f.opts)
+    accept_note(f, receipt)
+    {:ok, parent} = SymphonyElixir.NativeWork.read(f.parent, f.opts)
+    assert {:ok, decision} = TaskPlanManifest.decision(parent, f.plan, receipt)
+    assert :ok = TaskPlanManifest.current_acceptance(parent, f.plan, receipt, decision)
+
+    later_manifest = note(900, 99, block("plan-manifest", receipt["payload"]), @decision_at)
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [later_manifest] end))
+    {:ok, changed} = SymphonyElixir.NativeWork.read(f.parent, f.opts)
+
+    assert {:error, :parent_acceptance_changed} =
+             TaskPlanManifest.current_acceptance(changed, f.plan, receipt, decision)
+  end
+
+  test "a native parent pause arriving after prepare blocks close across both providers" do
+    for provider <- ["github", "gitlab"] do
+      baseline = native_fixture(provider) |> verified() |> close_member()
+      assert {:ok, %{"manifest" => baseline_receipt}} = TaskPlanManifest.advance(configured(baseline), baseline.opts)
+      accept_note(baseline, baseline_receipt)
+      Agent.update(baseline.state, &%{&1 | note_reads: 0})
+      assert {:ok, %{"status" => "confirmed"}} = TaskPlanManifest.advance(configured(baseline), baseline.opts)
+      reads_before_close = Agent.get(baseline.state, & &1.close_note_reads)
+      assert reads_before_close > 1
+
+      f = native_fixture(provider) |> verified() |> close_member()
+      assert {:ok, %{"manifest" => receipt}} = TaskPlanManifest.advance(configured(f), f.opts)
+      accept_note(f, receipt)
+      prepared = configured(f)
+      pause = note(900, 1, block("plan-decision", %{"action" => "pause", "revision" => f.plan["revision"]}), @decision_at)
+      arm_note_append(f, reads_before_close - 3, pause)
+
+      assert {:error, :parent_changed_after_prepare} = TaskPlanManifest.advance(prepared, f.opts)
+      assert issue_state(f, 1) == "open"
+      assert writes(f, "close") == 1
+      assert current(f)["parent_close_intent"] == nil
+    end
+  end
+
+  test "a native parent pause after the close write leaves the receipt inconsistent" do
+    f = native_fixture("github") |> verified() |> close_member()
+    assert {:ok, %{"manifest" => receipt}} = TaskPlanManifest.advance(configured(f), f.opts)
+    accept_note(f, receipt)
+    prepared = configured(f)
+    write_request = f.opts[:write_request]
+    parent_path = f.prefix <> "/issues/1"
+    pause = note(900, 1, block("plan-decision", %{"action" => "pause", "revision" => f.plan["revision"]}), @decision_at)
+
+    opts =
+      Keyword.put(f.opts, :write_request, fn provider, method, path, headers, body, settings ->
+        result = write_request.(provider, method, path, headers, body, settings)
+
+        if method == "PATCH" and path == parent_path do
+          Agent.update(f.state, fn state ->
+            %{state | objects: Map.update!(state.objects, f.parent_notes, &(&1 ++ [pause]))}
+          end)
+        end
+
+        result
+      end)
+
+    assert {:ok, %{"status" => "inconsistent"}} = TaskPlanManifest.advance(prepared, opts)
+    assert issue_state(f, 1) == "closed"
+    assert current(f)["parent_close_intent"]["status"] == "inconsistent"
   end
 
   test "publish recovers a lost write response by native readback instead of reposting" do

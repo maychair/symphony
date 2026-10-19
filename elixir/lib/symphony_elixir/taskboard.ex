@@ -823,12 +823,16 @@ defmodule SymphonyElixir.Taskboard do
     suffix = if entry["provider"] == "github", do: "/issues/#{number}", else: "/-/issues/#{number}"
     repository_id = ref["repository_id"] || ref["project_id"]
 
-    is_binary(uri.host) and is_binary(entry["host"]) and String.downcase(uri.host) == String.downcase(entry["host"]) and
-      uri.path == "/" <> path <> suffix and
+    native_uri?(uri, entry["host"], "/" <> path <> suffix) and
       (is_nil(repository_id) or to_string(repository_id) == to_string(entry["repository_id"]))
   end
 
   defp native_location?(_, _, _), do: false
+
+  defp native_uri?(uri, host, path) do
+    uri.scheme == "https" and uri.userinfo == nil and uri.authority == host and
+      uri.query == nil and uri.fragment == nil and uri.path == path
+  end
 
   defp repository_path("github", %Issue{native_ref: ref}) when is_map(ref), do: ref["repo"]
   defp repository_path("gitlab", %Issue{native_ref: ref}) when is_map(ref), do: ref["project_path"]

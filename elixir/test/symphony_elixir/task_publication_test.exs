@@ -3,9 +3,10 @@ defmodule SymphonyElixir.TaskPublicationTest do
   alias SymphonyElixir.{ArtifactStore, CommandCheck, ReportArtifact, TaskTools}
   alias SymphonyElixir.Codex.DynamicTool
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture}
-  alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskPlan, TaskPublication, TaskWorkflow, WorkRef}
-  alias SymphonyElixir.{TaskDelivery, TaskDependencies, TaskEvidence, TaskExecution, TaskLifecycle}
-  alias SymphonyElixir.{TaskExecutionConfig, TaskPlanPreflight, TaskWorkspace}
+  alias SymphonyElixir.{NativeWork, RunJournal, TaskDecision, TaskDelivery, TaskDependencies}
+  alias SymphonyElixir.{TaskEvidence, TaskExecution, TaskExecutionConfig, TaskLifecycle}
+  alias SymphonyElixir.{TaskPlan, TaskPlanManifest, TaskPlanPreflight, TaskPublication}
+  alias SymphonyElixir.{TaskWorkflow, TaskWorkspace, WorkRef}
 
   defp contract(work, parent, kind \\ "report") do
     data = %{
@@ -412,6 +413,73 @@ defmodule SymphonyElixir.TaskPublicationTest do
     assert admitted.flow["dispatchable"]
     assert {:ok, again} = TaskExecution.observe(f.parent, consumer, registry, f.opts)
     assert again.flow["inputs"] == [input]
+  end
+
+  test "confirmed dependent rework selects current upstream evidence instead of its stale binding" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    {:ok, upstream} = dependencies(f, 3, nil, [f])
+    [input] = inputs(upstream)
+    stale = Map.put(input, "version", String.duplicate("0", 40))
+    dependent = consumer(f, 3, [stale], [f])
+    work = dependent.payload["work"]
+    registry = executions([f, dependent])
+
+    assert {:error, :pinned_input_unconfirmed} = TaskExecution.observe(f.parent, work, registry, f.opts)
+
+    {:ok, preflight} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    plan = preflight.plan
+
+    body = %{
+      "schema_version" => 2,
+      "plan_revision" => plan["revision"],
+      "criteria" => plan["criteria"],
+      "integration" => plan["integration"],
+      "members" => Enum.map(plan["members"], &Map.take(&1, ["work"]))
+    }
+
+    manifest = Map.put(body, "revision", TaskWorkflow.digest(body))
+    manifest_note = note(710, 99, "<!-- symphony-plan-manifest " <> Jason.encode!(manifest) <> " -->")
+    [entry] = TaskPlanManifest.manifests(%{notes: [manifest_note]})
+    decision = %{"action" => "rework", "manifest" => entry["source"], "revision" => manifest["revision"], "criteria" => ["result"]}
+    decision_note = note(711, 2, "<!-- symphony-plan-acceptance " <> Jason.encode!(decision) <> " -->")
+    decision_note = Map.merge(decision_note, %{"created_at" => "2026-10-17T00:00:01Z", "updated_at" => "2026-10-17T00:00:01Z"})
+
+    Agent.update(f.state, &update_in(&1.objects[f.parent_notes], fn notes -> notes ++ [manifest_note, decision_note] end))
+
+    marker = %{
+      "status" => "confirmed",
+      "source" => "issue:reopened",
+      "parent_source" => TaskDecision.source_ref(decision_note),
+      "manifest" => entry["source"],
+      "criteria" => ["result"],
+      "superseded" => ["candidate", "verification"]
+    }
+
+    {:ok, stopped} = RunJournal.checkpoint(current(dependent), %{"rework" => marker, "native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+    {:ok, updated} = TaskPlanPreflight.inspect_plan(f.parent, f.opts)
+    assert TaskLifecycle.authorized_rework?(updated, work, current(dependent))
+    assert {:ok, observation} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert observation.flow["inputs"] == [input]
+    assert observation.flow["dispatchable"]
+  end
+
+  test "a newly approved explicit upstream selection replaces a stale dependent pin" do
+    f = fixture("github", ["verified"]) |> git_artifact() |> verified_tools()
+    {:ok, upstream} = dependencies(f, 3, nil, [f])
+    [input] = inputs(upstream)
+    stale = Map.put(input, "version", String.duplicate("0", 40))
+    dependent = consumer(f, 3, [stale], [f])
+    work = dependent.payload["work"]
+    registry = executions([f, dependent])
+
+    assert {:error, :pinned_input_unconfirmed} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    repin(f, 3, f.git.revision)
+    {:ok, stopped} = RunJournal.checkpoint(current(dependent), %{"native_stop_confirmed" => true})
+    :ok = RunJournal.complete(stopped, "completed")
+
+    assert {:ok, observation} = TaskExecution.observe(f.parent, work, registry, f.opts)
+    assert observation.flow["inputs"] == [input]
   end
 
   test "an explicit edge selection resolves only the approved upstream version and refuses any newer one" do
