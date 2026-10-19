@@ -361,3 +361,8 @@ For a packaged workflow check without dispatch, use the executable's `--prefligh
 option. Engine package selection and role materialization cleanup remain host
 responsibilities; they never create new task authority. See
 [the lifecycle boundaries](docs/workflow-lifecycle.md#lifecycle-write-and-retention-boundaries).
+
+Codex sessions disable shell snapshots and login shells on both new and resumed threads.
+Shell startup variables (`ZDOTDIR`, `BASH_ENV`, `ENV`) are pinned to `/dev/null`, and
+tracker secret names are excluded from tool environments. These constraints prevent automatic
+profile-based credential reinjection; they do not isolate readable host files from the same OS user.

@@ -86,6 +86,26 @@ defmodule SymphonyElixir.TestSupport do
     :ok
   end
 
+  # Run all cleanup steps even if the body or an earlier cleanup failed. ExUnit
+  # renders each original exception and stacktrace instead of hiding the cause.
+  def with_cleanup(body, cleanups) do
+    result = capture_failure(body)
+    failures = for cleanup <- cleanups, {:failure, failure} <- [capture_failure(cleanup)], do: failure
+
+    case {result, failures} do
+      {{:ok, value}, []} -> value
+      {{:failure, {kind, reason, stack}}, []} -> :erlang.raise(kind, reason, stack)
+      {{:failure, failure}, rest} -> raise ExUnit.MultiError, errors: [failure | rest]
+      {{:ok, _}, rest} -> raise ExUnit.MultiError, errors: rest
+    end
+  end
+
+  defp capture_failure(fun) do
+    {:ok, fun.()}
+  catch
+    kind, reason -> {:failure, {kind, reason, __STACKTRACE__}}
+  end
+
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 

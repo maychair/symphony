@@ -6,6 +6,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
 
+  @shell_environment %{"ZDOTDIR" => "/dev/null", "BASH_ENV" => "/dev/null", "ENV" => "/dev/null"}
+
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
@@ -461,14 +463,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp agent_port_env(binding) do
-    Enum.map(binding.agent_environment, fn {name, value} -> {String.to_charlist(name), String.to_charlist(value)} end)
+    Enum.map(agent_environment(binding), fn {name, value} -> {String.to_charlist(name), String.to_charlist(value)} end)
   end
 
   defp agent_environment_command(binding) do
-    case Enum.map(binding.agent_environment, fn {name, value} -> "export #{name}=#{shell_escape(value)}" end) do
-      [] -> nil
-      entries -> Enum.join(entries, " && ")
-    end
+    binding
+    |> agent_environment()
+    |> Enum.map_join(" && ", fn {name, value} -> "export #{name}=#{shell_escape(value)}" end)
+  end
+
+  defp agent_environment(binding) do
+    Map.merge(binding.agent_environment, @shell_environment)
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
@@ -550,12 +555,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp open_thread(port, workspace, policies, binding, opts) do
     case opts[:resume_thread_id] do
-      id when is_binary(id) -> open_existing_thread(port, id, workspace, policies, opts)
+      id when is_binary(id) -> open_existing_thread(port, id, workspace, policies, binding, opts)
       _ -> start_thread(port, workspace, policies, binding)
     end
   end
 
-  defp open_existing_thread(port, id, workspace, policies, opts) do
+  defp open_existing_thread(port, id, workspace, policies, binding, opts) do
     cond do
       opts[:halt_only] ->
         with :ok <- suspend_goal_for_resume(port, id, opts), do: inspect_thread(port, id, opts)
@@ -564,13 +569,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         inspect_thread(port, id, opts)
 
       true ->
-        resume_thread(port, id, workspace, policies, opts)
+        resume_thread(port, id, workspace, policies, binding, opts)
     end
   end
 
-  defp resume_thread(port, thread_id, workspace, policies, opts) do
+  defp resume_thread(port, thread_id, workspace, policies, binding, opts) do
     with :ok <- suspend_goal_for_resume(port, thread_id, opts) do
-      do_resume_thread(port, thread_id, workspace, policies, opts)
+      do_resume_thread(port, thread_id, workspace, policies, binding, opts)
     end
   end
 
@@ -685,7 +690,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       Enum.all?(turns, &(&1["status"] in ["completed", "failed", "interrupted"]))
   end
 
-  defp do_resume_thread(port, thread_id, workspace, policies, opts) do
+  defp do_resume_thread(port, thread_id, workspace, policies, binding, opts) do
     send_message(port, %{
       "id" => @thread_start_id,
       "method" => "thread/resume",
@@ -694,7 +699,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "cwd" => workspace,
         "approvalPolicy" => policies.approval_policy,
         "sandbox" => policies.thread_sandbox,
-        "config" => thread_sandbox_config(policies)
+        "config" => thread_config(policies, binding)
       }
     })
 
@@ -735,7 +740,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
-        "config" => thread_sandbox_config(policies),
+        "config" => thread_config(policies, dynamic_tool_binding),
         "cwd" => workspace,
         "dynamicTools" => dynamic_tool_binding.tool_specs
       }
@@ -751,6 +756,17 @@ defmodule SymphonyElixir.Codex.AppServer do
       other ->
         other
     end
+  end
+
+  # Apply on every new or restored thread; a user's saved snapshot/profile is
+  # not an authority to reintroduce host-side tracker credentials.
+  defp thread_config(policies, binding) do
+    Map.merge(thread_sandbox_config(policies), %{
+      "features.shell_snapshot" => false,
+      "allow_login_shell" => false,
+      "shell_environment_policy.set" => @shell_environment,
+      "shell_environment_policy.exclude" => valid_environment_names(binding.secret_environment_names)
+    })
   end
 
   # Native Goal turns use thread defaults rather than explicit turn/start policy.

@@ -1,6 +1,58 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "new, reviewed and restored sessions prevent automatic profile reinjection" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "isolated")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "isolation-server")
+    trace = Path.join(root, "isolation.jsonl")
+    profile = Path.join(root, "reinject.sh")
+    File.write!(profile, "export GITLAB_PAT=regression-sentinel\n")
+
+    for name <- ["BASH_ENV", "ENV", "ZDOTDIR"] do
+      previous = System.get_env(name)
+      System.put_env(name, profile)
+      on_exit(fn -> restore_env(name, previous) end)
+    end
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,os,subprocess,sys
+    assert all(os.environ.get(k)=='/dev/null' for k in ['BASH_ENV','ENV','ZDOTDIR'])
+    assert not subprocess.check_output(['bash','-c','printf %s "${GITLAB_PAT:-}"'])
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialized':continue
+      if m=='initialize':r={}
+      elif m in ['thread/start','thread/resume']:
+        c=q['params']['config']
+        assert c['features.shell_snapshot'] is False
+        assert c['allow_login_shell'] is False
+        assert c['shell_environment_policy.set']=={k:'/dev/null' for k in ['BASH_ENV','ENV','ZDOTDIR']}
+        assert 'GITLAB_PAT' in c['shell_environment_policy.exclude']
+        r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
+      elif m=='thread/read':r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
+      else:raise AssertionError(m)
+      print(json.dumps({'id':q['id'],'result':r}),flush=True)
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+    binding = %{tool_specs: [], secret_environment_names: ["GITLAB_PAT"], agent_environment: %{"BASH_ENV" => profile}}
+
+    for opts <- [[], [review_only: true], [resume_thread_id: "isolated"], [resume_thread_id: "isolated", inspect_only: true]] do
+      assert {:ok, session} = AppServer.start_session(workspace, Keyword.put(opts, :dynamic_tool_binding, binding))
+      assert :ok = AppServer.stop_session(session)
+    end
+
+    methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert Enum.count(methods, &(&1 == "thread/start")) == 2
+    assert Enum.count(methods, &(&1 == "thread/resume")) == 1
+    assert Enum.count(methods, &(&1 == "thread/read")) == 1
+  end
+
   test "bound execution sessions advertise only role tools and reject legacy mutation calls on the real protocol" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "workspaces/bound-tools")
@@ -67,6 +119,7 @@ defmodule SymphonyElixir.AppServerTest do
     requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
     starts = Enum.filter(requests, &(&1["method"] == "thread/start"))
     assert length(starts) == 2
+    assert Enum.all?(starts, &(get_in(&1, ["params", "config", "features.shell_snapshot"]) == false))
     assert Enum.all?(starts, fn start -> Enum.all?(start["params"]["dynamicTools"], &String.starts_with?(&1["name"], "task_")) end)
     assert Enum.count(requests, &(&1["id"] == 77 and get_in(&1, ["result", "success"]) == false)) == 2
   end

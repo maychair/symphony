@@ -6,14 +6,13 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
   @moduletag :live_e2e
   @moduletag timeout: 300_000
 
-  @api_url "https://gitlab.com/api/v4"
   @result_file "LIVE_GITLAB_E2E_RESULT.txt"
   @live_e2e_skip_reason if(System.get_env("SYMPHONY_RUN_GITLAB_LIVE_E2E") != "1",
                           do: "set SYMPHONY_RUN_GITLAB_LIVE_E2E=1 to enable the real GitLab/Codex end-to-end test"
                         )
 
   @tag skip: @live_e2e_skip_reason
-  test "creates a real GitLab issue and closes it through gitlab_api" do
+  test "closes and retains an approved real GitLab issue through gitlab_api" do
     project_id = required_env!("SYMPHONY_LIVE_GITLAB_PROJECT_ID")
     token = required_env!("GITLAB_PAT")
     run_id = "symphony-gitlab-live-e2e-#{System.unique_integer([:positive])}"
@@ -21,81 +20,79 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     workflow_root = Path.join(test_root, "workflow")
     workflow_file = Path.join(workflow_root, "WORKFLOW.md")
     workspace_root = Path.join(test_root, "workspaces")
-    codex_home = isolated_codex_home!(test_root)
+    codex_home = existing_codex_home!()
     original_workflow_path = Workflow.workflow_file_path()
     runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
     File.mkdir_p!(workflow_root)
 
-    issue_payload =
-      create_issue!(
-        project_id,
-        token,
-        "Symphony GitLab live e2e #{run_id}",
-        "Disposable issue created by the Symphony GitLab live E2E test."
-      )
+    issue_iid = required_env!("SYMPHONY_LIVE_GITLAB_ISSUE_IID")
+    issue_payload = get_issue!(project_id, token, issue_iid)
+    assert issue_payload["state"] == "opened", "prepare an open, approved test Issue before running"
+    expected_comment = "Symphony 真实测试：Agent 已读取本 Issue，并完成隔离目录的结果验证。"
 
-    issue_iid = Integer.to_string(issue_payload["iid"])
-    expected_comment = expected_comment("GL-#{issue_iid}", run_id)
+    SymphonyElixir.TestSupport.with_cleanup(
+      fn ->
+        assert %Issue{} =
+                 issue =
+                 GitLabClient.normalize_issue_for_test(
+                   issue_payload,
+                   tracker_settings(project_id)
+                 )
 
-    try do
-      assert %Issue{} =
-               issue =
-               GitLabClient.normalize_issue_for_test(
-                 issue_payload,
-                 tracker_settings(project_id)
-               )
+        stop_agent_runtime_if_running(runtime_pid)
+        Workflow.set_workflow_file_path(workflow_file)
 
-      stop_agent_runtime_if_running(runtime_pid)
-      Workflow.set_workflow_file_path(workflow_file)
+        write_workflow!(
+          workflow_file,
+          project_id,
+          workspace_root,
+          codex_home,
+          live_prompt(project_id, expected_comment)
+        )
 
-      write_workflow!(
-        workflow_file,
-        project_id,
-        workspace_root,
-        codex_home,
-        live_prompt(project_id, expected_comment)
-      )
+        assert %Issue{id: state_issue_id} = wait_for_open_state_issue!(issue.id)
+        assert state_issue_id == issue.id
 
-      assert %Issue{id: state_issue_id} = wait_for_open_state_issue!(issue.id)
-      assert state_issue_id == issue.id
+        assert {:ok, [%Issue{id: issue_id, identifier: identifier}]} =
+                 Tracker.fetch_issues_by_ids([issue.id])
 
-      assert {:ok, [%Issue{id: issue_id, identifier: identifier}]} =
-               Tracker.fetch_issues_by_ids([issue.id])
+        assert issue_id == issue.id
+        assert identifier == issue.identifier
 
-      assert issue_id == issue.id
-      assert identifier == issue.identifier
+        assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
 
-      assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
+        runtime_info = receive_runtime_info!(issue.id)
+        tool_calls = completed_gitlab_tool_calls(issue.id)
 
-      runtime_info = receive_runtime_info!(issue.id)
-      tool_calls = completed_gitlab_tool_calls(issue.id)
+        assert File.read!(Path.join(runtime_info.workspace_path, @result_file)) ==
+                 expected_result(issue.identifier, project_id)
 
-      assert File.read!(Path.join(runtime_info.workspace_path, @result_file)) ==
-               expected_result(issue.identifier, project_id)
+        assert %{"state" => "closed"} = get_issue!(project_id, token, issue.id)
 
-      assert %{"state" => "closed"} = get_issue!(project_id, token, issue.id)
+        assert notes!(project_id, token, issue.id)
+               |> Enum.any?(&(&1["body"] == expected_comment))
 
-      assert notes!(project_id, token, issue.id)
-             |> Enum.any?(&(&1["body"] == expected_comment))
+        issue_path = "/projects/#{project_id}/issues/#{issue.id}"
+        notes_path = issue_path <> "/notes"
 
-      issue_path = "/projects/#{project_id}/issues/#{issue.id}"
-      notes_path = issue_path <> "/notes"
-
-      assert_tool_call_count!(tool_calls, "GET", issue_path, 2)
-      assert_tool_call_count!(tool_calls, "GET", notes_path, 2)
-      assert_tool_call!(tool_calls, "POST", notes_path, %{"body" => expected_comment})
-      assert_tool_call!(tool_calls, "PUT", issue_path, %{"state_event" => "close"})
-    after
-      close_result = close_issue(project_id, token, issue_iid)
-      delete_result = delete_issue(project_id, token, issue_iid)
-      Workflow.set_workflow_file_path(original_workflow_path)
-      restart_agent_runtime_if_needed(runtime_pid)
-      File.rm_rf(test_root)
-      assert :ok = close_result
-      assert :ok = delete_result
-      assert :not_found = get_issue(project_id, token, issue_iid)
-    end
+        assert_tool_call_count!(tool_calls, "GET", issue_path, 2)
+        assert_tool_call_count!(tool_calls, "GET", notes_path, 2)
+        assert_tool_call!(tool_calls, "POST", notes_path, %{"body" => expected_comment})
+        assert_tool_call!(tool_calls, "PUT", issue_path, %{"state_event" => "close"})
+      end,
+      [
+        fn ->
+          assert :ok = close_issue(project_id, token, issue_iid)
+          assert %{"state" => "closed"} = get_issue!(project_id, token, issue_iid)
+        end,
+        fn -> Workflow.set_workflow_file_path(original_workflow_path) end,
+        fn -> restart_agent_runtime_if_needed(runtime_pid) end,
+        fn ->
+          assert {:ok, _} = File.rm_rf(test_root)
+        end
+      ]
+    )
   end
 
   defp tracker_settings(project_id) do
@@ -115,6 +112,8 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
       tracker:
         kind: gitlab
         provider:
+          api_url: #{Jason.encode!(api_url())}
+          allow_insecure_http: #{System.get_env("SYMPHONY_LIVE_GITLAB_ALLOW_INSECURE_HTTP") == "1"}
           project_path: #{Jason.encode!(project_id)}
           api_key: "$GITLAB_PAT"
         active_states: ["opened"]
@@ -190,25 +189,6 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     "identifier=#{identifier}\nproject_id=#{project_id}\ngitlab_pat_present=no\ngitlab_access_token_present=no\n"
   end
 
-  defp expected_comment(identifier, run_id) do
-    "Symphony GitLab live e2e comment\nidentifier=#{identifier}\nrun_id=#{run_id}"
-  end
-
-  defp create_issue!(project_id, token, title, description) do
-    response =
-      gitlab_request!(
-        :post,
-        "/projects/#{project_id}/issues",
-        token,
-        %{"title" => title, "description" => description}
-      )
-
-    case response.body do
-      %{"iid" => iid} = issue when is_integer(iid) -> issue
-      _ -> flunk("GitLab issue create returned an unexpected payload")
-    end
-  end
-
   defp get_issue!(project_id, token, issue_iid) do
     case get_issue(project_id, token, issue_iid) do
       %{} = issue -> issue
@@ -255,15 +235,6 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     end
   end
 
-  defp delete_issue(project_id, token, issue_iid) do
-    case gitlab_request(:delete, "/projects/#{project_id}/issues/#{issue_iid}", token, nil) do
-      {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, %{status: 404}} -> :ok
-      {:ok, %{status: status}} -> {:error, {:gitlab_delete_status, status}}
-      {:error, reason} -> {:error, {:gitlab_delete_request, reason}}
-    end
-  end
-
   defp gitlab_request!(method, path, token, body, query \\ %{}) do
     case gitlab_request(method, path, token, body, query) do
       {:ok, %{status: status} = response} when status in 200..299 -> response
@@ -275,7 +246,7 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
   defp gitlab_request(method, path, token, body, query \\ %{}) do
     request_opts = [
       method: method,
-      url: @api_url <> path,
+      url: api_url() <> path,
       headers: [
         {"Accept", "application/json"},
         {"PRIVATE-TOKEN", token}
@@ -368,23 +339,13 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     flunk("new GitLab issue did not appear in the open-state adapter read")
   end
 
-  defp isolated_codex_home!(test_root) do
-    codex_home = Path.join(test_root, "codex-home")
-    auth_json_path = Path.join(codex_home, "auth.json")
+  defp api_url do
+    System.get_env("SYMPHONY_LIVE_GITLAB_API_URL") || "https://gitlab.com/api/v4"
+  end
 
-    source_auth_json =
-      Path.join(
-        System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex"),
-        "auth.json"
-      )
-
-    unless File.regular?(source_auth_json) do
-      flunk("live GitLab e2e requires Codex auth")
-    end
-
-    File.mkdir_p!(codex_home)
-    File.cp!(source_auth_json, auth_json_path)
-    File.chmod!(auth_json_path, 0o600)
+  defp existing_codex_home! do
+    codex_home = System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex")
+    assert File.regular?(Path.join(codex_home, "auth.json")), "live GitLab e2e requires Codex auth"
     codex_home
   end
 

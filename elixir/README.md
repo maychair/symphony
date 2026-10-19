@@ -428,12 +428,18 @@ export SYMPHONY_LIVE_ASANA_WORKSPACE_GID=...
 SYMPHONY_RUN_ASANA_LIVE_E2E=1 mix test test/symphony_elixir/asana_live_e2e_test.exs
 ```
 
-Run the opt-in GitLab live E2E against a disposable project:
+Run the opt-in GitLab live E2E against an explicitly approved, open test Issue.
+The test comments, closes and retains that Issue; it never deletes it. Existing native
+Codex authentication is reused in place, without copying credentials. Main and cleanup
+failures are reported together. Prepare the Issue through approved repository tooling:
 
 ```bash
 cd elixir
 export GITLAB_PAT=...
 export SYMPHONY_LIVE_GITLAB_PROJECT_ID=...
+export SYMPHONY_LIVE_GITLAB_ISSUE_IID=...
+# Self-hosted: SYMPHONY_LIVE_GITLAB_API_URL must point to /api/v4.
+# HTTP additionally requires SYMPHONY_LIVE_GITLAB_ALLOW_INSECURE_HTTP=1.
 SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_test.exs
 ```
 
@@ -488,3 +494,8 @@ Workspace's launcher retains immutable local packages and can select a fixed
 package independently of the development checkout. See
 [the lifecycle contract](docs/workflow-lifecycle.md#lifecycle-write-and-retention-boundaries)
 for rework, completion evidence, provider review execution and v2 cleanup boundaries.
+
+Codex sessions disable shell snapshots and login shells on both new and resumed threads.
+Shell startup variables (`ZDOTDIR`, `BASH_ENV`, `ENV`) are pinned to `/dev/null`, and
+tracker secret names are excluded from tool environments. These constraints prevent automatic
+profile-based credential reinjection; they do not isolate readable host files from the same OS user.
