@@ -144,40 +144,39 @@ defmodule SymphonyElixir.TaskReconciler do
       flow = flow |> check_routing(facts, active) |> TaskWorkflow.reconcile(facts, events, now)
 
       with {:ok, saved} <- RunJournal.checkpoint(record, %{"workflow" => flow}),
-           {:ok, saved} <- notify_restrictions(saved, path, settings, client),
+           {:ok, saved} <- notify_restrictions(saved, path, settings, client, facts),
            {:ok, saved} <- maybe_close(saved, raw, path, settings, client) do
         routing(saved, raw, path, settings, client, active)
       end
     end
   end
 
-  defp notify_restrictions(record, path, settings, client) do
+  defp notify_restrictions(record, path, settings, client, facts) do
     if stopped?(record) do
       Enum.reduce_while(record["workflow"]["restrictions"], {:ok, record}, fn {id, restriction}, {:ok, current} ->
-        next_notice(current, id, restriction, path, settings, client)
+        next_notice(current, id, restriction, path, settings, client, facts)
       end)
     else
       {:ok, record}
     end
   end
 
-  defp next_notice(record, id, restriction, path, settings, client) do
-    case notify_restriction(record, id, restriction, path, settings, client) do
+  defp next_notice(record, id, restriction, path, settings, client, facts) do
+    case notify_restriction(record, id, restriction, path, settings, client, facts) do
       {:ok, saved} -> {:cont, {:ok, saved}}
       error -> {:halt, error}
     end
   end
 
-  defp notify_restriction(record, id, %{"kind" => kind} = restriction, path, settings, client)
+  defp notify_restriction(record, id, %{"kind" => kind} = restriction, path, settings, client, facts)
        when kind in ["decision", "scope", "budget"] do
-    key = TaskWorkflow.digest(restriction)
+    body = restriction_notice(record, id, kind, restriction, facts)
+    key = TaskWorkflow.digest(%{"restriction" => restriction, "body" => body})
     previous = record["waiting_notices"] || %{}
 
     if previous[id] == key do
       {:ok, record}
     else
-      body = restriction_notice(record, id, kind, restriction)
-
       with {:ok, notes} <- pages(client, path <> "/notes", settings, 1, []),
            :ok <- post_wait_notice(notes, body, path, settings, client) do
         RunJournal.checkpoint(record, %{"waiting_notices" => Map.put(previous, id, key)})
@@ -185,13 +184,13 @@ defmodule SymphonyElixir.TaskReconciler do
     end
   end
 
-  defp notify_restriction(record, _, _, _, _, _), do: {:ok, record}
+  defp notify_restriction(record, _, _, _, _, _, _), do: {:ok, record}
 
-  defp restriction_notice(record, id, kind, restriction) do
+  defp restriction_notice(record, id, kind, restriction, facts) do
     message =
       case {id, kind} do
         {"budget", _} -> "累计执行预算已用完。请授权人追加预算、调整约定或决定如何处理现有成果。"
-        {"baseline", _} -> "当前任务约定版本无法核验。请授权人确认范围、权限和验收条件。"
+        {"baseline", _} -> baseline_notice(facts)
         {"external_routing", _} -> "调度标签被外部移除，原因尚未核验。请授权人明确是否恢复执行。"
         {_, "scope"} -> "这条请求无法对应原有验收项，或改变了任务约定。请授权人确认受影响部分；独立且已授权的工作可继续。"
         _ -> "存在未解除的执行限制或含义不清的指令。请授权人确认具体决定；调度标签不会代替授权。"
@@ -204,6 +203,18 @@ defmodule SymphonyElixir.TaskReconciler do
       end
 
     "**Symphony 需要确认**\n\n" <> message <> source <> "\n\n" <> @engine_notice_marker
+  end
+
+  defp baseline_notice(%{"contract" => nil}) do
+    "Issue 缺少有效的结构化任务约定。请先保存已确认的约定和匹配的任务类型，再对当前版本授权执行。"
+  end
+
+  defp baseline_notice(%{"contract" => contract, "type" => type}) do
+    if contract["type"] != type do
+      "Issue 的任务类型与约定不一致。请设置匹配的 type:* 标签，再对当前版本授权执行。"
+    else
+      "当前 Issue 版本缺少有效的执行授权，或原授权已失效。请核对已确认的约定，再对当前版本授权执行。"
+    end
   end
 
   defp post_wait_notice(notes, body, path, settings, client) do
