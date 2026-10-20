@@ -301,6 +301,31 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["restrictions"]["baseline"]
     assert record["workflow"]["state"] == "waiting"
+    assert Agent.get(server, &List.last(&1.notes)["body"]) =~ "当前 Issue 版本缺少有效的执行授权"
+  end
+
+  test "baseline notices track changed prerequisites without repeating", %{server: server, issue: issue} do
+    description = Agent.get(server, & &1.raw["description"])
+    Agent.update(server, &put_in(&1.raw["description"], "Confirmed readable scope without a machine agreement"))
+    assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
+    assert Agent.get(server, &List.last(&1.notes)["body"]) =~ "Issue 缺少有效的结构化任务约定"
+
+    Agent.update(server, fn state ->
+      %{state | raw: state.raw |> Map.put("description", description) |> Map.put("labels", ["symphony:ready", "type:research"])}
+    end)
+
+    {:ok, record} = RunJournal.read(RunJournal.directory(Execution.journal_root(), issue.id))
+    {:ok, record} = TaskReconciler.refresh(record, false)
+    assert Agent.get(server, &List.last(&1.notes)["body"]) =~ "Issue 的任务类型与约定不一致"
+    count = Agent.get(server, &length(&1.notes))
+    assert {:ok, _} = TaskReconciler.refresh(record, false)
+    assert Agent.get(server, &length(&1.notes)) == count
+  end
+
+  test "a mismatched task type has an actionable notice", %{server: server, issue: issue} do
+    Agent.update(server, &put_in(&1.raw["labels"], ["symphony:ready", "type:research"]))
+    assert {:error, :task_workflow_waiting} = Execution.prepare(issue, [])
+    assert Agent.get(server, &List.last(&1.notes)["body"]) =~ "Issue 的任务类型与约定不一致"
   end
 
   test "an unexplained routing removal after handoff restricts an already started task", %{server: server, issue: issue} do
