@@ -105,3 +105,9 @@ completion proof. Findings can accompany a delivered review. Failure, missing
 input, stale eligibility and unconfirmed publication require Human Review.
 Review cards need no Issue or Symphony Issue labels. Ordinary Issue membership
 and assignment filtering continue to apply to Issue cards.
+
+The restricted reader returns UTF-8 pages of at most 16 KiB for diffs, tracked
+files, commit messages and file content. Reviewers follow byte offsets until
+`next_offset` is null. The engine rejects skipped offsets and cannot accept a
+complete axis until every diff page and every requested source file is read.
+A diff path filter is rejected explicitly; paths select source files only.

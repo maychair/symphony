@@ -205,6 +205,63 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     assert {:error, {:scheduler_stop, _}} = Task.await(task)
   end
 
+  test "large UTF-8 reads are bounded and every page is required before completion", %{context: c, root: root} do
+    # One long line with multibyte characters crosses a byte-page boundary.
+    diff = String.duplicate("x", 16_383) <> String.duplicate("中", 12_000)
+    File.write!(Path.join(root, "large.c"), diff)
+    Process.put(ReviewAxis, %{context: c, event: fn _ -> :ok end, result: nil, diff: diff, files: "large.c\n", commits: "commit\n", diff_read: false, files_read: false})
+    on_exit(fn -> Process.delete(ReviewAxis) end)
+    submit = %{"status" => "complete", "report" => "完整读取后核对", "findings" => []}
+
+    read = fn args ->
+      assert %{"success" => true, "output" => output} = ReviewAxis.execute_agent_tool("review_read", args, [])
+      Jason.decode!(output)
+    end
+
+    first = read.(%{"kind" => "diff"})
+    assert first["offset"] == 0 and first["next_offset"] == 16_383
+    assert byte_size(first["content"]) <= 16_384 and String.valid?(first["content"])
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_read", %{"kind" => "diff", "path" => "large.c"}, [])
+
+    for offset <- [-1, 1.5, "0", 16_384, byte_size(diff) + 1] do
+      assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_read", %{"kind" => "diff", "offset" => offset}, [])
+    end
+
+    file_first = read.(%{"kind" => "file", "path" => "large.c"})
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    # Re-reading an earlier page does not advance across an unread gap.
+    assert read.(%{"kind" => "diff"}) == first
+    remainder = read_all_pages(read, "diff", nil, first["next_offset"])
+    assert first["content"] <> remainder == diff
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    assert file_first["content"] <> read_all_pages(read, "file", "large.c", file_first["next_offset"]) == diff
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    assert read.(%{"kind" => "list"})["content"] == "large.c\n"
+    assert read.(%{"kind" => "commits"})["content"] == "commit\n"
+    assert read.(%{"kind" => "diff", "offset" => byte_size(diff)})["content"] == ""
+
+    for kind <- ["list", "commits"] do
+      state = Process.get(ReviewAxis)
+      key = if kind == "list", do: :files, else: :commits
+      state = state |> Map.put(key, diff) |> Map.update!(:pages, &Map.delete(&1, {kind, nil}))
+      Process.put(ReviewAxis, state)
+      first = read.(%{"kind" => kind})
+      assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+      assert first["content"] <> read_all_pages(read, kind, nil, first["next_offset"]) == diff
+      assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    end
+  end
+
+  defp read_all_pages(_read, _kind, _path, nil), do: ""
+
+  defp read_all_pages(read, kind, path, offset) do
+    args = %{"kind" => kind, "offset" => offset}
+    args = if path, do: Map.put(args, "path", path), else: args
+    page = read.(args)
+    assert byte_size(page["content"]) <= 16_384 and String.valid?(page["content"])
+    page["content"] <> read_all_pages(read, kind, path, page["next_offset"])
+  end
+
   defmodule Backend do
     import ExUnit.Assertions
 
