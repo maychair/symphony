@@ -54,6 +54,15 @@ defmodule SymphonyElixir.ReviewCliTest do
     File.write!(Path.join(root, "journal/manual"), "occupied")
     assert_raise Mix.Error, ~r/Manual review journal unavailable/, fn -> Review.run(["--workflow", workflow, "--request", request]) end
     refute File.exists?(Path.join(root, "native-requests.jsonl"))
+
+    store = Path.join(root, "journal/manual")
+    File.rm!(store)
+    File.mkdir_p!(store)
+    File.write!(Path.join(store, "format-version"), "2\n")
+    subject = %{"kind" => "local", "repository" => Path.join(root, "source")}
+    File.write!(Path.join(store, TaskWorkflow.digest(subject)), "occupied")
+    assert_raise Mix.Error, ~r/Manual review journal unavailable at/, fn -> Review.run(["--workflow", workflow, "--request", request]) end
+    refute File.exists?(Path.join(root, "native-requests.jsonl"))
   end
 
   defp await_manual_turns(root, attempts \\ 500)
