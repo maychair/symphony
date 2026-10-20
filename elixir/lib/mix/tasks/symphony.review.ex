@@ -37,6 +37,7 @@ defmodule Mix.Tasks.Symphony.Review do
   end
 
   defp run_context(context, request) do
+    ensure_manual_store!(context.config["state_dir"])
     subject = manual_subject(context, request)
 
     directory = Path.join([context.config["state_dir"], "manual", TaskWorkflow.digest(subject)])
@@ -60,6 +61,33 @@ defmodule Mix.Tasks.Symphony.Review do
         Mix.raise("Manual review journal unavailable at #{directory}: #{inspect(reason)}")
     end
   end
+
+  # Key semantics are a store contract. Unmarked predecessor stores require
+  # explicit operator retirement; this entry never imports or resumes them.
+  defp ensure_manual_store!(state_dir) do
+    directory = Path.join(state_dir, "manual")
+    marker = Path.join(directory, "format-version")
+
+    case File.lstat(marker) do
+      {:ok, %{type: :regular}} ->
+        if File.read(marker) != {:ok, "2\n"}, do: unsupported_manual_store!()
+
+      {:error, :enoent} ->
+        with :ok <- File.mkdir_p(directory),
+             {:ok, []} <- File.ls(directory),
+             :ok <- File.write(marker, "2\n", [:exclusive]) do
+          :ok
+        else
+          _ -> unsupported_manual_store!()
+        end
+
+      _ ->
+        unsupported_manual_store!()
+    end
+  end
+
+  defp unsupported_manual_store!,
+    do: Mix.raise("Manual review journal unavailable: unsupported manual review state requires explicit retirement after native stop verification; no migration is performed.")
 
   defp manual_subject(_context, %{"kind" => "local", "repository" => source}) do
     {:ok, canonical} = PathSafety.canonicalize(source)

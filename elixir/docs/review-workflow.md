@@ -129,3 +129,11 @@ host, repository ID and MR/PR number for remote requests. Unrelated request fiel
 cannot select another recovery fence. An independently verified `still_valid`
 response completes a round with `changes_requested`; omitted or undecidable
 required findings remain `needs_input`. Neither verdict approves or merges code.
+
+The manual store requires a regular `manual/format-version` marker containing
+`2`. Only an empty store may be initialized. Unmarked, unknown or linked markers
+refuse allocation, including when predecessor records claim completed native
+stop. No old-format interpretation, history import or automatic migration is
+provided. Before enabling this format over a populated predecessor store, an
+operator must verify native stop and retain that entire store as audit material
+outside the active manual directory; uncertain stop forbids retirement.

@@ -20,6 +20,8 @@ defmodule SymphonyElixir.ReviewCliTest do
     assert Enum.all?(saved["runtime"]["axes"], fn {_, axis} -> axis["thread_allocation_intent"] and axis["turn_allocation_intent"] end)
     capture_io(fn -> Review.run(["--workflow", workflow, "--request", request]) end)
     assert length(Jason.decode!(File.read!(journal))["history"]) == 1
+    subject = %{"provider" => "gitlab", "host" => "review.invalid", "repository" => Path.join(root, "source")}
+    assert_predecessor_store_blocked(workflow, request, root, subject)
   end
 
   test "manual controller death retains native identities and fences a replacement" do
@@ -151,6 +153,52 @@ defmodule SymphonyElixir.ReviewCliTest do
     File.write!(request, Jason.encode!(%{"kind" => "mr", "project" => "team/repo", "number" => 1, "repository" => local["repository"]}))
     assert_manual_fenced(workflow, request)
     assert subject == %{"kind" => "mr", "provider" => "gitlab", "host" => "review.invalid", "repository_id" => 10, "number" => 1}
+    predecessor = %{"provider" => "gitlab", "host" => "review.invalid", "repository" => nil, "project" => "team/repo", "iid" => 1}
+    assert_predecessor_store_blocked(workflow, request, root, predecessor)
+  end
+
+  defp assert_predecessor_store_blocked(workflow, request, root, subject) do
+    store = Path.join(root, "journal/manual")
+    [journal] = Path.wildcard(Path.join(store, "*/review-lane.json"))
+    saved = File.read!(journal) |> Jason.decode!() |> Map.put("subject", subject)
+    trace = File.read!(Path.join(root, "native-requests.jsonl"))
+    File.rm_rf!(Path.dirname(journal))
+    File.rm!(Path.join(store, "format-version"))
+    predecessor = Path.join([store, TaskWorkflow.digest(subject), "review-lane.json"])
+    File.mkdir_p!(Path.dirname(predecessor))
+
+    for stopped <- [false, true] do
+      record =
+        update_in(saved, ["runtime", "axes"], fn axes ->
+          Map.new(axes, fn {name, axis} -> {name, Map.put(axis, "native_stop_confirmed", stopped)} end)
+        end)
+
+      bytes = Jason.encode!(record)
+      File.write!(predecessor, bytes)
+
+      assert_raise Mix.Error, ~r/unsupported manual review state requires explicit retirement/, fn ->
+        Review.run(["--workflow", workflow, "--request", request])
+      end
+
+      assert File.read!(predecessor) == bytes
+      assert File.read!(Path.join(root, "native-requests.jsonl")) == trace
+      refute File.exists?(Path.join(store, "format-version"))
+    end
+  end
+
+  test "unknown and linked manual store markers cannot admit reviewers" do
+    {workflow, request, root} = fixture()
+    store = Path.join(root, "journal/manual")
+    File.mkdir_p!(store)
+    marker = Path.join(store, "format-version")
+    File.write!(marker, "unknown\n")
+    assert_raise Mix.Error, ~r/unsupported manual review state/, fn -> Review.run(["--workflow", workflow, "--request", request]) end
+    File.rm!(marker)
+    target = Path.join(root, "outside-marker")
+    File.write!(target, "2\n")
+    File.ln_s!(target, marker)
+    assert_raise Mix.Error, ~r/unsupported manual review state/, fn -> Review.run(["--workflow", workflow, "--request", request]) end
+    refute File.exists?(Path.join(root, "native-requests.jsonl"))
   end
 
   test "manual entry rejects malformed input and unavailable runtime rules" do
