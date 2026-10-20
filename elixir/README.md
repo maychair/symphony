@@ -485,6 +485,8 @@ Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMP
 
 GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels. Label authorization requires a published, unchanged candidate and the actual native actor; acceptance must bind an exact manifest. Enable it only after migrating retained private workflows and their Issue agreements.
 
+Before requesting execution, save the confirmed structured agreement and its matching `type:*` label. Saving an agreement does not grant execution approval. A blocked baseline notice identifies a missing agreement, a mismatched task type, or missing/stale execution approval so the coordinator can repair the specific prerequisite without asking the human to redefine an already confirmed scope.
+
 ## Parent plans and standalone review
 
 The [repository lifecycle contract](docs/workflow-lifecycle.md) defines sealed cross-repository plans,
