@@ -31,6 +31,13 @@ recovery. `Finding` continues to own finding identity and independent resolution
 `Publication` owns guarded native transport and receipts, not review judgement.
 No review component approves or merges a change.
 
+An admitted worker sends checkpoints directly to the owning listener. Native
+discovery may occupy that listener beyond the short observational health-probe
+timeout; a health probe is not an execution prerequisite. Checkpoints retain
+their bounded request timeout and ownership checks. During listener startup,
+only the explicit initializing response or a temporarily unavailable process
+uses the existing bounded reconnect window; rejected ownership is never retried.
+
 Execution state, review outcome and publication state are distinct. Only a
 complete review with no requested changes renders exactly `LGTM!`, without
 visible or hidden metadata. Changed results retain separate Standards and Spec
