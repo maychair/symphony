@@ -794,7 +794,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         "shell_environment_policy.exclude" => valid_environment_names(binding.secret_environment_names)
       })
     )
+    |> Map.merge(tool_output_config(binding))
   end
+
+  defp tool_output_config(%{tool_output_token_limit: limit}) when is_integer(limit) and limit > 0,
+    do: %{"tool_output_token_limit" => limit}
+
+  defp tool_output_config(_binding), do: %{}
 
   # Native Goal turns use thread defaults rather than explicit turn/start policy.
   defp thread_sandbox_config(%{thread_sandbox: "workspace-write", turn_sandbox_policy: policy}) do

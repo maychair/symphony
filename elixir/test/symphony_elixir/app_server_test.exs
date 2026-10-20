@@ -19,6 +19,7 @@ defmodule SymphonyElixir.AppServerTest do
         assert q['params']['approvalPolicy']=='never'
         assert q['params']['config']['model']=='review-fixture'
         assert q['params']['config']['model_reasoning_effort']=='high'
+        assert q['params']['config']['tool_output_token_limit']==32768
         assert 'sandbox_mode' not in q['params']['config']
         r={'thread':{'id':'probe-thread'}}
       elif m=='command/exec':
@@ -74,6 +75,7 @@ defmodule SymphonyElixir.AppServerTest do
         assert c['allow_login_shell'] is False
         assert c['shell_environment_policy.set']=={k:'/dev/null' for k in ['BASH_ENV','ENV','ZDOTDIR']}
         assert 'GITLAB_PAT' in c['shell_environment_policy.exclude']
+        assert 'tool_output_token_limit' not in c
         r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
       elif m=='thread/read':r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
       else:raise AssertionError(m)

@@ -111,3 +111,8 @@ files, commit messages and file content. Reviewers follow byte offsets until
 `next_offset` is null. The engine rejects skipped offsets and cannot accept a
 complete axis until every diff page and every requested source file is read.
 A diff path filter is rejected explicitly; paths select source files only.
+
+ReviewAxis supplies a fixed native tool-output history budget of 32,768 tokens
+for these pages. The transport applies it independently of model defaults and
+role-file settings, so an unknown model alias cannot silently shrink a page in
+the model-visible history. Ordinary task sessions retain their native budget.

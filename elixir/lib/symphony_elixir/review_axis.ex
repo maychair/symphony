@@ -158,6 +158,7 @@ defmodule SymphonyElixir.ReviewAxis do
 
     %{
       adapter: __MODULE__,
+      tool_output_token_limit: 32_768,
       tracker_settings: %{},
       secret_environment_names: ReviewLane.secret_environment_names(%{}),
       agent_environment: %{},
