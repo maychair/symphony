@@ -1127,9 +1127,13 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     start_supervised!({Listener, config: nil})
     assert Listener.health().health == :disabled
     assert {:error, :review_lane_initializing} = Listener.checkpoint(issue.id, running["execution_owner"], %{})
+    listener = Process.whereis(Listener)
+    trace_review_calls(task.pid, listener)
     send(task.pid, :symphony_stop)
-    ref = task.ref
-    refute_receive {^ref, _}, 500
+    {tag, {:checkpoint, _, owner, changes}} = await_checkpoint_call(task.pid, issue.id)
+    assert_receive {:trace, ^listener, :send, {^tag, {:error, :review_lane_initializing}}, _}, 5_000
+    {retry_tag, {:checkpoint, _, ^owner, ^changes}} = await_checkpoint_call(task.pid, issue.id)
+    refute retry_tag == tag
     :sys.replace_state(Listener, &%{&1 | initial_config: c.config})
     send(Listener, :configure)
     await_listener()
@@ -1274,7 +1278,9 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(Path.join(c.root, "hold-scan"), "true")
     send(Listener, :poll)
     await_file(Path.join(c.root, "scan-held"))
+    trace_review_calls(task.pid, Process.whereis(Listener))
     File.write!(Path.join(c.root, "release-snapshot"), "continue")
+    await_checkpoint_call(task.pid, issue.id)
     ref = task.ref
     refute_receive {^ref, _}, 5_500
     refute File.exists?(Path.join(c.root, "posts.json"))
@@ -1630,6 +1636,21 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     else
       Process.sleep(10)
       await_native_method(c, method, count, attempts - 1)
+    end
+  end
+
+  defp trace_review_calls(worker, listener) do
+    for pid <- [worker, listener] do
+      :erlang.trace(pid, true, [:send, {:tracer, self()}])
+    end
+  end
+
+  defp await_checkpoint_call(worker, id) do
+    receive do
+      {:trace, ^worker, :send, {:"$gen_call", {^worker, tag}, {:checkpoint, ^id, _, _} = message}, _} -> {tag, message}
+      {:trace, ^worker, :send, {:"$gen_call", {^worker, tag}, :health}, _} -> {tag, :health}
+    after
+      5_000 -> flunk("Worker did not call its review checkpoint boundary")
     end
   end
 
