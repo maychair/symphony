@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.ReviewLaneGitLabTest do
   use SymphonyElixir.TestSupport
-  alias SymphonyElixir.ReviewLane.GitLab
+  alias SymphonyElixir.ReviewLane.{GitHub, GitLab}
+  alias SymphonyElixir.RuntimeContext
 
   test "the review adapter cannot invoke native actions, foreign writes or quick actions inside comments" do
     config = %{"host" => "review.invalid", "projects" => %{"team/repo" => %{"id" => 10}}, "glab_bin" => "must-not-be-called"}
@@ -46,13 +47,13 @@ defmodule SymphonyElixir.ReviewLaneGitLabTest do
         Task.async(fn ->
           context = %{id: directory, environment: %{"GLAB_CONFIG_DIR" => directory, "GH_CONFIG_DIR" => directory, "GIT_CONFIG_PARAMETERS" => "'user.name=#{directory}'"}}
 
-          SymphonyElixir.RuntimeContext.with_context(context, fn ->
+          RuntimeContext.with_context(context, fn ->
             config = %{"host" => "review.invalid", "glab_bin" => cli, "gh_bin" => cli}
             assert {:ok, %{"id" => ^id}} = GitLab.request(config, "GET", "user")
             github = put_in(context, [:environment, "REVIEW_PROVIDER"], "github")
 
-            SymphonyElixir.RuntimeContext.with_context(github, fn ->
-              assert {:ok, %{"id" => ^id}} = SymphonyElixir.ReviewLane.GitHub.request(config, "GET", "user")
+            RuntimeContext.with_context(github, fn ->
+              assert {:ok, %{"id" => ^id}} = GitHub.request(config, "GET", "user")
             end)
 
             assert {:ok, name} = GitLab.command("git", ["config", "--get", "user.name"])

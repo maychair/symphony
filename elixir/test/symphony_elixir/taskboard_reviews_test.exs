@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskboardReviewsTest do
   use SymphonyElixir.TestSupport, runtime: false
-  alias SymphonyElixir.ReviewLane.Publication
+  alias SymphonyElixir.ReviewLane.{Finding, Publication}
   alias SymphonyElixir.ReviewResult
   alias SymphonyElixir.Taskboard
   alias SymphonyElixir.Taskboard.Reviews
@@ -135,7 +135,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     assert card.column == "Done"
     assert card.review.conclusion == "changes_requested"
 
-    prior = SymphonyElixir.ReviewLane.Finding.advance(nil, %{"findings" => [finding], "responses" => []}, 1)
+    prior = Finding.advance(nil, %{"findings" => [finding], "responses" => []}, 1)
     recheck = Map.put(record(2), "finding_register", prior)
     response = %{"finding" => "S1", "status" => "still_valid", "evidence" => "当前源码仍可触发原反例", "rationale" => "原问题未修复", "verified_by" => "reviewer"}
     completed_recheck = completed(recheck, [], [response])
