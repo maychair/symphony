@@ -16,7 +16,7 @@ defmodule SymphonyElixirWeb.TaskboardApiTest do
       title: "Mock Issue",
       description: "A mock Issue description.",
       state: "Todo",
-      labels: ["symphony:ready"],
+      labels: ["symphony:todo", "symphony:ready"],
       dispatchable: true
     }
 
@@ -58,6 +58,16 @@ defmodule SymphonyElixirWeb.TaskboardApiTest do
     start_supervised!({@endpoint, []})
 
     {:ok, settings: settings}
+  end
+
+  test "unlabeled closed Issues are absent from list and detail APIs" do
+    [member] = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    old = %{member | id: "37", identifier: "GL-37", state: "closed", labels: []}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [member, old])
+    board = json_response(get(build_conn(), "/api/v1/taskboard"), 200)
+    assert [%{"issue_identifier" => "MOCK-1"}] = board["cards"]
+    hidden = get(build_conn(), "/api/v1/taskboard/issues/memory-mock-issues/GL-37")
+    assert json_response(hidden, 404)["error"]["code"] == "issue_not_found"
   end
 
   test "serves Taskboard, Runtime, static assets, and read APIs" do

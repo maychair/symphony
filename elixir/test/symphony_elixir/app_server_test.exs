@@ -1,6 +1,47 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "review probes use native read-only execution and fail on unreadable output" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "review-probe")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "probe-server")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      if m=='initialized':continue
+      if m=='initialize':r={}
+      elif m=='thread/start':
+        assert q['params']['sandbox']=='read-only'
+        assert q['params']['approvalPolicy']=='never'
+        assert q['params']['config']['model']=='review-fixture'
+        assert q['params']['config']['model_reasoning_effort']=='high'
+        assert 'sandbox_mode' not in q['params']['config']
+        r={'thread':{'id':'probe-thread'}}
+      elif m=='command/exec':
+        p=q['params'];assert p['sandboxPolicy']=={'type':'readOnly'}
+        assert p['timeoutMs']==15000 and p['outputBytesCap']==4194305
+        r={'exitCode':0 if p['command']==['read'] else 1,'stdout':'source','stderr':''}
+      else:raise AssertionError(m)
+      print(json.dumps({'id':q['id'],'result':r}),flush=True)
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+    binding = Map.put(SymphonyElixir.ReviewAxis.tool_binding(), :model_settings, %{"model" => "review-fixture", "model_reasoning_effort" => "high", "sandbox_mode" => "danger-full-access"})
+    assert {:ok, session} = AppServer.start_session(workspace, review_only: true, dynamic_tool_binding: binding)
+
+    try do
+      assert {:ok, "source"} = AppServer.review_read(session, ["read"])
+      assert {:error, {:review_read_failed, _}} = AppServer.review_read(session, ["fail"])
+    after
+      AppServer.stop_session(session)
+    end
+  end
+
   test "new, reviewed and restored sessions prevent automatic profile reinjection" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "isolated")

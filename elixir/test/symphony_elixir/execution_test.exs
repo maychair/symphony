@@ -754,6 +754,31 @@ defmodule SymphonyElixir.ExecutionTest do
     assert current["stage_results"]["business_validation"] == "see_mr_evidence"
   end
 
+  test "legacy review handoff preserves todo membership while releasing execution authorization", %{issue: issue} do
+    {:ok, _, _opts} = Execution.prepare(issue, [])
+    settings = %{Config.settings!().tracker | required_labels: ["symphony:todo", "symphony:ready"]}
+
+    client = fn method, path, _, _, _ ->
+      send(self(), {:membership_handoff, method, path})
+
+      if method == "GET" and String.ends_with?(path, "/issues/42") do
+        {:ok, %{status: 200, body: %{"labels" => [%{"name" => "symphony:todo"}]}}}
+      else
+        native_ok(method, path)
+      end
+    end
+
+    assert Execution.handoff(%{"kind" => "review", "reason" => "Inspect delivery", "url" => "https://github.com/example/repository/pull/9"},
+             issue: issue,
+             tracker_settings: settings,
+             github_client: client
+           )["success"]
+
+    assert_receive {:membership_handoff, "POST", "/repos/example/repository/issues/42/comments"}
+    assert_receive {:membership_handoff, "DELETE", "/repos/example/repository/issues/42/labels/symphony%3Aready"}
+    refute_receive {:membership_handoff, "DELETE", "/repos/example/repository/issues/42/labels/symphony%3Atodo"}
+  end
+
   test "a partial handoff retries the routing release without repeating the notice", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     args = %{"kind" => "review", "reason" => "Please review.", "url" => "https://github.com/example/repository/pull/9"}

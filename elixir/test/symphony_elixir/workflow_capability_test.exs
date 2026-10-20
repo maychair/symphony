@@ -40,6 +40,7 @@ defmodule SymphonyElixir.WorkflowCapabilityTest do
              {"plan_manifest", 2} => 2,
              {"review_finding", 1} => 1,
              {"review_lane", 3} => 3,
+             {"review_workflow", 2} => 2,
              {"task_workflow", 2} => 2,
              {"taskboard_projection", 1} => 1,
              {"work_ref", 1} => 1,
@@ -65,6 +66,7 @@ defmodule SymphonyElixir.WorkflowCapabilityTest do
   test "legacy, future, unknown and malformed requirements fail closed" do
     for {name, version} <- [
           {"review_lane", 2},
+          {"review_workflow", 1},
           {"plan_contract", 0},
           {"workflow_capability", 1},
           {"plan_manifest", 99},

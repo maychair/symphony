@@ -208,7 +208,9 @@ must be merged with the recorded validation/review evidence before conclusion. `
 `review` attest to the linked MR's business validation and technical review;
 Symphony does not infer them from an agent exit or GitLab mergeability. Reports
 use an Issue note URL ending in `#note_ID`, with the digest of its JSON-encoded
-body. Put detailed reports and fixed evidence links in that note. This first
+body. GitLab `/-/issues/NUMBER` and `/-/work_items/NUMBER` routes identify
+the same Issue for report links; the origin, repository, Issue number, note ID
+and current body digest must still match. Put detailed reports and fixed evidence links in that note. This first
 protocol accepts same-repository MRs and Issue-note reports. Other artifact types
 must be represented by an evidenced report note; arbitrary mutable URLs are not
 accepted as versioned deliverables.
@@ -309,3 +311,27 @@ back to an unstructured agreement. Existing labels without candidate bindings
 cannot be promoted to authorization from the latest description. Retained source
 versions must be reconciled explicitly; do not rewrite historical receipts to
 make old authorization appear current.
+
+## Delegated Coordinator decisions
+
+An optional `tracker.provider.delegated_authority` policy names one human
+`principal` (equal to the configured assignee), native bot `publisher` ID and
+base64 raw Ed25519 `public_key`. A structured decision can carry `authority` with
+`grant` and base64 `signature`. The grant signs canonical JSON containing schema
+1, principal, publisher, host/repository, Issue number, issuance Unix seconds,
+`decision` (without authority), and `evidence` identifying the exact native Codex
+user request. The signature attests the trusted Coordinator's scope assessment;
+it is not a human signature. Executors cannot grant themselves authority merely
+by supplying an actor field or publishing under the bot.
+
+Native author must match the configured publisher, the note must be unedited and
+created within five minutes of issuance (allowing sixty seconds of backward clock
+skew), and repository, Issue, principal and complete payload must match. Repeated
+signed notes select the earliest valid native ID once. The execution journal pins
+that exact source version; copies cannot revoke it or replace it after editing or
+deletion. Modified or missing sources cannot retain current authorization. The native
+note reference continues to hash the bot author. Parsed events keep `publisher`
+and verified human `actor` separately. Replay and restart use the same verification;
+no old execution acquires new authority. Unsigned native human decisions and old
+notes remain supported without edits. Workers receive no signing key. This is an
+application trust boundary, not isolation from a malicious same-user process.

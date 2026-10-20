@@ -1,7 +1,6 @@
 defmodule SymphonyElixir.ReviewLane do
   alias SymphonyElixir.RuntimeContext
   @moduledoc "Native repository review discovery using the existing Orchestrator admission and capacity."
-  alias SymphonyElixir.ReviewLane.Listener
 
   @spec enabled?() :: boolean()
   def enabled?, do: not is_nil(config())
@@ -24,7 +23,10 @@ defmodule SymphonyElixir.ReviewLane do
   def validate_config(%{provider: %{"review_lane" => %{"enabled" => true} = raw}}) do
     config = resolve(raw)
 
+    allowed = ~w(enabled provider host reviewer_id publisher_id projects state_dir poll_interval_ms instructions_file policy_file role_files glab_bin gh_bin allow_insecure_http webhook_secret)
+
     checks = [
+      {Enum.all?(Map.keys(config), &(&1 in allowed)), :unknown_review_configuration},
       {config["provider"] in ["gitlab", "github"], :review_lane_provider_unsupported},
       {valid_host?(config["host"]), :review_lane_host_required},
       {positive?(config["reviewer_id"]), :review_lane_reviewer_id_required},
@@ -33,16 +35,23 @@ defmodule SymphonyElixir.ReviewLane do
       {valid_projects?(config["projects"]), :review_lane_invalid_projects},
       {absolute_path?(config["state_dir"]), :review_lane_absolute_state_required},
       {positive?(Map.get(config, "poll_interval_ms", 60_000)), :review_lane_poll_interval_required},
-      {instructions_file?(config["instructions_file"]), :review_lane_instructions_file_required}
+      {instructions_file?(config["policy_file"] || config["instructions_file"]), :review_lane_instructions_file_required}
     ]
 
     case Enum.find(checks, fn {valid, _reason} -> not valid end) do
-      nil -> :ok
+      nil -> validate_rules(config)
       {false, reason} -> {:error, reason}
     end
   end
 
   def validate_config(_settings), do: :ok
+
+  defp validate_rules(config) do
+    case SymphonyElixir.ReviewWorkflow.rules(config) do
+      {:ok, _rules, _sha} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp valid_host?(host), do: is_binary(host) and Regex.match?(~r/^[a-zA-Z0-9.-]+$/, host)
   defp positive?(value), do: is_integer(value) and value > 0
@@ -92,7 +101,7 @@ defmodule SymphonyElixir.ReviewLane do
         "name" => "review_submit",
         "description" =>
           "Submit substantiated Chinese findings as structured objects; the scheduler validates the fixed MR head, the finding identity and posts discussions. " <>
-            "An empty findings list explicitly completes a no-findings review. Mark required=true only for a violated agreed criterion or delivery condition; advice is required=false. " <>
+            "Findings alone cannot complete a review; completion is owned by ReviewWorkflow. Mark required=true only for a violated agreed criterion or delivery condition; advice is required=false. " <>
             "Resolve an earlier open finding only through responses with an independent verification conclusion and evidence. Do not include slash-command lines, even in examples.",
         "inputSchema" => %{
           "type" => "object",
@@ -149,9 +158,10 @@ defmodule SymphonyElixir.ReviewLane do
 
   @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
   def execute_agent_tool("review_submit", arguments, opts) do
-    result = Listener.submit(opts[:issue].id, opts[:issue].native_ref["execution_owner"], arguments)
+    result = {:error, :review_workflow_completion_required}
+    _ = {arguments, opts}
     output = Jason.encode!(%{"result" => inspect(result)})
-    %{"success" => result == :ok, "output" => output, "contentItems" => [%{"type" => "inputText", "text" => output}]}
+    %{"success" => false, "output" => output, "contentItems" => [%{"type" => "inputText", "text" => output}]}
   end
 
   def execute_agent_tool(_tool, _arguments, _opts), do: %{"success" => false, "output" => "Unsupported review tool", "contentItems" => []}

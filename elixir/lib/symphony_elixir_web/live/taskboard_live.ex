@@ -27,12 +27,13 @@ defmodule SymphonyElixirWeb.TaskboardLive do
         <div class="taskboard-heading">
           <p class="eyebrow">Repository work</p>
           <h1>Taskboard</h1>
+          <p class="help-note">Issues: symphony:todo adds membership; symphony:ready authorizes execution. Automatic reviews follow native reviewer requests.</p>
         </div>
 
         <div class="taskboard-filters">
           <label class="filter-control filter-search">
             <span>Search</span>
-            <input id="taskboard-filter" type="search" placeholder="Issue, title, label…" autocomplete="off" />
+            <input id="taskboard-filter" type="search" placeholder="Issue, MR/PR, title, label…" autocomplete="off" />
           </label>
           <label class="filter-control">
             <span>Project</span>

@@ -138,7 +138,9 @@ defmodule SymphonyElixir.Config do
 
   defp validate_task_workflow(settings, backend) do
     if settings.tracker.provider["task_workflow"] == true do
-      if settings.tracker.kind == "gitlab" and backend == "codex" and settings.agent.goal_mode, do: :ok, else: {:error, :task_workflow_requires_gitlab_native_goal}
+      if settings.tracker.kind == "gitlab" and backend == "codex" and settings.agent.goal_mode,
+        do: SymphonyElixir.TaskAuthority.validate(settings.tracker),
+        else: {:error, :task_workflow_requires_gitlab_native_goal}
     else
       :ok
     end

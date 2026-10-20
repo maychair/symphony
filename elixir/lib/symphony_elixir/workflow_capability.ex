@@ -13,7 +13,7 @@ defmodule SymphonyElixir.WorkflowCapability do
     {"provider_discovery", "Provider 与发现", [{"work_ref", 1}]},
     {"parent_child_coordination", "父子协调", [{"plan_manifest", 2}]},
     {"verification_delivery", "验证与交付", [{"task_workflow", 2}]},
-    {"review_loop", "Review 闭环", [{"review_lane", 3}, {"review_finding", 1}]},
+    {"review_loop", "Review 闭环", [{"review_lane", 3}, {"review_finding", 1}, {"review_workflow", 2}]},
     {"projection_closure", "投影与收尾", [{"closure_fence", 1}, {"taskboard_projection", 1}]},
     {"deployment", "部署", [{"workflow_capability", @version}]}
   ]

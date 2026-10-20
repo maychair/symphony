@@ -591,7 +591,8 @@ defmodule SymphonyElixir.Execution do
 
   # Only the legacy path keeps the pre-upgrade routing labels, so an Issue that
   # still carries `symphony:retry` stops being routed after the handoff.
-  defp legacy_routing_labels(settings), do: settings.required_labels ++ ["symphony:retry"]
+  defp legacy_routing_labels(settings),
+    do: Enum.reject(settings.required_labels, &(&1 == "symphony:todo")) ++ ["symphony:retry"]
 
   defp routing_released?(labels, settings) do
     routing = legacy_routing_labels(settings)

@@ -332,6 +332,11 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 - <only include when something was confusing during execution>
 ````
 
+
+The Taskboard includes only Issues carrying the human-owned `symphony:todo` membership label; when `tracker.assignee` is configured, the sole native assignee must also match. Membership is checked before lifecycle classification, including closed Issues and detail reads. A todo-only Issue remains visible without authorizing an Agent. Configure `tracker.required_labels: [symphony:todo, symphony:ready]` to require both membership and execution authorization. Keep `symphony:todo` through running, review and completion; removing it removes the Issue from the board. Historical unlabeled closed Issues are not review requests.
+
+For ordinary GitLab Issues using `task_workflow`, Done is verified by read-only native replay of the current agreement, manifest and acceptance sources, matched against the retained lifecycle. The Issue must be closed, its execution completed and its native stop confirmed. Missing, edited or unreadable evidence remains in Human Review. Reading the board neither executes work nor updates its journal.
+
 Repository Issue workflows can enable `agent.goal_mode` and set a durable
 `agent.run_journal_dir`. Task content stays on the provider; see
 [repository execution](docs/repository-issues.md).
@@ -384,3 +389,23 @@ repositories. Add `?repository=ID` for scoped API reads, refresh and webhooks.
 Ambiguous effects and journal lookups fail closed. Every Codex session excludes
 the credential environment names of all repositories in the shared process.
 Existing single-repository launch behavior is unchanged.
+
+Repository runtimes may select an independent native GitLab CLI store with `GLAB_CONFIG_DIR` and Git identity through `GIT_CONFIG_PARAMETERS`, `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`. These non-secret settings stay repository-scoped across hooks and asynchronous workers; token values remain in native authentication stores or host credential bindings. Selecting a bot does not change the human Issue assignee or grant execution authority.
+
+GitLab task workflows can verify signed Coordinator relays with
+`tracker.provider.delegated_authority` (`principal`, bot `publisher`, raw Ed25519
+`public_key`). The bot remains the native publisher; verified human authority is
+recorded separately. Missing/invalid evidence cannot confer authorization. See the
+delegated decision protocol in `elixir/docs/task-workflow.md` (repository root).
+
+For native review lanes, `policy_file` selects the maintained shared review policy with Common, Standards and Spec sections. Optional `role_files` references the central Standards/Spec model configurations. These configure criteria and roles; two-axis completion, read-only permission, exact `LGTM!` output and publication identity checks are engine invariants.
+
+Configured automatic review lanes also supply read-only Taskboard cards. No extra
+board membership label or execution option is needed for MR/PR reviews. Manual
+Skill/CLI reviews are excluded. A board refresh cannot admit or requeue work;
+Done requires the complete review and confirmed native publication for that round.
+
+Enabled review policies are validated during preflight, before allocation.
+Standalone preflight also reports the executable's workflow capability inventory;
+managed service launch requires `review_workflow` version 2 from that inventory.
+Completed legacy review records do not requeue for policy-only upgrades.

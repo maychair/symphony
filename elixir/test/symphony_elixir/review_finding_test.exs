@@ -226,7 +226,7 @@ defmodule SymphonyElixir.ReviewFindingTest do
       {:ok, [_]} = Listener.issues()
 
       discussions = Jason.decode!(File.read!(Path.join(root, "discussions.json")))
-      assert length(discussions) == 2
+      assert length(discussions) == 1
 
       record = review_record(config, issue)
       assert Finding.register?(record["finding_register"])
@@ -336,7 +336,7 @@ defmodule SymphonyElixir.ReviewFindingTest do
   end
 
   defp owns(id), do: get_in(:sys.get_state(Listener), [:records, String.replace_prefix(id, "review:", ""), "execution_owner"])
-  defp owned_submit(id, arguments), do: Listener.submit(id, owns(id), arguments)
+  defp owned_submit(id, arguments), do: SymphonyElixir.TestSupport.submit_review(id, arguments)
   defp owned_checkpoint(id, changes), do: Listener.checkpoint(id, owns(id), changes)
 
   defp review_record(config, issue) do

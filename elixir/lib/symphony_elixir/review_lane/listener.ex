@@ -10,13 +10,17 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
   alias SymphonyElixir.ReviewLane.{Finding, GitHub, GitLab, Journal, Owner, Policy, Publication}
 
-  @worker_fields ~w(thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
+  @worker_fields ~w(axes review_protocol policy_sha thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]) |> Keyword.put_new(:name, __MODULE__))
 
   @spec health() :: map()
   def health, do: GenServer.call(RuntimeContext.server(__MODULE__), :health)
+
+  @doc "Read the automatic lane without discovery, reconciliation or publication."
+  @spec board_snapshot() :: {:ok, map()} | {:error, term()}
+  def board_snapshot, do: GenServer.call(RuntimeContext.server(__MODULE__), :board_snapshot, 1_000)
 
   @spec issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def issues, do: GenServer.call(RuntimeContext.server(__MODULE__), :issues, 120_000)
@@ -54,6 +58,19 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   @impl true
+  def handle_call(:board_snapshot, _from, %{config: nil} = state), do: {:reply, {:ok, %{config: nil, records: []}}, state}
+
+  def handle_call(:board_snapshot, _from, state) do
+    result =
+      with :ok <- Journal.check(state.journal),
+           true <- config_current?(state) || {:error, :review_lane_configuration_changed_restart_required} do
+        config = Map.take(state.config, ~w(enabled provider host reviewer_id publisher_id projects allow_insecure_http))
+        {:ok, %{config: config, records: Map.values(state.records)}}
+      end
+
+    {:reply, result, state}
+  end
+
   def handle_call(message, from, state) do
     if message == :health or is_nil(state.config) do
       handle_current_call(message, from, state)
@@ -159,10 +176,25 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     Enum.all?(Map.keys(changes), &(&1 in @worker_fields)) and
       changes["phase"] in [nil, "failed", "fenced"] and stop_changes?(record, changes) and
       Enum.all?(~w(thread_allocation_intent turn_allocation_intent), &(not Map.has_key?(changes, &1) or changes[&1] == true)) and
-      same_thread?(record, changes) and same_runtime?(record, changes)
+      changes["policy_sha"] in [nil, record["policy_sha"]] and same_thread?(record, changes) and
+      same_runtime?(record, changes) and axis_changes?(record, changes)
   end
 
   defp worker_changes?(_, _), do: false
+
+  defp axis_changes?(record, %{"axes" => axes}) when is_map(axes) do
+    Enum.all?(axes, fn {name, axis} ->
+      name in ["standards", "spec"] and is_map(axis) and same_axis?(get_in(record, ["axes", name]) || %{}, axis)
+    end) and Enum.all?(Map.keys(record["axes"] || %{}), &Map.has_key?(axes, &1))
+  end
+
+  defp axis_changes?(_record, changes), do: not Map.has_key?(changes, "axes")
+
+  defp same_axis?(old, axis) do
+    Enum.all?(~w(thread_id turn_id workspace), &(is_nil(old[&1]) or old[&1] == axis[&1])) and
+      (old["native_stop_confirmed"] != true or axis["native_stop_confirmed"] == true) and
+      Enum.all?(~w(thread_allocation_intent turn_allocation_intent read_failure), &(old[&1] != true or axis[&1] == true))
+  end
 
   defp stop_changes?(record, changes) do
     not (stopped?(record) and (allocation?(changes) or changes["native_stop_confirmed"] == false)) and
@@ -179,10 +211,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp same_thread?(_, _), do: true
-  defp allocation?(changes), do: changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true
+
+  defp allocation?(changes),
+    do:
+      changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true or
+        Enum.any?(changes["axes"] || %{}, fn {_, axis} -> is_map(axis) and (axis["thread_allocation_intent"] == true or axis["turn_allocation_intent"] == true) end)
 
   defp checkpoint_owned(state, record, changes) do
-    if allocation?(changes) do
+    if allocation_request?(record, changes) do
       next = if current_config?(state), do: reconcile(state), else: suspend(state)
       current = next.records[record["id"]]
 
@@ -195,6 +231,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       changes = if stopped?(record) and record["phase"] in ["completed", "ended"], do: Map.delete(changes, "phase"), else: changes
       {:reply, :ok, put_record(state, Map.merge(record, changes))}
     end
+  end
+
+  defp allocation_request?(record, changes) do
+    changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true or
+      Enum.any?(changes["axes"] || %{}, fn {name, axis} ->
+        old = get_in(record, ["axes", name]) || %{}
+        Enum.any?(~w(thread_allocation_intent turn_allocation_intent), &(axis[&1] == true and old[&1] != true))
+      end)
   end
 
   defp allocation_allowed?(state, record, changes) do
@@ -409,8 +453,15 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp auxiliary_fields?(record) do
     (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"])) and
-      completion?(record) and review_gap?(record)
+      completion?(record) and review_gap?(record) and unified_result?(record)
   end
+
+  defp unified_result?(%{"review_protocol" => 2, "review_result" => result} = record) do
+    SymphonyElixir.ReviewResult.validate(result, record) == :ok and result["axes"] == record["axes"] and
+      (is_nil(record["review_completion"]) or result["status"] in ["passed", "changes_requested"])
+  end
+
+  defp unified_result?(record), do: record["review_protocol"] in [nil, 2] and is_nil(record["review_result"]) and (record["review_protocol"] != 2 or is_nil(record["review_completion"]))
 
   defp completion?(%{"review_completion" => completion} = record) when is_map(completion) do
     completion == completion_proof(record) and published_review?(record)
@@ -523,6 +574,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     register = carried_register(state, project, iid, round)
 
     record = %{
+      "review_protocol" => 2,
       "id" => id,
       "project" => project,
       "work" => work,
@@ -538,6 +590,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       "verdict" => Finding.verdict(register),
       "author_id" => mr["author"]["id"],
       "url" => mr["web_url"],
+      "title" => mr["title"],
+      "created_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+      "updated_at" => mr["updated_at"],
       "findings" => [],
       "phase" => "queued"
     }
@@ -578,7 +633,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
     with {:ok, mr} <- read_mr(state.config, record["project"], record["iid"]),
          true <- valid_mr?(mr, record["project"], record["iid"], state.config) or {:error, :invalid_native_review} do
-      reconcile_native(state, record, mr, path)
+      metadata = %{"title" => mr["title"], "updated_at" => mr["updated_at"]}
+      reconcile_native(state, Map.merge(record, metadata), mr, path)
     else
       {:error, reason} -> put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
     end
@@ -672,19 +728,36 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp changed_inputs?(config, record, mr, responses) do
     mr["sha"] != record["head"] or target_changed?(record, mr) or mr["diff_refs"]["base_sha"] != record["base"] or
-      responses != record["response_sha"] or policy_sha(config) != record["policy_sha"] or record["phase"] == "ended"
+      responses != record["response_sha"] or policy_changed?(config, record) or record["phase"] == "ended"
+  end
+
+  # A protocol upgrade does not authorize rerunning a completed legacy review.
+  # Native revision/reply changes still admit a new round under the current protocol.
+  defp policy_changed?(config, record) do
+    if record["phase"] == "completed" and is_nil(record["review_protocol"]),
+      do: false,
+      else: policy_sha(config) != record["policy_sha"]
   end
 
   # Retargeting changes the integration context even when head and merge base
   # are unchanged, so the previous round can no longer prove the new target.
   defp target_changed?(record, mr), do: mr["target_branch"] != record["target_branch"]
 
+  defp stopped?(%{"axes" => axes} = record) when is_map(axes) and map_size(axes) > 0 do
+    record["native_stop_confirmed"] == true and Enum.all?(axes, fn {_, axis} -> axis["native_stop_confirmed"] == true end)
+  end
+
   defp stopped?(record) do
     record["native_stop_confirmed"] == true or
       (is_nil(record["native_stop_confirmed"]) and record["phase"] not in ["running", "publishing", "failed", "fenced"] and is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true)
   end
 
-  defp policy_sha(config), do: TaskWorkflow.digest(%{"instructions" => File.read!(config["instructions_file"]), "projects" => config["projects"]})
+  defp policy_sha(config) do
+    case SymphonyElixir.ReviewWorkflow.rules(config) do
+      {:ok, _, sha} -> sha
+      _ -> TaskWorkflow.digest(%{"instructions" => File.read!(config["instructions_file"]), "projects" => config["projects"]})
+    end
+  end
 
   defp issue(record) do
     active = record["phase"] in ["queued", "running"] or (record["phase"] == "completed" and not stopped?(record))
@@ -704,18 +777,20 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     }
   end
 
-  defp publish(state, id, %{"findings" => _findings} = arguments) do
+  defp publish(state, id, %{"completion" => completion}) do
     record = state.records[record_key(id)]
 
     with true <- publishable?(record),
-         {:ok, submission} <- Finding.validate(arguments, record),
-         record = register(record, submission),
+         :ok <- SymphonyElixir.ReviewResult.validate(completion, record),
+         true <- completion["axes"] == record["axes"] and stopped?(record),
+         {:ok, submission} <- Finding.validate(%{"findings" => completion["findings"], "responses" => completion["responses"]}, record),
+         record = record |> Map.put("review_result", completion) |> register(submission),
          {:ok, record} <- Publication.prepare(record, submission, state.config["publisher_id"]) do
       record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")
       finish_publication(put_record(state, record), record, :worker)
     else
       {:error, reason} -> {:error, reason, state}
-      false -> {:error, :invalid_review_submission, state}
+      false -> {:error, :incomplete_review, state}
     end
   end
 
@@ -736,7 +811,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
     case Publication.publish(record, state.config, &put_record(state, &1), guard) do
       {:ok, current} ->
-        current = current |> Map.put("phase", "completed") |> Map.delete("publication_error") |> Map.put("review_completion", completion_proof(current))
+        failed = get_in(current, ["review_result", "status"]) in ["failed", "needs_input"]
+        current = current |> Map.put("phase", if(failed, do: "failed", else: "completed")) |> Map.delete("publication_error")
+        current = Map.put(current, "review_completion", if(failed, do: nil, else: completion_proof(current)))
         {:ok, put_record(state, current)}
 
       {:error, reason, current} ->
@@ -809,7 +886,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp same_responses(record, discussions, config) do
     expected = record["response_sha"]
-    findings = record["response_findings"] ++ record["findings"]
+    findings = (record["response_findings"] || []) ++ record["findings"]
     discussions = bind_replies(config, findings, discussions, record["author_id"])
 
     case Policy.response_digest(findings, discussions, record["author_id"]) do

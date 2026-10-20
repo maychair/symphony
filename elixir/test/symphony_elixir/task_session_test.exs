@@ -400,7 +400,7 @@ defmodule SymphonyElixir.TaskSessionTest do
       state: "closed",
       url: "https://github.test/team/repo/issues/2",
       native_ref: %{"number" => 2, "repo" => "team/repo"},
-      labels: []
+      labels: ["symphony:todo"]
     }
 
     board = fn issue ->

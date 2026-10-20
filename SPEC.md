@@ -1494,6 +1494,7 @@ Enablement (extension):
 
 - Host a repository Issue Taskboard at `/`.
 - Host the runtime observability dashboard at `/runtime`.
+- The Taskboard MUST require the human-owned `symphony:todo` membership label before classifying any Issue, including closed Issues. With a configured owner, the sole native assignee MUST match. Membership alone does not authorize execution; `symphony:ready` remains a separate execution gate. Detail and aggregate projections MUST preserve the membership boundary.
 - The Taskboard SHOULD depict repository Issues in exactly four user-facing columns: `Todo`,
   `In Progress`, `Human Review`, and `Done`.
 - The Taskboard SHOULD remain a navigation and status surface. Issue cards SHOULD open the native
@@ -1506,6 +1507,7 @@ Enablement (extension):
   against the current candidate with no remaining restriction. A label, native Issue closure, or a
   successful Agent turn, published delivery, or merged change alone MUST NOT project an Issue as
   `Done`.
+- For ordinary GitLab workflow Issues, the board MUST recheck native agreement, manifest and acceptance sources against the retained lifecycle before projecting Done. Native closure, completed execution and confirmed native stop are required. Missing, changed or unreadable evidence MUST fail closed; projection MUST NOT execute work or mutate the journal.
 - The runtime surface SHOULD depict active sessions, retry delays, token consumption, runtime
   totals, recent events, and health/error indicators.
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
@@ -2395,3 +2397,29 @@ Configured parent plans now receive [native preflight](elixir/docs/workflow-life
 [Native execution generations](elixir/docs/workflow-lifecycle.md#native-execution-generations) bind roles and fixed inputs, preserve cumulative accounting, and require native stop before replacing a thread. The member lifecycle reducer derives developer/verifier selection from resolved evidence, with finite repair accounting and version-bound delivery checks; GitHub/GitLab Issue evidence publication now persists send intent and verifies native readback. Git-backed verifier commands now produce isolated host receipts, and publication attests those results. Native result selection retains fixed Git snapshots with durable consumer references and re-attests command receipts. Native parent/member controls now preserve the approval grant, bind each resume to its pause and fence fresh publication with durable source receipts. Bound Codex sessions now expose role-specific context, candidate publication, configured host checks and verification tools; command results come from host receipts and calls revalidate native controls. Verified dependency edges now resolve native publications transitively, re-attest host checks and retain consumer references. Role tools revalidate their pinned inputs before effects; new candidates do not silently replace those inputs. Native PR/MR delivery reads now bind the approved target branch and actual merged revision. Delivered dependencies require independent verification of that exact revision, including after squash/rebase; original-head checks cannot unlock them. Markdown report candidates now retain exact UTF-8 content and publish readable evidence to their owning Issue without Git. Independently verified native report publications can satisfy verified, delivered or published dependencies. The native member admission coordinator now derives developer/verifier generations from complete evidence, rechecks under the journal lock and preserves observed pauses before first execution. Generation-owned role workspaces now materialize retained inputs, preserve developer edits on resume and give verifiers a separate fixed candidate checkout. Host checks consume the same manifest under read-only input isolation. Local role sessions now prepare those workspaces, recheck native authority before thread and Goal activation, fence callbacks to the owning process and attempt, and record stop only after native readback. Managed role Goals now observe native controls asynchronously, preserve intervening turn and budget updates, and stop on pauses, role changes or unconfirmed observations. Ownership fences also guard native Goal cleanup. Managed Goal finalization now records one result per attempt, applies finite retry accounting, and releases execution ownership after a durable final phase. Unconfirmed native stop remains an incident and never authorizes a replacement. The member worker now derives role Goals from sealed native scope and runs admission, workspace preparation, execution and finalization together, including startup failures. Synchronous admission-read exceptions release only the unstarted owned attempt and preserve changed ownership for recovery. Report development, independent verification, bounded repair and re-verification are exercised through the native protocol. Configured member execution now resolves every approved member’s repository policy and exact native base branch before entering the role worker. Initial source intent survives partial preparation and branch changes; generation rotation preserves its history. Configured native plans now feed member jobs into the existing scheduler and its shared capacity and retry queue. Durable, launch-bound results drive automatic role continuation; stopped or paused members lose eligibility, while an abruptly killed worker retains its exclusion lock. Legacy entry-point deadlines do not override sealed member budgets. General release publication, parent integration/acceptance/closure, retention cleanup, missing Git object acquisition and automatic crash recovery remain under development.
 
 Native standalone review now uses GitLab repository scans and persisted webhook hints through `review_lane`; mailbox watching and mail replay have been removed. Stable reviewer/publisher IDs, fixed-input rounds and native-stop fencing replace mail-based admission. Review comments now retain per-entry send intent, exact native readback and version-bound conclusions; partial batches resume only after confirmed native stop and current-scope checks. Live review cancellation now interrupts recorded native turns and requires idle readback before confirming stop; uncertain stops retain the snapshot. Review callbacks now bind the admitted worker and attempt, and same-VM Listener restarts stop surviving workers. Review journal reads and writes now use one Linux kernel-locked Python 3 transport, with durable predecessor-controller identity checks before takeover. Existing journals without ownership receipts require migration after old controllers are stopped. GitHub review, native orphan recovery after VM loss and the remaining assignment integration are still under development.
+
+### Delegated GitLab control publication
+
+For the minimal GitLab task workflow, an explicitly trusted interactive Coordinator
+may relay a human-authorized decision under a configured project-bot identity.
+The native publisher remains the bot. A signed, scope-bound attestation identifies
+the human principal and exact native user input separately; assignment or a bot's
+self-declared actor cannot supply authority. The engine verifies its configured
+public key, repository, Issue, principal, publisher, immutable publication window
+and duplicate grants on replay as well as admission. Executing Agents cannot
+originate these attestations through the supported entry. They may submit delivery
+manifests, which cannot authorize control or acceptance. Existing native human
+decisions and audit records remain unchanged. This application trust boundary does
+not claim an OS sandbox against a malicious same-user process. See the delegated
+protocol in [the workflow contract](elixir/docs/task-workflow.md).
+
+### Unified review execution
+
+Automatic MR/PR review requests MUST appear as one Taskboard card per native
+subject, showing the latest round and preserving round history and report links.
+Only configured repositories and retained reviewer requests belong to this view;
+manual reviews do not. Board reads MUST NOT discover, dispatch, retry or publish.
+Done means complete review and confirmed version-bound publication, including
+reviews that found defects; incomplete or uncertain work MUST NOT appear Done.
+
+Manual and discovered reviews MUST use one execution workflow and result validator. Standards and Spec run independently in parallel at fixed revisions and policy version. Missing requirements, failed reads or incomplete axes MUST NOT yield technical pass. Both completed native identities and stop confirmations are required. A complete clean result is exactly `LGTM!`; its metadata belongs to execution/publication receipts. Legacy publication recovery does not establish missing review coverage.

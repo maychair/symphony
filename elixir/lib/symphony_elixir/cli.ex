@@ -80,6 +80,7 @@ defmodule SymphonyElixir.CLI do
       case Map.get(deps, :preflight, &SymphonyElixir.Preflight.run/1).(issue) do
         {:ok, count} ->
           IO.puts("Repository tracker preflight passed (#{count} Issues read; no dispatch).")
+          IO.puts(Jason.encode!(%{workflow_capability: SymphonyElixir.WorkflowCapability.layers()}))
           {:ok, :preflight}
 
         {:error, reason} ->

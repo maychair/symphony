@@ -51,6 +51,24 @@ defmodule SymphonyElixir.TaskWorkflowTest do
     Map.merge(%{"ref" => "manifest", "contract" => "auth", "items" => [%{"id" => "code", "kind" => "mr", "url" => @mr, "version" => "v1", "criteria" => ["a", "b"]}]}, extra)
   end
 
+  test "configured bot can submit delivery but cannot grant control or acceptance" do
+    flow = authorized()
+    native = facts(%{"delivery_publisher" => "194"})
+    delivered = Flow.reconcile(flow, native, [event("manifest", "manifest", 2, manifest(), "194")], 0)
+    assert delivered["manifest"]["ref"] == "manifest"
+
+    for action <- ~w(authorize pause resume cancel accept rework budget) do
+      unauthorized = event(action, "bot-control", 3, %{"manifest" => "manifest"}, "194")
+      result = Flow.reconcile(delivered, native, [unauthorized], 0)
+      refute result["events"]["bot-control"] in ["authorized", "accepted", "paused", "cancelled"]
+      assert result["acceptance"] == nil
+      assert result["contract"]["authorizer"] == "1"
+    end
+
+    rejected = Flow.reconcile(flow, facts(), [event("manifest", "manifest", 2, manifest(), "194")], 0)
+    assert rejected["manifest"] == nil
+  end
+
   test "authorization is versioned, typed and explicitly owned" do
     flow = Flow.new(1_000, 0)
     rejected = Flow.reconcile(flow, facts(), [event("pause", "p", 2)], 0)

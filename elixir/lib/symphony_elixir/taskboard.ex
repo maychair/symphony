@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Taskboard do
   @moduledoc """
-  Read-only repository Issue board projection for the Symphony Dashboard.
+  Read-only repository Issue and automatic MR/PR review projection.
 
   The Taskboard is a view over tracker Issues and execution observations. It
   keeps no task database and never mutates a tracker: every write stays in the
@@ -12,8 +12,9 @@ defmodule SymphonyElixir.Taskboard do
 
   require Logger
 
-  alias SymphonyElixir.{Config, Execution, Orchestrator, RunJournal, TaskPlanExecution, WorkRef}
+  alias SymphonyElixir.{Config, Execution, Orchestrator, RunJournal, TaskPlanExecution, TaskReconciler, WorkRef}
   alias SymphonyElixir.Taskboard.Provider
+  alias SymphonyElixir.Taskboard.Reviews
   alias SymphonyElixir.Tracker.Issue
 
   @columns ["Todo", "In Progress", "Human Review", "Done"]
@@ -41,6 +42,8 @@ defmodule SymphonyElixir.Taskboard do
       |> project_entries(opts)
       |> Enum.map(&project_snapshot_entry(&1, opts))
 
+    {projects, review_errors} = Reviews.merge(projects, review_snapshot(opts))
+
     cards =
       projects
       |> Enum.flat_map(&Map.get(&1, :cards, []))
@@ -66,7 +69,7 @@ defmodule SymphonyElixir.Taskboard do
       counts: counts,
       projects: Enum.map(projects, &public_project/1),
       cards: cards,
-      errors: errors,
+      errors: errors ++ review_errors,
       capabilities: read_only_capabilities()
     }
   end
@@ -90,19 +93,31 @@ defmodule SymphonyElixir.Taskboard do
   def project_snapshot(project_id, opts \\ []) do
     settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!() end)
 
-    with {:ok, project} <- find_project(project_id, settings, opts) do
-      snapshot = project_snapshot_entry(project, opts)
+    projects =
+      case find_project(project_id, settings, opts) do
+        {:ok, project} -> [project_snapshot_entry(project, opts)]
+        {:error, :taskboard_project_not_found} -> []
+      end
 
-      {:ok,
-       %{
-         generated_at: now(),
-         columns: @columns,
-         project: public_project(snapshot),
-         cards: Map.get(snapshot, :cards, []),
-         errors: if(snapshot[:error], do: [snapshot.error], else: [])
-       }}
+    {projects, review_errors} = Reviews.merge(projects, review_snapshot(opts))
+
+    case Enum.find(projects, &(&1.id == project_id)) do
+      nil ->
+        {:error, :taskboard_project_not_found}
+
+      snapshot ->
+        {:ok,
+         %{
+           generated_at: now(),
+           columns: @columns,
+           project: public_project(snapshot),
+           cards: Map.get(snapshot, :cards, []) |> sort_cards(),
+           errors: if(snapshot[:error], do: [snapshot.error | review_errors], else: review_errors)
+         }}
     end
   end
+
+  defp review_snapshot(opts), do: Keyword.get(opts, :review_snapshot_fun, &Reviews.snapshot/0).()
 
   def issue_detail(project_id, identifier, opts \\ [])
 
@@ -111,7 +126,8 @@ defmodule SymphonyElixir.Taskboard do
     settings = Keyword.get_lazy(opts, :settings, fn -> Config.settings!() end)
 
     with {:ok, project} <- find_project(project_id, settings, opts),
-         {:ok, detail} <- fetch_detail(project, identifier, opts) do
+         {:ok, detail} <- fetch_detail(project, identifier, opts),
+         :ok <- visible_detail(project, detail) do
       detail = attach_local_execution(project, detail, opts)
 
       card =
@@ -278,6 +294,7 @@ defmodule SymphonyElixir.Taskboard do
       cards =
         issues
         |> assigned_to(project.settings.tracker)
+        |> Enum.filter(&board_member?/1)
         |> Enum.map(fn
           %Issue{} = issue ->
             card_payload(
@@ -308,7 +325,10 @@ defmodule SymphonyElixir.Taskboard do
 
     case remote_request(project, path, opts) do
       {:ok, payload} when is_map(payload) ->
-        cards = Enum.map(payload["cards"] || [], &normalize_remote_card(&1, project))
+        cards =
+          (payload["cards"] || [])
+          |> Enum.filter(&board_member?/1)
+          |> Enum.map(&normalize_remote_card(&1, project))
 
         project
         |> public_project()
@@ -332,6 +352,25 @@ defmodule SymphonyElixir.Taskboard do
   end
 
   defp assigned_to(issues, _tracker), do: issues
+
+  # Membership is independent of dispatch authorization and lifecycle state.
+  # In particular, an unrelated closed Issue must not become a review request.
+  defp board_member?(%Issue{labels: labels}), do: todo_label?(labels)
+
+  defp board_member?(%{"item_type" => "review", "review" => %{"round" => round}, "url" => url}) do
+    is_integer(round) and round > 0 and is_binary(url) and String.starts_with?(url, ["https://", "http://"])
+  end
+
+  defp board_member?(%{"labels" => labels}), do: todo_label?(labels)
+  defp board_member?(_), do: false
+
+  defp todo_label?(labels),
+    do: Enum.any?(List.wrap(labels), &(normalize_label(&1) == "symphony:todo"))
+
+  defp visible_detail(project, %{issue: issue}) do
+    owned? = not project.local or assigned_to([issue], project.settings.tracker) != []
+    if owned? and board_member?(issue), do: :ok, else: {:error, :taskboard_issue_not_found}
+  end
 
   defp failed_project(project, reason) do
     project
@@ -538,6 +577,8 @@ defmodule SymphonyElixir.Taskboard do
 
   defp normalize_remote_card(card, project) when is_map(card) do
     %{
+      item_type: card["item_type"] || "issue",
+      review: card["review"],
       issue_id: card["issue_id"],
       issue_identifier: card["issue_identifier"],
       title: card["title"],
@@ -561,34 +602,6 @@ defmodule SymphonyElixir.Taskboard do
       human_action: card["human_action"],
       updated_at: card["updated_at"],
       created_at: card["created_at"]
-    }
-  end
-
-  defp normalize_remote_card(_card, project) do
-    %{
-      issue_id: nil,
-      issue_identifier: nil,
-      title: "Invalid remote card",
-      summary: nil,
-      description: nil,
-      priority: nil,
-      tracker_state: nil,
-      labels: [],
-      url: nil,
-      project_id: project.id,
-      project: project.name,
-      repo: project.repo,
-      kind: project.kind,
-      column: "Todo",
-      agent_status: "idle",
-      needs_human: false,
-      runtime: nil,
-      delivery: nil,
-      artifacts: [],
-      projection: nil,
-      human_action: nil,
-      updated_at: nil,
-      created_at: nil
     }
   end
 
@@ -666,6 +679,8 @@ defmodule SymphonyElixir.Taskboard do
   # historical fallback for work that has no plan identity, and it never grants
   # acceptance on its own.
   defp local_execution(%Issue{} = issue, settings, projections, opts) do
+    opts = Keyword.put(opts, :tracker_settings, settings.tracker)
+
     case work_ref_for(issue, settings) do
       {:ok, work} -> member_execution(issue, work, projections, opts)
       :error -> legacy_local_execution(issue, opts)
@@ -742,7 +757,7 @@ defmodule SymphonyElixir.Taskboard do
     end
   end
 
-  defp legacy_local_execution(_issue, identifier, opts) do
+  defp legacy_local_execution(issue, identifier, opts) do
     case read_journal(identifier, opts) do
       %{} = record ->
         record
@@ -753,11 +768,33 @@ defmodule SymphonyElixir.Taskboard do
           directory: record["directory"],
           observed_at: now()
         })
+        |> ordinary_completion(issue, record, Keyword.get(opts, :tracker_settings))
 
       _ ->
         nil
     end
   end
+
+  defp ordinary_completion(execution, issue, record, %{kind: "gitlab", provider: %{"task_workflow" => true}} = tracker) do
+    if closed?(issue) or get_in(record, ["workflow", "state"]) == "ended" do
+      assessment = TaskReconciler.completion(record, settings: tracker)
+      complete = match?({:ok, %{completed: true}}, assessment)
+
+      execution
+      |> Map.put(:closeable, complete)
+      |> Map.put(:projection, %{
+        status: if(complete, do: "current", else: "stale"),
+        source: "repository_issue_conclusion",
+        reason: if(complete, do: nil, else: "completion_not_verified"),
+        directory: record["directory"],
+        observed_at: now()
+      })
+    else
+      execution
+    end
+  end
+
+  defp ordinary_completion(execution, _issue, _record, _tracker), do: execution
 
   defp read_journal(identifier, opts) do
     case RunJournal.read(RunJournal.directory(journal_root(opts), identifier)) do

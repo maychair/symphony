@@ -182,6 +182,7 @@
 
     const head = el('div', 'task-card-head');
     head.appendChild(el('span', 'task-card-id', card.issue_identifier));
+    if (card.item_type === 'review') head.appendChild(el('span', 'task-card-label', 'Automatic Review'));
     head.appendChild(el('span', `agent-dot ${agentTone(card.agent_status)}`));
     if (card.priority !== null && card.priority !== undefined) {
       head.appendChild(el('span', 'task-card-priority', `P${card.priority}`));
@@ -203,6 +204,26 @@
     node.appendChild(title);
 
     if (card.summary) node.appendChild(el('p', 'task-card-summary', card.summary));
+
+    if (card.item_type === 'review' && card.review) {
+      const review = card.review;
+      const conclusion = review.conclusion === 'passed' ? 'LGTM!' : review.conclusion;
+      node.appendChild(el('p', 'task-card-summary',
+        `Round ${review.round} · ${safe(review.head).slice(0, 8)} · ${conclusion}`));
+      const history = el('details', 'review-history');
+      history.appendChild(el('summary', null, 'Review history'));
+      (review.history || []).forEach((round) => {
+        const row = el('div', 'task-card-links');
+        row.appendChild(el('span', null,
+          `Round ${round.round} · ${safe(round.head).slice(0, 8)} · ${round.phase} · ${round.conclusion}`));
+        (round.artifacts || []).forEach((artifact) => {
+          const link = externalLink(trackerUrl(artifact.url), 'task-card-link', 'Report ↗');
+          if (link) row.appendChild(link);
+        });
+        history.appendChild(row);
+      });
+      node.appendChild(history);
+    }
 
     const meta = el('div', 'task-card-meta');
     meta.appendChild(el('span', null, card.project || card.repo || 'Repository'));
@@ -234,7 +255,7 @@
     node.appendChild(foot);
 
     const links = el('div', 'task-card-links');
-    const issueLink = externalLink(url, 'task-card-link issue', 'Issue ↗');
+    const issueLink = externalLink(url, 'task-card-link issue', card.item_type === 'review' ? 'MR/PR ↗' : 'Issue ↗');
     if (issueLink) links.appendChild(issueLink);
 
     (card.artifacts || []).forEach((artifact) => {

@@ -13,7 +13,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
 
     source = Path.join(root, "source")
     File.mkdir_p!(source)
-    File.write!(Path.join(root, "instructions"), "Review only.")
+    File.write!(Path.join(root, "instructions"), "## Common\nRead all evidence.\n## Standards\nRead standards.\n## Spec\nVerify requirements.\n")
     File.write!(Path.join(root, "reviews.json"), "[]")
     File.write!(Path.join(root, "comments.json"), "[]")
     File.write!(Path.join(root, "timeline.json"), Jason.encode!([request_event(1, "review_requested")]))
@@ -26,12 +26,13 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     path=a[a.index('--method')+2];method=a[a.index('--method')+1]
     head=(r/'head').read_text() if (r/'head').exists() else ('c' if (r/'changed-head').exists() else 'a')*40
     base=(r/'base').read_text() if (r/'base').exists() else 'b'*40
-    pull={'number':1,'id':101,'state':('closed' if (r/'closed').exists() else 'open'),'merged':False,'head':{'sha':head},'base':{'sha':base,'ref':'main','repo':{'id':10}},'user':{'id':30},'requested_reviewers':([] if (r/'withdrawn').exists() else [{'id':20}]),'html_url':'https://github.invalid/team/repo/pull/1'}
+    pull={'body':'Closes #1','number':1,'id':101,'state':('closed' if (r/'closed').exists() else 'open'),'merged':False,'head':{'sha':head},'base':{'sha':base,'ref':'main','repo':{'id':10}},'user':{'id':30},'requested_reviewers':([] if (r/'withdrawn').exists() else [{'id':20}]),'html_url':'https://github.invalid/team/repo/pull/1'}
     reviews=json.loads((r/'reviews.json').read_text())
     if path=='user':out={'id':(99 if (r/'wrong-user').exists() else 20)}
     elif path=='repos/team/repo':out={'id':10,'full_name':'team/repo','html_url':'https://github.invalid/team/repo','ssh_url':'git@github.invalid:team/repo.git'}
     elif path.startswith('repos/team/repo/pulls?'):out=[pull]
     elif path=='repos/team/repo/pulls/1':out=pull
+    elif path=='repos/team/repo/issues/1':out={'number':1,'body':'验收完整变更'}
     elif path.startswith('repos/team/repo/issues/1/timeline?'):out=json.loads((r/'timeline.json').read_text())
     elif path.startswith('repos/team/repo/issues/1/comments?'):out=json.loads((r/'comments.json').read_text())
     elif path.startswith('repos/team/repo/pulls/1/comments?'):out=[]
@@ -76,7 +77,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert :ok = SymphonyElixir.WorkRef.validate(issue.native_ref["work"])
     assert issue.title == "Review team/repo#1"
     assert {:ok, _, _} = Listener.begin_run(issue.id)
-    assert :ok = Listener.submit(issue.id, owner_for(issue.id), %{"findings" => []})
+    assert :ok = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
     assert length(Jason.decode!(File.read!(Path.join(c.root, "reviews.json")))) == 1
     assert :ok = Listener.checkpoint(issue.id, owner_for(issue.id), %{"native_stop_confirmed" => true})
     assert {:ok, [done]} = Listener.issues()
@@ -95,8 +96,8 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
   test "a GitHub author reply creates one new review round while unchanged polls do not", c do
     assert {:ok, [issue]} = Listener.issues()
     assert {:ok, _, _} = Listener.begin_run(issue.id)
-    assert :ok = Listener.submit(issue.id, owner_for(issue.id), %{"findings" => ["已验证边界条件失败，请在 source.cpp:10 修复越界读取。"]})
-    assert length(Jason.decode!(File.read!(Path.join(c.root, "reviews.json")))) == 2
+    assert :ok = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => ["已验证边界条件失败，请在 source.cpp:10 修复越界读取。"]})
+    assert length(Jason.decode!(File.read!(Path.join(c.root, "reviews.json")))) == 1
     assert :ok = Listener.checkpoint(issue.id, owner_for(issue.id), %{"native_stop_confirmed" => true})
 
     comment = %{"id" => 500, "body" => "已修复越界读取并补回归检查。", "user" => %{"id" => 30}, "created_at" => "2026-01-03T00:00:00Z"}
@@ -111,7 +112,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, [issue]} = Listener.issues()
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     File.write!(Path.join(c.root, "wrong-user"), "yes")
-    assert {:error, :github_identity_mismatch} = Listener.submit(issue.id, owner_for(issue.id), %{"findings" => []})
+    assert {:error, :github_identity_mismatch} = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
     assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
 
     File.rm!(Path.join(c.root, "wrong-user"))
@@ -134,7 +135,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     File.write!(Path.join(c.root, "withdrawn"), "yes")
     File.write!(Path.join(c.root, "timeline.json"), Jason.encode!([request_event(1, "review_requested"), request_event(2, "review_request_removed")]))
-    assert {:error, :review_assignment_withdrawn} = Listener.submit(issue.id, owner_for(issue.id), %{"findings" => []})
+    assert {:error, :review_assignment_withdrawn} = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
     assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
   end
 
@@ -143,7 +144,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     File.write!(Path.join(c.root, "withdrawn"), "yes")
     File.write!(Path.join(c.root, "timeline.json"), "[]")
-    assert {:error, :review_assignment_unconfirmed} = Listener.submit(issue.id, owner_for(issue.id), %{"findings" => []})
+    assert {:error, :review_assignment_unconfirmed} = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
     assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
   end
 
@@ -154,10 +155,15 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     File.write!(Path.join(source, "source.txt"), "fixed GitHub candidate")
     {_, 0} = System.cmd(git, ["-C", source, "add", "source.txt"])
     {_, 0} = System.cmd(git, ["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture"])
+    {base, 0} = System.cmd(git, ["-C", source, "rev-parse", "HEAD"])
+    base = String.trim(base)
+    File.write!(Path.join(source, "source.txt"), "changed candidate")
+    {_, 0} = System.cmd(git, ["-C", source, "add", "source.txt"])
+    {_, 0} = System.cmd(git, ["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Change"])
     {head, 0} = System.cmd(git, ["-C", source, "rev-parse", "HEAD"])
     head = String.trim(head)
     File.write!(Path.join(c.root, "head"), head)
-    File.write!(Path.join(c.root, "base"), head)
+    File.write!(Path.join(c.root, "base"), base)
     bin = Path.join(c.root, "bin")
     File.mkdir!(bin)
 
@@ -178,31 +184,12 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     on_exit(fn -> restore_env("PATH", previous) end)
     server = Path.join(c.root, "native-review-server")
 
-    File.write!(server, """
-    #!/usr/bin/env python3
-    import sys,json
-    def emit(v):print(json.dumps(v),flush=True)
-    for line in sys.stdin:
-      q=json.loads(line);m=q.get('method')
-      if m=='initialize':emit({'id':q['id'],'result':{}})
-      elif m=='thread/goal/get':emit({'id':q['id'],'result':{'goal':None}})
-      elif m in ['thread/start','thread/resume']:
-        emit({'id':q['id'],'result':{'thread':{'id':'github-review-thread','status':{'type':'idle'},'turns':[]}}})
-      elif m=='turn/start':
-        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
-        emit({'id':q['id'],'result':{'turn':{'id':'github-review-turn'}}})
-        emit({'id':100,'method':'item/tool/call','params':{'threadId':'github-review-thread','turnId':'github-review-turn','tool':'review_submit','arguments':{'findings':[]}}})
-      elif q.get('id')==100:
-        assert q['result']['success'],q
-        emit({'method':'turn/completed','params':{'threadId':'github-review-thread','turn':{'id':'github-review-turn','status':'completed'}}})
-    """)
-
-    File.chmod!(server, 0o755)
+    SymphonyElixir.TestSupport.write_review_server(server, c.root)
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", workspace_root: Path.join(c.root, "workspaces"), codex_command: server)
     {:ok, [issue]} = Listener.issues()
     assert :ok = Runner.run(issue, self())
     assert_received {:worker_runtime_info, _, %{workspace_path: snapshot}}
-    assert File.read!(Path.join(snapshot, "source.txt")) == "fixed GitHub candidate"
+    assert File.read!(Path.join(snapshot, "source.txt")) == "changed candidate"
     assert File.read!(Path.join(c.root, "fetch-ref")) == "refs/pull/1/head"
     {:ok, [complete]} = Listener.issues()
     assert complete.native_ref["phase"] == "completed"

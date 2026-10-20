@@ -185,6 +185,60 @@ defmodule SymphonyElixir.RepositoryServiceTest do
     assert RuntimeContext.current() == nil
   end
 
+  test "native CLI and Git identities stay scoped to repository hooks and captured workers", %{root: root} do
+    {manifest, entries} = fixture(root)
+    previous = System.get_env("GLAB_CONFIG_DIR")
+
+    entries =
+      Enum.map(entries, fn entry ->
+        id = entry["id"]
+        email = id <> "-bot@example.test"
+        store = Path.join(root, id <> "-native-store")
+        remote = "https://git.example/" <> id <> ".git"
+
+        identity = %{
+          "GLAB_CONFIG_DIR" => store,
+          "GIT_CONFIG_PARAMETERS" => "'user.name=meichao-agent' 'user.email=#{email}' 'remote.origin.pushurl=#{remote}'",
+          "GIT_AUTHOR_NAME" => "meichao-agent",
+          "GIT_AUTHOR_EMAIL" => email,
+          "GIT_COMMITTER_NAME" => "meichao-agent",
+          "GIT_COMMITTER_EMAIL" => email
+        }
+
+        config = entry["workflow"] |> File.read!() |> String.split("---", parts: 3) |> Enum.at(1) |> Jason.decode!()
+
+        hook = """
+        set -eu
+        printf '%s\\n' "$GLAB_CONFIG_DIR" "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" \
+          "$GIT_COMMITTER_NAME" "$GIT_COMMITTER_EMAIL" \
+          "$(git config --get user.email)" "$(git config --get remote.origin.pushurl)" > identity.txt
+        """
+
+        write(entry["workflow"], put_in(config, ["hooks", "after_create"], hook))
+        Map.update!(entry, "environment", &Map.merge(&1, identity))
+      end)
+
+    write(manifest, %{"repositories" => entries})
+    assert {:ok, contexts} = RepositoryService.load(manifest)
+    start_supervised!({RepositoryService, contexts})
+
+    for context <- contexts do
+      scope(context, fn ->
+        task = Task.async(RuntimeContext.wrap(fn -> Workspace.create_for_issue(%Tracker.Issue{id: "7", identifier: "IDENTITY"}) end))
+        assert {:ok, path} = Task.await(task)
+        email = context.id <> "-bot@example.test"
+
+        assert File.read!(Path.join(path, "identity.txt")) ==
+                 Enum.join(
+                   [Path.join(root, context.id <> "-native-store"), "meichao-agent", email, "meichao-agent", email, email, "https://git.example/" <> context.id <> ".git"],
+                   "\n"
+                 ) <> "\n"
+      end)
+    end
+
+    assert System.get_env("GLAB_CONFIG_DIR") == previous
+  end
+
   test "reject ambiguous ownership, unsafe roots, recursive manifests and secret environment overrides", %{root: root} do
     {manifest, [a, b]} = fixture(root)
 

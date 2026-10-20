@@ -35,7 +35,7 @@ queue, native Goal state, and acceptance protocol remain authoritative.
 | Todo | Open or active Issue that is not running, retrying, blocked, in review, or accepted |
 | In Progress | Runtime entry is running/retrying, or the engine's `symphony:running` label is present |
 | Human Review | Runtime blocked, `symphony:review`/`symphony:blocked`/`symphony:failed`, or a native closure without versioned acceptance |
-| Done | The versioned member journal reports `workflow.closeable == true`: completed, delivered against the current candidate and with no remaining restriction |
+| Done | The versioned member journal reports `workflow.closeable == true`, or an ordinary Issue has a freshly verified accepted conclusion, native closure and confirmed execution stop |
 
 When `tracker.assignee` is configured, the local projection includes only Issues whose normalized
 `assignee_id` matches that tracker identity. Managed Workspace workflows configure this field to
@@ -52,6 +52,12 @@ lifecycle.
 A successful Agent turn, published pull/merge request, or merged delivery alone does not produce
 Done. The member lifecycle must prove completion and delivery, and the engine closes the member
 Issue under the sealed plan authority only after that evidence exists.
+
+For ordinary GitLab Issues using `task_workflow`, Done is verified by read-only native replay of the current agreement, manifest and acceptance sources, matched against the retained lifecycle. The Issue must be closed, its execution completed and its native stop confirmed. Missing, edited or unreadable evidence remains in Human Review. Reading the board neither executes work nor updates its journal.
+
+## Membership and execution
+
+The Taskboard includes only Issues carrying the human-owned `symphony:todo` membership label; when `tracker.assignee` is configured, the sole native assignee must also match. Membership is checked before lifecycle classification, including closed Issues and detail reads. A todo-only Issue remains visible without authorizing an Agent. Configure `tracker.required_labels: [symphony:todo, symphony:ready]` to require both membership and execution authorization. Keep `symphony:todo` through running, review and completion; removing it removes the Issue from the board. Historical unlabeled closed Issues are not review requests.
 
 ## Navigation-only dashboard
 

@@ -989,7 +989,7 @@ defmodule SymphonyElixir.TaskPlanManifestTest do
         description: raw["body"] || raw["description"],
         url: raw["html_url"] || raw["web_url"],
         state: raw["state"],
-        labels: [],
+        labels: ["symphony:todo"],
         native_ref: %{"number" => 2, "iid" => 2, "repo" => "team/repo", "project_path" => "team/repo", "repository_id" => "10", "project_id" => 10}
       }
 

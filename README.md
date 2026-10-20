@@ -1,5 +1,13 @@
 # Symphony
 
+Managed deployments can verify the unified review protocol from standalone
+preflight. A successful tracker read alone does not establish review capability.
+
+The Taskboard also projects automatic MR/PR review requests as cards, with the
+latest round, pinned revision, conclusion, native report links and history.
+Manual reviews are excluded. Board refreshes are read-only and do not schedule
+work. See [the review workflow](elixir/docs/review-workflow.md).
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
@@ -49,6 +57,10 @@ The Elixir implementation supports repository Issues directly through the GitHub
 
 Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies to the personal Taskboard projection, admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
 
+The Taskboard includes only Issues carrying the human-owned `symphony:todo` membership label; when `tracker.assignee` is configured, the sole native assignee must also match. Membership is checked before lifecycle classification, including closed Issues and detail reads. A todo-only Issue remains visible without authorizing an Agent. Configure `tracker.required_labels: [symphony:todo, symphony:ready]` to require both membership and execution authorization. Keep `symphony:todo` through running, review and completion; removing it removes the Issue from the board. Historical unlabeled closed Issues are not review requests.
+
+For ordinary GitLab Issues using `task_workflow`, Done is verified by read-only native replay of the current agreement, manifest and acceptance sources, matched against the retained lifecycle. The Issue must be closed, its execution completed and its native stop confirmed. Missing, edited or unreadable evidence remains in Human Review. Reading the board neither executes work nor updates its journal.
+
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR, posts the deduplicated review notification and requests the engine-owned `symphony:review` label, without another Agent call. Handoff never writes or removes the human `symphony:ready` authorization label. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
 
 ## Versioned task workflow
@@ -97,3 +109,13 @@ repositories. Add `?repository=ID` for scoped API reads, refresh and webhooks.
 Ambiguous effects and journal lookups fail closed. Every Codex session excludes
 the credential environment names of all repositories in the shared process.
 Existing single-repository launch behavior is unchanged.
+
+Repository runtimes may select an independent native GitLab CLI store with `GLAB_CONFIG_DIR` and Git identity through `GIT_CONFIG_PARAMETERS`, `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`. These non-secret settings stay repository-scoped across hooks and asynchronous workers; token values remain in native authentication stores or host credential bindings. Selecting a bot does not change the human Issue assignee or grant execution authority.
+
+GitLab task workflows can verify signed Coordinator relays with
+`tracker.provider.delegated_authority` (`principal`, bot `publisher`, raw Ed25519
+`public_key`). The bot remains the native publisher; verified human authority is
+recorded separately. Missing/invalid evidence cannot confer authorization. See the
+delegated decision protocol in `elixir/docs/task-workflow.md` (repository root).
+
+Review execution uses one workflow for manual and automatic requests: independent Standards and Spec reviewers, explicit completion evidence, and one result renderer. A complete clean review renders exactly `LGTM!`; incomplete reviews fail. See [the review contract](elixir/docs/review-workflow.md).

@@ -109,6 +109,8 @@ defmodule SymphonyElixir.ReviewLane.GitHub do
          "sha" => head,
          "diff_refs" => %{"base_sha" => base},
          "target_branch" => target_branch,
+         "title" => pull["title"] || "",
+         "description" => pull["body"] || "",
          "author" => %{"id" => author_id},
          "reviewers" => Enum.map(reviewers, &Map.take(&1, ["id"])),
          "state" => state,

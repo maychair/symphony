@@ -85,8 +85,14 @@ defmodule SymphonyElixir.TaskWorkflow do
     |> check_conclusion_conflict()
     |> check_closure(facts)
     |> derive(facts)
+    |> remember_relays(facts)
     |> Map.put("observed_refs", facts["observed_refs"] || [])
     |> Map.put("observed_label_refs", facts["observed_label_refs"] || [])
+  end
+
+  defp remember_relays(flow, facts) do
+    sources = Map.merge(facts["relay_sources"] || %{}, flow["relay_sources"] || %{})
+    if sources == %{}, do: flow, else: Map.put(flow, "relay_sources", sources)
   end
 
   @spec tick(map(), integer()) :: map()
@@ -145,22 +151,22 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp apply_event(%{"contract" => nil} = flow, _event, _facts), do: {flow, "missing_authorization"}
 
-  defp apply_event(flow, event, _facts) do
+  defp apply_event(flow, event, facts) do
     cond do
       event["contract"] != flow["contract"]["ref"] -> {flow, "stale_contract"}
       obsolete_delivery?(flow, event) -> {flow, "obsolete_delivery_decision"}
-      permitted?(flow["contract"], event) -> transition(flow, event)
+      permitted?(flow["contract"], event, facts) -> transition(flow, event)
       true -> {flow, "no_authorized_transition"}
     end
   end
 
-  defp permitted?(contract, event) do
+  defp permitted?(contract, event, facts) do
     actor = event["actor"]
 
     case event["action"] do
       action when action in ["pause", "cancel", "restrict", "resume", "release", "budget", "clarify"] -> actor == contract["authorizer"]
       "rework" -> actor in [contract["acceptor"] | contract["reviewers"] || []]
-      "manifest" -> actor in [contract["authorizer"], contract["acceptor"]]
+      "manifest" -> actor in [contract["authorizer"], contract["acceptor"], facts["delivery_publisher"]]
       "accept" -> actor == contract["acceptor"]
       _ -> false
     end
@@ -216,7 +222,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp remember_natural_resume(flow, _), do: flow
 
-  defp order(event), do: Map.take(event, ["at", "id", "version", "ref", "binding"])
+  defp order(event), do: Map.take(event, ["at", "id", "version", "ref", "binding", "publisher"])
   defp event_priority(%{"ref" => "note:" <> _}), do: 0
   defp event_priority(_), do: 1
 
@@ -464,7 +470,7 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp artifact_kind(url) do
     cond do
       Regex.match?(~r{/-/merge_requests/[1-9][0-9]*$}, url) -> "mr"
-      Regex.match?(~r{/-/issues/[1-9][0-9]*#note_[1-9][0-9]*$}, url) -> "report"
+      Regex.match?(~r{/-/(?:issues|work_items)/[1-9][0-9]*#note_[1-9][0-9]*$}, url) -> "report"
       true -> nil
     end
   end

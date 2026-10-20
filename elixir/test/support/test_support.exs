@@ -106,6 +106,115 @@ defmodule SymphonyElixir.TestSupport do
     kind, reason -> {:failure, {kind, reason, __STACKTRACE__}}
   end
 
+  def write_review_server(server, root) do
+    File.write!(server, """
+    #!/usr/bin/env python3
+    import sys,json,pathlib,os,subprocess
+    root=pathlib.Path(#{inspect(root)});tid='review-thread-'+str(os.getpid());turn=tid+'-turn';cwd=None;step=0
+    def state():return root/(tid+'.json')
+    def save(status):state().write_text(json.dumps({'id':turn,'status':status}))
+    def thread():
+      turns=[json.loads(state().read_text())] if state().exists() else []
+      return {'id':tid,'status':{'type':'active' if turns and turns[-1]['status']=='inProgress' else 'idle'},'turns':turns}
+    def emit(v):print(json.dumps(v),flush=True)
+    def tool(name,args):emit({'id':100,'method':'item/tool/call','params':{'threadId':tid,'turnId':turn,'tool':name,'arguments':args}})
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with (root/'native-requests.jsonl').open('a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialize':emit({'id':q['id'],'result':{}})
+      elif m=='thread/goal/get':emit({'id':q['id'],'result':{'goal':None}})
+      elif m=='thread/read':
+        tid=q['params'].get('threadId',tid);turn=tid+'-turn'
+        emit({'id':q['id'],'result':{'thread':thread()}})
+      elif m=='turn/interrupt':
+        if not (root/'unconfirmed-stop').exists():save('interrupted')
+        emit({'id':q['id'],'result':{}})
+      elif m in ['thread/start','thread/resume']:
+        cwd=q['params'].get('cwd');tid=q['params'].get('threadId',tid);turn=tid+'-turn'
+        emit({'id':q['id'],'result':{'thread':thread()}})
+      elif m=='command/exec':
+        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
+        r=subprocess.run(q['params']['command'],cwd=q['params']['cwd'],text=True,capture_output=True)
+        emit({'id':q['id'],'result':{'exitCode':r.returncode,'stdout':r.stdout,'stderr':r.stderr}})
+      elif m=='turn/start':
+        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
+        save('inProgress');emit({'id':q['id'],'result':{'turn':{'id':turn}}})
+        if (root/'disconnect').exists():sys.exit(0)
+        if (root/'hang').exists():continue
+        if (root/'no-submit').exists():
+          save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
+        else:tool('review_read',{'kind':'diff'})
+      elif q.get('id')==100:
+        assert q['result']['success'],q
+        step+=1
+        if step==1:tool('review_read',{'kind':'file','path':'source.txt'})
+        elif step==2:tool('review_axis_submit',{'status':'complete','report':'已核对完整差异和相关源文件。','findings':[]})
+        else:
+          save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
+    """)
+
+    File.chmod!(server, 0o755)
+  end
+
+  # Native execution is exercised by runner fixtures. Listener-only tests supply
+  # two independent completed axes through the same engine result reducer.
+  def submit_review(id, arguments) do
+    alias SymphonyElixir.ReviewLane.{Finding, Listener}
+    key = String.replace_prefix(id, "review:", "")
+    record = get_in(:sys.get_state(Listener), [:records, key])
+    owner = if record, do: record["execution_owner"]
+
+    if is_nil(owner) do
+      Listener.submit(id, owner, arguments)
+    else
+      with {:ok, submission} <- Finding.validate(arguments, record),
+           normalized = fixture_submission(submission, record),
+           axes = fixture_axes(record, normalized),
+           :ok <- Listener.checkpoint(id, owner, %{"axes" => axes, "native_stop_confirmed" => true}),
+           {:ok, result} <- SymphonyElixir.ReviewResult.aggregate(record, axes) do
+        Listener.submit(id, owner, %{"completion" => result})
+      end
+    end
+  end
+
+  defp fixture_submission(%{} = submission, _record), do: submission
+
+  defp fixture_submission(findings, record) do
+    values =
+      Enum.with_index(findings, fn body, index ->
+        %{
+          "schema_version" => 1,
+          "id" => "fixture-#{index}",
+          "required" => true,
+          "criterion" => "测试约定",
+          "version" => %{"head" => record["head"], "base" => record["base"], "target" => record["target_branch"]},
+          "location" => "source.cpp:10",
+          "evidence" => body,
+          "impact" => "可复现的行为不符合约定。",
+          "resolution" => "修复行为并通过回归验证。",
+          "regression_of" => nil
+        }
+      end)
+
+    %{"findings" => values, "responses" => []}
+  end
+
+  defp fixture_axes(record, submission) do
+    Map.new(["standards", "spec"], fn axis ->
+      {axis,
+       %{
+         "status" => "complete",
+         "report" => "已完成本轴核对。",
+         "thread_id" => record["id"] <> axis,
+         "turn_id" => record["id"] <> axis <> "-turn",
+         "native_stop_confirmed" => true,
+         "reads_verified" => true,
+         "findings" => if(axis == "standards", do: submission["findings"], else: []),
+         "responses" => if(axis == "standards", do: submission["responses"] || [], else: [])
+       }}
+    end)
+  end
+
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 

@@ -66,6 +66,9 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec validate_review_workspace(Path.t()) :: :ok | {:error, term()}
+  def validate_review_workspace(path), do: validate_workspace_path(path, nil)
+
   defp mark_retained(workspace, nil) do
     if retain_workspace?(), do: retain_marker(Path.join(workspace, ".symphony-retain")), else: :ok
   end

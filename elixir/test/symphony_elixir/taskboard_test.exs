@@ -156,6 +156,42 @@ defmodule SymphonyElixir.TaskboardTest do
     assert snapshot.counts == %{"Todo" => 1, "In Progress" => 0, "Human Review" => 0, "Done" => 0}
   end
 
+  test "todo membership excludes unrelated and closed Issues before lifecycle classification", %{settings: settings} do
+    candidates = [
+      %{issue("20", "MOCK-20", "Pending", "Todo", []) | assignee_id: "20"},
+      %{issue("21", "MOCK-21", "Ready only", "Todo", []) | assignee_id: "20", labels: ["symphony:ready"]},
+      %{issue("37", "GL-37", "Old closed live test", "closed", []) | assignee_id: "20", labels: []},
+      %{issue("23", "MOCK-23", "Other owner", "Todo", []) | assignee_id: "21"},
+      %{issue("24", "MOCK-24", "Unassigned", "Todo", []) | labels: ["symphony:todo"]},
+      %{issue("25", "MOCK-25", "Review", "In Progress", ["symphony:review"]) | assignee_id: "20"},
+      %{issue("26", "MOCK-26", "Not membership", "Todo", []) | assignee_id: "20", labels: ["symphony:todo-later"]}
+    ]
+
+    settings = put_in(settings.tracker.assignee, "20")
+
+    snapshot =
+      Taskboard.snapshot(
+        settings: settings,
+        issues_fun: fn _ -> candidates end,
+        runtime_snapshot_fun: fn -> %{} end
+      )
+
+    assert MapSet.new(Enum.map(snapshot.cards, & &1.issue_identifier)) == MapSet.new(["MOCK-20", "MOCK-25"])
+    assert snapshot.counts == %{"Todo" => 1, "In Progress" => 0, "Human Review" => 1, "Done" => 0}
+    refute_received {:taskboard_mutation, _}
+  end
+
+  test "detail cannot reintroduce an unlabeled or differently owned Issue", %{settings: settings} do
+    issue = %{issue("1", "MOCK-1", "Hidden", "Todo", []) | labels: []}
+    opts = [settings: settings, issues_fun: fn _ -> [issue] end, runtime_snapshot_fun: fn -> %{} end]
+    assert {:error, :taskboard_issue_not_found} = Taskboard.issue_detail("memory-mock-issues", "MOCK-1", opts)
+
+    settings = put_in(settings.tracker.assignee, "20")
+    issue = %{issue | labels: ["symphony:todo"], assignee_id: "21"}
+    opts = Keyword.merge(opts, settings: settings, issues_fun: fn _ -> [issue] end)
+    assert {:error, :taskboard_issue_not_found} = Taskboard.issue_detail("memory-mock-issues", "MOCK-1", opts)
+  end
+
   test "a retrying runtime entry keeps the Issue in progress while recovery is pending", %{
     settings: settings
   } do
@@ -917,7 +953,7 @@ defmodule SymphonyElixir.TaskboardTest do
                "project_id" => "remote-workspace",
                "repo" => "maychair/workspace",
                "kind" => "github",
-               "labels" => ["symphony:ready"],
+               "labels" => ["symphony:todo", "symphony:ready"],
                "agent_status" => "idle"
              }
            ]
@@ -1050,7 +1086,7 @@ defmodule SymphonyElixir.TaskboardTest do
     assert {:ok, %{cards: [card]}} =
              Taskboard.project_snapshot(project_id,
                settings: settings,
-               issues_fun: fn _states -> [valid_issue, :ignored] end,
+               issues_fun: fn _states -> [valid_issue, :ignored, %{"labels" => ["symphony:todo"]}] end,
                runtime_snapshot_fun: fn -> :not_a_snapshot end
              )
 
@@ -1072,7 +1108,7 @@ defmodule SymphonyElixir.TaskboardTest do
       )
 
     assert card.column == "In Progress"
-    assert card.labels == ["", "symphony:running"]
+    assert card.labels == ["symphony:todo", "", "symphony:running"]
   end
 
   test "Issue detail reads bounded execution evidence from the local journal" do
@@ -1149,10 +1185,11 @@ defmodule SymphonyElixir.TaskboardTest do
                body: %{
                  "cards" => [
                    "not-a-card",
+                   %{"issue_identifier" => "GH-37", "column" => "Human Review", "labels" => []},
                    %{
                      "issue_identifier" => "GH-9",
                      "column" => "Unknown",
-                     "labels" => [nil],
+                     "labels" => [nil, "symphony:todo"],
                      "updated_at" => "not-a-time"
                    }
                  ]
@@ -1164,7 +1201,7 @@ defmodule SymphonyElixir.TaskboardTest do
              %{
                status: 200,
                body: %{
-                 "issue" => %{"identifier" => "GH-9", "title" => "Remote"},
+                 "issue" => %{"identifier" => "GH-9", "title" => "Remote", "labels" => ["symphony:todo"]},
                  "comments" => [
                    %{
                      "id" => 1,
@@ -1187,8 +1224,9 @@ defmodule SymphonyElixir.TaskboardTest do
         remote_request_fun: remote_fun
       )
 
+    refute Enum.any?(snapshot.cards, &(&1.issue_identifier == "GH-37"))
     assert Enum.any?(snapshot.cards, &(&1.issue_identifier == "GH-9" and &1.project_id == "remote-workspace"))
-    assert Enum.any?(snapshot.cards, &(&1.project_id == "remote-workspace" and &1.column == "Todo"))
+    refute Enum.any?(snapshot.cards, &(&1.project_id == "remote-workspace" and &1.title == "Invalid remote card"))
 
     assert {:ok, %{comments: [%{author: "human", engine: true}]}} =
              Taskboard.issue_detail("remote-workspace", "GH-9",
@@ -1316,7 +1354,7 @@ defmodule SymphonyElixir.TaskboardTest do
       description: "Implement the replayed fixture.",
       state: state,
       url: "https://example.invalid/issues/#{id}",
-      labels: labels,
+      labels: ["symphony:todo" | labels],
       dispatchable: true,
       created_at: ~U[2026-10-17 00:00:00Z],
       updated_at: ~U[2026-10-17 01:00:00Z]

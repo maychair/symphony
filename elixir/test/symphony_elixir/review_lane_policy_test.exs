@@ -6,7 +6,7 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
   test "configuration validates each required boundary and resolves nested environment references" do
     root = Path.dirname(Workflow.workflow_file_path())
     instructions = Path.join(root, "instructions")
-    File.write!(instructions, "Review instructions")
+    File.write!(instructions, "## Common\nRead evidence.\n## Standards\nRead standards.\n## Spec\nVerify scope.\n")
 
     config = %{
       "enabled" => true,
@@ -20,8 +20,19 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     }
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
+
+    for {key, value} <- [{"axes", ["standards"]}, {"pass_on_error", true}, {"lgtm_body", "custom pass"}, {"publisher_approve", true}] do
+      assert {:error, :unknown_review_configuration} = ReviewLane.validate_config(%{provider: %{"review_lane" => Map.put(config, key, value)}})
+    end
+
+    assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config |> Map.delete("instructions_file") |> Map.put("policy_file", instructions)}})
+
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => %{config | "provider" => "github"}}})
     assert {:error, :mail_review_retired_migration_required} = ReviewLane.validate_config(%{provider: %{"mail_review" => config}})
+
+    File.write!(instructions, "Legacy review instructions without the shared axes")
+    assert {:error, :shared_review_policy_unavailable} = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
+    File.write!(instructions, "## Common\nRead evidence.\n## Standards\nRead standards.\n## Spec\nVerify scope.\n")
 
     for {key, value, reason} <- [
           {"host", "invalid/host", :review_lane_host_required},

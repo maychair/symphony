@@ -111,6 +111,27 @@ defmodule SymphonyElixir.Codex.AppServer do
     %{executor: executor, thread_id: thread_id, turn_id: turn_id, strict: strict}
   end
 
+  @doc "Execute a bounded read probe with the same native read-only policy as a review turn."
+  @spec review_read(session(), [String.t()]) :: {:ok, String.t()} | {:error, term()}
+  def review_read(%{port: port, turn_sandbox_policy: %{"type" => "readOnly"} = policy, workspace: workspace}, argv) do
+    send_message(port, %{
+      "id" => 91,
+      "method" => "command/exec",
+      "params" => %{
+        "command" => argv,
+        "cwd" => workspace,
+        "sandboxPolicy" => policy,
+        "timeoutMs" => 15_000,
+        "outputBytesCap" => 4_194_305
+      }
+    })
+
+    case await_response(port, 91) do
+      {:ok, %{"exitCode" => 0, "stdout" => output}} when byte_size(output) <= 4_194_304 -> {:ok, output}
+      other -> {:error, {:review_read_failed, other}}
+    end
+  end
+
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
         %{
@@ -764,12 +785,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   # Apply on every new or restored thread; a user's saved snapshot/profile is
   # not an authority to reintroduce host-side tracker credentials.
   defp thread_config(policies, binding) do
-    Map.merge(thread_sandbox_config(policies), %{
-      "features.shell_snapshot" => false,
-      "allow_login_shell" => false,
-      "shell_environment_policy.set" => @shell_environment,
-      "shell_environment_policy.exclude" => valid_environment_names(binding.secret_environment_names)
-    })
+    Map.merge(
+      Map.take(binding[:model_settings] || %{}, ["model", "model_reasoning_effort"]),
+      Map.merge(thread_sandbox_config(policies), %{
+        "features.shell_snapshot" => false,
+        "allow_login_shell" => false,
+        "shell_environment_policy.set" => @shell_environment,
+        "shell_environment_policy.exclude" => valid_environment_names(binding.secret_environment_names)
+      })
+    )
   end
 
   # Native Goal turns use thread defaults rather than explicit turn/start policy.
