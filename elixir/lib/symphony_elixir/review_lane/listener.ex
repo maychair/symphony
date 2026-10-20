@@ -753,10 +753,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp policy_sha(config) do
-    case SymphonyElixir.ReviewWorkflow.rules(config) do
-      {:ok, _, sha} -> sha
-      _ -> TaskWorkflow.digest(%{"instructions" => File.read!(config["instructions_file"]), "projects" => config["projects"]})
-    end
+    {:ok, _rules, sha} = SymphonyElixir.ReviewWorkflow.rules(config)
+    sha
   end
 
   defp issue(record) do

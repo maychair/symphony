@@ -66,7 +66,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubTest do
   test "ReviewLane.validate_config accepts github provider" do
     root = Path.dirname(Workflow.workflow_file_path())
     instructions = Path.join(root, "instructions")
-    File.write!(instructions, "Review instructions")
+    File.write!(instructions, "## Common\nRead evidence.\n## Standards\nRead standards.\n## Spec\nVerify scope.\n")
 
     config = %{
       "enabled" => true,

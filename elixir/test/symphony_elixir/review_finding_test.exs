@@ -294,7 +294,7 @@ defmodule SymphonyElixir.ReviewFindingTest do
 
     fixture = Path.join(root, "fixture")
     File.mkdir_p!(Path.join(root, "source"))
-    File.write!(Path.join(root, "instructions"), "Review only; no subagents.")
+    File.write!(Path.join(root, "instructions"), "## Common\nReview only.\n## Standards\nRead standards.\n## Spec\nVerify scope.\n")
     File.write!(Path.join(root, "discussions.json"), "[]")
 
     File.write!(fixture, """
