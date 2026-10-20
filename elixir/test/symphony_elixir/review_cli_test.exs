@@ -168,10 +168,8 @@ defmodule SymphonyElixir.ReviewCliTest do
     File.mkdir_p!(Path.dirname(predecessor))
 
     for stopped <- [false, true] do
-      record =
-        update_in(saved, ["runtime", "axes"], fn axes ->
-          Map.new(axes, fn {name, axis} -> {name, Map.put(axis, "native_stop_confirmed", stopped)} end)
-        end)
+      axes = Map.new(saved["runtime"]["axes"], fn {name, axis} -> {name, Map.put(axis, "native_stop_confirmed", stopped)} end)
+      record = put_in(saved, ["runtime", "axes"], axes)
 
       bytes = Jason.encode!(record)
       File.write!(predecessor, bytes)
