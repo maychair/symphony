@@ -98,6 +98,8 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              "GH_TOKEN",
              "GITHUB_ENTERPRISE_TOKEN",
              "GH_ENTERPRISE_TOKEN",
+             "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+             "SYMPHONY_TASKBOARD_CONTROL_TOKEN",
              "SYMPHONY_GITHUB_TOKEN"
            ]
   end
@@ -396,6 +398,8 @@ defmodule SymphonyElixir.GitHub.AdapterTest do
              "GH_TOKEN",
              "GITHUB_ENTERPRISE_TOKEN",
              "GH_ENTERPRISE_TOKEN",
+             "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+             "SYMPHONY_TASKBOARD_CONTROL_TOKEN",
              token_env
            ]
 

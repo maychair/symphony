@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Config do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Runtime configuration loaded from `WORKFLOW.md`.
   """
@@ -92,6 +94,10 @@ defmodule SymphonyElixir.Config do
     Path.expand(settings!().workspace.root, workflow_dir)
   end
 
+  @doc false
+  @spec local_workspace_root_for(Schema.t(), Path.t()) :: Path.t()
+  def local_workspace_root_for(settings, workflow), do: Path.expand(settings.workspace.root, Path.dirname(workflow))
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     WorkflowStore.force_reload()
@@ -119,19 +125,22 @@ defmodule SymphonyElixir.Config do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
-      backend = System.get_env("SYMPHONY_EXECUTION_BACKEND") || settings.agent.backend
+      backend = RuntimeContext.get_env("SYMPHONY_EXECUTION_BACKEND") || settings.agent.backend
 
       with true <- backend in ["codex", "omp"] || {:error, :invalid_execution_backend},
+           :ok <- SymphonyElixir.RepositoryService.validate_settings(settings),
            :ok <- validate_task_workflow(settings, backend),
            :ok <- Tracker.validate_config(settings.tracker) do
-        SymphonyElixir.MailReview.validate_config(settings.tracker)
+        SymphonyElixir.ReviewLane.validate_config(settings.tracker)
       end
     end
   end
 
   defp validate_task_workflow(settings, backend) do
     if settings.tracker.provider["task_workflow"] == true do
-      if settings.tracker.kind == "gitlab" and backend == "codex" and settings.agent.goal_mode, do: :ok, else: {:error, :task_workflow_requires_gitlab_native_goal}
+      if settings.tracker.kind == "gitlab" and backend == "codex" and settings.agent.goal_mode,
+        do: SymphonyElixir.TaskAuthority.validate(settings.tracker),
+        else: {:error, :task_workflow_requires_gitlab_native_goal}
     else
       :ok
     end

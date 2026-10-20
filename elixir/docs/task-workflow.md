@@ -9,7 +9,7 @@ unsupported combination. The five logical states are `ready`, `running`,
 People and the engine own different labels. Humans own `symphony:ready`
 (authorization and scheduling, kept while the task is live; removing it revokes
 scheduling), `symphony:rework` (in-scope rework against an existing criterion) and
-`symphony:accept` (accept the current manifest). The engine owns
+`symphony:accept` (accept the uniquely bound published manifest). The engine owns
 `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed`;
 it never writes a human label, and it repairs its own state label from the journal
 on every poll. Each human label event is consumed once by its native event ID, so
@@ -24,8 +24,10 @@ slots and includes retained tasks without routing labels or with closed Issues.
 
 ## Confirmed agreement
 
-The sole assigned user confirms the first agreement with two facts: the
-`symphony:ready` label and a self-checked contract block in the Issue description.
+The sole assigned user confirms the first agreement by applying `symphony:ready`
+after a reviewable candidate note has been published. Its native actor must be
+present; the assignee never substitutes for a missing event actor. The Issue
+description contains a self-checked contract block:
 
 ```html
 <!-- symphony-contract
@@ -34,12 +36,26 @@ The sole assigned user confirms the first agreement with two facts: the
 ```
 
 `contract_sha` is SHA-256 of the remaining JSON object (UTF-8, compact JSON,
-sorted keys, unescaped Unicode). The `symphony:ready` label authorizes only when
-that digest verifies against its own payload. The recorded authorization stores
-`issue_version`, the digest of the whole Issue description; editing any part of
-the description, inside or outside the block, invalidates it until a human applies
-`symphony:ready` again. The description contains the human-confirmed goal, scope,
-permissions and acceptance criteria. IDs in `criteria` and `deliverables` refer to
+sorted keys, unescaped Unicode). Before authorization, publish a human-readable
+copy of the agreement with a `symphony-candidate` trailer. Its payload is
+`{"action":"authorize","data":CONTRACT_WITH_ISSUE_VERSION}`: data repeats the
+complete checked contract and adds `issue_version`, the digest of the full Issue
+description. `TaskDecision.candidate_block/1` renders this trailer; rendering or
+publishing a candidate grants no execution authority.
+
+The candidate must have native creation and update times proving unchanged
+content before the label event. The newest preceding candidate must be unique;
+cross-stream timestamp ties, edits, missing timestamps or missing actors cannot
+be resolved from polling order. Use an explicitly versioned `authorize` note
+when that proof is unavailable. The ready event stores the candidate's source
+reference and is checked again on admission and reconciliation. An old ready
+cannot authorize a replacement candidate or the latest editable description.
+Editing the description currently invalidates this legacy whole-description
+agreement; publish and authorize a new candidate. The parent-plan protocol will
+separate contract content from ordinary progress prose.
+
+The description contains the human-confirmed goal, scope, permissions and
+acceptance criteria. IDs in `criteria` and `deliverables` refer to
 that agreement. An agreement names an acceptor and optional reviewers explicitly
 delegated to request in-scope rework. GitLab membership or an ordinary comment
 grants no authority. Later authorization changes require that recorded authorizer.
@@ -70,7 +86,9 @@ list `scope`; omitted scope blocks the whole task. Dependencies are in the same
 repository and resolve on native closure or merge.
 
 A decision reference is `note:ID@VERSION`, where VERSION hashes the compact JSON
-object containing `body` and `updated_at`, with sorted keys. The authorization
+object containing the present `body`, `created_at`, `updated_at` fields and
+`actor` (the native author ID), with sorted keys. Mutable display names and
+profile metadata do not change a source version. The authorization
 reference is `label:ID@ACTOR@CREATED_AT`, taken from the authorizing
 `symphony:ready` label event. Every later decision names a top-level `contract`
 with the confirmed authorization reference, alongside `action` and `data`. For
@@ -101,8 +119,11 @@ acceptance evidence cannot grant new permission or prove completion.
 | `cancel` | Authorizer; nonempty `reason`; cancellation is distinct from acceptance |
 
 `symphony:rework` and `symphony:accept` are the label form of the `rework` and
-`accept` decisions: the engine derives `criteria` from the recorded agreement and
-the manifest from the latest submission, so the labels need no payload. Pause,
+`accept` decisions. A rework label needs an unchanged `symphony-candidate` note
+with action `rework`, the exact contract and explicit repair data. An accept label
+binds an unchanged native manifest note that demonstrably precedes it; it never
+borrows the current journal manifest. Without a unique binding, use an explicit
+versioned decision note. Pause,
 resume, restrict, budget, manifest and cancel still use the note form above.
 
 Unmapped rework or nonempty changes creates a scope restriction. It does not
@@ -155,6 +176,13 @@ submission with intermediate continuation. Stopped-run polls recover unfinished
 review requests, including an already merged MR or a notice beyond the first
 comments page, without allocating a replacement executor.
 
+The final handoff includes a `需要你做什么` section. It links the submitted
+artifacts, states when a report-only task correctly has no MR, and names the
+remaining action: merge the approved MR, add `symphony:accept` for separate
+acceptance, or request in-scope rework. The Scheduler generates this section
+from the manifest and acceptance mode so the action does not depend on an
+executor inventing prose.
+
 Publish an overall `manifest` decision using this complete `--decision-file` object:
 
 ```json
@@ -180,7 +208,9 @@ must be merged with the recorded validation/review evidence before conclusion. `
 `review` attest to the linked MR's business validation and technical review;
 Symphony does not infer them from an agent exit or GitLab mergeability. Reports
 use an Issue note URL ending in `#note_ID`, with the digest of its JSON-encoded
-body. Put detailed reports and fixed evidence links in that note. This first
+body. GitLab `/-/issues/NUMBER` and `/-/work_items/NUMBER` routes identify
+the same Issue for report links; the origin, repository, Issue number, note ID
+and current body digest must still match. Put detailed reports and fixed evidence links in that note. This first
 protocol accepts same-repository MRs and Issue-note reports. Other artifact types
 must be represented by an evidenced report note; arbitrary mutable URLs are not
 accepted as versioned deliverables.
@@ -199,9 +229,10 @@ Use the authorization label's reference for `contract` and the submitted manifes
 note's reference for `data.manifest`; they identify different source decisions.
 The authorization reference comes from the `symphony:ready` label, so use its
 `label:ID@ACTOR@CREATED_AT` value. The `symphony:accept` label carries no manifest
-ref of its own: it accepts the manifest current when the poll reduces events, so a
-manifest note and an `symphony:accept` label that arrive in the same poll are
-applied in source order.
+ref of its own: the adapter must reconstruct its exact preceding manifest from
+native history before reduction. A manifest note and label may arrive in the same
+poll only when their native times prove the order. An `accept` note without
+`data.manifest` is rejected, even when a current manifest exists.
 
 Merge acceptance requires the declared single MR, verified source version,
 recorded checks/review evidence and native merge. A substantive report or source
@@ -264,3 +295,43 @@ records and existing executions. Legacy records are readable but receive no
 inferred agreement or acceptance; provide a real Issue confirmation before
 resuming them. A stale execution lock or unknown native allocation remains a
 recovery incident. Do not delete locks to manufacture stop confirmation.
+
+The candidate-binding update also changes note source digests to include native
+creation time and author ID. The Workspace scheduling entry publishes an explicit
+versioned execution approval before routing the Issue, avoiding timestamp guesses
+when native actions occur in the same second. The terminal verifier accepts both
+explicit note decisions and the engine-selected label bindings. Deploy the engine
+and these helpers together; an engine-only rollout is unsupported.
+
+`observed_label_refs` fingerprints native label facts independently of consumed
+decisions. Freshness reporting may acknowledge an unbound event without turning
+it into an authorization. A new or changed relevant event fences cleanup until
+the scheduler has observed it. Duplicate or malformed contract blocks never fall
+back to an unstructured agreement. Existing labels without candidate bindings
+cannot be promoted to authorization from the latest description. Retained source
+versions must be reconciled explicitly; do not rewrite historical receipts to
+make old authorization appear current.
+
+## Delegated Coordinator decisions
+
+An optional `tracker.provider.delegated_authority` policy names one human
+`principal` (equal to the configured assignee), native bot `publisher` ID and
+base64 raw Ed25519 `public_key`. A structured decision can carry `authority` with
+`grant` and base64 `signature`. The grant signs canonical JSON containing schema
+1, principal, publisher, host/repository, Issue number, issuance Unix seconds,
+`decision` (without authority), and `evidence` identifying the exact native Codex
+user request. The signature attests the trusted Coordinator's scope assessment;
+it is not a human signature. Executors cannot grant themselves authority merely
+by supplying an actor field or publishing under the bot.
+
+Native author must match the configured publisher, the note must be unedited and
+created within five minutes of issuance (allowing sixty seconds of backward clock
+skew), and repository, Issue, principal and complete payload must match. Repeated
+signed notes select the earliest valid native ID once. The execution journal pins
+that exact source version; copies cannot revoke it or replace it after editing or
+deletion. Modified or missing sources cannot retain current authorization. The native
+note reference continues to hash the bot author. Parsed events keep `publisher`
+and verified human `actor` separately. Replay and restart use the same verification;
+no old execution acquires new authority. Unsigned native human decisions and old
+notes remain supported without edits. Workers receive no signing key. This is an
+application trust boundary, not isolation from a malicious same-user process.

@@ -47,8 +47,8 @@ ordinary turn completion and review handoffs retain their existing behavior.
 
 Native REST tools can read and update existing Issues. They reject Issue creation;
 creation requires explicit user authorization through the operator's task entry.
-The optional MR mail-review lane uses its own execution journal and does not create
-Issues. Existing native tracker and non-Goal execution modes remain available.
+The optional native MR review lane uses repository scans, authenticated event hints
+and its own execution journal. It does not use a mailbox or create Issues. Existing native tracker and non-Goal execution modes remain available.
 
 Run `mix execution.preflight --workflow FILE [--issue NUMBER]` to validate tracker
 access and render prompts without starting the scheduler. Runtime diagnostics:

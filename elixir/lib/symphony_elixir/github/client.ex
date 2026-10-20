@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.GitHub.Client do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Thin GitHub REST client for repository issue polling.
   """
@@ -25,7 +27,10 @@ defmodule SymphonyElixir.GitHub.Client do
       "GITHUB_TOKEN",
       "GH_TOKEN",
       "GITHUB_ENTERPRISE_TOKEN",
-      "GH_ENTERPRISE_TOKEN" | env_reference_names([provider["token"]])
+      "GH_ENTERPRISE_TOKEN",
+      "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+      "SYMPHONY_TASKBOARD_CONTROL_TOKEN"
+      | env_reference_names([provider["token"]])
     ]
     |> Enum.uniq()
   end
@@ -35,9 +40,21 @@ defmodule SymphonyElixir.GitHub.Client do
     fetch_issues_by_states(state_names, Config.settings!().tracker, &perform_request/5)
   end
 
+  @spec fetch_issues_by_states([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(state_names, tracker_settings)
+      when is_list(state_names) and is_map(tracker_settings) do
+    fetch_issues_by_states(state_names, tracker_settings, &perform_request/5)
+  end
+
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids) when is_list(issue_ids) do
     fetch_issues_by_ids(issue_ids, Config.settings!().tracker, &perform_request/5)
+  end
+
+  @spec fetch_issues_by_ids([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, tracker_settings)
+      when is_list(issue_ids) and is_map(tracker_settings) do
+    fetch_issues_by_ids(issue_ids, tracker_settings, &perform_request/5)
   end
 
   @spec request(String.t(), String.t(), map(), term(), keyword()) ::
@@ -289,8 +306,8 @@ defmodule SymphonyElixir.GitHub.Client do
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
     api_url = provider["api_url"] || @default_api_url
-    repo = resolve_setting(provider["repo"], System.get_env("GITHUB_REPO"))
-    token = resolve_setting(provider["token"], System.get_env("GITHUB_TOKEN"))
+    repo = resolve_setting(provider["repo"], RuntimeContext.get_env("GITHUB_REPO"))
+    token = resolve_setting(provider["token"], RuntimeContext.get_env("GITHUB_TOKEN"))
 
     cond do
       not valid_api_url?(api_url) -> {:error, :invalid_github_api_url}
@@ -306,9 +323,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp resolve_setting(nil, fallback), do: normalize_string(fallback)
 
-  defp resolve_setting("$" <> env_name, fallback) do
+  defp resolve_setting("$" <> env_name, _fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name) || fallback)
+      normalize_string(RuntimeContext.get_env(env_name))
     else
       nil
     end

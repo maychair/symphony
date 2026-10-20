@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskReconciler do
   @moduledoc "Reconcile Issue decisions on the existing execution and scheduler loops."
   require Logger
-  alias SymphonyElixir.{Config, Execution, RunJournal, TaskWorkflow}
+  alias SymphonyElixir.{Config, Execution, RunJournal, TaskAuthority, TaskDecision, TaskWorkflow}
   alias SymphonyElixir.GitLab.Client
 
   # Human labels. The engine never writes them: authorization, rework and
@@ -50,7 +50,8 @@ defmodule SymphonyElixir.TaskReconciler do
 
   defp poll_record(path, active_ids) do
     with {:ok, record} when is_map(record) <- RunJournal.read(Path.dirname(path)),
-         false <- MapSet.member?(active_ids, record["issue_id"]) do
+         false <- MapSet.member?(active_ids, record["issue_id"]),
+         true <- legacy_record?(record) do
       locked_refresh(record)
     end
   end
@@ -113,6 +114,42 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec observe(map(), keyword()) :: {:ok, map()} | {:error, term()}
   def observe(record, opts \\ []) do
+    if legacy_record?(record) do
+      observe_legacy(record, opts)
+    else
+      {:error, :plan_execution_requires_native_coordinator}
+    end
+  end
+
+  @doc "Recheck an ordinary Issue's accepted completion from native sources without changing any state."
+  @spec completion(map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def completion(record, opts \\ []) do
+    with %{"schema_version" => 1} = previous <- record["workflow"],
+         {:ok, observation} <- observe(record, opts) do
+      now = Keyword.get(opts, :now, System.system_time(:millisecond))
+      stopped = record["native_stop_confirmed"] == true
+      facts = Map.merge(observation.facts, %{"active" => false, "now" => now, "stopped" => stopped})
+      current = previous |> check_routing(facts, false) |> TaskWorkflow.reconcile(facts, observation.events, now)
+      replay = TaskWorkflow.new(previous["budget_ms"], now) |> TaskWorkflow.reconcile(facts, observation.events, now)
+      core = ["contract", "manifest", "acceptance", "cancellation"]
+
+      # The retained flow preserves runtime restrictions such as a reopen. A
+      # separate native replay proves its business fields instead of trusting
+      # cached fields whose source event was already marked as consumed.
+      complete =
+        record["phase"] == "completed" and stopped and current["state"] == "ended" and
+          replay["state"] == "ended" and is_map(current["acceptance"]) and
+          Map.take(current, core) == Map.take(replay, core)
+
+      {:ok, %{completed: complete, workflow_state: current["state"]}}
+    else
+      nil -> {:error, :unconfirmed_task_workflow}
+      %{} -> {:error, :unsupported_task_workflow}
+      error -> error
+    end
+  end
+
+  defp observe_legacy(record, opts) do
     settings = Keyword.get(opts, :settings, Config.settings!().tracker)
     default_client = Application.get_env(:symphony_elixir, :task_workflow_client, &Client.request/5)
     client = Keyword.get(opts, :client, default_client)
@@ -133,6 +170,14 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec apply_observation(map(), map(), boolean(), keyword()) :: {:ok, map()} | {:error, term()}
   def apply_observation(record, observation, active, opts \\ []) do
+    if legacy_record?(record),
+      do: apply_legacy_observation(record, observation, active, opts),
+      else: {:error, :plan_execution_requires_native_coordinator}
+  end
+
+  defp legacy_record?(record), do: not Map.has_key?(record, "execution_binding") and get_in(record, ["workflow", "schema_version"]) != 2
+
+  defp apply_legacy_observation(record, observation, active, opts) do
     %{facts: facts, events: events, raw: raw, path: path, settings: settings, client: client} = observation
     now = Keyword.get(opts, :now, System.system_time(:millisecond))
 
@@ -269,18 +314,32 @@ defmodule SymphonyElixir.TaskReconciler do
     flow = record["workflow"] || TaskWorkflow.new(Execution.run_budget_ms(record["issue_id"]), now)
     contract = description_contract(raw["description"])
     issue_version = TaskWorkflow.digest(raw["description"] || "")
-    events = events(notes, flow, owner) ++ label_events(label_events, flow, contract, issue_version, owner)
+    uri = URI.parse(raw["web_url"])
+
+    scope = %{
+      policy: settings.provider["delegated_authority"],
+      owner: settings.assignee,
+      repository: (uri.host || "") <> "/" <> settings.provider["project_path"],
+      issue: raw["web_url"] |> String.split("/") |> List.last() |> String.to_integer()
+    }
+
+    events = events(notes, flow, owner, scope) ++ TaskDecision.label_events(label_events, notes)
 
     basic = %{
       "owner" => owner,
+      "delivery_publisher" => get_in(scope, [:policy, "publisher"]) |> to_string(),
       "type" => type,
       "issue_version" => issue_version,
       "contract" => contract,
+      "contract_invalid" => is_nil(contract) and Regex.match?(~r/<!--\s*symphony-contract\b/, raw["description"] || ""),
       "closed" => raw["state"] == "closed",
       "labels" => raw["labels"],
       "versions" => %{},
       "now" => now,
       "source_refs" => Enum.map(events, & &1["ref"]),
+      "relay_sources" => events |> Enum.filter(& &1["relay_id"]) |> Map.new(&{&1["relay_id"], &1["ref"]}),
+      "decision_bindings" => Map.new(events, &{&1["ref"], &1["binding"]}),
+      "observed_label_refs" => Enum.map(label_events, &TaskDecision.label_observation/1),
       "observed_refs" => notes |> Enum.reject(&(&1["system"] == true)) |> Enum.map(&source_ref/1),
       "owner_valid" => owner == settings.assignee
     }
@@ -297,7 +356,8 @@ defmodule SymphonyElixir.TaskReconciler do
 
   @spec description_contract(String.t() | nil) :: map() | nil
   def description_contract(description) do
-    with [_, json] <- Regex.run(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
+    with [_] <- Regex.scan(~r/<!--\s*symphony-contract\b/, description || ""),
+         [[_, json]] <- Regex.scan(~r/<!--\s*symphony-contract\s+(\{.*?\})\s*-->/s, description || ""),
          {:ok, %{"contract_sha" => sha} = block} when is_binary(sha) <- Jason.decode(json),
          data = Map.delete(block, "contract_sha"),
          true <- sha == TaskWorkflow.digest(data) do
@@ -307,59 +367,31 @@ defmodule SymphonyElixir.TaskReconciler do
     end
   end
 
-  @spec label_events([map()], map(), map() | nil, String.t(), String.t() | nil) :: [map()]
-  def label_events(raw_events, flow, contract, issue_version, owner) do
-    raw_events
-    |> Enum.filter(&(&1["action"] == "add"))
-    |> Enum.flat_map(&label_event(&1, flow, contract, issue_version, owner))
-  end
-
-  defp label_event(%{"label" => %{"name" => name}, "id" => id} = raw, flow, contract, issue_version, owner) do
-    actor = to_string(get_in(raw, ["user", "id"]) || owner)
-    ref = "label:#{id}@#{actor}@#{raw["created_at"]}"
-
-    # Zero-padding keeps `{at, id, version}` in numeric order for label events
-    # instead of lexicographic order, while every label id still sorts above the
-    # integer note ids, matching `event_priority/1`.
-    base = %{"id" => "label:#{String.pad_leading(to_string(id), 12, "0")}", "ref" => ref, "at" => time(raw["created_at"]), "actor" => actor}
-
-    case name do
-      "symphony:ready" ->
-        [base |> Map.put("action", "authorize") |> Map.put("contract", nil) |> Map.put("data", authorize_data(contract, issue_version))]
-
-      "symphony:rework" ->
-        [base |> Map.put("action", "rework") |> Map.put("contract", contract_ref(flow)) |> Map.put("data", rework_data(flow))]
-
-      "symphony:accept" ->
-        [base |> Map.put("action", "accept") |> Map.put("contract", contract_ref(flow)) |> Map.put("data", %{})]
-
-      _ ->
-        []
-    end
-  end
-
-  defp label_event(_, _, _, _, _), do: []
-
-  defp contract_ref(flow), do: get_in(flow, ["contract", "ref"])
-
-  defp authorize_data(nil, issue_version), do: %{"issue_version" => issue_version}
-  defp authorize_data(contract, issue_version), do: Map.put(contract, "issue_version", issue_version)
-
-  defp rework_data(flow), do: %{"criteria" => get_in(flow, ["contract", "criteria"]) || [], "changes" => []}
-
-  @spec events([map()], map(), String.t() | nil) :: [map()]
-  def events(notes, flow, owner) do
+  @spec events([map()], map(), String.t() | nil, map() | nil) :: [map()]
+  def events(notes, flow, owner, scope \\ nil) do
     question = question(notes)
 
     parsed =
       notes
       |> Enum.reject(&(&1["system"] == true))
-      |> Enum.map(&parse_note(&1, flow, owner, question))
+      |> Enum.map(&parse_note(&1, flow, owner, question, scope))
       |> Enum.reject(&is_nil/1)
+      |> unique_relays(flow)
 
     contracts = Enum.filter(parsed, &(&1["action"] == "authorize" and &1["actor"] == (get_in(flow, ["contract", "authorizer"]) || owner)))
 
     Enum.map(parsed, &bind_natural(&1, contracts, parsed, flow))
+  end
+
+  defp unique_relays(events, flow) do
+    chosen =
+      events
+      |> Enum.filter(& &1["relay_id"])
+      |> Enum.group_by(& &1["relay_id"])
+      |> Map.new(fn {id, copies} -> {id, Enum.min_by(copies, & &1["id"])["ref"]} end)
+      |> Map.merge(flow["relay_sources"] || %{})
+
+    events |> Enum.filter(&(is_nil(&1["relay_id"]) or chosen[&1["relay_id"]] == &1["ref"])) |> Enum.uniq_by(& &1["ref"])
   end
 
   defp bind_natural(%{"natural" => true} = event, contracts, parsed, flow) do
@@ -391,28 +423,42 @@ defmodule SymphonyElixir.TaskReconciler do
     if get_in(flow, ["restrictions", "handoff", "kind"]) == "decision", do: ["handoff"], else: []
   end
 
-  defp parse_note(note, flow, owner, question) do
+  defp parse_note(note, flow, owner, question, scope) do
     body = note["body"] || ""
     answers? = answer?(note, flow, owner, question)
     declared = note_payload(body)
     payload = declared || (answers? and %{"action" => "resume", "natural" => true})
 
-    if is_map(payload) and is_map(payload["data"] || %{}) do
-      version = note_version(note)
+    with %{} = payload <- payload,
+         true <- is_map(payload["data"] || %{}),
+         actor when is_binary(actor) <- TaskAuthority.actor(note, payload, scope) do
+      native_event(note, payload, actor, answers?, declared)
+    else
+      _ -> nil
+    end
+  end
 
-      %{
-        "id" => note["id"],
-        "version" => version,
-        "ref" => "note:#{note["id"]}@#{version}",
-        "at" => note_at(note),
-        "actor" => to_string(get_in(note, ["author", "id"])),
-        "action" => payload["action"],
-        "contract" => payload["contract"],
-        "data" => payload["data"] || %{},
-        "natural" => payload["natural"] == true,
-        "resume" => declared_resume?(declared),
-        "answer" => answer_event?(answers?, payload)
-      }
+  defp native_event(note, payload, actor, answers?, declared) do
+    version = note_version(note)
+
+    event = %{
+      "id" => note["id"],
+      "version" => version,
+      "ref" => "note:#{note["id"]}@#{version}",
+      "at" => note_at(note),
+      "actor" => actor,
+      "action" => payload["action"],
+      "contract" => payload["contract"],
+      "data" => payload["data"] || %{},
+      "natural" => payload["natural"] == true,
+      "resume" => declared_resume?(declared),
+      "answer" => answer_event?(answers?, payload)
+    }
+
+    if Map.has_key?(payload, "authority") do
+      Map.merge(event, %{"publisher" => to_string(get_in(note, ["author", "id"])), "relay_id" => TaskWorkflow.digest(payload["authority"]["signature"])})
+    else
+      event
     end
   end
 
@@ -473,8 +519,8 @@ defmodule SymphonyElixir.TaskReconciler do
   end
 
   @spec source_ref(map()) :: String.t()
-  def source_ref(note), do: "note:#{note["id"]}@#{note_version(note)}"
-  defp note_version(note), do: TaskWorkflow.digest(%{"body" => note["body"] || "", "updated_at" => note["updated_at"]})
+  def source_ref(note), do: TaskDecision.source_ref(note)
+  defp note_version(note), do: TaskDecision.version(note)
 
   @spec intent(String.t()) :: map() | nil
   def intent(text) do
@@ -517,12 +563,13 @@ defmodule SymphonyElixir.TaskReconciler do
   end
 
   defp artifact(item, prefix, issue_url, notes, client, settings) do
+    issue_url = String.replace(issue_url, ~r{/-/work_items/([1-9][0-9]*)$}, "/-/issues/\\1")
     mr_prefix = String.replace(issue_url, ~r{/issues/\d+$}, "/merge_requests/")
-    url = item["url"] || ""
+    url = String.replace(item["url"] || "", ~r{/-/work_items/([1-9][0-9]*)(#note_[1-9][0-9]*)$}, "/-/issues/\\1\\2")
 
     cond do
       item["kind"] == "mr" and String.starts_with?(url, mr_prefix) -> mr_artifact(item, prefix, mr_prefix, client, settings)
-      item["kind"] == "report" and String.starts_with?(url, issue_url <> "#note_") -> report_artifact(url, notes)
+      item["kind"] == "report" and String.starts_with?(url, issue_url <> "#note_") -> report_artifact(url, issue_url, notes)
       true -> {:error, :unsupported_artifact_reference}
     end
   end
@@ -541,8 +588,10 @@ defmodule SymphonyElixir.TaskReconciler do
     end
   end
 
-  defp report_artifact(url, notes) do
-    case Regex.run(~r/#note_([1-9][0-9]*)$/, url) do
+  defp report_artifact(url, issue_url, notes) do
+    id = String.replace_prefix(url, issue_url <> "#note_", "")
+
+    case Regex.run(~r/\A([1-9][0-9]*)\z/, id) do
       [_, id] ->
         note = Enum.find(notes, &(&1["id"] == String.to_integer(id)))
         version = if note, do: TaskWorkflow.digest(note["body"] || "")

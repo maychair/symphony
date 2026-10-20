@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.AgentRunner do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Executes a single tracker work item in its workspace with Codex.
   """
@@ -6,10 +8,12 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Execution, ExecutionBackend, PromptBuilder, RunJournal, Tracker, Workspace}
-  alias SymphonyElixir.MailReview.Runner
+  alias SymphonyElixir.ReviewLane.Runner
+  alias SymphonyElixir.{TaskExecution, TaskExecutionConfig, TaskRecovery, TaskSession, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
+  @type member_result :: {:ok, map()} | {:waiting, map()} | {:error, term()}
 
   @doc false
   @spec continue_with_issue_for_test(Issue.t(), ([String.t()] -> term())) ::
@@ -21,12 +25,83 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
+    if SymphonyElixir.TaskPlanExecution.job?(issue) do
+      SymphonyElixir.TaskPlanExecution.run(issue, codex_update_recipient, opts)
+    else
+      run_tracker_issue(issue, codex_update_recipient, opts)
+    end
+  end
+
+  defp run_tracker_issue(issue, codex_update_recipient, opts) do
     budget = Execution.run_budget_ms(issue.id)
     opts = if Execution.enabled?(), do: Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + budget), else: opts
 
-    if SymphonyElixir.MailReview.job?(issue),
-      do: Runner.run(issue, codex_update_recipient, opts),
-      else: do_run(issue, codex_update_recipient, opts)
+    if SymphonyElixir.ReviewLane.job?(issue) do
+      Runner.run(issue, codex_update_recipient, opts)
+    else
+      do_run(issue, codex_update_recipient, opts)
+    end
+  end
+
+  @doc "Execute one plan-member role from native admission to owned finalization; the scheduler owns continuation."
+  @spec run_member(map(), map(), map(), pid() | nil, keyword()) :: member_result()
+  def run_member(parent, work, executions, recipient \\ nil, opts \\ []) do
+    with true <- (ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])) or {:error, :unsupported_task_session_transport},
+         {:ok, record, directory} <- member_record(work, executions) do
+      if RunJournal.interrupted_member?(record),
+        do: recover_member(record, directory, parent, work, executions, opts),
+        else: run_admitted_member(parent, work, executions, recipient, opts)
+    end
+  end
+
+  defp member_record(work, executions) do
+    case executions[WorkRef.key(work)] do
+      %{directory: directory} ->
+        with {:ok, record} <- RunJournal.read(directory), do: {:ok, record, directory}
+
+      _ ->
+        {:ok, nil, nil}
+    end
+  end
+
+  defp recover_member(record, directory, parent, work, executions, opts) do
+    binding = record["execution_binding"]
+
+    if record["directory"] == directory and record["issue_id"] == WorkRef.key(work) and
+         binding["work"] == work and binding["authority"]["work"] == parent,
+       do: TaskRecovery.recover(record, executions, opts),
+       else: {:error, :member_recovery_scope_changed}
+  end
+
+  defp run_admitted_member(parent, work, executions, recipient, opts) do
+    with {:ok, admitted} <- TaskExecution.admit(parent, work, executions, opts) do
+      id = opts[:dispatch_id] || admitted.record["issue_id"]
+      issue = %Issue{id: id, identifier: id, title: "Plan member", state: "open"}
+
+      callbacks = [
+        on_ready: fn record ->
+          send_worker_runtime_info(recipient, issue, nil, record["workspace"])
+          Keyword.get(opts, :on_ready, fn _ -> :ok end).(record)
+        end,
+        on_message: fn event ->
+          send_codex_update(recipient, issue, event)
+          Keyword.get(opts, :on_message, fn _ -> :ok end).(event)
+        end
+      ]
+
+      TaskSession.run(admitted.record, executions, Keyword.merge(opts, callbacks))
+    end
+  end
+
+  @doc "Resolve every approved member's host configuration before entering the existing role worker."
+  @spec run_configured_member(map(), map(), pid() | nil, keyword()) :: member_result()
+  def run_configured_member(parent, work, recipient \\ nil, opts \\ []) do
+    local = ExecutionBackend.kind() == "codex" and is_nil(opts[:worker_host])
+
+    with true <- local or {:error, :unsupported_task_session_transport},
+         {:ok, configured} <- TaskExecutionConfig.prepare(parent, opts) do
+      run_member(parent, work, configured.executions, recipient, configured.opts)
+    end
   end
 
   defp do_run(issue, codex_update_recipient, opts) do
@@ -112,6 +187,8 @@ defmodule SymphonyElixir.AgentRunner do
       worker_host: worker_host,
       run_record: record,
       tracker_settings: opts[:tracker_settings],
+      execution_policy: opts[:execution_policy],
+      task_native_options: opts[:task_native_options],
       resume_thread_id: record && record["thread_id"],
       expected_turn_id: record && (record["turn_id"] || :no_turns),
       suspend_goal: Execution.enabled?(),
@@ -315,9 +392,11 @@ defmodule SymphonyElixir.AgentRunner do
       owner = self()
 
       {pid, monitor} =
-        spawn_monitor(fn ->
-          send(owner, {:workflow_observation, self(), SymphonyElixir.TaskReconciler.observe(current)})
-        end)
+        spawn_monitor(
+          RuntimeContext.wrap(fn ->
+            send(owner, {:workflow_observation, self(), SymphonyElixir.TaskReconciler.observe(current)})
+          end)
+        )
 
       Process.put(:workflow_observer, {pid, monitor, now})
     end

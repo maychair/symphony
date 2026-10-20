@@ -1,10 +1,14 @@
 defmodule SymphonyElixir.Codex.AppServer do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Minimal client for the Codex app-server JSON-RPC 2.0 stream over stdio.
   """
 
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+
+  @shell_environment %{"ZDOTDIR" => "/dev/null", "BASH_ENV" => "/dev/null", "ENV" => "/dev/null"}
 
   @initialize_id 1
   @thread_start_id 2
@@ -16,6 +20,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @goal_interrupt_id 7
   @goal_inspect_id 8
   @max_stream_log_bytes 1_000
+  defguardp interruptible(ctx) when is_map_key(ctx, :goal_mode) or :erlang.map_get(:interruptible, ctx) == true
+
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -43,45 +49,56 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
-    dynamic_tool_binding = Keyword.get_lazy(opts, :dynamic_tool_binding, fn -> DynamicTool.bind(opts[:tracker_settings]) end)
 
+    with {:ok, dynamic_tool_binding} <- DynamicTool.bind_session(opts),
+         dynamic_tool_binding = Map.update!(dynamic_tool_binding, :secret_environment_names, &Enum.uniq(&1 ++ SymphonyElixir.RepositoryService.secret_environment_names())),
+         {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+      try do
+        initialize_session(port, expanded_workspace, worker_host, dynamic_tool_binding, opts)
+      catch
+        kind, reason ->
+          stop_port(port)
+          {:error, {:native_session_start_failed, kind, inspect(reason)}}
+      end
+    end
+  end
+
+  defp initialize_session(port, expanded_workspace, worker_host, dynamic_tool_binding, opts) do
     on_thread_intent = Keyword.get(opts, :on_thread_intent, fn -> :ok end)
     on_thread_started = Keyword.get(opts, :on_thread_started, fn _id -> :ok end)
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
+    metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
-           {:ok, thread_id} <-
-             do_start_session(
-               port,
-               expanded_workspace,
-               session_policies,
-               dynamic_tool_binding,
-               opts,
-               on_thread_intent
-             ) do
-        on_thread_started.(thread_id)
-
-        {:ok,
-         %{
-           port: port,
-           metadata: metadata,
-           approval_policy: session_policies.approval_policy,
-           auto_approve_requests: auto_approve?(session_policies, dynamic_tool_binding),
-           thread_sandbox: session_policies.thread_sandbox,
-           turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
-           workspace: expanded_workspace,
-           worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
-         }}
-      else
-        {:error, reason} ->
-          stop_port(port)
-          {:error, reason}
-      end
+    with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
+         {:ok, thread_id} <-
+           do_start_session(
+             port,
+             expanded_workspace,
+             session_policies,
+             dynamic_tool_binding,
+             opts,
+             on_thread_intent
+           ),
+         :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(opts[:run_record] || %{}, %{"thread_id" => thread_id}),
+         :ok <- on_thread_started.(thread_id) do
+      {:ok,
+       %{
+         port: port,
+         metadata: metadata,
+         approval_policy: session_policies.approval_policy,
+         auto_approve_requests: auto_approve?(session_policies, dynamic_tool_binding),
+         thread_sandbox: session_policies.thread_sandbox,
+         turn_sandbox_policy: session_policies.turn_sandbox_policy,
+         thread_id: thread_id,
+         workspace: expanded_workspace,
+         worker_host: worker_host,
+         dynamic_tool_binding: dynamic_tool_binding
+       }}
+    else
+      {:error, reason} ->
+        stop_port(port)
+        {:error, reason}
     end
   end
 
@@ -89,9 +106,30 @@ defmodule SymphonyElixir.Codex.AppServer do
     policies.approval_policy == "never"
   end
 
-  defp execution_context(executor, thread_id, turn_id, _binding) do
-    strict = Config.settings!().agent.goal_mode
+  defp execution_context(executor, thread_id, turn_id, binding) do
+    strict = Config.settings!().agent.goal_mode or Map.has_key?(binding, :task_execution)
     %{executor: executor, thread_id: thread_id, turn_id: turn_id, strict: strict}
+  end
+
+  @doc "Execute a bounded read probe with the same native read-only policy as a review turn."
+  @spec review_read(session(), [String.t()]) :: {:ok, String.t()} | {:error, term()}
+  def review_read(%{port: port, turn_sandbox_policy: %{"type" => "readOnly"} = policy, workspace: workspace}, argv) do
+    send_message(port, %{
+      "id" => 91,
+      "method" => "command/exec",
+      "params" => %{
+        "command" => argv,
+        "cwd" => workspace,
+        "sandboxPolicy" => policy,
+        "timeoutMs" => 15_000,
+        "outputBytesCap" => 4_194_305
+      }
+    })
+
+    case await_response(port, 91) do
+      {:ok, %{"exitCode" => 0, "stdout" => output}} when byte_size(output) <= 4_194_304 -> {:ok, output}
+      other -> {:error, {:review_read_failed, other}}
+    end
   end
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -117,9 +155,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    Keyword.get(opts, :before_turn, fn -> :ok end).()
+    started =
+      with :ok <- Keyword.get(opts, :before_turn, fn -> :ok end).(),
+           :ok <- turn_admission(opts) do
+        start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy)
+      end
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case started do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -138,7 +180,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         case await_turn_completion(
                port,
                on_message,
-               Map.put(execution_context(tool_executor, thread_id, turn_id, dynamic_tool_binding), :deadline, opts[:deadline]),
+               execution_context(tool_executor, thread_id, turn_id, dynamic_tool_binding)
+               |> Map.merge(%{deadline: opts[:deadline], interruptible: opts[:interruptible] == true}),
                auto_approve_requests
              ) do
           {:ok, result} ->
@@ -175,6 +218,20 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp turn_admission(opts) do
+    interruptible = opts[:interruptible] == true
+
+    if is_integer(opts[:deadline]) and opts[:deadline] <= System.monotonic_time(:millisecond) do
+      {:error, :execution_budget_exhausted}
+    else
+      receive do
+        :symphony_stop when interruptible -> {:error, :scheduler_stop}
+      after
+        0 -> :ok
+      end
+    end
+  end
+
   @doc "Run the task's native Goal; automatic Goal turns belong to this executor, not a UI parent."
   @spec run_goal(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_goal(session, objective, issue, opts \\ []) do
@@ -185,9 +242,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
 
     with {:ok, existing} <- read_goal(session),
-         :ok <- resumable_goal(existing, opts) do
-      Keyword.get(opts, :before_goal, fn -> :ok end).()
-
+         :ok <- resumable_goal(existing, opts),
+         :ok <- Keyword.get(opts, :before_goal, fn -> :ok end).(),
+         :ok <- turn_admission(opts) do
       context =
         execution_context(executor, session.thread_id, nil, session.dynamic_tool_binding)
         |> Map.merge(%{
@@ -197,6 +254,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           goal_running: false,
           goal_stop_requested: nil,
           deadline: opts[:deadline] || System.monotonic_time(:millisecond) + Config.settings!().codex.turn_timeout_ms,
+          before_goal_stop: Keyword.get(opts, :before_goal_stop, fn -> :ok end),
           handoff_status: Keyword.get(opts, :handoff_status, fn -> nil end)
         })
 
@@ -267,7 +325,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp stop_goal_after_error(session, opts) do
     turn_id = Keyword.get(opts, :latest_turn, fn -> nil end).()
 
-    with {:ok, goal} <- halt_goal(session),
+    with :ok <- Keyword.get(opts, :before_goal_stop, fn -> :ok end).(),
+         {:ok, goal} <- halt_goal(session),
          true <- goal["threadId"] == session.thread_id do
       emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
 
@@ -319,6 +378,15 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, %{"goal" => goal}} -> {:ok, goal}
       error -> error
     end
+  end
+
+  @doc "Halt the thread through its owning transport and observe terminal state before closing it."
+  @spec halt_session(session(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def halt_session(%{port: port, thread_id: thread}, opts) do
+    opts = Keyword.merge(opts, suspend_goal: true, interrupt_active: true, halt_only: true, reconcile_terminal_turns: true)
+    with :ok <- suspend_goal_for_resume(port, thread, opts), do: inspect_thread(port, thread, opts)
+  rescue
+    ArgumentError -> {:error, :native_stop_transport_unavailable}
   end
 
   @spec stop_session(session()) :: :ok
@@ -419,14 +487,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp agent_port_env(binding) do
-    Enum.map(binding.agent_environment, fn {name, value} -> {String.to_charlist(name), String.to_charlist(value)} end)
+    Enum.map(agent_environment(binding), fn {name, value} -> {String.to_charlist(name), String.to_charlist(value)} end)
   end
 
   defp agent_environment_command(binding) do
-    case Enum.map(binding.agent_environment, fn {name, value} -> "export #{name}=#{shell_escape(value)}" end) do
-      [] -> nil
-      entries -> Enum.join(entries, " && ")
-    end
+    binding
+    |> agent_environment()
+    |> Enum.map_join(" && ", fn {name, value} -> "export #{name}=#{shell_escape(value)}" end)
+  end
+
+  defp agent_environment(binding) do
+    RuntimeContext.environment() |> Map.merge(binding.agent_environment) |> Map.merge(@shell_environment)
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
@@ -489,7 +560,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp session_policies(workspace, nil, opts) do
-    if Keyword.get(opts, :review_only, false) do
+    if Keyword.get(opts, :review_only, false) or get_in(opts[:run_record] || %{}, ["execution_binding", "role"]) == "verifier" do
       {:ok, %{approval_policy: "never", thread_sandbox: "read-only", turn_sandbox_policy: %{"type" => "readOnly"}}}
     else
       Config.codex_runtime_settings(workspace)
@@ -501,21 +572,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, opts, on_intent) do
-    with :ok <- send_initialize(port) do
-      on_intent.()
-
+    with :ok <- send_initialize(port), :ok <- on_intent.() do
       open_thread(port, workspace, session_policies, dynamic_tool_binding, opts)
     end
   end
 
   defp open_thread(port, workspace, policies, binding, opts) do
     case opts[:resume_thread_id] do
-      id when is_binary(id) -> open_existing_thread(port, id, workspace, policies, opts)
+      id when is_binary(id) -> open_existing_thread(port, id, workspace, policies, binding, opts)
       _ -> start_thread(port, workspace, policies, binding)
     end
   end
 
-  defp open_existing_thread(port, id, workspace, policies, opts) do
+  defp open_existing_thread(port, id, workspace, policies, binding, opts) do
     cond do
       opts[:halt_only] ->
         with :ok <- suspend_goal_for_resume(port, id, opts), do: inspect_thread(port, id, opts)
@@ -524,13 +593,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         inspect_thread(port, id, opts)
 
       true ->
-        resume_thread(port, id, workspace, policies, opts)
+        resume_thread(port, id, workspace, policies, binding, opts)
     end
   end
 
-  defp resume_thread(port, thread_id, workspace, policies, opts) do
+  defp resume_thread(port, thread_id, workspace, policies, binding, opts) do
     with :ok <- suspend_goal_for_resume(port, thread_id, opts) do
-      do_resume_thread(port, thread_id, workspace, policies, opts)
+      do_resume_thread(port, thread_id, workspace, policies, binding, opts)
     end
   end
 
@@ -542,7 +611,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       case read_goal(session) do
         {:ok, nil} ->
-          :ok
+          maybe_interrupt_active(session, opts)
 
         {:ok, _goal} ->
           halt_goal_for_resume(session, opts)
@@ -645,7 +714,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       Enum.all?(turns, &(&1["status"] in ["completed", "failed", "interrupted"]))
   end
 
-  defp do_resume_thread(port, thread_id, workspace, policies, opts) do
+  defp do_resume_thread(port, thread_id, workspace, policies, binding, opts) do
     send_message(port, %{
       "id" => @thread_start_id,
       "method" => "thread/resume",
@@ -654,7 +723,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "cwd" => workspace,
         "approvalPolicy" => policies.approval_policy,
         "sandbox" => policies.thread_sandbox,
-        "config" => thread_sandbox_config(policies)
+        "config" => thread_config(policies, binding)
       }
     })
 
@@ -695,7 +764,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
-        "config" => thread_sandbox_config(policies),
+        "config" => thread_config(policies, dynamic_tool_binding),
         "cwd" => workspace,
         "dynamicTools" => dynamic_tool_binding.tool_specs
       }
@@ -712,6 +781,26 @@ defmodule SymphonyElixir.Codex.AppServer do
         other
     end
   end
+
+  # Apply on every new or restored thread; a user's saved snapshot/profile is
+  # not an authority to reintroduce host-side tracker credentials.
+  defp thread_config(policies, binding) do
+    Map.merge(
+      Map.take(binding[:model_settings] || %{}, ["model", "model_reasoning_effort"]),
+      Map.merge(thread_sandbox_config(policies), %{
+        "features.shell_snapshot" => false,
+        "allow_login_shell" => false,
+        "shell_environment_policy.set" => @shell_environment,
+        "shell_environment_policy.exclude" => valid_environment_names(binding.secret_environment_names)
+      })
+    )
+    |> Map.merge(tool_output_config(binding))
+  end
+
+  defp tool_output_config(%{tool_output_token_limit: limit}) when is_integer(limit) and limit > 0,
+    do: %{"tool_output_token_limit" => limit}
+
+  defp tool_output_config(_binding), do: %{}
 
   # Native Goal turns use thread defaults rather than explicit turn/start policy.
   defp thread_sandbox_config(%{thread_sandbox: "workspace-write", turn_sandbox_policy: policy}) do
@@ -763,7 +852,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     receive do
-      :symphony_stop when is_map_key(tool_executor, :goal_mode) -> {:error, :scheduler_stop}
+      :symphony_stop when interruptible(tool_executor) -> {:error, :scheduler_stop}
     after
       0 -> receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
     end
@@ -775,7 +864,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
 
     receive do
-      :symphony_stop when is_map_key(tool_executor, :goal_mode) ->
+      :symphony_stop when interruptible(tool_executor) ->
         {:error, :scheduler_stop}
 
       {^port, {:data, {:eol, chunk}}} ->
@@ -886,6 +975,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         context = %{context | turn_id: turn_id, goal_running: true}
 
         if context.goal_stop_requested do
+          :ok = context.before_goal_stop.()
           interrupt_goal_turn(port, context.thread_id, turn_id)
         end
 
@@ -919,6 +1009,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp maybe_request_goal_handoff(port, %{goal_mode: true, goal_stop_requested: nil} = context) do
     case context.handoff_status.() do
       status when status in ["complete", "blocked"] ->
+        :ok = context.before_goal_stop.()
+
         send_message(port, %{
           "id" => @goal_stop_id,
           "method" => "thread/goal/set",

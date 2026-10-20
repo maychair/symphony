@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.GitLab.Client do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Thin GitLab REST client for project-scoped issue polling.
   """
@@ -23,7 +25,10 @@ defmodule SymphonyElixir.GitLab.Client do
       "GITLAB_PAT",
       "GITLAB_ACCESS_TOKEN",
       "GITLAB_TOKEN",
-      "OAUTH_TOKEN" | env_reference_names([provider["api_key"]])
+      "OAUTH_TOKEN",
+      "SYMPHONY_OPERATOR_TRACKER_TOKEN",
+      "SYMPHONY_TASKBOARD_CONTROL_TOKEN"
+      | env_reference_names([provider["api_key"]])
     ]
     |> Enum.uniq()
   end
@@ -33,9 +38,21 @@ defmodule SymphonyElixir.GitLab.Client do
     fetch_issues_by_states(states, Config.settings!().tracker, &perform_request/5)
   end
 
+  @spec fetch_issues_by_states([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, tracker_settings)
+      when is_list(states) and is_map(tracker_settings) do
+    fetch_issues_by_states(states, tracker_settings, &perform_request/5)
+  end
+
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(ids) when is_list(ids) do
     fetch_issues_by_ids(ids, Config.settings!().tracker, &perform_request/5)
+  end
+
+  @spec fetch_issues_by_ids([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(ids, tracker_settings)
+      when is_list(ids) and is_map(tracker_settings) do
+    fetch_issues_by_ids(ids, tracker_settings, &perform_request/5)
   end
 
   @spec request(String.t(), String.t(), map(), term(), keyword()) ::
@@ -210,6 +227,7 @@ defmodule SymphonyElixir.GitLab.Client do
       "iid" => issue["iid"],
       "project_id" => issue["project_id"],
       "project_path" => project_path,
+      "merge_requests_count" => issue["merge_requests_count"],
       "references" => issue["references"]
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -283,6 +301,7 @@ defmodule SymphonyElixir.GitLab.Client do
         url: settings.api_url <> path,
         headers: gitlab_headers(settings.api_key),
         params: query,
+        decode_body: not String.ends_with?(path, "/raw"),
         connect_options: [timeout: 30_000]
       ]
 
@@ -298,9 +317,9 @@ defmodule SymphonyElixir.GitLab.Client do
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
     api_url = provider["api_url"] || @default_api_url
-    project_path = resolve_setting(provider["project_path"], System.get_env("GITLAB_PROJECT_PATH"))
+    project_path = resolve_setting(provider["project_path"], RuntimeContext.get_env("GITLAB_PROJECT_PATH"))
 
-    api_key = resolve_setting(provider["api_key"], System.get_env("GITLAB_PAT"))
+    api_key = resolve_setting(provider["api_key"], RuntimeContext.get_env("GITLAB_PAT"))
 
     cond do
       not (valid_api_url?(api_url) or (provider["allow_insecure_http"] == true and match?(%URI{scheme: "http", host: host} when is_binary(host), URI.parse(api_url)))) ->
@@ -330,9 +349,9 @@ defmodule SymphonyElixir.GitLab.Client do
 
   defp resolve_setting(nil, fallback), do: normalize_string(fallback)
 
-  defp resolve_setting("$" <> env_name, fallback) do
+  defp resolve_setting("$" <> env_name, _fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name) || fallback)
+      normalize_string(RuntimeContext.get_env(env_name))
     else
       nil
     end

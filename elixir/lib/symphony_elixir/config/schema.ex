@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Config.Schema do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc false
 
   use Ecto.Schema
@@ -303,6 +304,71 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Taskboard do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+
+    embedded_schema do
+      field(:enabled, :boolean, default: true)
+      field(:control_token, :string)
+      field(:provider_token, :string)
+      field(:refresh_ms, :integer, default: 5_000)
+      field(:projects, {:array, :map}, default: [])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:enabled, :control_token, :provider_token, :refresh_ms, :projects], empty_values: [])
+      |> validate_number(:refresh_ms, greater_than_or_equal_to: 1_000)
+      |> validate_change(:projects, fn :projects, projects ->
+        projects
+        |> Enum.with_index()
+        |> Enum.flat_map(fn {project, index} -> validate_project(project, index) end)
+      end)
+      |> validate_change(:projects, fn :projects, projects ->
+        ids =
+          projects
+          |> Enum.map(&Map.get(&1, "id"))
+          |> Enum.reject(&is_nil/1)
+
+        if length(ids) == length(Enum.uniq(ids)) do
+          []
+        else
+          [projects: "project IDs must be unique"]
+        end
+      end)
+    end
+
+    defp validate_project(project, index) when is_map(project) do
+      id = Map.get(project, "id")
+      kind = Map.get(project, "kind")
+      url = Map.get(project, "url")
+      repo = Map.get(project, "repo")
+
+      []
+      |> maybe_error(id, is_binary(id) and id != "", "projects[#{index}].id must be a non-empty string")
+      |> maybe_error(kind, kind in ["github", "gitlab"], "projects[#{index}].kind must be github or gitlab")
+      |> maybe_error(url, valid_http_url?(url), "projects[#{index}].url must be an HTTP(S) URL")
+      |> maybe_error(repo, is_binary(repo) and repo != "", "projects[#{index}].repo must be a non-empty string")
+    end
+
+    defp maybe_error(errors, _value, true, _message), do: errors
+    defp maybe_error(errors, _value, false, message), do: [{:projects, message} | errors]
+
+    defp valid_http_url?(value) when is_binary(value) do
+      case URI.parse(value) do
+        %URI{scheme: scheme, host: host} when scheme in ["http", "https"] and is_binary(host) -> true
+        _ -> false
+      end
+    end
+
+    defp valid_http_url?(_value), do: false
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -332,6 +398,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:taskboard, Taskboard, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
 
@@ -427,6 +494,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
+    |> cast_embed(:taskboard, with: &Taskboard.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
@@ -444,10 +512,10 @@ defmodule SymphonyElixir.Config.Schema do
             |> Map.put_new("assignee", settings.tracker.assignee)
 
           resolved_api_key =
-            resolve_secret_setting(linear_provider["api_key"], System.get_env("LINEAR_API_KEY"))
+            resolve_secret_setting(linear_provider["api_key"], RuntimeContext.get_env("LINEAR_API_KEY"))
 
           resolved_assignee =
-            resolve_secret_setting(linear_provider["assignee"], System.get_env("LINEAR_ASSIGNEE"))
+            resolve_secret_setting(linear_provider["assignee"], RuntimeContext.get_env("LINEAR_ASSIGNEE"))
 
           {
             resolved_api_key,
@@ -485,7 +553,18 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    taskboard = %{
+      settings.taskboard
+      | control_token: resolve_secret_setting(settings.taskboard.control_token, nil),
+        provider_token: resolve_secret_setting(settings.taskboard.provider_token, nil),
+        projects: Enum.map(settings.taskboard.projects, &resolve_project_token/1)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, taskboard: taskboard}
+  end
+
+  defp resolve_project_token(project) when is_map(project) do
+    Map.update(project, "token", nil, fn token -> resolve_secret_setting(token, nil) end)
   end
 
   defp tracker_states(settings) do
@@ -555,7 +634,7 @@ defmodule SymphonyElixir.Config.Schema do
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do
       {:ok, env_name} ->
-        case System.get_env(env_name) do
+        case RuntimeContext.get_env(env_name) do
           nil -> fallback
           "" -> nil
           env_value -> env_value
@@ -593,7 +672,7 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp resolve_env_token(env_name) do
-    case System.get_env(env_name) do
+    case RuntimeContext.get_env(env_name) do
       nil -> :missing
       env_value -> env_value
     end

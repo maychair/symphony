@@ -85,7 +85,14 @@ defmodule SymphonyElixir.TaskWorkflow do
     |> check_conclusion_conflict()
     |> check_closure(facts)
     |> derive(facts)
+    |> remember_relays(facts)
     |> Map.put("observed_refs", facts["observed_refs"] || [])
+    |> Map.put("observed_label_refs", facts["observed_label_refs"] || [])
+  end
+
+  defp remember_relays(flow, facts) do
+    sources = Map.merge(facts["relay_sources"] || %{}, flow["relay_sources"] || %{})
+    if sources == %{}, do: flow, else: Map.put(flow, "relay_sources", sources)
   end
 
   @spec tick(map(), integer()) :: map()
@@ -144,22 +151,22 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp apply_event(%{"contract" => nil} = flow, _event, _facts), do: {flow, "missing_authorization"}
 
-  defp apply_event(flow, event, _facts) do
+  defp apply_event(flow, event, facts) do
     cond do
       event["contract"] != flow["contract"]["ref"] -> {flow, "stale_contract"}
       obsolete_delivery?(flow, event) -> {flow, "obsolete_delivery_decision"}
-      permitted?(flow["contract"], event) -> transition(flow, event)
+      permitted?(flow["contract"], event, facts) -> transition(flow, event)
       true -> {flow, "no_authorized_transition"}
     end
   end
 
-  defp permitted?(contract, event) do
+  defp permitted?(contract, event, facts) do
     actor = event["actor"]
 
     case event["action"] do
       action when action in ["pause", "cancel", "restrict", "resume", "release", "budget", "clarify"] -> actor == contract["authorizer"]
       "rework" -> actor in [contract["acceptor"] | contract["reviewers"] || []]
-      "manifest" -> actor in [contract["authorizer"], contract["acceptor"]]
+      "manifest" -> actor in [contract["authorizer"], contract["acceptor"], facts["delivery_publisher"]]
       "accept" -> actor == contract["acceptor"]
       _ -> false
     end
@@ -201,10 +208,9 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp transition(flow, %{"action" => "accept"} = event) do
     manifest = flow["manifest"]
     ref = event["data"]["manifest"]
-    ref = if is_binary(ref), do: ref, else: manifest && manifest["ref"]
 
-    if is_map(manifest) and ref == manifest["ref"],
-      do: {flow |> Map.put("acceptance", %{"ref" => event["ref"], "manifest" => manifest["ref"]}) |> Map.put("acceptance_order", order(event)), "accepted_version"},
+    if is_map(manifest) and is_binary(ref) and ref != "" and ref == manifest["ref"],
+      do: {flow |> Map.put("acceptance", %{"ref" => event["ref"], "manifest" => manifest["ref"], "binding" => event["binding"]}) |> Map.put("acceptance_order", order(event)), "accepted_version"},
       else: {flow, "no_authorized_transition"}
   end
 
@@ -216,7 +222,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp remember_natural_resume(flow, _), do: flow
 
-  defp order(event), do: Map.take(event, ["at", "id", "version", "ref"])
+  defp order(event), do: Map.take(event, ["at", "id", "version", "ref", "binding", "publisher"])
   defp event_priority(%{"ref" => "note:" <> _}), do: 0
   defp event_priority(_), do: 1
 
@@ -248,7 +254,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
   defp valid_contract?(data, facts) do
     baseline =
-      data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"] and
+      facts["contract_invalid"] != true and data["issue_version"] == facts["issue_version"] and data["type"] == facts["type"] and
         data["contract_sha"] == digest(Map.drop(data, ["contract_sha", "issue_version"]))
 
     baseline and matches_description?(data, facts["contract"]) and valid_controls?(data) and nonempty_strings?(data["criteria"]) and
@@ -398,9 +404,22 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp check_baseline(flow, facts) do
     contract = flow["contract"]
 
-    if is_map(contract) and contract["issue_version"] == facts["issue_version"] and contract["type"] == facts["type"] and
-         contract["ref"] in facts["source_refs"], do: clear(flow, "baseline"), else: automatic(flow, "baseline", "decision")
+    valid = facts["contract_invalid"] != true and is_map(contract) and contract["issue_version"] == facts["issue_version"] and contract["type"] == facts["type"]
+
+    if valid and current_decision?(contract, facts),
+      do: clear(flow, "baseline"),
+      else: automatic(flow, "baseline", "decision")
   end
+
+  # Old labels without a verifiable candidate stay readable but cannot grant
+  # new execution or closure after migration. Explicit note decisions already
+  # carry their target in their versioned content.
+  defp valid_binding?(%{"ref" => "label:" <> _} = decision, facts),
+    do: is_binary(decision["binding"]) and get_in(facts, ["decision_bindings", decision["ref"]]) == decision["binding"]
+
+  defp valid_binding?(_, _), do: true
+
+  defp current_decision?(decision, facts), do: decision["ref"] in facts["source_refs"] and valid_binding?(decision, facts)
 
   defp check_decision_sources(flow, facts) do
     if is_binary(flow["cancellation"]) and flow["cancellation"] not in facts["source_refs"], do: automatic(flow, "cancellation_source", "decision"), else: clear(flow, "cancellation_source")
@@ -451,7 +470,7 @@ defmodule SymphonyElixir.TaskWorkflow do
   defp artifact_kind(url) do
     cond do
       Regex.match?(~r{/-/merge_requests/[1-9][0-9]*$}, url) -> "mr"
-      Regex.match?(~r{/-/issues/[1-9][0-9]*#note_[1-9][0-9]*$}, url) -> "report"
+      Regex.match?(~r{/-/(?:issues|work_items)/[1-9][0-9]*#note_[1-9][0-9]*$}, url) -> "report"
       true -> nil
     end
   end
@@ -468,7 +487,7 @@ defmodule SymphonyElixir.TaskWorkflow do
 
     flow =
       if is_map(flow["acceptance"]) and flow["acceptance"]["ref"] != "verified_merge" and
-           flow["acceptance"]["ref"] not in facts["source_refs"], do: Map.put(flow, "acceptance", nil), else: flow
+           not current_decision?(flow["acceptance"], facts), do: Map.put(flow, "acceptance", nil), else: flow
 
     cond do
       not valid ->

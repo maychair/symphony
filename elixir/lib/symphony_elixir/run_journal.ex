@@ -6,13 +6,15 @@ defmodule SymphonyElixir.RunJournal do
   only after native idle validation.
   """
 
-  @spec admit(Path.t(), String.t()) :: {:ok, map()} | {:error, term()}
-  def admit(root, issue_id) do
+  alias SymphonyElixir.ExecutionOwner
+
+  @spec admit(Path.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def admit(root, issue_id, opts \\ []) do
     directory = Path.join(root, key(issue_id))
 
     with :ok <- File.mkdir_p(directory),
          :ok <- File.mkdir(Path.join(directory, "executor.lock")) do
-      result = admit_locked(directory, issue_id)
+      result = admit_locked(directory, issue_id, opts)
 
       if match?({:error, _}, result) do
         File.rm(Path.join([directory, "executor.lock", "executor-owner.json"]))
@@ -25,9 +27,11 @@ defmodule SymphonyElixir.RunJournal do
     end
   end
 
-  defp admit_locked(directory, issue_id) do
+  defp admit_locked(directory, issue_id, opts) do
     with {:ok, previous} <- read(directory),
-         {:ok, record} <- admission(previous, issue_id) do
+         true <- SymphonyElixir.CommandCheck.stopped?(previous || %{}) or {:error, :check_execution_requires_recovery},
+         {:ok, record} <- admission(previous, issue_id),
+         {:ok, record} <- SymphonyElixir.ExecutionBinding.bind(record, opts[:execution_binding]) do
       {:ok, host} = :inet.gethostname()
 
       record =
@@ -39,11 +43,20 @@ defmodule SymphonyElixir.RunJournal do
         |> Map.put("host", to_string(host))
         |> Map.put("executor_os_pid", System.pid())
 
-      with {:ok, record} <- carry_pending_review(previous, record),
+      record =
+        if record["execution_binding"],
+          do: Map.put(record, "executor_identity", ExecutionOwner.new(self())),
+          else: record
+
+      with {:ok, record} <- carry_review_for_execution(previous, record),
            :ok <- save_lock_owner(record) do
         checkpoint(record, %{"phase" => "admitted"})
       end
     end
+  end
+
+  defp carry_review_for_execution(previous, record) do
+    if record["execution_binding"], do: {:ok, record}, else: carry_pending_review(previous, record)
   end
 
   defp save_lock_owner(record) do
@@ -75,19 +88,62 @@ defmodule SymphonyElixir.RunJournal do
 
   @spec checkpoint(map(), map()) :: {:ok, map()} | {:error, term()}
   def checkpoint(%{"directory" => directory} = record, changes) do
+    :global.trans({{__MODULE__, directory}, self()}, fn -> write_checkpoint(record, changes) end, [node()])
+  end
+
+  defp write_checkpoint(%{"directory" => directory} = record, changes) do
     now = DateTime.to_iso8601(DateTime.utc_now())
     event = Map.take(changes, ["phase", "thread_id", "turn_id"]) |> Map.put("at", now) |> Map.put("attempt_id", record["attempt_id"])
     events = Enum.take((record["events"] || []) ++ [event], -200)
     updated = record |> Map.merge(changes) |> Map.put("updated_at", now) |> Map.put("events", events)
     updated = account_budget(updated, changes)
     updated = Map.put(updated, "stage_results", stage_results(updated))
+    updated = if record["execution_binding"], do: Map.put(updated, "journal_version", (record["journal_version"] || 0) + 1), else: updated
     path = Path.join(directory, "run.json")
     temporary = path <> ".pending"
 
-    with :ok <- write_synced(temporary, Jason.encode!(updated)),
+    with :ok <- bound_checkpoint_owner(record),
+         :ok <- SymphonyElixir.ExecutionBinding.check_native_identity(record, changes),
+         :ok <- write_synced(temporary, Jason.encode!(updated)),
          :ok <- File.rename(temporary, path) do
       {:ok, updated}
     end
+  end
+
+  # A late developer callback must not overwrite the verifier generation, even
+  # when both workers run in the same scheduler OS process. The admission lock
+  # and monotonically increasing journal version fence these independent races.
+  defp bound_checkpoint_owner(%{"execution_binding" => %{}, "directory" => directory} = record) do
+    with {:ok, current} <- read(directory),
+         true <- is_nil(current) or current["journal_version"] == record["journal_version"],
+         true <- executor_checkpoint_owner?(record) or reconciler_checkpoint_owner?(record, current) do
+      :ok
+    else
+      _ -> {:error, :stale_or_unowned_execution_checkpoint}
+    end
+  end
+
+  defp bound_checkpoint_owner(record) do
+    case read(record["directory"]) do
+      {:ok, %{"execution_binding" => %{}}} -> {:error, :execution_binding_required}
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp executor_checkpoint_owner?(record) do
+    with true <- record["executor_os_pid"] == System.pid(),
+         {:ok, data} <- File.read(Path.join([record["directory"], "executor.lock", "executor-owner.json"])),
+         {:ok, owner} <- Jason.decode(data) do
+      owner == Map.take(record, ["attempt_id", "host", "executor_os_pid"])
+    else
+      _ -> false
+    end
+  end
+
+  defp reconciler_checkpoint_owner?(record, current) do
+    is_map(current) and current["attempt_id"] == record["attempt_id"] and
+      File.read(Path.join([record["directory"], "executor.lock", "reconcile-owner"])) == {:ok, System.pid()}
   end
 
   defp account_budget(%{"workflow" => %{} = flow} = record, changes) do
@@ -165,11 +221,52 @@ defmodule SymphonyElixir.RunJournal do
     end
   end
 
+  @doc "A local dead BEAM owner is recoverable; an OS PID, timeout or foreign VM is not proof of its exit."
+  @spec interrupted_member?(term()) :: boolean()
+  def interrupted_member?(%{"execution_binding" => %{}, "directory" => directory} = record) when is_binary(directory) do
+    case ExecutionOwner.local_pid(record["executor_identity"]) do
+      pid when is_pid(pid) ->
+        not Process.alive?(pid) and record["executor_os_pid"] == System.pid() and
+          File.dir?(Path.join(directory, "executor.lock")) and recoverable_lock?(record)
+
+      _ ->
+        false
+    end
+  end
+
+  def interrupted_member?(_), do: false
+
+  @doc "Claim only a proven dead owner in this VM, retaining the attempt, native identity and all accounting."
+  @spec recover_member(map()) :: {:ok, map()} | {:error, term()}
+  def recover_member(%{"directory" => directory} = record) do
+    :global.trans(
+      {{__MODULE__, directory}, self()},
+      fn ->
+        with {:ok, ^record} <- read(directory),
+             true <- interrupted_member?(record),
+             {:ok, ^record} <- SymphonyElixir.ExecutionBinding.bind(record, record["execution_binding"]) do
+          write_checkpoint(record, %{"executor_identity" => ExecutionOwner.new(self()), "recovery" => "local worker exit confirmed; native stop pending"})
+        else
+          _ -> {:error, :member_recovery_not_owned}
+        end
+      end,
+      [node()]
+    )
+  end
+
   @spec read(Path.t()) :: {:ok, map() | nil} | {:error, term()}
   def read(directory) do
     case File.read(Path.join(directory, "run.json")) do
-      {:ok, data} -> Jason.decode(data)
+      {:ok, data} -> decode_record(data)
       {:error, :enoent} -> {:ok, nil}
+      error -> error
+    end
+  end
+
+  defp decode_record(data) do
+    case Jason.decode(data) do
+      {:ok, %{} = record} -> {:ok, record}
+      {:ok, _} -> {:error, :invalid_run_journal}
       error -> error
     end
   end

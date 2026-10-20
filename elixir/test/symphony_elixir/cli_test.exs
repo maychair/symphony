@@ -2,6 +2,7 @@ defmodule SymphonyElixir.CLITest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.CLI
+  import ExUnit.CaptureIO
 
   @ack_flag "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
 
@@ -135,5 +136,41 @@ defmodule SymphonyElixir.CLITest do
     }
 
     assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
+  end
+
+  test "standalone preflight never starts the scheduler or needs the unsafe execution acknowledgement" do
+    parent = self()
+
+    deps = %{
+      file_regular?: fn _ -> true end,
+      set_workflow_file_path: fn _ -> :ok end,
+      preflight: fn issue ->
+        send(parent, {:checked, issue})
+        {:ok, 0}
+      end,
+      ensure_all_started: fn -> flunk("preflight started the scheduler") end
+    }
+
+    assert {:ok, :preflight} = CLI.evaluate(["--preflight", "--issue", "2", "WORKFLOW.md"], deps)
+    assert_received {:checked, "2"}
+    assert {:error, message} = CLI.evaluate(["--preflight"], %{deps | preflight: fn _ -> {:error, :offline} end})
+    assert message =~ "offline"
+    assert {:error, missing} = CLI.evaluate(["--preflight"], %{deps | file_regular?: fn _ -> false end})
+    assert missing =~ "Workflow file not found"
+    assert {:error, _} = CLI.evaluate([@ack_flag, "--issue", "2"], deps)
+  end
+
+  test "successful preflight reports the executable's unified review protocol without starting execution" do
+    deps = %{
+      file_regular?: fn _ -> true end,
+      set_workflow_file_path: fn _ -> :ok end,
+      preflight: fn _ -> {:ok, 0} end,
+      ensure_all_started: fn -> flunk("capability reporting started execution") end
+    }
+
+    output = capture_io(fn -> assert {:ok, :preflight} = CLI.evaluate(["--preflight"], deps) end)
+    report = output |> String.split("\n", trim: true) |> List.last() |> Jason.decode!()
+    protocols = Enum.flat_map(report["workflow_capability"], & &1["capabilities"])
+    assert Enum.any?(protocols, &(&1["name"] == "review_workflow" and &1["version"] == 2))
   end
 end

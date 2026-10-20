@@ -6,7 +6,9 @@ defmodule SymphonyElixir.ExecutionTest do
     @spec start_session(Path.t(), keyword()) :: term()
     def start_session(workspace, opts) do
       send(self(), {:stop_probe, workspace, opts})
-      Process.get(:stop_probe_result, {:ok, %{}})
+      result = Process.get(:stop_probe_result, {:ok, %{}})
+      if match?({:ok, _}, result) and Process.get(:stop_probe_observation, true), do: opts[:on_thread_observed].(%{turn_id: opts[:expected_turn_id]})
+      result
     end
 
     @spec stop_session(map()) :: :ok
@@ -752,6 +754,31 @@ defmodule SymphonyElixir.ExecutionTest do
     assert current["stage_results"]["business_validation"] == "see_mr_evidence"
   end
 
+  test "legacy review handoff preserves todo membership while releasing execution authorization", %{issue: issue} do
+    {:ok, _, _opts} = Execution.prepare(issue, [])
+    settings = %{Config.settings!().tracker | required_labels: ["symphony:todo", "symphony:ready"]}
+
+    client = fn method, path, _, _, _ ->
+      send(self(), {:membership_handoff, method, path})
+
+      if method == "GET" and String.ends_with?(path, "/issues/42") do
+        {:ok, %{status: 200, body: %{"labels" => [%{"name" => "symphony:todo"}]}}}
+      else
+        native_ok(method, path)
+      end
+    end
+
+    assert Execution.handoff(%{"kind" => "review", "reason" => "Inspect delivery", "url" => "https://github.com/example/repository/pull/9"},
+             issue: issue,
+             tracker_settings: settings,
+             github_client: client
+           )["success"]
+
+    assert_receive {:membership_handoff, "POST", "/repos/example/repository/issues/42/comments"}
+    assert_receive {:membership_handoff, "DELETE", "/repos/example/repository/issues/42/labels/symphony%3Aready"}
+    refute_receive {:membership_handoff, "DELETE", "/repos/example/repository/issues/42/labels/symphony%3Atodo"}
+  end
+
   test "a partial handoff retries the routing release without repeating the notice", %{issue: issue} do
     {:ok, _, opts} = Execution.prepare(issue, [])
     args = %{"kind" => "review", "reason" => "Please review.", "url" => "https://github.com/example/repository/pull/9"}
@@ -985,6 +1012,12 @@ defmodule SymphonyElixir.ExecutionTest do
     assert recovery[:suspend_goal]
     assert recovery[:worker_host] == "worker-a"
     assert_receive :stop_probe_closed
+    Process.put(:stop_probe_observation, false)
+    {:ok, unobserved} = Execution.reconcile_native_stop(record, backend: StopProbe)
+    refute unobserved["native_stop_confirmed"]
+    assert unobserved["native_stop_recovery"] =~ "native_stop_observation_missing"
+    assert_receive {:stop_probe, ^workspace, _}
+    assert_receive :stop_probe_closed
     Process.put(:stop_probe_result, {:error, :native_thread_not_idle})
     {:ok, uncertain} = Execution.reconcile_native_stop(record, backend: StopProbe)
     refute uncertain["native_stop_confirmed"]
@@ -999,6 +1032,17 @@ defmodule SymphonyElixir.ExecutionTest do
     {:ok, _, resumed} = Execution.prepare(issue, worker_host: "worker-b")
     assert resumed[:worker_host] == "worker-a"
     assert resumed[:run_record]["thread_id"] == "recorded"
+  end
+
+  test "native stop requires both recorded identities and normalizes a verified thread without turns" do
+    alias SymphonyElixir.NativeStop
+    assert {:error, :native_stop_identity_missing} = NativeStop.confirm(%{"thread_id" => "recorded"}, backend: StopProbe)
+    refute_receive {:stop_probe, _, _}
+    assert {:ok, evidence} = NativeStop.confirm(%{"thread_id" => "recorded", "workspace" => "/recorded"}, backend: StopProbe)
+    assert evidence["native_stop_confirmed"]
+    assert evidence["turn_id"] == nil
+    assert evidence["native_stop_receipt"]["thread_id"] == "recorded"
+    assert_receive :stop_probe_closed
   end
 
   test "orphan stop interrupts an unobserved active turn without resuming or allocating a thread", %{issue: issue} do

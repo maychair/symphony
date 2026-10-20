@@ -12,6 +12,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   def mount(_params, _session, socket) do
     socket =
       socket
+      |> assign(:shell, "runtime")
       |> assign(:payload, load_payload())
       |> assign(:now, DateTime.utc_now())
 

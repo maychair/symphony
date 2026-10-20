@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.WorkflowStore do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Caches the last known good workflow and reloads it when `WORKFLOW.md` changes.
   """
@@ -20,14 +22,14 @@ defmodule SymphonyElixir.WorkflowStore do
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, RuntimeContext.server(__MODULE__)))
   end
 
   @spec current() :: {:ok, Workflow.loaded_workflow()} | {:error, term()}
   def current do
-    case Process.whereis(__MODULE__) do
+    case RuntimeContext.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :current)
+        GenServer.call(RuntimeContext.server(__MODULE__), :current)
 
       _ ->
         Workflow.load()
@@ -36,9 +38,9 @@ defmodule SymphonyElixir.WorkflowStore do
 
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
-    case Process.whereis(__MODULE__) do
+    case RuntimeContext.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :settings)
+        GenServer.call(RuntimeContext.server(__MODULE__), :settings)
 
       _ ->
         case load_state(Workflow.workflow_file_path()) do
@@ -50,9 +52,9 @@ defmodule SymphonyElixir.WorkflowStore do
 
   @spec force_reload() :: :ok | {:error, term()}
   def force_reload do
-    case Process.whereis(__MODULE__) do
+    case RuntimeContext.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :force_reload)
+        GenServer.call(RuntimeContext.server(__MODULE__), :force_reload)
 
       _ ->
         case load_state(Workflow.workflow_file_path()) do
@@ -63,7 +65,9 @@ defmodule SymphonyElixir.WorkflowStore do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    RuntimeContext.install(opts[:context])
+
     case load_state(Workflow.workflow_file_path()) do
       {:ok, state} ->
         schedule_poll()
@@ -158,6 +162,7 @@ defmodule SymphonyElixir.WorkflowStore do
     with {:ok, workflow} <- Workflow.load(path),
          {:ok, settings} <- Schema.parse(workflow.config),
          :ok <- Config.validate_settings(settings),
+         :ok <- SymphonyElixir.RepositoryService.validate_manifest(workflow),
          {:ok, stamp} <- current_stamp(path) do
       {:ok, %State{path: path, stamp: stamp, workflow: workflow, settings: settings}}
     else

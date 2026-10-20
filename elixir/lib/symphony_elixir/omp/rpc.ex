@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Omp.Rpc do
+  alias SymphonyElixir.RuntimeContext
   @moduledoc "OMP's native JSONL transport; host task policy stays in Tracker."
   alias SymphonyElixir.{Config, ExecutionBackend, PathSafety, RunJournal, Tracker}
   @response_ms 30_000
@@ -61,7 +62,7 @@ defmodule SymphonyElixir.Omp.Rpc do
     args = if record["native_session_file"], do: " --resume " <> quote_arg(record["native_session_file"]), else: ""
 
     overlay =
-      case System.get_env("SYMPHONY_OMP_CONFIG") do
+      case RuntimeContext.get_env("SYMPHONY_OMP_CONFIG") do
         nil ->
           ""
 

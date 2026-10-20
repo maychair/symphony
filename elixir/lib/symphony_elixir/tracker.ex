@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Tracker do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Adapter boundary for issue tracker reads and provider-native agent tools.
 
@@ -7,8 +9,8 @@ defmodule SymphonyElixir.Tracker do
   leak into scheduler policy.
   """
 
-  alias SymphonyElixir.Config
-  alias SymphonyElixir.MailReview.Listener
+  alias SymphonyElixir.{Config, TaskPlan, TaskPlanExecution, TaskPlanPreflight}
+  alias SymphonyElixir.ReviewLane.{Listener, Ownership}
   alias SymphonyElixir.Tracker.Issue
 
   @adapters %{
@@ -66,26 +68,55 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_states(states) do
+  @spec fetch_issues_by_states([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states, opts \\ []) do
     with {:ok, issues} <- adapter().fetch_issues_by_states(states),
-         {:ok, reviews} <- review_issues() do
-      {:ok, Enum.reject(issues, &("symphony-review" in &1.labels)) ++ Enum.filter(reviews, &(&1.state in states))}
+         {:ok, reviews} <- review_issues(),
+         {:ok, members} <- TaskPlanExecution.discover(opts) do
+      parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
+      {members, reviews} = Ownership.converge(reviews, members, opts)
+      {parents, members} = parent_lifecycle(parents, members)
+      {:ok, parents ++ Enum.filter(reviews ++ members, &(&1.state in states))}
     end
   end
 
-  @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_issues_by_ids(issue_ids) do
-    {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "mail-review:"))
+  @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(issue_ids, opts \\ []) do
+    {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "review:"))
+    {plan_ids, normal_ids} = Enum.split_with(normal_ids, &(String.starts_with?(&1, "member:") or String.starts_with?(&1, "plan:")))
 
     with {:ok, issues} <- adapter().fetch_issues_by_ids(normal_ids),
-         {:ok, reviews} <- review_issues() do
-      {:ok, Enum.reject(issues, &("symphony-review" in &1.labels)) ++ Enum.filter(reviews, &(&1.id in review_ids))}
+         {:ok, reviews} <- review_issues(),
+         {:ok, members} <- TaskPlanExecution.discover(opts) do
+      parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
+      {members, reviews} = Ownership.converge(reviews, members, opts)
+      {parents, members} = parent_lifecycle(parents, members)
+      {:ok, parents ++ Enum.filter(reviews, &(&1.id in review_ids)) ++ Enum.filter(members, &(&1.id in plan_ids))}
     end
+  end
+
+  defp parent_lifecycle(parents, members) do
+    lifecycle = Map.new(members, fn issue -> {get_in(issue.native_ref, ["work"]), issue} end)
+
+    parents =
+      Enum.map(parents, fn issue ->
+        work = get_in(issue.native_ref, ["plan", "parent"])
+
+        case lifecycle[work] do
+          %Issue{kind: :plan, native_ref: %{"plan_lifecycle" => state}} ->
+            %{issue | native_ref: Map.put(issue.native_ref, "plan_lifecycle", state)}
+
+          _ ->
+            issue
+        end
+      end)
+
+    owned = MapSet.new(parents, &get_in(&1.native_ref, ["plan", "parent"]))
+    {parents, Enum.reject(members, &(&1.kind == :plan and MapSet.member?(owned, &1.native_ref["work"])))}
   end
 
   defp review_issues do
-    if SymphonyElixir.MailReview.enabled?() and Process.whereis(SymphonyElixir.MailReview.Listener), do: Listener.issues(), else: {:ok, []}
+    if SymphonyElixir.ReviewLane.enabled?() and RuntimeContext.whereis(SymphonyElixir.ReviewLane.Listener), do: Listener.issues(), else: {:ok, []}
   end
 
   @doc """
@@ -173,7 +204,7 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp adapter_secret_environment_names(adapter, tracker_settings) do
-    adapter.secret_environment_names(tracker_settings)
+    Enum.uniq(adapter.secret_environment_names(tracker_settings) ++ SymphonyElixir.NativeWork.secret_environment_names(tracker_settings))
   end
 
   defp unsupported_agent_tool_response(tool) do

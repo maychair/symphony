@@ -36,17 +36,25 @@ defmodule SymphonyElixir.Application do
     :ok = SymphonyElixir.BuildInfo.capture()
     :ok = SymphonyElixir.LogFile.configure()
 
+    {:ok, repositories} = SymphonyElixir.RepositoryService.load(SymphonyElixir.Workflow.workflow_file_path())
+
+    runtime =
+      if repositories == [] do
+        [SymphonyElixir.AgentRuntimeSupervisor, SymphonyElixir.ReviewLane.Listener]
+      else
+        [{SymphonyElixir.RepositoryService, repositories}]
+      end
+
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       SymphonyElixir.WorkflowStore,
-      SymphonyElixir.AgentRuntimeSupervisor,
-      SymphonyElixir.MailReview.Listener,
+      runtime,
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard
     ]
 
     Supervisor.start_link(
-      children,
+      List.flatten(children),
       strategy: :one_for_one,
       name: SymphonyElixir.Supervisor
     )

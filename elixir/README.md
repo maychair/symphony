@@ -1,5 +1,14 @@
 # Symphony Elixir
 
+Standalone preflight reports `review_workflow` protocol 2 for package verification
+and rejects enabled review lanes with obsolete shared-policy sections. Completed
+legacy reviews remain historical when only deployment policy changes.
+
+Automatic MR/PR review records appear in the Taskboard alongside repository
+Issues. Review cards use native reviewer eligibility and confirmed publication,
+independently of Issue routing labels. Manual review records are excluded; board
+reads never trigger execution. See [review workflow](docs/review-workflow.md).
+
 This directory contains the current Elixir/OTP implementation of Symphony, based on
 [`SPEC.md`](../SPEC.md) at the repository root.
 
@@ -20,6 +29,17 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
    workspace
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
+
+The Phoenix service exposes a read-only repository Issue Taskboard at `/` and the lower-level
+runtime observability dashboard at `/runtime`. The Taskboard is a projection over configured
+GitHub, GitLab, or memory-backed Issues, execution manifests, and the runtime snapshot; it does not
+keep a second task database. Its four columns are user-facing views over tracker state, labels, and
+Symphony execution observations. Cards open the native Issue in a new tab and expose delivered MRs
+or reports as separate links. Linked MRs are read from the tracker, while report evidence comes from
+the execution manifest. When `tracker.assignee` is configured, the personal projection includes
+only Issues assigned to that identity. Human Review cards state the concrete acceptance or decision action.
+Issue operations take place in the tracker. See
+[Taskboard](docs/taskboard.md) for state mapping, operator authentication, and the JSON API.
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
@@ -157,6 +177,12 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+taskboard:
+  control_token: $SYMPHONY_TASKBOARD_CONTROL_TOKEN
+  provider_token: $SYMPHONY_OPERATOR_TRACKER_TOKEN
+server:
+  host: 127.0.0.1
+  port: 8092
 codex:
   command: codex app-server
 ---
@@ -206,6 +232,16 @@ Notes:
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
   launched shell.
+- `taskboard.control_token` authenticates write API calls made by the operator UI. The UI requests
+  it once per browser session and stores it only in `sessionStorage`.
+- `taskboard.provider_token` is the human operator's tracker token. Symphony uses it only for
+  Taskboard Issue creation, comments, and explicit human labels, so those writes keep the human
+  identity while scheduler writes continue to use the engine identity.
+- Both Taskboard secrets should be environment references. Symphony removes these variables from
+  agent subprocesses. The read-only Taskboard projections do not require either secret.
+- `server.host` defaults to loopback. Set `0.0.0.0` only when the dashboard must be reached from
+  another machine on a trusted network, and put an authenticated gateway or private network in
+  front of it before exposing it beyond the LAN.
 
 ```yaml
 tracker:
@@ -223,8 +259,10 @@ codex:
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
-- `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- `server.port` or CLI `--port` enables the Phoenix service. The repository Issue Taskboard is at
+  `/`; the original runtime dashboard remains at `/runtime`. Runtime JSON endpoints remain under
+  `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`. Taskboard endpoints are
+  documented in [Taskboard](docs/taskboard.md).
 
 ### Linear adapter profile
 
@@ -315,10 +353,11 @@ codex:
 
 ## Web dashboard
 
-The observability UI now runs on a minimal Phoenix stack:
+The web UI runs on a minimal Phoenix stack:
 
-- LiveView for the dashboard at `/`
-- JSON API for operational debugging under `/api/v1/*`
+- Read-only four-column Repository Issue Taskboard at `/`, with native tracker links
+- Original runtime observability dashboard at `/runtime`
+- Taskboard and operational JSON APIs under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
@@ -398,12 +437,18 @@ export SYMPHONY_LIVE_ASANA_WORKSPACE_GID=...
 SYMPHONY_RUN_ASANA_LIVE_E2E=1 mix test test/symphony_elixir/asana_live_e2e_test.exs
 ```
 
-Run the opt-in GitLab live E2E against a disposable project:
+Run the opt-in GitLab live E2E against an explicitly approved, open test Issue.
+The test comments, closes and retains that Issue; it never deletes it. Existing native
+Codex authentication is reused in place, without copying credentials. Main and cleanup
+failures are reported together. Prepare the Issue through approved repository tooling:
 
 ```bash
 cd elixir
 export GITLAB_PAT=...
 export SYMPHONY_LIVE_GITLAB_PROJECT_ID=...
+export SYMPHONY_LIVE_GITLAB_ISSUE_IID=...
+# Self-hosted: SYMPHONY_LIVE_GITLAB_API_URL must point to /api/v4.
+# HTTP additionally requires SYMPHONY_LIVE_GITLAB_ALLOW_INSECURE_HTTP=1.
 SYMPHONY_RUN_GITLAB_LIVE_E2E=1 mix test test/symphony_elixir/gitlab_live_e2e_test.exs
 ```
 
@@ -428,12 +473,74 @@ This project is licensed under the [Apache License 2.0](../LICENSE).
 
 See [repository execution](docs/repository-issues.md) for native Goal sessions, durable execution records and handoffs.
 
-Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies at admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
+Repository Issue routing can additionally restrict `tracker.assignee` (GitLab user ID or GitHub login). The same owner check applies to the personal Taskboard projection, admission, reconciliation, retry, recovery and continuation; unassigned or multiply assigned issues do not match a configured owner.
+
+The Taskboard includes only Issues carrying the human-owned `symphony:todo` membership label; when `tracker.assignee` is configured, the sole native assignee must also match. Membership is checked before lifecycle classification, including closed Issues and detail reads. A todo-only Issue remains visible without authorizing an Agent. Configure `tracker.required_labels: [symphony:todo, symphony:ready]` to require both membership and execution authorization. Keep `symphony:todo` through running, review and completion; removing it removes the Issue from the board. Historical unlabeled closed Issues are not review requests.
+
+For ordinary GitLab Issues using `task_workflow`, Done is verified by read-only native replay of the current agreement, manifest and acceptance sources, matched against the retained lifecycle. The Issue must be closed, its execution completed and its native stop confirmed. Missing, edited or unreadable evidence remains in Human Review. Reading the board neither executes work nor updates its journal.
 
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR, posts the deduplicated review notification and requests the engine-owned `symphony:review` label, without another Agent call. Handoff never writes or removes the human `symphony:ready` authorization label. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
 
 ## Versioned task workflow
 
-GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels. Enable it only after migrating retained private workflows and their Issue agreements.
+GitLab repositories can opt into the [versioned task workflow](docs/task-workflow.md). It separates authorized work, intermediate review, overall acceptance, native closure and confirmed execution stop. Humans drive it with `symphony:ready`, `symphony:rework` and `symphony:accept`; the engine only writes its own `symphony:running`, `symphony:review`, `symphony:blocked` and `symphony:failed` state labels. Label authorization requires a published, unchanged candidate and the actual native actor; acceptance must bind an exact manifest. Enable it only after migrating retained private workflows and their Issue agreements.
 
 Before requesting execution, save the confirmed structured agreement and its matching `type:*` label. Saving an agreement does not grant execution approval. A blocked baseline notice identifies a missing agreement, a mismatched task type, or missing/stale execution approval so the coordinator can repair the specific prerequisite without asking the human to redefine an already confirmed scope.
+
+## Parent plans and standalone review
+
+The [repository lifecycle contract](docs/workflow-lifecycle.md) defines sealed cross-repository plans,
+version-bound evidence, parent acceptance and comments-only standalone review.
+Parent plan Issues are coordination work and never ordinary coding executions.
+Plan graph validation, configured member dispatch, fixed parent manifests, native acceptance and scoped
+rework are implemented in the isolated workflow branch. Deployment migration and live-provider acceptance
+remain to be verified before enabling the new protocol.
+
+Configured parent plans now receive [native preflight](docs/workflow-lifecycle.md#native-plan-preflight) on tracker reads. This verifies complete cross-repository scope and approval without granting child dispatch or treating Issue closure as dependency evidence.
+
+[Native execution generations](docs/workflow-lifecycle.md#native-execution-generations) bind roles and fixed inputs, preserve cumulative accounting, and require native stop before replacing a thread. The member lifecycle reducer derives developer/verifier selection from resolved evidence, with finite repair accounting and version-bound delivery checks; GitHub/GitLab Issue evidence publication now persists send intent and verifies native readback. Git-backed verifier commands now produce isolated host receipts, and publication attests those results. Native result selection retains fixed Git snapshots with durable consumer references and re-attests command receipts. Native parent/member controls now preserve the approval grant, bind each resume to its pause and fence fresh publication with durable source receipts. Bound Codex sessions now expose role-specific context, candidate publication, configured host checks and verification tools; command results come from host receipts and calls revalidate native controls. Verified dependency edges now resolve native publications transitively, re-attest host checks and retain consumer references. Role tools revalidate their pinned inputs before effects; new candidates do not silently replace those inputs. Native PR/MR delivery reads now bind the approved target branch and actual merged revision. Delivered dependencies require independent verification of that exact revision, including after squash/rebase; original-head checks cannot unlock them. Markdown report candidates now retain exact UTF-8 content and publish readable evidence to their owning Issue without Git. Independently verified native report publications can satisfy verified, delivered or published dependencies. The native member admission coordinator now derives developer/verifier generations from complete evidence, rechecks under the journal lock and preserves observed pauses before first execution. Generation-owned role workspaces now materialize retained inputs, preserve developer edits on resume and give verifiers a separate fixed candidate checkout. Host checks consume the same manifest under read-only input isolation. Local role sessions now prepare those workspaces, recheck native authority before thread and Goal activation, fence callbacks to the owning process and attempt, and record stop only after native readback. Managed role Goals now observe native controls asynchronously, preserve intervening turn and budget updates, and stop on pauses, role changes or unconfirmed observations. Ownership fences also guard native Goal cleanup. Managed Goal finalization now records one result per attempt, applies finite retry accounting, and releases execution ownership after a durable final phase. Unconfirmed native stop remains an incident and never authorizes a replacement. The member worker now derives role Goals from sealed native scope and runs admission, workspace preparation, execution and finalization together, including startup failures. Synchronous admission-read exceptions release only the unstarted owned attempt and preserve changed ownership for recovery. Report development, independent verification, bounded repair and re-verification are exercised through the native protocol. Configured member execution now resolves every approved member’s repository policy and exact native base branch before entering the role worker. Initial source intent survives partial preparation and branch changes; generation rotation preserves its history. Configured native plans now feed member jobs into the existing scheduler and its shared capacity and retry queue. Durable, launch-bound results drive automatic role continuation; stopped or paused members lose eligibility, while an abruptly killed worker retains its exclusion lock. Legacy entry-point deadlines do not override sealed member budgets. Publication outside the owning Issue, retention cleanup, missing Git object acquisition and automatic crash recovery remain under development; parent manifest, acceptance and scoped rework require migration and live-provider validation.
+
+Native standalone review now uses GitLab repository scans and persisted webhook hints through `review_lane`; mailbox watching and mail replay have been removed. Stable reviewer/publisher IDs, fixed-input rounds and native-stop fencing replace mail-based admission. Review comments now retain per-entry send intent, exact native readback and version-bound conclusions; partial batches resume only after confirmed native stop and current-scope checks. Live review cancellation now interrupts recorded native turns and requires idle readback before confirming stop; uncertain stops retain the snapshot. Review callbacks now bind the admitted worker and attempt, and same-VM Listener restarts stop surviving workers. Review journal reads and writes now use one Linux kernel-locked Python 3 transport, with durable predecessor-controller identity checks before takeover. Existing journals without ownership receipts require migration after old controllers are stopped. GitHub review now has native PR discovery, fixed-head comment readback and reviewer-withdrawal reconciliation. Live-provider acceptance, native orphan recovery after VM loss and deployment handoff remain to be validated.
+
+The packaged executable also supports read-only tracker validation with
+`bin/symphony /absolute/path/WORKFLOW.md --preflight [--issue ID]`; this does not
+start Symphony's scheduler or HTTP server and needs no Mix project at runtime.
+Workspace's launcher retains immutable local packages and can select a fixed
+package independently of the development checkout. See
+[the lifecycle contract](docs/workflow-lifecycle.md#lifecycle-write-and-retention-boundaries)
+for rework, completion evidence, provider review execution and v2 cleanup boundaries.
+
+Codex sessions disable shell snapshots and login shells on both new and resumed threads.
+Shell startup variables (`ZDOTDIR`, `BASH_ENV`, `ENV`) are pinned to `/dev/null`, and
+tracker secret names are excluded from tool environments. These constraints prevent automatic
+profile-based credential reinjection; they do not isolate readable host files from the same OS user.
+
+Standalone review sessions reuse the GitLab and GitHub credential-name lists for the same environment boundary.
+
+## Multiple repositories in one service
+
+A service Workflow may contain a `repositories` list of maps with `id`, `workflow`
+(relative to the service Workflow), and optional non-secret `environment`.
+One BEAM process and HTTP endpoint host repository-isolated OTP subtrees;
+concurrency remains per repository. Each repository owns its Workflow cache,
+Orchestrator, task supervisor, review listener, workspaces and execution journals.
+Repository IDs, native tracker scope and storage roots must not overlap.
+Membership/environment/storage/native ownership changes require a restart; other
+Workflow changes use the existing last-known-good reload.
+
+The service's normal tracker configuration is control-only (use an empty memory
+tracker). `/runtime`, `/api/v1/state` and the read-only Taskboard aggregate all
+repositories. Add `?repository=ID` for scoped API reads, refresh and webhooks.
+Ambiguous effects and journal lookups fail closed. Every Codex session excludes
+the credential environment names of all repositories in the shared process.
+Existing single-repository launch behavior is unchanged.
+
+Repository runtimes may select an independent native GitLab CLI store with `GLAB_CONFIG_DIR` and Git identity through `GIT_CONFIG_PARAMETERS`, `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`. These non-secret settings stay repository-scoped across hooks and asynchronous workers; token values remain in native authentication stores or host credential bindings. Selecting a bot does not change the human Issue assignee or grant execution authority.
+
+GitLab task workflows can verify signed Coordinator relays with
+`tracker.provider.delegated_authority` (`principal`, bot `publisher`, raw Ed25519
+`public_key`). The bot remains the native publisher; verified human authority is
+recorded separately. Missing/invalid evidence cannot confer authorization. See the
+delegated decision protocol in `elixir/docs/task-workflow.md` (repository root).
+
+Manual and discovered reviews share `ReviewWorkflow` and `ReviewResult`; see [the review contract](docs/review-workflow.md). Source reads and both native reviewer completions are required before a clean result. Review components never approve or merge.

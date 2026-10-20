@@ -1,6 +1,220 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "review probes use native read-only execution and fail on unreadable output" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "review-probe")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "probe-server")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      if m=='initialized':continue
+      if m=='initialize':r={}
+      elif m=='thread/start':
+        assert q['params']['sandbox']=='read-only'
+        assert q['params']['approvalPolicy']=='never'
+        assert q['params']['config']['model']=='review-fixture'
+        assert q['params']['config']['model_reasoning_effort']=='high'
+        assert q['params']['config']['tool_output_token_limit']==32768
+        assert 'sandbox_mode' not in q['params']['config']
+        r={'thread':{'id':'probe-thread'}}
+      elif m=='command/exec':
+        p=q['params'];assert p['sandboxPolicy']=={'type':'readOnly'}
+        assert p['timeoutMs']==15000 and p['outputBytesCap']==4194305
+        r={'exitCode':0 if p['command']==['read'] else 1,'stdout':'source','stderr':''}
+      else:raise AssertionError(m)
+      print(json.dumps({'id':q['id'],'result':r}),flush=True)
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+    binding = Map.put(SymphonyElixir.ReviewAxis.tool_binding(), :model_settings, %{"model" => "review-fixture", "model_reasoning_effort" => "high", "sandbox_mode" => "danger-full-access"})
+    assert {:ok, session} = AppServer.start_session(workspace, review_only: true, dynamic_tool_binding: binding)
+
+    try do
+      assert {:ok, "source"} = AppServer.review_read(session, ["read"])
+      assert {:error, {:review_read_failed, _}} = AppServer.review_read(session, ["fail"])
+    after
+      AppServer.stop_session(session)
+    end
+  end
+
+  test "new, reviewed and restored sessions prevent automatic profile reinjection" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "isolated")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "isolation-server")
+    trace = Path.join(root, "isolation.jsonl")
+    profile = Path.join(root, "reinject.sh")
+    File.write!(profile, "export GITLAB_PAT=regression-sentinel\n")
+
+    for name <- ["BASH_ENV", "ENV", "ZDOTDIR", "GITLAB_PAT", "GITLAB_ACCESS_TOKEN"] do
+      previous = System.get_env(name)
+      System.put_env(name, profile)
+      on_exit(fn -> restore_env(name, previous) end)
+    end
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,os,subprocess,sys
+    assert all(not os.environ.get(k) for k in ['GITLAB_PAT','GITLAB_ACCESS_TOKEN'])
+    assert all(os.environ.get(k)=='/dev/null' for k in ['BASH_ENV','ENV','ZDOTDIR'])
+    assert not subprocess.check_output(['bash','-c','printf %s "${GITLAB_PAT:-}"'])
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialized':continue
+      if m=='initialize':r={}
+      elif m in ['thread/start','thread/resume']:
+        c=q['params']['config']
+        assert c['features.shell_snapshot'] is False
+        assert c['allow_login_shell'] is False
+        assert c['shell_environment_policy.set']=={k:'/dev/null' for k in ['BASH_ENV','ENV','ZDOTDIR']}
+        assert 'GITLAB_PAT' in c['shell_environment_policy.exclude']
+        assert 'tool_output_token_limit' not in c
+        r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
+      elif m=='thread/read':r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
+      else:raise AssertionError(m)
+      print(json.dumps({'id':q['id'],'result':r}),flush=True)
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+    binding = %{tool_specs: [], secret_environment_names: ["GITLAB_PAT", "GITLAB_ACCESS_TOKEN"], agent_environment: %{"BASH_ENV" => profile}}
+
+    for opts <- [[], [review_only: true], [resume_thread_id: "isolated"], [resume_thread_id: "isolated", inspect_only: true]],
+        binding <- [binding, SymphonyElixir.ReviewLane.binding()] do
+      assert {:ok, session} = AppServer.start_session(workspace, Keyword.put(opts, :dynamic_tool_binding, binding))
+      assert :ok = AppServer.stop_session(session)
+    end
+
+    methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert Enum.count(methods, &(&1 == "thread/start")) == 4
+    assert Enum.count(methods, &(&1 == "thread/resume")) == 2
+    assert Enum.count(methods, &(&1 == "thread/read")) == 2
+  end
+
+  test "bound execution sessions advertise only role tools and reject legacy mutation calls on the real protocol" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "workspaces/bound-tools")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "bound-server")
+    trace = Path.join(root, "bound-requests.jsonl")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    def emit(value):print(json.dumps(value),flush=True)
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialized':continue
+      if m=='initialize':result={}
+      elif m=='thread/start':result={'thread':{'id':'bound-native'}}
+      elif m=='turn/start':
+        emit({'id':q['id'],'result':{'turn':{'id':'bound-turn'}}})
+        emit({'id':76,'method':'item/tool/call','params':{'tool':'task_context','arguments':{}}})
+        continue
+      elif q.get('id')==76:
+        assert q['result']['success'] is False
+        assert 'root_task_tools_only' in q['result']['contentItems'][0]['text']
+        emit({'id':77,'method':'item/tool/call','params':{'tool':'task_handoff','arguments':{},'callId':'forbidden','threadId':'bound-native','turnId':'bound-turn'}})
+        continue
+      elif q.get('id')==77:
+        assert q['result']['success'] is False
+        emit({'method':'turn/completed','params':{'threadId':'bound-native','turn':{'id':'bound-turn','status':'completed'}}})
+        continue
+      else:raise AssertionError('Unexpected method: '+str(m))
+      emit({'id':q['id'],'result':result})
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace), codex_command: binary)
+    work = %{"provider" => "github", "host" => "github.test", "repository_id" => "1", "kind" => "issue", "number" => 2}
+    sha = SymphonyElixir.TaskWorkflow.digest("scope")
+    policy = %{"engine_actor" => "99", "max_retries" => 2, "max_repairs" => 2, "checks" => %{"review" => %{"kind" => "review"}}}
+
+    for role <- ["developer", "verifier"] do
+      binding = %{
+        "work" => work,
+        "role" => role,
+        "plan_revision" => sha,
+        "contract_sha" => sha,
+        "policy_sha" => SymphonyElixir.TaskWorkflow.digest(policy),
+        "inputs" => [],
+        "candidate" => if(role == "verifier", do: sha),
+        "authority" => %{"work" => %{work | "number" => 1}, "actor" => "1", "source" => "note:1", "revision" => sha}
+      }
+
+      {:ok, record} = SymphonyElixir.RunJournal.admit(Path.join(root, "runs"), role, execution_binding: binding)
+      assert {:error, :invalid_task_tool_binding} = AppServer.start_session(workspace, run_record: record)
+      opts = [run_record: record, execution_policy: policy, dynamic_tool_binding: %{tool_specs: [%{"name" => "unsafe"}]}]
+      {:ok, session} = AppServer.start_session(workspace, opts)
+      expected = if role == "developer", do: ["task_context", "task_candidate"], else: ["task_context", "task_check", "task_verification"]
+      assert Enum.map(session.dynamic_tool_binding.tool_specs, & &1["name"]) == expected
+      issue = %Issue{id: role, identifier: role, title: "Bound task", state: "open"}
+      assert {:ok, _} = AppServer.run_turn(session, "Probe forbidden legacy tool", issue)
+      :ok = AppServer.stop_session(session)
+    end
+
+    requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    starts = Enum.filter(requests, &(&1["method"] == "thread/start"))
+    assert length(starts) == 2
+    assert Enum.all?(starts, &(get_in(&1, ["params", "config", "features.shell_snapshot"]) == false))
+    assert Enum.all?(starts, fn start -> Enum.all?(start["params"]["dynamicTools"], &String.starts_with?(&1["name"], "task_")) end)
+    assert Enum.count(requests, &(&1["id"] == 77 and get_in(&1, ["result", "success"]) == false)) == 2
+  end
+
+  test "stop after native thread allocation prevents turn allocation and verifies the empty thread" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "workspaces/stopped")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "stopped-server")
+    trace = Path.join(root, "requests.jsonl")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialized':continue
+      if m=='initialize':result={}
+      elif m=='thread/goal/get':result={'goal':None}
+      elif m in ['thread/start','thread/read']:result={'thread':{'id':'stopped','status':{'type':'idle'},'turns':[]}}
+      else:raise AssertionError('unexpected native execution: '+str(m))
+      print(json.dumps({'id':q['id'],'result':result}),flush=True)
+    """)
+
+    File.chmod!(binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.dirname(workspace), codex_command: binary)
+    {:ok, session} = AppServer.start_session(workspace)
+    issue = %Issue{id: "stopped", identifier: "STOP", title: "Stop before turn", state: "open"}
+    reject_turn = fn -> {:error, :review_execution_fenced} end
+    assert {:error, :review_execution_fenced} = AppServer.run_turn(session, "do not start", issue, before_turn: reject_turn)
+    assert {:error, :review_execution_fenced} = AppServer.run_goal(session, "do not activate", issue, before_goal: reject_turn)
+    expired = [deadline: System.monotonic_time(:millisecond) - 1]
+    assert {:error, :execution_budget_exhausted} = AppServer.run_goal(session, "expired goal", issue, expired)
+    assert {:error, :execution_budget_exhausted} = AppServer.run_turn(session, "expired turn", issue, expired)
+    send(self(), :symphony_stop)
+    assert {:error, :scheduler_stop} = AppServer.run_goal(session, "cancelled goal", issue, interruptible: true)
+    send(self(), :symphony_stop)
+    assert {:error, :scheduler_stop} = AppServer.run_turn(session, "do not start", issue, interruptible: true)
+    AppServer.stop_session(session)
+    assert {:ok, evidence} = SymphonyElixir.NativeStop.confirm(%{"thread_id" => "stopped", "workspace" => workspace})
+    assert evidence["native_stop_confirmed"]
+    assert evidence["native_stop_receipt"]["turn_id"] == nil
+    methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert Enum.count(methods, &(&1 == "thread/start")) == 1
+    refute Enum.any?(methods, &(&1 in ["thread/resume", "turn/start", "thread/goal/set"]))
+    reject_thread = fn _ -> {:error, :checkpoint_rejected} end
+    assert {:error, :checkpoint_rejected} = AppServer.start_session(workspace, on_thread_started: reject_thread)
+  end
+
   test "recovery inspection never resumes or reconciles active, foreign or missing native turns" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "inspection/issue")

@@ -440,6 +440,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
   end
 
+  test "todo membership alone never authorizes repository execution" do
+    for kind <- ["gitlab", "github"] do
+      tracker = %{kind: kind, required_labels: ["symphony:todo", "symphony:ready"], assignee: "20"}
+      issue = %Issue{labels: ["symphony:todo", "symphony:ready"], dispatchable: true, assignee_id: "20"}
+      assert Issue.routable?(issue, tracker)
+      refute Issue.routable?(%{issue | labels: ["symphony:todo"]}, tracker)
+      refute Issue.routable?(%{issue | labels: ["symphony:ready"]}, tracker)
+      refute Issue.routable?(%{issue | assignee_id: nil}, tracker)
+      refute Issue.routable?(%{issue | assignee_id: "21"}, tracker)
+    end
+  end
+
   test "repository routing requires the configured owner as well as labels" do
     for kind <- ["gitlab", "github"] do
       tracker = %{kind: kind, required_labels: ["symphony:ready"], assignee: "20"}

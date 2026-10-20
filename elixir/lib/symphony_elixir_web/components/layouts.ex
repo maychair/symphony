@@ -12,6 +12,8 @@ defmodule SymphonyElixirWeb.Layouts do
       |> assign(:csrf_token, Plug.CSRFProtection.get_csrf_token())
       |> assign(:dashboard_css_url, SymphonyElixirWeb.StaticAssets.dashboard_css_url())
       |> assign(:favicon_url, SymphonyElixirWeb.StaticAssets.favicon_url())
+      |> assign(:taskboard_css_url, SymphonyElixirWeb.StaticAssets.taskboard_css_url())
+      |> assign(:taskboard_js_url, SymphonyElixirWeb.StaticAssets.taskboard_js_url())
 
     ~H"""
     <!DOCTYPE html>
@@ -42,6 +44,8 @@ defmodule SymphonyElixirWeb.Layouts do
           });
         </script>
         <link rel="stylesheet" href={@dashboard_css_url} />
+        <link rel="stylesheet" href={@taskboard_css_url} />
+        <script defer src={@taskboard_js_url}></script>
       </head>
       <body>
         {@inner_content}
@@ -53,7 +57,17 @@ defmodule SymphonyElixirWeb.Layouts do
   @spec app(map()) :: Phoenix.LiveView.Rendered.t()
   def app(assigns) do
     ~H"""
-    <main class="app-shell">
+    <nav class="global-nav" aria-label="Symphony">
+      <a class="global-brand" href="/">
+        <span class="global-brand-mark">S</span>
+        <span>Symphony</span>
+      </a>
+      <div class="global-links">
+        <a href="/" class={if Map.get(assigns, :shell) == "taskboard", do: "active"}>Taskboard</a>
+        <a href="/runtime" class={if Map.get(assigns, :shell) == "runtime", do: "active"}>Runtime</a>
+      </div>
+    </nav>
+    <main class={"app-shell app-shell-" <> to_string(Map.get(assigns, :shell, "runtime"))}>
       {@inner_content}
     </main>
     """

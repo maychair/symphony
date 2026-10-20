@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Jira.Client do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Thin Jira Cloud REST client for project-scoped issue polling.
   """
@@ -412,9 +414,9 @@ defmodule SymphonyElixir.Jira.Client do
 
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
-    base_url = resolve_setting(provider["base_url"], System.get_env("JIRA_BASE_URL"))
-    email = resolve_setting(provider["email"], System.get_env("JIRA_EMAIL"))
-    api_token = resolve_setting(provider["api_token"], System.get_env("JIRA_API_TOKEN"))
+    base_url = resolve_setting(provider["base_url"], RuntimeContext.get_env("JIRA_BASE_URL"))
+    email = resolve_setting(provider["email"], RuntimeContext.get_env("JIRA_EMAIL"))
+    api_token = resolve_setting(provider["api_token"], RuntimeContext.get_env("JIRA_API_TOKEN"))
     project_key = resolve_setting(provider["project_key"], nil)
 
     cond do
@@ -449,7 +451,7 @@ defmodule SymphonyElixir.Jira.Client do
 
   defp resolve_setting("$" <> env_name, fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name) || fallback)
+      normalize_string(RuntimeContext.get_env(env_name) || fallback)
     else
       nil
     end

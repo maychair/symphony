@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Asana.Client do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Thin Asana REST client for project-scoped task polling.
   """
@@ -325,7 +327,7 @@ defmodule SymphonyElixir.Asana.Client do
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)
     endpoint = provider["endpoint"] || @default_endpoint
-    api_key = resolve_setting(provider["api_key"], System.get_env("ASANA_PAT"))
+    api_key = resolve_setting(provider["api_key"], RuntimeContext.get_env("ASANA_PAT"))
     project_gid = resolve_setting(provider["project_gid"], nil)
 
     cond do
@@ -355,7 +357,7 @@ defmodule SymphonyElixir.Asana.Client do
 
   defp resolve_setting("$" <> env_name, fallback) do
     if valid_env_name?(env_name) do
-      normalize_string(System.get_env(env_name) || fallback)
+      normalize_string(RuntimeContext.get_env(env_name) || fallback)
     else
       nil
     end

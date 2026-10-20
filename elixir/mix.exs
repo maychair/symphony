@@ -30,6 +30,9 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.HttpServer,
           SymphonyElixir.StatusDashboard,
           SymphonyElixir.LogFile,
+          SymphonyElixir.Taskboard.GitHub,
+          SymphonyElixir.Taskboard.GitLab,
+          SymphonyElixir.Taskboard.Memory,
           SymphonyElixir.Workspace,
           SymphonyElixirWeb.DashboardLive,
           SymphonyElixirWeb.Endpoint,
@@ -40,11 +43,14 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixirWeb.Presenter,
           SymphonyElixirWeb.StaticAssetController,
           SymphonyElixirWeb.StaticAssets,
+          SymphonyElixirWeb.TaskboardApiController,
+          SymphonyElixirWeb.TaskboardLive,
           SymphonyElixirWeb.Router,
           SymphonyElixirWeb.Router.Helpers
         ]
       ],
       test_ignore_filters: [
+        "test/support/git_artifact_fixture.exs",
         "test/support/snapshot_support.exs",
         "test/support/test_support.exs"
       ],

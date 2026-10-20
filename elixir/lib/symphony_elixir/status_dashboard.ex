@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.StatusDashboard do
+  alias SymphonyElixir.RuntimeContext
+
   @moduledoc """
   Renders a status snapshot for orchestrator and worker activity as a terminal UI.
   """
@@ -549,7 +551,7 @@ defmodule SymphonyElixir.StatusDashboard do
     do: dashboard_url(host, configured_port, bound_port)
 
   defp snapshot_payload do
-    if Process.whereis(Orchestrator) do
+    if Process.whereis(Orchestrator) || SymphonyElixir.RepositoryService.aggregate?() do
       case Orchestrator.snapshot() do
         %{
           running: running,
@@ -795,7 +797,7 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp terminal_columns_from_env do
-    case System.get_env("COLUMNS") do
+    case RuntimeContext.get_env("COLUMNS") do
       nil ->
         fixed_running_width() + @running_row_chrome_width + @running_event_default_width
 

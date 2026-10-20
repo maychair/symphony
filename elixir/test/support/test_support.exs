@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
 
-  defmacro __using__(_opts) do
+  defmacro __using__(opts) do
     quote do
       use ExUnit.Case
       import ExUnit.CaptureLog
@@ -23,6 +23,12 @@ defmodule SymphonyElixir.TestSupport do
 
       import SymphonyElixir.TestSupport,
         only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+
+      setup_all do
+        if unquote(Keyword.get(opts, :runtime, true)),
+          do: :ok,
+          else: SymphonyElixir.TestSupport.isolate_default_runtime()
+      end
 
       setup do
         workflow_root =
@@ -50,6 +56,21 @@ defmodule SymphonyElixir.TestSupport do
     end
   end
 
+  # Provider/board fixtures must not be consumed by the application's live
+  # scheduler. Tests opting out own any runtime they explicitly start.
+  def isolate_default_runtime do
+    runtime = SymphonyElixir.AgentRuntimeSupervisor
+    supervisor = SymphonyElixir.Supervisor
+    running? = is_pid(Process.whereis(runtime))
+    :ok = Supervisor.terminate_child(supervisor, runtime)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      if running?, do: Supervisor.restart_child(supervisor, runtime)
+    end)
+
+    :ok
+  end
+
   def write_workflow_file!(path, overrides \\ []) do
     workflow = workflow_content(overrides)
     File.write!(path, workflow)
@@ -63,6 +84,135 @@ defmodule SymphonyElixir.TestSupport do
     end
 
     :ok
+  end
+
+  # Run all cleanup steps even if the body or an earlier cleanup failed. ExUnit
+  # renders each original exception and stacktrace instead of hiding the cause.
+  def with_cleanup(body, cleanups) do
+    result = capture_failure(body)
+    failures = for cleanup <- cleanups, {:failure, failure} <- [capture_failure(cleanup)], do: failure
+
+    case {result, failures} do
+      {{:ok, value}, []} -> value
+      {{:failure, {kind, reason, stack}}, []} -> :erlang.raise(kind, reason, stack)
+      {{:failure, failure}, rest} -> raise ExUnit.MultiError, errors: [failure | rest]
+      {{:ok, _}, rest} -> raise ExUnit.MultiError, errors: rest
+    end
+  end
+
+  defp capture_failure(fun) do
+    {:ok, fun.()}
+  catch
+    kind, reason -> {:failure, {kind, reason, __STACKTRACE__}}
+  end
+
+  def write_review_server(server, root) do
+    File.write!(server, """
+    #!/usr/bin/env python3
+    import sys,json,pathlib,os,subprocess
+    root=pathlib.Path(#{inspect(root)});tid='review-thread-'+str(os.getpid());turn=tid+'-turn';cwd=None;step=0
+    def state():return root/(tid+'.json')
+    def save(status):state().write_text(json.dumps({'id':turn,'status':status}))
+    def thread():
+      turns=[json.loads(state().read_text())] if state().exists() else []
+      return {'id':tid,'status':{'type':'active' if turns and turns[-1]['status']=='inProgress' else 'idle'},'turns':turns}
+    def emit(v):print(json.dumps(v),flush=True)
+    def tool(name,args):emit({'id':100,'method':'item/tool/call','params':{'threadId':tid,'turnId':turn,'tool':name,'arguments':args}})
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      with (root/'native-requests.jsonl').open('a') as f:f.write(json.dumps(q)+'\\n')
+      if m=='initialize':emit({'id':q['id'],'result':{}})
+      elif m=='thread/goal/get':emit({'id':q['id'],'result':{'goal':None}})
+      elif m=='thread/read':
+        tid=q['params'].get('threadId',tid);turn=tid+'-turn'
+        emit({'id':q['id'],'result':{'thread':thread()}})
+      elif m=='turn/interrupt':
+        if not (root/'unconfirmed-stop').exists():save('interrupted')
+        emit({'id':q['id'],'result':{}})
+      elif m in ['thread/start','thread/resume']:
+        cwd=q['params'].get('cwd');tid=q['params'].get('threadId',tid);turn=tid+'-turn'
+        emit({'id':q['id'],'result':{'thread':thread()}})
+      elif m=='command/exec':
+        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
+        r=subprocess.run(q['params']['command'],cwd=q['params']['cwd'],text=True,capture_output=True)
+        emit({'id':q['id'],'result':{'exitCode':r.returncode,'stdout':r.stdout,'stderr':r.stderr}})
+      elif m=='turn/start':
+        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
+        save('inProgress');emit({'id':q['id'],'result':{'turn':{'id':turn}}})
+        if (root/'disconnect').exists():sys.exit(0)
+        if (root/'hang').exists():continue
+        if (root/'no-submit').exists():
+          save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
+        else:tool('review_read',{'kind':'diff'})
+      elif q.get('id')==100:
+        assert q['result']['success'],q
+        step+=1
+        if step==1:tool('review_read',{'kind':'file','path':'source.txt'})
+        elif step==2:tool('review_axis_submit',{'status':'complete','report':'已核对完整差异和相关源文件。','findings':[]})
+        else:
+          save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
+    """)
+
+    File.chmod!(server, 0o755)
+  end
+
+  # Native execution is exercised by runner fixtures. Listener-only tests supply
+  # two independent completed axes through the same engine result reducer.
+  def submit_review(id, arguments) do
+    alias SymphonyElixir.ReviewLane.{Finding, Listener}
+    key = String.replace_prefix(id, "review:", "")
+    record = get_in(:sys.get_state(Listener), [:records, key])
+    owner = if record, do: record["execution_owner"]
+
+    if is_nil(owner) do
+      Listener.submit(id, owner, arguments)
+    else
+      with {:ok, submission} <- Finding.validate(arguments, record),
+           normalized = fixture_submission(submission, record),
+           axes = fixture_axes(record, normalized),
+           :ok <- Listener.checkpoint(id, owner, %{"axes" => axes, "native_stop_confirmed" => true}),
+           {:ok, result} <- SymphonyElixir.ReviewResult.aggregate(record, axes) do
+        Listener.submit(id, owner, %{"completion" => result})
+      end
+    end
+  end
+
+  defp fixture_submission(%{} = submission, _record), do: submission
+
+  defp fixture_submission(findings, record) do
+    values =
+      Enum.with_index(findings, fn body, index ->
+        %{
+          "schema_version" => 1,
+          "id" => "fixture-#{index}",
+          "required" => true,
+          "criterion" => "测试约定",
+          "version" => %{"head" => record["head"], "base" => record["base"], "target" => record["target_branch"]},
+          "location" => "source.cpp:10",
+          "evidence" => body,
+          "impact" => "可复现的行为不符合约定。",
+          "resolution" => "修复行为并通过回归验证。",
+          "regression_of" => nil
+        }
+      end)
+
+    %{"findings" => values, "responses" => []}
+  end
+
+  defp fixture_axes(record, submission) do
+    Map.new(["standards", "spec"], fn axis ->
+      {axis,
+       %{
+         "status" => "complete",
+         "report" => "已完成本轴核对。",
+         "thread_id" => record["id"] <> axis,
+         "turn_id" => record["id"] <> axis <> "-turn",
+         "native_stop_confirmed" => true,
+         "reads_verified" => true,
+         "findings" => if(axis == "standards", do: submission["findings"], else: []),
+         "responses" => if(axis == "standards", do: submission["responses"] || [], else: [])
+       }}
+    end)
   end
 
   def restore_env(key, nil), do: System.delete_env(key)
@@ -122,6 +272,11 @@ defmodule SymphonyElixir.TestSupport do
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
+          taskboard_enabled: nil,
+          taskboard_refresh_ms: nil,
+          taskboard_control_token: nil,
+          taskboard_provider_token: nil,
+          taskboard_projects: nil,
           server_port: nil,
           server_host: nil,
           prompt: @workflow_prompt
@@ -160,6 +315,11 @@ defmodule SymphonyElixir.TestSupport do
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    taskboard_enabled = Keyword.get(config, :taskboard_enabled)
+    taskboard_refresh_ms = Keyword.get(config, :taskboard_refresh_ms)
+    taskboard_control_token = Keyword.get(config, :taskboard_control_token)
+    taskboard_provider_token = Keyword.get(config, :taskboard_provider_token)
+    taskboard_projects = Keyword.get(config, :taskboard_projects)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
@@ -196,6 +356,13 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        taskboard_yaml(
+          taskboard_enabled,
+          taskboard_refresh_ms,
+          taskboard_control_token,
+          taskboard_provider_token,
+          taskboard_projects
+        ),
         server_yaml(server_port, server_host),
         "---",
         prompt
@@ -264,6 +431,21 @@ defmodule SymphonyElixir.TestSupport do
       "  refresh_ms: #{yaml_value(refresh_ms)}",
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
     ]
+    |> Enum.join("\n")
+  end
+
+  defp taskboard_yaml(nil, nil, nil, nil, nil), do: nil
+
+  defp taskboard_yaml(enabled, refresh_ms, control_token, provider_token, projects) do
+    [
+      "taskboard:",
+      !is_nil(enabled) && "  enabled: #{yaml_value(enabled)}",
+      !is_nil(refresh_ms) && "  refresh_ms: #{yaml_value(refresh_ms)}",
+      !is_nil(control_token) && "  control_token: #{yaml_value(control_token)}",
+      !is_nil(provider_token) && "  provider_token: #{yaml_value(provider_token)}",
+      !is_nil(projects) && "  projects: #{yaml_value(projects)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

@@ -6,6 +6,10 @@ defmodule SymphonyElixirWeb.Router do
   use Phoenix.Router
   import Phoenix.LiveView.Router
 
+  pipeline :repository do
+    plug(SymphonyElixirWeb.RepositoryScope)
+  end
+
   pipeline :browser do
     plug(:fetch_session)
     plug(:fetch_live_flash)
@@ -16,6 +20,8 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     get("/dashboard.css", StaticAssetController, :dashboard_css)
+    get("/taskboard.css", StaticAssetController, :taskboard_css)
+    get("/taskboard.js", StaticAssetController, :taskboard_js)
     get("/favicon.png", StaticAssetController, :favicon)
     get("/vendor/phoenix_html/phoenix_html.js", StaticAssetController, :phoenix_html_js)
     get("/vendor/phoenix/phoenix.js", StaticAssetController, :phoenix_js)
@@ -25,11 +31,26 @@ defmodule SymphonyElixirWeb.Router do
   scope "/", SymphonyElixirWeb do
     pipe_through(:browser)
 
-    live("/", DashboardLive, :index)
+    live("/", TaskboardLive, :index)
+    live("/runtime", DashboardLive, :index)
   end
 
   scope "/", SymphonyElixirWeb do
+    pipe_through(:repository)
+
     post("/api/v1/webhooks/:provider", WebhookController, :receive_event)
+    get("/api/v1/taskboard", TaskboardApiController, :state)
+    get("/api/v1/taskboard/projects/:project_id", TaskboardApiController, :project)
+    get("/api/v1/taskboard/issues/:project_id/:issue_identifier", TaskboardApiController, :issue)
+    post("/api/v1/taskboard/issues", TaskboardApiController, :create_issue)
+    post("/api/v1/taskboard/issues/:project_id/:issue_identifier/comments", TaskboardApiController, :comment)
+
+    post(
+      "/api/v1/taskboard/issues/:project_id/:issue_identifier/actions/:action",
+      TaskboardApiController,
+      :transition
+    )
+
     get("/api/v1/runs/:issue_identifier", ObservabilityApiController, :run)
     get("/api/v1/state", ObservabilityApiController, :state)
 
