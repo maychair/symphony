@@ -86,6 +86,7 @@ defmodule Mix.Tasks.Symphony.Review do
     end
   end
 
+  @spec unsupported_manual_store!() :: no_return()
   defp unsupported_manual_store!,
     do: Mix.raise("Manual review journal unavailable: unsupported manual review state requires explicit retirement after native stop verification; no migration is performed.")
 
