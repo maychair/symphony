@@ -71,7 +71,7 @@ defmodule SymphonyElixir.ReviewLane.GitHub do
 
   @spec command(String.t(), [String.t()]) :: {:ok, String.t()} | {:error, term()}
   def command(executable, args) do
-    case System.cmd("timeout", ["--signal=TERM", "30s", executable | args], stderr_to_stdout: false) do
+    case System.cmd("timeout", ["--signal=TERM", "30s", executable | args], stderr_to_stdout: false, env: Map.to_list(SymphonyElixir.RuntimeContext.environment())) do
       {output, 0} when byte_size(output) <= 8_388_608 -> {:ok, output}
       {_output, status} -> {:error, {:command_failed, executable, status}}
     end

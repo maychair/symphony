@@ -68,6 +68,25 @@ defmodule SymphonyElixir.ReviewResultTest do
     assert ReviewResult.validate(pass, Map.put(r, "finding_register", advanced)) == :ok
   end
 
+  test "an independently confirmed still-valid finding completes with changes requested" do
+    prior = Finding.advance(nil, %{"findings" => [finding()], "responses" => []}, 1)
+    r = Map.put(record(), "finding_register", prior)
+
+    for {judgement, expected} <- [{"still_valid", "changes_requested"}, {"undecidable", "needs_input"}] do
+      response = %{"finding" => "R1", "status" => judgement, "evidence" => "已完整核对当前源码和反例", "rationale" => "独立复核结论", "verified_by" => "reviewer"}
+      input = put_in(axes(), ["spec", "responses"], [response])
+      assert {:ok, result} = ReviewResult.aggregate(r, input)
+      assert result["status"] == expected
+      refute result["body"] == "LGTM!"
+      advanced = Finding.advance(prior, %{"findings" => [], "responses" => [response]}, 2)
+      assert ReviewResult.validate(result, Map.put(r, "finding_register", advanced)) == :ok
+      forged = Map.merge(result, %{"status" => "passed", "body" => "LGTM!"})
+      refute ReviewResult.render(forged) == "LGTM!"
+      assert {:ok, missing} = ReviewResult.aggregate(Map.put(r, "finding_register", advanced), axes())
+      assert missing["status"] == "needs_input"
+    end
+  end
+
   test "incomplete evidence, unknown shapes and nonindependent reviewers fail closed" do
     for patch <- [%{"status" => "failed"}, %{"status" => "needs_input"}] do
       assert {:ok, result} = ReviewResult.aggregate(record(), put_in(axes(), ["standards"], Map.merge(axis("standards"), patch)))

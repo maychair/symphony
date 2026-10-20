@@ -37,11 +37,7 @@ defmodule Mix.Tasks.Symphony.Review do
   end
 
   defp run_context(context, request) do
-    subject =
-      context.config
-      |> Map.take(~w(provider host))
-      |> Map.merge(Map.take(context.record, ~w(project iid)))
-      |> Map.put("repository", manual_repository(request["repository"]))
+    subject = manual_subject(context, request)
 
     directory = Path.join([context.config["state_dir"], "manual", TaskWorkflow.digest(subject)])
 
@@ -65,11 +61,17 @@ defmodule Mix.Tasks.Symphony.Review do
     end
   end
 
-  defp manual_repository(nil), do: nil
+  defp manual_subject(_context, %{"kind" => "local", "repository" => source}) do
+    {:ok, canonical} = PathSafety.canonicalize(source)
+    %{"kind" => "local", "repository" => canonical}
+  end
 
-  defp manual_repository(path) do
-    {:ok, canonical} = PathSafety.canonicalize(path)
-    canonical
+  defp manual_subject(context, %{"kind" => "mr"}) do
+    project = context.record["project"]
+
+    context.config
+    |> Map.take(~w(provider host))
+    |> Map.merge(%{"kind" => "mr", "repository_id" => context.config["projects"][project]["id"], "number" => context.record["iid"]})
   end
 
   defp manual_history(nil, _subject), do: []

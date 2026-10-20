@@ -31,7 +31,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     }
   end
 
-  defp completed(record, findings \\ []) do
+  defp completed(record, findings \\ [], responses \\ []) do
     axes =
       Map.new(["standards", "spec"], fn name ->
         {name,
@@ -39,7 +39,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
            "status" => "complete",
            "report" => "审查完成",
            "findings" => if(name == "spec", do: findings, else: []),
-           "responses" => [],
+           "responses" => if(name == "spec", do: responses, else: []),
            "thread_id" => name,
            "turn_id" => name <> "-turn",
            "reads_verified" => true,
@@ -134,6 +134,15 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     [card] = cards([completed(r, [finding])])
     assert card.column == "Done"
     assert card.review.conclusion == "changes_requested"
+
+    prior = SymphonyElixir.ReviewLane.Finding.advance(nil, %{"findings" => [finding], "responses" => []}, 1)
+    recheck = Map.put(record(2), "finding_register", prior)
+    response = %{"finding" => "S1", "status" => "still_valid", "evidence" => "当前源码仍可触发原反例", "rationale" => "原问题未修复", "verified_by" => "reviewer"}
+    completed_recheck = completed(recheck, [], [response])
+    [recheck_card] = cards([completed_recheck])
+    assert recheck_card.column == "Done"
+    assert recheck_card.review.conclusion == "changes_requested"
+    refute completed_recheck["review_result"]["body"] == "LGTM!"
   end
 
   test "native provider identity and allowlist filter records; manual journals are not a data source" do

@@ -38,6 +38,8 @@ defmodule SymphonyElixir.ReviewCliTest do
     File.ln_s!(data["repository"], alias_path)
     File.write!(request, Jason.encode!(%{data | "repository" => alias_path, "head" => data["base"]}))
     assert_manual_fenced(workflow, request)
+    File.write!(request, Jason.encode!(Map.put(data, "record", %{"project" => "unrelated/project", "iid" => 77})))
+    assert_manual_fenced(workflow, request)
     requests = root |> Path.join("native-requests.jsonl") |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
     assert Enum.count(requests, &(&1["method"] == "thread/start")) == 2
     assert File.exists?(journal)
@@ -143,7 +145,12 @@ defmodule SymphonyElixir.ReviewCliTest do
     assert Jason.decode!(String.trim(output))["body"] == "LGTM!"
     [journal] = Path.wildcard(Path.join(root, "journal/manual/*/review-lane.json"))
     subject = journal |> File.read!() |> Jason.decode!() |> Map.fetch!("subject")
-    assert subject == %{"provider" => "gitlab", "host" => "review.invalid", "repository" => nil, "project" => "team/repo", "iid" => 1}
+    saved = journal |> File.read!() |> Jason.decode!()
+    saved = update_in(saved, ["runtime", "axes"], fn axes -> Map.new(axes, fn {axis, item} -> {axis, Map.put(item, "native_stop_confirmed", false)} end) end)
+    File.write!(journal, Jason.encode!(saved))
+    File.write!(request, Jason.encode!(%{"kind" => "mr", "project" => "team/repo", "number" => 1, "repository" => local["repository"]}))
+    assert_manual_fenced(workflow, request)
+    assert subject == %{"kind" => "mr", "provider" => "gitlab", "host" => "review.invalid", "repository_id" => 10, "number" => 1}
   end
 
   test "manual entry rejects malformed input and unavailable runtime rules" do

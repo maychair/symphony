@@ -116,3 +116,16 @@ ReviewAxis supplies a fixed native tool-output history budget of 32,768 tokens
 for these pages. The transport applies it independently of model defaults and
 role-file settings, so an unknown model alias cannot silently shrink a page in
 the model-visible history. Ordinary task sessions retain their native budget.
+
+Axis prompts supply the complete fixed finding version, including the target
+branch name. A rejected finding returns its actual validation reason so the
+reviewer can correct an invalid version without losing a substantiated finding.
+The completeness and fixed-version checks remain mandatory.
+
+Native review CLI and Git commands receive the captured repository environment
+without changing the service process environment. Manual journal identity uses
+only the verified source repository for local requests, or the native provider,
+host, repository ID and MR/PR number for remote requests. Unrelated request fields
+cannot select another recovery fence. An independently verified `still_valid`
+response completes a round with `changes_requested`; omitted or undecidable
+required findings remain `needs_input`. Neither verdict approves or merges code.

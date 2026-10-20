@@ -28,7 +28,7 @@ defmodule SymphonyElixir.ReviewResult do
          {:ok, findings, responses} <- valid_review_items(axes, record) do
       review = %{"findings" => findings, "responses" => responses}
       advanced = Finding.advance(register, review, record["round"])
-      unresolved = unresolved(advanced, record["round"])
+      unresolved = unresolved(advanced, record["round"], responses)
       status = status(axes, findings, unresolved)
 
       {:ok,
@@ -72,7 +72,7 @@ defmodule SymphonyElixir.ReviewResult do
       when status in @result_statuses and is_map(axes) and is_binary(body) do
     with :ok <- result_shape(result),
          {:ok, axes} <- valid_axes(axes),
-         true <- status != "passed" or (complete_axes?(axes) and no_required_findings?(axes)),
+         true <- status != "passed" or (complete_axes?(axes) and no_change_requests?(axes)),
          true <- if(status == "passed", do: body == "LGTM!", else: String.trim(body) != "LGTM!") do
       body
     else
@@ -180,13 +180,14 @@ defmodule SymphonyElixir.ReviewResult do
 
   defp status(axes, findings, unresolved) do
     statuses = Enum.map(@axes, &axes[&1]["status"])
+    responses = flattened(axes, "responses")
 
     cond do
       "failed" in statuses -> "failed"
       "needs_input" in statuses -> "needs_input"
       not complete_axes?(axes) -> "failed"
-      unresolved != [] -> "needs_input"
-      findings != [] -> "changes_requested"
+      unresolved != [] or Enum.any?(responses, &(&1["status"] == "undecidable")) -> "needs_input"
+      findings != [] or Enum.any?(responses, &(&1["status"] == "still_valid")) -> "changes_requested"
       true -> "passed"
     end
   end
@@ -196,12 +197,16 @@ defmodule SymphonyElixir.ReviewResult do
       standards["turn_id"] != spec["turn_id"]
   end
 
-  defp no_required_findings?(axes), do: flattened(axes, "findings") == []
+  defp no_change_requests?(axes),
+    do: flattened(axes, "findings") == [] and not Enum.any?(flattened(axes, "responses"), &(&1["status"] in ["still_valid", "undecidable"]))
 
-  defp unresolved(after_advance, round) do
+  defp unresolved(after_advance, round, responses) do
+    reviewed = MapSet.new(responses, & &1["finding"])
+
     after_advance
     |> Enum.filter(fn {_id, entry} ->
-      entry["round"] < round and entry["required"] == true and entry["status"] in ["open", "undecidable"]
+      entry["round"] < round and entry["required"] == true and entry["status"] in ["open", "undecidable"] and
+        (entry["status"] == "undecidable" or not MapSet.member?(reviewed, entry["id"]))
     end)
     |> Enum.map(&elem(&1, 0))
     |> Enum.sort()

@@ -25,6 +25,46 @@ defmodule SymphonyElixir.ReviewLaneGitLabTest do
     end
   end
 
+  test "native review commands inherit only their concurrent repository environment" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    cli = Path.join(root, "identity-cli")
+
+    File.write!(cli, """
+    #!/usr/bin/env python3
+    import json,os
+    key='GH_CONFIG_DIR' if os.environ.get('REVIEW_PROVIDER')=='github' else 'GLAB_CONFIG_DIR'
+    print(json.dumps({'id':{'bot-a':21,'bot-b':22}.get(os.environ.get(key),999),'name':'meichao-agent','bot':True}))
+    """)
+
+    File.chmod!(cli, 0o755)
+    previous = System.get_env("GLAB_CONFIG_DIR")
+    System.put_env("GLAB_CONFIG_DIR", "personal-host")
+    on_exit(fn -> restore_env("GLAB_CONFIG_DIR", previous) end)
+
+    tasks =
+      for {directory, id} <- [{"bot-a", 21}, {"bot-b", 22}] do
+        Task.async(fn ->
+          context = %{id: directory, environment: %{"GLAB_CONFIG_DIR" => directory, "GH_CONFIG_DIR" => directory, "GIT_CONFIG_PARAMETERS" => "'user.name=#{directory}'"}}
+
+          SymphonyElixir.RuntimeContext.with_context(context, fn ->
+            config = %{"host" => "review.invalid", "glab_bin" => cli, "gh_bin" => cli}
+            assert {:ok, %{"id" => ^id}} = GitLab.request(config, "GET", "user")
+            github = put_in(context, [:environment, "REVIEW_PROVIDER"], "github")
+
+            SymphonyElixir.RuntimeContext.with_context(github, fn ->
+              assert {:ok, %{"id" => ^id}} = SymphonyElixir.ReviewLane.GitHub.request(config, "GET", "user")
+            end)
+
+            assert {:ok, name} = GitLab.command("git", ["config", "--get", "user.name"])
+            assert String.trim(name) == directory
+          end)
+        end)
+      end
+
+    Enum.each(tasks, &Task.await(&1, 5_000))
+    assert System.get_env("GLAB_CONFIG_DIR") == "personal-host"
+  end
+
   test "private HTTP scope is explicit and cannot redirect metadata to another native path" do
     config = %{"host" => "review.invalid", "projects" => %{"team/repo" => %{"id" => 10}}}
     repository = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "http://review.invalid/team/repo"}

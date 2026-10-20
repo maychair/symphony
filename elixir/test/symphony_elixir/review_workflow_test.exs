@@ -262,6 +262,31 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     page["content"] <> read_all_pages(read, kind, path, page["next_offset"])
   end
 
+  test "a rejected finding exposes its actual version error and can be corrected", %{context: c} do
+    Process.put(ReviewAxis, %{context: c, result: nil, diff_read: true, files_read: true})
+
+    finding = %{
+      "schema_version" => 1,
+      "id" => "cache-retention",
+      "required" => true,
+      "criterion" => "Preserve retained data",
+      "location" => "source.c:1",
+      "evidence" => "The later archive overwrites the earlier cache.",
+      "impact" => "第一次执行的数据丢失",
+      "resolution" => "两次执行分别保留缓存",
+      "regression_of" => nil,
+      "version" => %{"head" => c.record["head"], "base" => c.record["base"], "target" => c.record["base"]}
+    }
+
+    submission = %{"status" => "complete", "report" => "已完成固定版本审查", "findings" => [finding]}
+    assert %{"success" => false, "output" => ":finding_version_not_current"} = ReviewAxis.execute_agent_tool("review_axis_submit", submission, [])
+    assert Process.get(ReviewAxis).result == nil
+    corrected = put_in(finding, ["version", "target"], c.record["target_branch"])
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_axis_submit", %{submission | "findings" => [corrected]}, [])
+    assert Process.get(ReviewAxis).result["findings"] == [corrected]
+    Process.delete(ReviewAxis)
+  end
+
   defmodule Backend do
     import ExUnit.Assertions
 
@@ -287,7 +312,9 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     def review_read(_, ["git", "ls-files"]), do: {:ok, "source.c\n"}
     def review_read(_, _), do: {:ok, "diff --git a/source.c b/source.c\n+fixed\n"}
 
-    def run_turn(session, _prompt, _issue, opts) do
+    def run_turn(session, prompt, _issue, opts) do
+      assert prompt =~ ~s("target":"main")
+      assert prompt =~ "target is the branch name"
       :ok = opts[:before_turn].()
       opts[:on_message].(%{event: :session_started, turn_id: "native-turn"})
       assert %{"success" => false} = ReviewAxis.execute_agent_tool("unknown", %{}, [])
