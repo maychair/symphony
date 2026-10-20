@@ -23,6 +23,10 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     import sys,json,pathlib,time
     r=pathlib.Path(#{inspect(root)});a=sys.argv[1:];name=pathlib.Path(sys.argv[0]).name
     path=a[a.index('--method')+2];method=a[a.index('--method')+1]
+    if method=='GET' and (r/'hold-scan').exists():
+      (r/'scan-held').write_text('ready');deadline=time.monotonic()+15
+      while not (r/'release-scan').exists() and time.monotonic()<deadline:time.sleep(0.01)
+      assert (r/'release-scan').exists()
     if (r/'responses.json').exists():
       responses=json.loads((r/'responses.json').read_text())
       key=method+' '+path
@@ -1111,6 +1115,34 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     refute File.exists?(Path.join(c.root, "posts.json"))
   end
 
+  test "a stop checkpoint waits for listener initialization without replacing native sessions", c do
+    %{issue: issue} = runner_fixture(c)
+    File.write!(Path.join(c.root, "hang"), "true")
+    recipient = self()
+    task = Task.async(fn -> Runner.run(issue, recipient) end)
+    assert_receive {:codex_worker_update, _, %{event: :session_started}}, 5_000
+    await_native_method(c, "turn/start", 2)
+    running = review_record(c, issue)
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: nil})
+    assert Listener.health().health == :disabled
+    assert {:error, :review_lane_initializing} = Listener.checkpoint(issue.id, running["execution_owner"], %{})
+    send(task.pid, :symphony_stop)
+    ref = task.ref
+    refute_receive {^ref, _}, 500
+    :sys.replace_state(Listener, &%{&1 | initial_config: c.config})
+    send(Listener, :configure)
+    await_listener()
+    assert Task.await(task, 5_000) == :ok
+    stopped = review_record(c, issue)
+    assert stopped["execution_owner"] == running["execution_owner"]
+    assert stopped["native_stop_confirmed"]
+    assert Enum.count(native_methods(c), &(&1 == "thread/start")) == 2
+    assert Enum.count(native_methods(c), &(&1 == "turn/interrupt")) == 2
+    refute "thread/resume" in native_methods(c)
+    refute File.exists?(Path.join(c.root, "posts.json"))
+  end
+
   test "legacy: an owner that exits during publication cannot send the remaining sealed comments", c do
     faults(c, %{"1" => "hold"})
     {:ok, [issue]} = Listener.issues()
@@ -1215,6 +1247,43 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
     assert_raise RuntimeError, ~r/review_execution_fenced/, fn -> Runner.run(issue, nil) end
     assert native_methods(c) == methods
+    assert posts(c) == ["LGTM!"]
+  end
+
+  test "a native scan longer than the health probe does not abort an admitted checkpoint", c do
+    %{issue: issue} = runner_fixture(c)
+    File.write!(Path.join(c.root, "hold-snapshot"), "true")
+
+    on_exit(fn ->
+      File.write(Path.join(c.root, "release-snapshot"), "continue")
+      File.write(Path.join(c.root, "release-scan"), "continue")
+    end)
+
+    task =
+      Task.async(fn ->
+        try do
+          Runner.run(issue, nil)
+        rescue
+          error -> {:error, Exception.message(error)}
+        catch
+          :exit, reason -> {:error, reason}
+        end
+      end)
+
+    await_file(Path.join(c.root, "snapshot-held"))
+    File.write!(Path.join(c.root, "hold-scan"), "true")
+    send(Listener, :poll)
+    await_file(Path.join(c.root, "scan-held"))
+    File.write!(Path.join(c.root, "release-snapshot"), "continue")
+    ref = task.ref
+    refute_receive {^ref, _}, 5_500
+    refute File.exists?(Path.join(c.root, "posts.json"))
+    File.write!(Path.join(c.root, "release-scan"), "continue")
+    assert Task.await(task, 15_000) == :ok
+    record = review_record(c, issue)
+    assert record["phase"] == "completed"
+    assert record["native_stop_confirmed"]
+    assert Enum.count(native_methods(c), &(&1 == "thread/start")) == 2
     assert posts(c) == ["LGTM!"]
   end
 
@@ -1501,8 +1570,12 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
 
     File.write!(Path.join(bin, "git"), """
     #!/usr/bin/env python3
-    import os,sys,pathlib
+    import os,sys,pathlib,time
     a=sys.argv[1:]
+    if 'checkout' in a and pathlib.Path(#{inspect(Path.join(c.root, "hold-snapshot"))}).exists():
+      root=pathlib.Path(#{inspect(c.root)});(root/'snapshot-held').write_text('ready');deadline=time.monotonic()+15
+      while not (root/'release-snapshot').exists() and time.monotonic()<deadline:time.sleep(0.01)
+      assert (root/'release-snapshot').exists()
     if 'checkout' in a and pathlib.Path(#{inspect(Path.join(c.root, "change-policy-during-snapshot"))}).exists():pathlib.Path(#{inspect(Path.join(c.root, "instructions"))}).write_text('invalid')
     if 'fetch' in a: a=a[:a.index('fetch')]+['fetch',#{inspect(source)},'HEAD']
     os.execv(#{inspect(git)},[#{inspect(git)}]+a)
@@ -1546,6 +1619,18 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   defp native_methods(c) do
     path = Path.join(c.root, "native-requests.jsonl")
     if File.exists?(path), do: File.read!(path) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"]), else: []
+  end
+
+  defp await_native_method(c, method, count, attempts \\ 500)
+  defp await_native_method(_c, method, _count, 0), do: flunk("Native method #{method} was not observed")
+
+  defp await_native_method(c, method, count, attempts) do
+    if Enum.count(native_methods(c), &(&1 == method)) >= count do
+      :ok
+    else
+      Process.sleep(10)
+      await_native_method(c, method, count, attempts - 1)
+    end
   end
 
   defp responses(c, values), do: File.write!(Path.join(c.root, "responses.json"), Jason.encode!(values))

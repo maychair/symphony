@@ -70,11 +70,9 @@ defmodule SymphonyElixir.ReviewLane.Runner do
   defp checkpoint(issue, changes), do: checkpoint(issue, changes, System.monotonic_time(:millisecond) + 5_000)
 
   defp checkpoint(issue, changes, deadline) do
-    if Listener.health().health == :disabled and System.monotonic_time(:millisecond) < deadline do
-      Process.sleep(25)
-      checkpoint(issue, changes, deadline)
-    else
-      Listener.checkpoint(issue.id, issue.native_ref["execution_owner"], changes)
+    case Listener.checkpoint(issue.id, issue.native_ref["execution_owner"], changes) do
+      {:error, :review_lane_initializing} -> exit(:review_lane_initializing)
+      reply -> reply
     end
   catch
     :exit, reason ->

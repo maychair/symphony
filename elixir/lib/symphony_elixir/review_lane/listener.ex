@@ -120,6 +120,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
+  defp handle_request({:checkpoint, _, _, _}, _from, %{config: nil} = state),
+    do: {:reply, {:error, :review_lane_initializing}, state}
+
   defp handle_request({:checkpoint, id, owner, changes}, {caller, _}, state) do
     record = state.records[record_key(id)]
 
