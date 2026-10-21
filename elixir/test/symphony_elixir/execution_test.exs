@@ -622,7 +622,7 @@ defmodule SymphonyElixir.ExecutionTest do
         if p['status']=='active': emit({'method':'turn/started','params':{'threadId':'cancel-thread','turn':{'id':'cancel-turn'}}})
       elif m=='turn/interrupt': emit({'id':q['id'],'result':{}})
       elif m=='thread/turns/list': emit({'id':q['id'],'result':{'data':[{'id':'cancel-turn','status':'interrupted' if goal['status']=='blocked' else 'inProgress'}],'nextCursor':None}})
-      elif m=='thread/read': emit({'id':q['id'],'result':{'thread':{'id':'cancel-thread','turns':[{'id':'cancel-turn','status':'interrupted' if goal['status']=='blocked' else 'inProgress'}]}}})
+      elif m=='thread/read': emit({'id':q['id'],'result':{'thread':{'id':'cancel-thread','status':{'type':'idle' if goal['status']=='blocked' else 'active'},'turns':[{'id':'cancel-turn','status':'interrupted' if goal['status']=='blocked' else 'inProgress'}]}}})
     """)
 
     File.chmod!(binary, 0o755)
@@ -659,7 +659,8 @@ defmodule SymphonyElixir.ExecutionTest do
 
     File.write!(binary, """
     #!/usr/bin/env python3
-    import json,sys
+    import json,sys,pathlib
+    mode=pathlib.Path(#{Jason.encode!(Path.join(root, "stop-mode"))}).read_text()
     def emit(x): print(json.dumps(x),flush=True)
     goal=None
     for line in sys.stdin:
@@ -672,8 +673,11 @@ defmodule SymphonyElixir.ExecutionTest do
         emit({'id':q['id'],'result':{'goal':goal}})
         if p['status']=='active': emit({'method':'turn/started','params':{'threadId':'cancel-thread','turn':{'id':'cancel-turn'}}})
       elif m=='turn/interrupt': emit({'id':q['id'],'result':{}})
-      elif m=='thread/turns/list': emit({'id':q['id'],'result':{'data':[{'id':'cancel-turn','status':'inProgress'}],'nextCursor':None}})
-      elif m=='thread/read': emit({'id':q['id'],'result':{'thread':{'id':'cancel-thread','turns':[{'id':'cancel-turn','status':'inProgress'}]}}})
+      elif m=='thread/turns/list':
+        if mode=='unknown-prefix' and p.get('cursor') is None: data=[{'id':'earlier','status':'unknown'}];cursor='later'
+        else: data=[{'id':'cancel-turn','status':'interrupted' if mode=='unknown-prefix' else 'inProgress'}];cursor=None
+        emit({'id':q['id'],'result':{'data':data,'nextCursor':cursor}})
+      elif m=='thread/read': emit({'id':q['id'],'result':{'thread':{'id':'cancel-thread','status':{'type':'idle' if mode=='unknown-prefix' else 'active'},'turns':[]}}})
     """)
 
     File.chmod!(binary, 0o755)
@@ -685,20 +689,24 @@ defmodule SymphonyElixir.ExecutionTest do
     )
 
     assert :ok = WorkflowStore.force_reload()
-    {:ok, session} = AppServer.start_session(workspace)
 
-    try do
-      assert {:error, :scheduler_stop} =
-               AppServer.run_goal(session, "fixture", issue,
-                 deadline: System.monotonic_time(:millisecond) + 3_000,
-                 latest_turn: fn -> "cancel-turn" end,
-                 on_message: fn event -> if event.event == :session_started, do: send(self(), :symphony_stop) end,
-                 on_goal_stopped: fn confirmed -> send(self(), {:confirmed, confirmed}) end
-               )
+    for mode <- ["active", "unknown-prefix"] do
+      File.write!(Path.join(root, "stop-mode"), mode)
+      {:ok, session} = AppServer.start_session(workspace)
 
-      assert_receive {:confirmed, false}
-    after
-      AppServer.stop_session(session)
+      try do
+        assert {:error, :scheduler_stop} =
+                 AppServer.run_goal(session, "fixture", issue,
+                   deadline: System.monotonic_time(:millisecond) + 3_000,
+                   latest_turn: fn -> "cancel-turn" end,
+                   on_message: fn event -> if event.event == :session_started, do: send(self(), :symphony_stop) end,
+                   on_goal_stopped: fn confirmed -> send(self(), {:confirmed, confirmed}) end
+                 )
+
+        assert_receive {:confirmed, false}
+      after
+        AppServer.stop_session(session)
+      end
     end
   end
 

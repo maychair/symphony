@@ -149,6 +149,9 @@ Native stop reads thread metadata without history hydration and follows every
 `thread/turns/list` page in ascending order, with item content omitted. An empty
 metadata `turns` array proves nothing. Missing pages, repeated cursors and active
 or unknown turn states retain the execution fence. Stop never resumes a thread.
+Goal error/cancellation callbacks use that same halt operation before recording
+stop confirmation, then read back the paused/blocked/terminal Goal state. A
+terminal last turn alone cannot hide an earlier unknown or active turn.
 
 Native review CLI and Git commands receive the captured repository environment
 without changing the service process environment. Manual journal identity uses

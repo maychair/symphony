@@ -328,30 +328,25 @@ defmodule SymphonyElixir.Codex.AppServer do
     turn_id = Keyword.get(opts, :latest_turn, fn -> nil end).()
 
     with :ok <- Keyword.get(opts, :before_goal_stop, fn -> :ok end).(),
-         {:ok, goal} <- halt_goal(session),
-         true <- goal["threadId"] == session.thread_id do
-      emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
-
-      if is_binary(turn_id) do
-        send_message(session.port, %{
-          "id" => @goal_interrupt_id,
-          "method" => "turn/interrupt",
-          "params" => %{"threadId" => session.thread_id, "turnId" => turn_id}
-        })
-
-        await_response(session.port, @goal_interrupt_id)
-      end
-
-      case read_thread(session.port, session.thread_id, @goal_inspect_id) do
-        {:ok, %{"thread" => thread}} -> thread["id"] == session.thread_id and reconciled_turn?(thread, turn_id || :no_turns)
-        _ -> false
-      end
+         {:ok, _thread} <- halt_session(session, expected_turn_id: turn_id || :no_turns),
+         {:ok, goal} <- read_goal(session) do
+      confirm_halted_goal(goal, session, opts)
     else
       _ -> false
     end
   rescue
     _ -> false
   end
+
+  defp confirm_halted_goal(nil, _session, _opts), do: true
+
+  defp confirm_halted_goal(%{"status" => status} = goal, session, opts)
+       when status in ["paused", "blocked", "usageLimited", "budgetLimited", "complete"] do
+    emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
+    true
+  end
+
+  defp confirm_halted_goal(_, _, _), do: false
 
   defp halt_goal(session) do
     with {:ok, goal} when is_map(goal) <- read_goal(session) do
