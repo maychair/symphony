@@ -50,11 +50,11 @@ defmodule SymphonyElixir.AppServerTest do
     binary = Path.join(root, "paged-server")
     trace = Path.join(root, "paged-requests.jsonl")
 
-    for mode <- ["complete", "failed-page", "repeated-cursor", "unknown-state"] do
+    for mode <- ["complete", "failed-page", "repeated-cursor", "unknown-state", "unknown-prefix", "unknown-prefix-missing"] do
       File.write!(binary, """
       #!/usr/bin/env python3
       import json,sys
-      stopped=False;mode=#{inspect(mode)}
+      mode=#{inspect(mode)};stopped=mode.startswith("unknown-prefix")
       for line in sys.stdin:
         q=json.loads(line);m=q.get('method');p=q.get('params',{})
         with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
@@ -66,7 +66,7 @@ defmodule SymphonyElixir.AppServerTest do
           r={'thread':{'id':'paged','status':{'type':'idle' if stopped else 'active'},'turns':[]}}
         elif m=='thread/turns/list':
           assert p['itemsView']=='notLoaded' and p['sortDirection']=='asc'
-          if p.get('cursor') is None:r={'data':[{'id':'old','status':'completed'}],'nextCursor':'page2'}
+          if p.get('cursor') is None:r={'data':[{'id':'old','status':'unknown' if mode.startswith('unknown-prefix') else 'completed'}],'nextCursor':'page2'}
           elif mode=='failed-page':
             print(json.dumps({'id':q['id'],'error':{'code':-32601,'message':'unavailable'}}),flush=True);continue
           else:r={'data':[{'id':'later','status':'unknown' if mode=='unknown-state' else 'interrupted' if stopped else 'inProgress'}],'nextCursor':'page2' if mode=='repeated-cursor' else None}
@@ -78,7 +78,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.chmod!(binary, 0o755)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
-      result = SymphonyElixir.NativeStop.confirm(%{"thread_id" => "paged", "workspace" => workspace, "turn_id" => "old"})
+      expected = if mode == "unknown-prefix", do: "later", else: if(mode == "unknown-prefix-missing", do: "missing", else: "old")
+      result = SymphonyElixir.NativeStop.confirm(%{"thread_id" => "paged", "workspace" => workspace, "turn_id" => expected})
 
       if mode == "complete" do
         assert {:ok, %{"native_stop_confirmed" => true, "turn_id" => "later"}} = result

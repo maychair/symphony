@@ -266,7 +266,7 @@ defmodule SymphonyElixir.ReviewAxis do
 
     with :ok <- valid_representation(kind, representation),
          :ok <- valid_offset(offset, consumed, representation) do
-      fetch_page(reader, kind, path, args, representation, state)
+      fetch_page(reader, kind, path, args, state)
     end
   end
 
@@ -280,12 +280,12 @@ defmodule SymphonyElixir.ReviewAxis do
       else: {:error, :invalid_or_skipped_read_offset}
   end
 
-  defp fetch_page(reader, kind, path, args, representation, state) do
+  defp fetch_page(reader, kind, path, args, state) do
     previous = get_in(state, [:read_evidence, {kind, path}])
 
     with {:ok, page} <- native_page(reader, args),
          :ok <- unchanged_input(previous, page) do
-      if representation != "raw", do: record_page(kind, path, page, state)
+      record_page(kind, path, page, state)
       {:ok, Jason.encode!(page)}
     else
       error ->
@@ -301,14 +301,30 @@ defmodule SymphonyElixir.ReviewAxis do
   defp record_page(kind, path, page, state) do
     key = {kind, path}
     finish = page["offset"] + byte_size(page["content"])
-    pages = Map.put(Map.get(state, :pages, %{}), key, max(get_in(state, [:pages, key]) || 0, finish))
-    sizes = Map.put(Map.get(state, :read_sizes, %{}), key, page["total_bytes"])
+    raw = page["representation"] == "raw"
+    pages = Map.put_new(Map.get(state, :pages, %{}), key, 0)
+    sizes = Map.get(state, :read_sizes, %{})
+    pages = if raw, do: pages, else: Map.update!(pages, key, &max(&1, finish))
+    sizes = if raw, do: sizes, else: Map.put(sizes, key, page["total_bytes"])
     files_read = Enum.any?(pages, fn {{type, _}, _} -> type == "file" end) and Enum.all?(pages, fn {key, read} -> read == sizes[key] end)
     updated = state |> Map.put(:pages, pages) |> Map.put(:read_sizes, sizes) |> Map.put(:files_read, files_read)
-    evidence = page |> Map.take(["kind", "path", "representation", "raw_bytes", "raw_sha256", "total_bytes"]) |> Map.put("read_bytes", pages[key])
+    evidence = read_evidence(page, get_in(state, [:read_evidence, key]) || %{}, pages[key])
     updated = Map.update(updated, :read_evidence, %{key => evidence}, &Map.put(&1, key, evidence))
     updated = if kind == "diff", do: Map.put(updated, :diff_read, pages[key] == sizes[key]), else: updated
     Process.put(__MODULE__, updated)
+  end
+
+  defp read_evidence(%{"representation" => "raw"} = page, previous, consumed) do
+    sample = Map.take(page, ["offset"]) |> Map.put("read_bytes", byte_size(page["content"]))
+
+    previous
+    |> Map.merge(Map.take(page, ["kind", "path", "raw_bytes", "raw_sha256"]))
+    |> Map.put("read_bytes", consumed)
+    |> Map.update("raw_samples", [sample], &Enum.uniq(&1 ++ [sample]))
+  end
+
+  defp read_evidence(page, previous, consumed) do
+    previous |> Map.merge(Map.take(page, ["kind", "path", "representation", "raw_bytes", "raw_sha256", "total_bytes"])) |> Map.put("read_bytes", consumed)
   end
 
   defp read_failure(state) do

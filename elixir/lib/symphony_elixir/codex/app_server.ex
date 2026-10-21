@@ -711,6 +711,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp reconciled_observation(thread, opts) do
+    if opts[:halt_only] == true and not halted_observation?(thread["turns"] || [], opts) do
+      {:error, :native_turn_not_reconciled}
+    else
+      reconcile_expected_turn(thread, opts)
+    end
+  end
+
+  defp reconcile_expected_turn(thread, opts) do
     turns = thread["turns"] || []
     expected = opts[:expected_turn_id]
     index = Enum.find_index(turns, &(&1["id"] == expected))

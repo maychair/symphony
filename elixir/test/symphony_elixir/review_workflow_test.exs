@@ -318,6 +318,40 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     end
   end
 
+  test "a raw first read registers structural coverage and pins input before any structural read", %{context: c, root: root} do
+    File.write!(Path.join(root, ".fixture-diff"), "diff\n")
+    for path <- ["first.c", "second.c", "mutable.c"], do: File.write!(Path.join(root, path), "source\n")
+
+    reader = %{
+      backend: SymphonyElixir.ReviewWorkflowTest.ReaderBackend,
+      session: %{workspace: root},
+      base: c.record["base"],
+      head: c.record["head"]
+    }
+
+    Process.put(ReviewAxis, %{context: c, reader: reader, event: fn _ -> :ok end, result: nil, diff_read: false, files_read: false})
+    submit = %{"status" => "complete", "report" => "核对当前输入", "findings" => []}
+
+    for args <- [%{"kind" => "diff"}, %{"kind" => "file", "path" => "first.c"}] do
+      assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_read", args, [])
+    end
+
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    raw = %{"kind" => "file", "path" => "second.c", "representation" => "raw"}
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_read", raw, [])
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    assert Process.get(ReviewAxis).read_evidence[{"file", "second.c"}]["read_bytes"] == 0
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_read", Map.delete(raw, "representation"), [])
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+    raw = %{raw | "path" => "mutable.c"}
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_read", raw, [])
+    assert [%{"offset" => 0, "read_bytes" => 7}] = Process.get(ReviewAxis).read_evidence[{"file", "mutable.c"}]["raw_samples"]
+    File.write!(Path.join(root, "mutable.c"), "replacement\n")
+    assert %{"success" => false, "output" => ":review_input_changed"} = ReviewAxis.execute_agent_tool("review_read", raw, [])
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_read", Map.delete(raw, "representation"), [])
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
+  end
+
   defmodule Backend do
     import ExUnit.Assertions
 
