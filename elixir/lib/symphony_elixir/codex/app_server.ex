@@ -111,29 +111,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     %{executor: executor, thread_id: thread_id, turn_id: turn_id, strict: strict}
   end
 
-  @doc "Execute a bounded read probe with the same native read-only policy as a review turn."
-  @spec review_read(session(), [String.t()]) :: {:ok, String.t()} | {:error, term()}
-  def review_read(%{port: port, turn_sandbox_policy: %{"type" => "readOnly"} = policy, workspace: workspace}, argv) do
-    send_message(port, %{
-      "id" => 91,
-      "method" => "command/exec",
-      "params" => %{
-        "command" => argv,
-        "cwd" => workspace,
-        "sandboxPolicy" => policy,
-        "timeoutMs" => 15_000,
-        "outputBytesCap" => 4_194_305
-      }
-    })
-
-    case await_response(port, 91, true) do
-      {:ok, %{"exitCode" => 0, "stdout" => output}} when byte_size(output) <= 4_194_304 -> {:ok, output}
-      {:ok, %{"exitCode" => 0}} -> {:error, :review_read_output_limit}
-      {:ok, %{"exitCode" => code}} -> {:error, {:review_read_exit, code}}
-      other -> {:error, {:review_read_failed, other}}
-    end
-  end
-
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
         %{
@@ -551,7 +528,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp session_policies(workspace, nil, opts) do
-    if Keyword.get(opts, :review_only, false) or get_in(opts[:run_record] || %{}, ["execution_binding", "role"]) == "verifier" do
+    if get_in(opts[:run_record] || %{}, ["execution_binding", "role"]) == "verifier" do
       {:ok, %{approval_policy: "never", thread_sandbox: "read-only", turn_sandbox_policy: %{"type" => "readOnly"}}}
     else
       Config.codex_runtime_settings(workspace)
@@ -693,15 +670,32 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case await_response(port, request_id) do
       {:ok, %{"data" => turns, "nextCursor" => next}} when is_list(turns) ->
-        cond do
-          not Enum.all?(turns, &match?(%{"id" => id, "status" => status} when is_binary(id) and is_binary(status), &1)) -> {:error, :invalid_native_turn_page}
-          is_nil(next) -> {:ok, pages |> Enum.reverse([turns]) |> List.flatten()}
-          not is_binary(next) or Map.has_key?(seen, next) -> {:error, :invalid_native_turn_cursor}
-          true -> read_turns(port, thread_id, request_id, next, Map.put(seen, next, true), [turns | pages])
-        end
+        consume_turn_page(port, thread_id, request_id, turns, next, seen, pages)
+
+      {:error, {:response_error, %{"code" => -32_600, "message" => msg}}} = error ->
+        if is_nil(cursor) and pages == [] and is_binary(msg) and
+             String.starts_with?(msg, "thread #{thread_id} is not materialized yet;"),
+           do: {:ok, []},
+           else: {:error, {:native_turn_page_unavailable, error}}
 
       error ->
         {:error, {:native_turn_page_unavailable, error}}
+    end
+  end
+
+  defp consume_turn_page(port, thread_id, request_id, turns, next, seen, pages) do
+    cond do
+      not Enum.all?(turns, &match?(%{"id" => id, "status" => status} when is_binary(id) and is_binary(status), &1)) ->
+        {:error, :invalid_native_turn_page}
+
+      is_nil(next) ->
+        {:ok, pages |> Enum.reverse([turns]) |> List.flatten()}
+
+      not is_binary(next) or Map.has_key?(seen, next) ->
+        {:error, :invalid_native_turn_cursor}
+
+      true ->
+        read_turns(port, thread_id, request_id, next, Map.put(seen, next, true), [turns | pages])
     end
   end
 

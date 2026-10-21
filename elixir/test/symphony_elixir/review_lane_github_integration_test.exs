@@ -59,7 +59,8 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
       "publisher_id" => 20,
       "projects" => %{"team/repo" => %{"id" => 10, "checkout" => source}},
       "state_dir" => Path.join(root, "state"),
-      "instructions_file" => Path.join(root, "instructions"),
+      "instruction_files" => [Path.join(root, "instructions")],
+      "result_command" => SymphonyElixir.TestSupport.workflow_result_command(),
       "gh_bin" => cli
     }
 

@@ -119,3 +119,12 @@ recorded separately. Missing/invalid evidence cannot confer authorization. See t
 delegated decision protocol in `elixir/docs/task-workflow.md` (repository root).
 
 Review execution uses one workflow for manual and automatic requests: independent Standards and Spec reviewers, explicit completion evidence, and one result renderer. A complete clean review renders exactly `LGTM!`; incomplete reviews fail. See [the review contract](elixir/docs/review-workflow.md).
+
+## Review workflow boundary
+
+Automatic review executes integration-supplied Workflow/Playbook instructions
+through the ordinary native session. Symphony owns admission, execution and
+publication receipts; review stages and result criteria are supplied externally.
+Manual review uses the same assets without this service. See the
+[Review contract](elixir/docs/review-workflow.md). Historical execution records
+are retained for audit, never automatically replayed by this change.

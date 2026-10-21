@@ -16,7 +16,8 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
       "publisher_id" => 20,
       "projects" => %{"team/repo" => %{"id" => 10, "checkout" => root}},
       "state_dir" => root,
-      "instructions_file" => instructions
+      "instruction_files" => [instructions],
+      "result_command" => SymphonyElixir.TestSupport.workflow_result_command()
     }
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
@@ -25,13 +26,13 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
       assert {:error, :unknown_review_configuration} = ReviewLane.validate_config(%{provider: %{"review_lane" => Map.put(config, key, value)}})
     end
 
-    assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config |> Map.delete("instructions_file") |> Map.put("policy_file", instructions)}})
+    assert {:error, :unknown_review_configuration} = ReviewLane.validate_config(%{provider: %{"review_lane" => Map.put(config, "policy_file", instructions)}})
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => %{config | "provider" => "github"}}})
     assert {:error, :mail_review_retired_migration_required} = ReviewLane.validate_config(%{provider: %{"mail_review" => config}})
 
-    File.write!(instructions, "Legacy review instructions without the shared axes")
-    assert {:error, :shared_review_policy_unavailable} = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
+    File.write!(instructions, "")
+    assert {:error, :workflow_instructions_unavailable} = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
     File.write!(instructions, "## Common\nRead evidence.\n## Standards\nRead standards.\n## Spec\nVerify scope.\n")
 
     for {key, value, reason} <- [
@@ -46,7 +47,11 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
           {"projects", %{"team/repo" => %{"checkout" => "relative"}}, :review_lane_invalid_projects},
           {"state_dir", "relative", :review_lane_absolute_state_required},
           {"poll_interval_ms", -1, :review_lane_poll_interval_required},
-          {"instructions_file", root, :review_lane_instructions_file_required}
+          {"result_command", nil, :workflow_result_command_required},
+          {"result_command", ["python3", 1], :workflow_result_command_required},
+          {"model_settings", "invalid", :invalid_workflow_model_settings},
+          {"model_settings", %{"sandbox_mode" => "danger-full-access"}, :invalid_workflow_model_settings},
+          {"instruction_files", [root], :workflow_instructions_unavailable}
         ] do
       assert {:error, ^reason} = ReviewLane.validate_config(%{provider: %{"review_lane" => Map.put(config, key, value)}})
     end
@@ -54,10 +59,8 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     System.put_env("SYMPHONY_TEST_REVIEW_VALUE", "fixture")
     on_exit(fn -> System.delete_env("SYMPHONY_TEST_REVIEW_VALUE") end)
     assert %{"key" => ["fixture", 2]} == ReviewLane.resolve(%{"key" => ["$SYMPHONY_TEST_REVIEW_VALUE", 2]})
-    assert ReviewLane.binding().adapter == ReviewLane
     assert ReviewLane.job?(%Issue{id: "review:id", native_ref: %{"execution_kind" => "review_lane"}})
     refute ReviewLane.job?(%Issue{id: "normal"})
-    assert %{"success" => false} = ReviewLane.execute_agent_tool("unknown", %{}, [])
   end
 
   test "response versions distinguish new replies, edits and resolution from repeated or irrelevant observations" do
@@ -92,6 +95,7 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     mr = %{"author" => %{"id" => 30}}
 
     refute Policy.prior_review?([], mr, config)
+    refute Policy.prior_review?([nil, %{}, %{"notes" => [nil]}], mr, config)
 
     # Approved MR checks
     assert Policy.prior_review?([], Map.put(mr, "approved", true), config)

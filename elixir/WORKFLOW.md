@@ -4,6 +4,8 @@ tracker:
   # assignee: "20"
   kind: linear
   provider:
+    # Optional review_lane uses instruction_files: [absolute Workflow, Playbook]
+    # and result_command: [executable, validator]. No stage logic belongs here.
     project_slug: "symphony-0c79b11b75ea"
   required_labels: []
   active_states:

@@ -1,9 +1,8 @@
 defmodule SymphonyElixir.ReviewRequest do
   @moduledoc """
-  Normalizes manual and automatic review requests into the fixed ReviewWorkflow context.
+  Prepares fixed review source context for the admitted native target.
 
-  Preparation owns source acquisition and provider reads only. Policy loading,
-  prompts, axis execution and result reduction remain in ReviewWorkflow.
+  Preparation owns source acquisition and provider reads only. Instruction loading and native execution belong to the caller.
   """
 
   alias SymphonyElixir.ReviewLane.{GitHub, GitLab}

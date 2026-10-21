@@ -40,7 +40,7 @@ defmodule SymphonyElixir.WorkflowCapabilityTest do
              {"plan_manifest", 2} => 2,
              {"review_finding", 1} => 1,
              {"review_lane", 3} => 3,
-             {"review_workflow", 2} => 2,
+             {"review_workflow", 3} => 3,
              {"task_workflow", 2} => 2,
              {"taskboard_projection", 1} => 1,
              {"work_ref", 1} => 1,

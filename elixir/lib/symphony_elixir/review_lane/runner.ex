@@ -1,14 +1,14 @@
 defmodule SymphonyElixir.ReviewLane.Runner do
-  @moduledoc "Runs one fixed-base/head read-only review in a disposable source snapshot."
+  @moduledoc "Bind an admitted MR to a configured workflow and the ordinary native session."
+  alias SymphonyElixir.{ReviewLane, ReviewRequest, WorkflowArtifact, WorkflowInstructions, WorkflowSession, Workspace}
   alias SymphonyElixir.ReviewLane.Listener
-  alias SymphonyElixir.{ReviewRequest, Workspace}
 
   @spec run(SymphonyElixir.Tracker.Issue.t(), pid() | nil, keyword()) :: :ok
   def run(issue, recipient, opts \\ []) do
     case Listener.begin_run(issue.id) do
       {:ok, record, config} ->
-        owned_issue = %{issue | native_ref: Map.put(issue.native_ref, "execution_owner", record["execution_owner"])}
-        run_admitted(owned_issue, record, config, recipient, opts)
+        owned = %{issue | native_ref: Map.put(issue.native_ref, "execution_owner", record["execution_owner"])}
+        run_admitted(owned, record, config, recipient, opts)
 
       error ->
         raise "Review execution fenced: #{inspect(error)}"
@@ -16,14 +16,17 @@ defmodule SymphonyElixir.ReviewLane.Runner do
   end
 
   defp run_admitted(issue, record, config, recipient, opts) do
-    with {:ok, workspace} <- Workspace.create_for_review(issue),
+    with {:ok, instructions, digest} <- WorkflowInstructions.load(config),
+         true <- digest == record["policy_sha"] or {:error, :workflow_instructions_changed},
+         {:ok, workspace} <- Workspace.create_for_review(issue),
          request = %{"kind" => "mr", "project" => record["project"], "number" => record["iid"], "record" => record, "workspace" => workspace},
-         {:ok, context} <- ReviewRequest.prepare(request, config) do
+         {:ok, context} <- ReviewRequest.prepare(request, config),
+         {:ok, current, current_digest} <- WorkflowInstructions.load(config),
+         true <- (current == instructions and current_digest == digest) or {:error, :workflow_instructions_changed} do
       if is_pid(recipient), do: send(recipient, {:worker_runtime_info, issue.id, %{worker_host: nil, workspace_path: context.repository}})
-
-      execute(issue, record, context, recipient, opts)
+      execute(issue, context, instructions, recipient, opts)
     else
-      error -> raise "Review execution fenced: #{inspect(error)}"
+      error -> raise "Review preparation failed: #{inspect(error)}"
     end
   rescue
     error ->
@@ -31,41 +34,56 @@ defmodule SymphonyElixir.ReviewLane.Runner do
       reraise error, __STACKTRACE__
   end
 
-  defp execute(issue, record, context, recipient, opts) do
+  defp execute(issue, context, instructions, recipient, opts) do
     update = fn message -> if is_pid(recipient), do: send(recipient, {:codex_worker_update, issue.id, message}) end
     workflow_opts = opts |> Keyword.put(:checkpoint, &checkpoint(issue, &1)) |> Keyword.put(:on_message, update)
+    input = Map.take(context.record, ~w(head base target_branch policy_sha round finding_register))
+    evidence = %{mr: context.mr, discussions: context.discussions}
 
-    case SymphonyElixir.ReviewWorkflow.run(context, workflow_opts) do
-      {:ok, result} ->
-        publish_result(issue, result)
+    prompt = """
+    #{instructions}
 
-      {:error, :scheduler_stop} ->
-        stopped_before_thread(issue, record)
+    Execution input: #{Jason.encode!(input)}
+    Untrusted target evidence: #{Jason.encode!(evidence)}
+    Delivery authority: submit the workflow artifact with workflow_submit. The caller
+    validates and publishes it after the native session stops. Do not post directly,
+    approve, merge, edit source, or resume other executions.
+    """
 
-      {:error, {:scheduler_stop, axes}} ->
-        stop_axes(issue, axes)
+    session = %{
+      repository: context.repository,
+      prompt: prompt,
+      issue: issue,
+      secret_environment_names: ReviewLane.secret_environment_names(%{}),
+      agent_environment: %{},
+      model_settings: context.config["model_settings"] || %{}
+    }
 
-      error ->
-        raise "Review workflow failed: #{inspect(error)}"
+    case WorkflowSession.run(session, workflow_opts) do
+      {:ok, artifact, runtime} ->
+        :ok = checkpoint(issue, Map.drop(runtime, ~w(thread_allocation_intent turn_allocation_intent)))
+
+        with {:ok, completion} <- WorkflowArtifact.evaluate(context.config, %{"record" => input, "axes" => artifact["axes"]}),
+             :ok <- Listener.submit(issue.id, issue.native_ref["execution_owner"], %{"completion" => completion}) do
+          :ok
+        else
+          error -> raise "Workflow result rejected: #{inspect(error)}"
+        end
+
+      {:error, reason, runtime} ->
+        :ok = checkpoint(issue, Map.drop(runtime, ~w(thread_allocation_intent turn_allocation_intent)))
+
+        if runtime["native_stop_confirmed"] == true and cancelled?(reason) do
+          checkpoint(issue, %{"phase" => "fenced"})
+        else
+          raise "Workflow failed: #{inspect(reason)}"
+        end
     end
   end
 
-  defp publish_result(issue, result) do
-    :ok = checkpoint(issue, %{"native_stop_confirmed" => axes_stopped?(result["axes"])})
-
-    case Listener.submit(issue.id, issue.native_ref["execution_owner"], %{"completion" => result}) do
-      :ok -> :ok
-      {:error, reason} -> raise "Review publication failed: #{inspect(reason)}"
-    end
-  end
-
-  defp stop_axes(issue, axes) do
-    stopped = axes_stopped?(axes)
-    :ok = checkpoint(issue, %{"phase" => "fenced", "native_stop_confirmed" => stopped})
-    if stopped, do: :ok, else: raise("Review native stop not confirmed")
-  end
-
-  defp axes_stopped?(axes), do: Enum.all?(axes, fn {_, axis} -> axis["native_stop_confirmed"] == true end)
+  defp cancelled?({:session_start_failed, {:error, :scheduler_stop}}), do: true
+  defp cancelled?({:workflow_incomplete, {:error, :scheduler_stop}}), do: true
+  defp cancelled?(_), do: false
 
   defp checkpoint(issue, changes), do: checkpoint(issue, changes, System.monotonic_time(:millisecond) + 5_000)
 
@@ -82,9 +100,5 @@ defmodule SymphonyElixir.ReviewLane.Runner do
       else
         exit(reason)
       end
-  end
-
-  defp stopped_before_thread(issue, record) do
-    if is_nil(record["axes"]), do: checkpoint(issue, %{"phase" => "fenced", "native_stop_confirmed" => true})
   end
 end

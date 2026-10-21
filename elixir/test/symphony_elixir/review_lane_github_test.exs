@@ -76,16 +76,17 @@ defmodule SymphonyElixir.ReviewLaneGitHubTest do
       "publisher_id" => 20,
       "projects" => %{"team/repo" => %{"id" => 10, "checkout" => root}},
       "state_dir" => root,
-      "instructions_file" => instructions
+      "instruction_files" => [instructions],
+      "result_command" => SymphonyElixir.TestSupport.workflow_result_command()
     }
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
-    assert "GITLAB_PAT" in ReviewLane.binding().secret_environment_names
-    assert "GITLAB_ACCESS_TOKEN" in ReviewLane.binding().secret_environment_names
+    assert "GITLAB_PAT" in ReviewLane.secret_environment_names(%{})
+    assert "GITLAB_ACCESS_TOKEN" in ReviewLane.secret_environment_names(%{})
     assert "GITHUB_TOKEN" in ReviewLane.secret_environment_names(%{"provider" => "github"})
     assert "GH_TOKEN" in ReviewLane.secret_environment_names(%{"provider" => "github"})
-    assert "GH_ENTERPRISE_TOKEN" in ReviewLane.binding().secret_environment_names
-    assert "GITHUB_ENTERPRISE_TOKEN" in ReviewLane.binding().secret_environment_names
+    assert "GH_ENTERPRISE_TOKEN" in ReviewLane.secret_environment_names(%{})
+    assert "GITHUB_ENTERPRISE_TOKEN" in ReviewLane.secret_environment_names(%{})
   end
 
   test "permitted? and helper paths for reviews and issue comments" do
