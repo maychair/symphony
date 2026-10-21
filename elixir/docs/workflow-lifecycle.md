@@ -1256,7 +1256,10 @@ review_lane:
   reviewer_id: 123
   publisher_id: 456
   state_dir: /absolute/private/review-state
-  instructions_file: /absolute/trusted/review-instructions.md
+  instruction_files:
+    - /absolute/trusted/workflow.md
+    - /absolute/trusted/playbook.md
+  result_command: [python3, /absolute/trusted/review.py]
   poll_interval_ms: 60000
   webhook_secret: $REVIEW_WEBHOOK_SECRET
   projects:
@@ -1281,24 +1284,17 @@ references, not task content or execution authorization. Duplicate hints coalesc
 failed reads keep the hint across restart. Scans also revisit known requests,
 including completed reviews and requests no longer in the assigned-open listing.
 
-A changed fixed head, base, relevant author response or review-instruction digest
-selects a new round. No-findings results also respond to new pushes. Relevant
-replies need not answer every finding; their IDs/content versions and resolution
-state contribute to a stable response digest. Duplicate polling, unrelated replies
-and the engine's own marked notes do not create a round. Missing finding sources
-block interpretation. Old rounds retain evidence but lose dispatch eligibility.
+Admission requires the configured reviewer and `disabled: false`. Any prior
+human or automated review prevents another automatic execution, including after
+new pushes or instruction changes. Polling and duplicate hints do not create
+another round. Unknown native reads block admission.
 
-Before admission the listener reconciles native state again. Closed, merged or
-unassigned requests lose eligibility; an observed reopening/reassignment may
-start a fresh round after prior native stop is confirmed. Active or uncertain
-threads cannot be replaced because the input changed. `Runner` records thread
-allocation intent and confirms native stop only after the fixed review turn
-completes; merely stopping a process is not that proof. A published result keeps
-its existing worker active until that native completion arrives, while refusing
-another execution of the same round. Restart during this interval fences the
-uncertain thread. Unknown native reads fence eligibility. The review tool is `review_submit`; its only effect is comment
-publication, including an explicit no-findings statement. Native approvals,
-requests for changes and merges remain outside this tool.
+The configured [Review Workflow](review-workflow.md) owns review procedure,
+Standards/Spec criteria and result validation. Runner prepares the selected source
+and starts one ordinary native session. `workflow_submit` records an artifact;
+it neither publishes nor proves completion. The session must finish and its stop
+must be confirmed before validation and native publication. Approval and merge
+remain outside the delivery authority.
 
 `review-lane.json` stores schema-versioned execution records and pending hints.
 A legacy `mail-review.json` beside it blocks startup rather than importing old
@@ -1311,29 +1307,19 @@ live-provider deployment validation remain necessary for the full lifecycle.
 
 ## Review publication receipts
 
-`ReviewLane.Publication` owns a versioned batch of finding comments followed by
-one round conclusion. Each body includes the fixed base/head, round and a digest
-of the native work, response and instruction context. An empty finding set still
-publishes an explicit conclusion. All batch bodies are sealed before the first
-send. A repeated identical submission reads back the original batch; changing a
-sealed submission is rejected.
+`ReviewLane.Publication` delivers one body from the configured result validator.
+It does not render findings or decide whether the review is complete. A repeated
+identical submission reads back the original receipt; changing a sealed
+submission is rejected. Protocol 3 does not execute older multi-comment formats.
 
-Each entry advances from `prepared` to `sending` to `published`. The listener
-syncs the journal and its directory before issuing a POST, and checkpoints each
-read-back receipt separately. POST responses alone never prove delivery. Recovery
-matches the exact native repository, discussion/note IDs, stable publisher ID,
-full body and creation timestamp. Missing confirmed notes, changed content or
-identity, duplicate markers and unexpected comments for never-sent entries are
-conflicts. An absent `sending` entry stays uncertain; it is never blindly resent.
+The intent advances from `prepared` to `sending` to `published`. The journal is
+synced before POST. Only native readback of the returned discussion/note identity,
+publisher, full body and creation timestamp proves delivery. An uncertain send
+is never repeated by guessing from an identical comment.
 
-On restart, reads recover partial receipts even for old rounds. Continuing an
-unsent entry requires confirmed native execution stop and the current head,
-base, reviewer, publisher, policy and response context. The same checks run before
-every new send and after the final readback. Replies to findings published during
-the batch also invalidate its remaining conclusion. A changed version preserves
-old receipts and permits a new round only after native stop; it never moves an
-unfinished old batch onto the new revision. The round is delivered only after
-all findings and its conclusion have native receipts.
+On restart, an unsent artifact can be delivered only with confirmed native stop
+and current scope and publisher authority. Changed revisions retain prior audit
+evidence without creating a replacement review. Recovery never starts an Agent.
 
 Published entries are re-read during reconciliation. Edited, deleted or replaced
 comments no longer count as current delivery evidence. A new push does not bypass

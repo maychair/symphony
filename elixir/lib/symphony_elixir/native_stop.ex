@@ -25,7 +25,7 @@ defmodule SymphonyElixir.NativeStop do
         worker_host: record["worker_host"],
         tracker_settings: Config.settings!().tracker,
         on_thread_observed: fn observation -> send(self(), {:native_stop_observed, ref, observation}) end
-      ] ++ Keyword.take(opts, [:review_only, :dynamic_tool_binding])
+      ] ++ Keyword.take(opts, [:dynamic_tool_binding])
 
     with {:ok, session} <- backend.start_session(workspace, session_opts) do
       try do

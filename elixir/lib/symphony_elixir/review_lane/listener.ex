@@ -10,7 +10,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
   alias SymphonyElixir.ReviewLane.{Finding, GitHub, GitLab, Journal, Owner, Policy, Publication}
 
-  @worker_fields ~w(axes review_protocol policy_sha thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
+  @worker_fields ~w(policy_sha native_stop_error thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]) |> Keyword.put_new(:name, __MODULE__))
@@ -193,24 +193,10 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       changes["phase"] in [nil, "failed", "fenced"] and stop_changes?(record, changes) and
       Enum.all?(~w(thread_allocation_intent turn_allocation_intent), &(not Map.has_key?(changes, &1) or changes[&1] == true)) and
       changes["policy_sha"] in [nil, record["policy_sha"]] and same_thread?(record, changes) and
-      same_runtime?(record, changes) and axis_changes?(record, changes)
+      same_runtime?(record, changes)
   end
 
   defp worker_changes?(_, _), do: false
-
-  defp axis_changes?(record, %{"axes" => axes}) when is_map(axes) do
-    Enum.all?(axes, fn {name, axis} ->
-      name in ["standards", "spec"] and is_map(axis) and same_axis?(get_in(record, ["axes", name]) || %{}, axis)
-    end) and Enum.all?(Map.keys(record["axes"] || %{}), &Map.has_key?(axes, &1))
-  end
-
-  defp axis_changes?(_record, changes), do: not Map.has_key?(changes, "axes")
-
-  defp same_axis?(old, axis) do
-    Enum.all?(~w(thread_id turn_id workspace), &(is_nil(old[&1]) or old[&1] == axis[&1])) and
-      (old["native_stop_confirmed"] != true or axis["native_stop_confirmed"] == true) and
-      Enum.all?(~w(thread_allocation_intent turn_allocation_intent read_failure), &(old[&1] != true or axis[&1] == true))
-  end
 
   defp stop_changes?(record, changes) do
     not (stopped?(record) and (allocation?(changes) or changes["native_stop_confirmed"] == false)) and
@@ -228,10 +214,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp same_thread?(_, _), do: true
 
-  defp allocation?(changes),
-    do:
-      changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true or
-        Enum.any?(changes["axes"] || %{}, fn {_, axis} -> is_map(axis) and (axis["thread_allocation_intent"] == true or axis["turn_allocation_intent"] == true) end)
+  defp allocation?(changes), do: changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true
 
   defp checkpoint_owned(state, record, changes) do
     if allocation_request?(record, changes) do
@@ -249,13 +232,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
-  defp allocation_request?(record, changes) do
-    changes["thread_allocation_intent"] == true or changes["turn_allocation_intent"] == true or
-      Enum.any?(changes["axes"] || %{}, fn {name, axis} ->
-        old = get_in(record, ["axes", name]) || %{}
-        Enum.any?(~w(thread_allocation_intent turn_allocation_intent), &(axis[&1] == true and old[&1] != true))
-      end)
-  end
+  defp allocation_request?(_record, changes), do: allocation?(changes)
 
   defp allocation_allowed?(state, record, changes) do
     state.health != :failed and record["phase"] == "running" and record["eligibility"] == "current" and
@@ -460,7 +437,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp records?(_, _), do: false
 
   defp record?(id, %{} = record, config) do
-    valid_subject?(record, config) and record_shape?(record) and Publication.valid?(record, config["publisher_id"]) and
+    valid_subject?(record, config) and record_shape?(record, config) and Publication.valid?(record, config["publisher_id"]) and
       target_branch?(record["target_branch"]) and
       (is_nil(record["finding_register"]) or Finding.register?(record["finding_register"])) and
       record["work"] == work(config, record["project"], record["iid"]) and
@@ -469,25 +446,25 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp record?(_, _, _), do: false
 
-  defp record_shape?(record) do
+  defp record_shape?(record, config) do
     is_integer(record["round"]) and record["round"] > 0 and
       record["phase"] in ~w(queued running publishing completed failed fenced ended superseded) and
       is_list(record["findings"]) and Enum.all?(record["findings"], &is_map/1) and
       Enum.all?(~w(head base), &valid_sha?(record[&1])) and Enum.all?(~w(policy_sha response_sha), &digest?(record[&1])) and
-      auxiliary_fields?(record)
+      auxiliary_fields?(record, config)
   end
 
-  defp auxiliary_fields?(record) do
+  defp auxiliary_fields?(record, config) do
     (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"])) and
-      completion?(record) and review_gap?(record) and unified_result?(record)
+      completion?(record) and review_gap?(record) and unified_result?(record, config)
   end
 
-  defp unified_result?(%{"review_protocol" => 2, "review_result" => result} = record) do
-    SymphonyElixir.ReviewResult.validate(result, record) == :ok and result["axes"] == record["axes"] and
+  defp unified_result?(%{"review_protocol" => 3, "review_result" => result} = record, config) do
+    SymphonyElixir.WorkflowArtifact.evaluate(config, %{"record" => record, "result" => result}) == {:ok, result} and
       (is_nil(record["review_completion"]) or result["status"] in ["passed", "changes_requested"])
   end
 
-  defp unified_result?(record), do: record["review_protocol"] in [nil, 2] and is_nil(record["review_result"]) and (record["review_protocol"] != 2 or is_nil(record["review_completion"]))
+  defp unified_result?(record, _config), do: record["review_protocol"] == 3 and is_nil(record["review_result"]) and is_nil(record["review_completion"])
 
   defp completion?(%{"review_completion" => completion} = record) when is_map(completion) do
     completion == completion_proof(record) and published_review?(record)
@@ -617,10 +594,10 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp queue(state, project, iid, mr, round, response_sha \\ TaskWorkflow.digest([])) do
     work = work(state.config, project, iid)
     id = round_id(work, round, state.config)
-    register = carried_register(state, project, iid, round)
+    register = %{}
 
     record = %{
-      "review_protocol" => 2,
+      "review_protocol" => 3,
       "id" => id,
       "project" => project,
       "work" => work,
@@ -644,16 +621,6 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     }
 
     {:ok, put_record(state, record)}
-  end
-
-  # Findings keep their identity across rounds of the same MR; a later round
-  # inherits every conclusion an earlier round recorded (§17.1).
-  defp carried_register(state, project, iid, round) do
-    state.records
-    |> Map.values()
-    |> Enum.filter(&(&1["project"] == project and &1["iid"] == iid and &1["round"] < round))
-    |> Enum.sort_by(& &1["round"])
-    |> Enum.reduce(%{}, fn record, acc -> Map.merge(acc, record["finding_register"] || %{}) end)
   end
 
   defp work(config, project, iid) do
@@ -767,21 +734,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       responses != record["response_sha"] or policy_changed?(config, record) or record["phase"] == "ended"
   end
 
-  # A protocol upgrade does not authorize rerunning a completed legacy review.
-  # Native revision/reply changes still admit a new round under the current protocol.
-  defp policy_changed?(config, record) do
-    if record["phase"] == "completed" and is_nil(record["review_protocol"]),
-      do: false,
-      else: policy_sha(config) != record["policy_sha"]
-  end
+  defp policy_changed?(config, record), do: policy_sha(config) != record["policy_sha"]
 
   # Retargeting changes the integration context even when head and merge base
   # are unchanged, so the previous round can no longer prove the new target.
   defp target_changed?(record, mr), do: mr["target_branch"] != record["target_branch"]
-
-  defp stopped?(%{"axes" => axes} = record) when is_map(axes) and map_size(axes) > 0 do
-    record["native_stop_confirmed"] == true and Enum.all?(axes, fn {_, axis} -> axis["native_stop_confirmed"] == true end)
-  end
 
   defp stopped?(record) do
     record["native_stop_confirmed"] == true or
@@ -789,7 +746,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp policy_sha(config) do
-    {:ok, _rules, sha} = SymphonyElixir.ReviewWorkflow.rules(config)
+    {:ok, _rules, sha} = SymphonyElixir.WorkflowInstructions.load(config)
     sha
   end
 
@@ -815,9 +772,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     record = state.records[record_key(id)]
 
     with true <- publishable?(record),
-         :ok <- SymphonyElixir.ReviewResult.validate(completion, record),
-         true <- completion["axes"] == record["axes"] and stopped?(record),
-         {:ok, submission} <- Finding.validate(%{"findings" => completion["findings"], "responses" => completion["responses"]}, record),
+         {:ok, ^completion} <- SymphonyElixir.WorkflowArtifact.evaluate(state.config, %{"record" => record, "result" => completion}),
+         true <- stopped?(record),
+         submission = Map.take(completion, ~w(findings responses)),
          record = record |> Map.put("review_result", completion) |> register(submission),
          {:ok, record} <- Publication.prepare(record, submission, state.config["publisher_id"]) do
       record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")

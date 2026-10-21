@@ -1,18 +1,15 @@
 # Symphony Elixir
 
-Standalone preflight reports `review_workflow` protocol 2 for package verification
-and rejects enabled review lanes with obsolete shared-policy sections. Completed
-legacy reviews remain historical when only deployment policy changes.
+Standalone preflight reports `review_workflow` protocol 3. Automatic review uses
+configured Workflow/Playbook instructions in an ordinary native session and an
+external artifact validator. Manual review uses those same assets independently
+of Symphony. The former engine review pipeline and restricted reader are removed.
+See [review workflow](docs/review-workflow.md) for configuration and lifecycle.
 
-Automatic MR/PR review records appear in the Taskboard alongside repository
-Issues. Review cards use native reviewer eligibility and confirmed publication,
-independently of Issue routing labels. Manual review records are excluded; board
-reads never trigger execution. See [review workflow](docs/review-workflow.md).
-
-Review source transport pages large text inside the native read-only sandbox.
-Opaque hex literals expose explicit size/hash evidence and bounded original-byte
-inspection; missing required data validation remains non-pass. Native stop checks
-metadata and every paginated turn rather than hydrating full thread history.
+Automatic MR/PR review records appear in the Taskboard; manual reviews do not.
+Done requires fixed-scope review completion and confirmed native publication.
+Native stop checks metadata and every paginated turn, retaining uncertainty when
+stop cannot be verified. Historical audit records are retained but not replayed.
 
 This directory contains the current Elixir/OTP implementation of Symphony, based on
 [`SPEC.md`](../SPEC.md) at the repository root.
@@ -548,4 +545,4 @@ GitLab task workflows can verify signed Coordinator relays with
 recorded separately. Missing/invalid evidence cannot confer authorization. See the
 delegated decision protocol in `elixir/docs/task-workflow.md` (repository root).
 
-Manual and discovered reviews share `ReviewWorkflow` and `ReviewResult`; see [the review contract](docs/review-workflow.md). Source reads and both native reviewer completions are required before a clean result. Review components never approve or merge.
+Manual and discovered reviews use the same configured Workflow, Playbook and external artifact validator; see [the review contract](docs/review-workflow.md). The Workflow owns Standards and Spec completion. Symphony owns native execution and delivery receipts. Review components never approve or merge.

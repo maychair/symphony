@@ -4,8 +4,7 @@ defmodule SymphonyElixir.ReviewFindingTest do
 
   A finding keeps a stable identity across rounds, records the version it applies
   to and the violated criterion, separates advice from required conditions, and is
-  only settled by the independent reviewer. The frozen v1 sentence shape stays
-  readable, and every other shape is refused rather than silently degraded (§13.1).
+  only settled by the reviewer. Old string-list submissions are rejected.
   """
 
   use SymphonyElixir.TestSupport, runtime: false
@@ -14,95 +13,6 @@ defmodule SymphonyElixir.ReviewFindingTest do
 
   @head String.duplicate("c", 40)
   @base String.duplicate("b", 40)
-
-  describe "submission shape" do
-    test "the frozen v1 sentence shape stays readable and publishable" do
-      assert {:ok, []} = Finding.validate(%{"findings" => []}, record())
-      assert {:ok, ["空输入导致越界，见 source.cpp:10。"]} = Finding.validate(%{"findings" => ["空输入导致越界，见 source.cpp:10。"]}, record())
-    end
-
-    test "every unsupported submission shape is refused instead of silently degraded" do
-      for {arguments, reason} <- [
-            {%{}, :invalid_review_submission},
-            {"bad", :invalid_review_submission},
-            {%{"findings" => ["English only"]}, :invalid_review_submission},
-            {%{"findings" => ["请核对空输入。\n/approve"]}, :invalid_review_submission},
-            {%{"findings" => [String.duplicate("中", 6_000)]}, :invalid_review_submission},
-            {%{"findings" => [], "extra" => 1}, :unsupported_review_submission},
-            {%{"findings" => "中文"}, :unsupported_review_submission},
-            {%{"findings" => List.duplicate("中文", 51)}, :unsupported_review_submission},
-            {%{"findings" => [], "responses" => "x"}, :unsupported_review_submission},
-            {%{"findings" => ["中文", finding()]}, :unsupported_review_submission_schema},
-            {%{"findings" => [123]}, :unsupported_review_submission_schema},
-            {%{"findings" => ["中文"], "responses" => []}, :unsupported_review_submission_schema}
-          ] do
-        assert {:error, ^reason} = Finding.validate(arguments, record())
-      end
-
-      assert {:error, :invalid_review_submission} = Finding.validate(%{"findings" => []}, nil)
-    end
-
-    test "structured findings carry identity, criterion and version" do
-      finding = finding()
-      assert {:ok, %{"findings" => [^finding], "responses" => []}} = Finding.validate(%{"findings" => [finding]}, record())
-    end
-
-    test "a malformed structured finding is refused with a precise reason" do
-      for {value, reason} <- [
-            {Map.drop(finding(), ["impact"]), :invalid_review_finding},
-            {%{finding() | "schema_version" => 2}, :unsupported_review_finding_schema},
-            {%{finding() | "id" => "bad id"}, :invalid_finding_identity},
-            {%{finding() | "required" => "yes"}, :invalid_finding_class},
-            {%{finding() | "criterion" => "   "}, :incomplete_review_finding},
-            {%{finding() | "impact" => "english only"}, :non_chinese_review_finding},
-            {%{finding() | "resolution" => "no chinese"}, :non_chinese_review_finding},
-            {%{finding() | "version" => Map.put(version(), "extra", 1)}, :invalid_finding_version},
-            {%{finding() | "version" => "not a version"}, :invalid_finding_version},
-            {%{finding() | "regression_of" => "bad id"}, :invalid_finding_regression},
-            {%{finding() | "version" => version(String.duplicate("d", 40))}, :finding_version_not_current}
-          ] do
-        assert {:error, ^reason} = Finding.validate(%{"findings" => [value]}, record())
-      end
-    end
-
-    test "finding identity is unique within one submission" do
-      assert {:error, :duplicate_finding_identity} = Finding.validate(%{"findings" => [finding(), finding()]}, record())
-    end
-
-    test "a regression must reference an identity the register already knows" do
-      assert {:error, :unknown_finding_regression} = Finding.validate(%{"findings" => [%{finding() | "regression_of" => "Gone"}]}, record())
-
-      register = registered([finding()])
-      regressed = %{finding() | "id" => "F2", "regression_of" => "F1"}
-      assert {:ok, %{"findings" => [^regressed], "responses" => []}} = Finding.validate(%{"findings" => [regressed]}, record(%{"finding_register" => register}))
-    end
-  end
-
-  describe "independent resolution" do
-    test "only an independent reviewer response may settle a finding" do
-      register = registered([finding()])
-      base = %{"finding" => "F1", "status" => "fixed", "evidence" => "已补充边界测试", "rationale" => nil, "verified_by" => "reviewer"}
-
-      for {response, reason} <- [
-            {Map.drop(base, ["status"]), :invalid_review_response},
-            {%{base | "status" => "done"}, :invalid_finding_status},
-            {%{base | "verified_by" => "developer"}, :review_verdict_author_not_independent},
-            {%{base | "finding" => "  "}, :invalid_review_response},
-            {%{base | "evidence" => nil}, :incomplete_finding_resolution},
-            {%{base | "status" => "undecidable", "rationale" => nil, "evidence" => nil}, :incomplete_finding_resolution},
-            {%{base | "finding" => "Missing"}, :unknown_finding_response},
-            {"not a map", :unsupported_review_submission_schema}
-          ] do
-        assert {:error, ^reason} = Finding.validate(%{"findings" => [], "responses" => [response]}, record(%{"finding_register" => register}))
-      end
-
-      refuted = %{"finding" => "F1", "status" => "not_substantiated", "evidence" => nil, "rationale" => "新版本已证明输入受限", "verified_by" => "reviewer"}
-      submission = %{"findings" => [], "responses" => [refuted]}
-
-      assert {:ok, %{"findings" => [], "responses" => [^refuted]}} =
-               Finding.validate(submission, record(%{"finding_register" => register}))
-    end
-  end
 
   describe "register and verdict" do
     test "identity survives rounds and the verdict separates advice from required conditions" do
@@ -117,9 +27,6 @@ defmodule SymphonyElixir.ReviewFindingTest do
       assert verdict["required_open"] == ["F1"]
       assert verdict["suggestions"] == ["F2"]
       assert verdict["resolved"] == []
-
-      assert Finding.advance(%{"kept" => 1}, ["旧版一句话结论。"], 4) == %{"kept" => 1}
-      assert Finding.advance(nil, ["旧版一句话结论。"], 4) == %{}
     end
 
     test "rounds advance an existing register instead of dropping open conditions" do
@@ -137,61 +44,22 @@ defmodule SymphonyElixir.ReviewFindingTest do
       assert Finding.verdict(advanced)["decision_required"]
       assert Finding.verdict(advanced)["undecidable"] == ["F1"]
     end
-
-    test "a finding renders a class-separated, machine-checkable comment" do
-      assert Finding.render(finding()) =~ "[必需（阻止技术通过）] F1"
-      assert Finding.render(finding()) =~ "<!-- symphony-finding "
-      assert Finding.render(finding()) =~ "适用版本：head=#{@head} base=#{@base} target=main"
-      assert Finding.render(%{finding() | "required" => false}) =~ "[建议（不阻止技术通过）] F1"
-      assert Finding.render(%{finding() | "regression_of" => "OLD"}) =~ "回归关系：原问题 OLD"
-    end
-  end
-
-  describe "agent tool schema" do
-    test "review_submit advertises the structured finding and response schemas" do
-      [%{"name" => "review_submit", "inputSchema" => %{"properties" => properties}}] = SymphonyElixir.ReviewLane.agent_tool_specs()
-
-      assert %{"findings" => %{"items" => finding_schema}, "responses" => %{"items" => response_schema}} = properties
-      assert finding_schema["required"] == ~w(schema_version id required criterion version location evidence impact resolution regression_of)
-      assert finding_schema["properties"]["version"]["required"] == ~w(head base target)
-      assert response_schema["required"] == ~w(finding status evidence rationale verified_by)
-    end
   end
 
   describe "publication mapping" do
-    test "a required condition is published separately from advice" do
-      submission = %{"findings" => [finding(), %{finding() | "id" => "F2", "required" => false}], "responses" => []}
-      register = Finding.advance(nil, submission, 1)
-
-      assert {:ok, prepared} = Publication.prepare(publication_record(register), submission, 20)
-      bodies = Enum.map(prepared["publication"]["entries"], & &1["body"])
-
-      assert length(bodies) == 3
-      assert Enum.any?(bodies, &String.contains?(&1, "阻止技术通过：必需项 F1"))
-      assert Enum.any?(bodies, &String.contains?(&1, "建议性改善（不阻止技术通过）：F2"))
-      assert Enum.all?(bodies, &String.contains?(&1, "<!-- symphony-review:"))
+    test "publication uses the single validated body rather than rendering another conclusion" do
+      submission = %{"findings" => [finding()], "responses" => []}
+      record = publication_record(%{}) |> Map.put("review_result", Map.merge(submission, %{"protocol" => 3, "body" => "Validated findings body"}))
+      assert {:ok, prepared} = Publication.prepare(record, submission, 20)
+      assert [%{"body" => "Validated findings body"}] = prepared["publication"]["entries"]
     end
 
-    test "advice alone never withholds a technical pass" do
-      submission = %{"findings" => [%{finding() | "required" => false}], "responses" => []}
-      register = Finding.advance(nil, submission, 1)
-
-      assert {:ok, prepared} = Publication.prepare(publication_record(register), submission, 20)
-      [_finding, conclusion] = prepared["publication"]["entries"]
-      assert conclusion["body"] =~ "建议性改善（不阻止技术通过）：F1"
-      refute conclusion["body"] =~ "阻止技术通过：必需项"
-      refute Finding.verdict(register)["blocking"]
-    end
-
-    test "the frozen v1 list still publishes and a native-command body is refused" do
-      assert {:ok, prepared} = Publication.prepare(publication_record(%{}), ["空输入导致越界，见 source.cpp:10。"], 20)
-      assert length(prepared["publication"]["entries"]) == 2
-
-      injection = %{finding() | "evidence" => "复现步骤：\n/approve"}
-      submission = %{"findings" => [injection], "responses" => []}
-
-      assert {:error, :invalid_review_publication_body} =
-               Publication.prepare(publication_record(%{}), submission, 20)
+    test "old result protocols cannot publish and native-command bodies are refused" do
+      old = Map.delete(publication_record(%{}), "review_protocol")
+      assert {:error, :unsupported_review_result} = Publication.prepare(old, ["old finding"], 20)
+      submission = %{"findings" => [], "responses" => []}
+      record = put_in(publication_record(%{}), ["review_result", "body"], "example\n/approve")
+      assert {:error, :invalid_review_publication_body} = Publication.prepare(record, submission, 20)
     end
 
     test "publication validity distinguishes no intent from an inconsistent one" do
@@ -207,6 +75,9 @@ defmodule SymphonyElixir.ReviewFindingTest do
       [entry] = prepared["publication"]["entries"]
       refute Publication.valid?(put_in(prepared["publication"]["entries"], [nil]), 20)
       refute Publication.valid?(put_in(prepared["publication"]["entries"], [%{entry | "status" => "corrupt"}]), 20)
+      refute Publication.valid?(put_in(prepared["publication"]["entries"], [Map.put(entry, "native_candidate", %{"note_id" => 1})]), 20)
+      malformed = prepared |> Map.put("submission", %{"findings" => nil, "responses" => []}) |> put_in(["review_result", "findings"], nil)
+      refute Publication.valid?(malformed, 20)
 
       missing_receipt = entry |> Map.put("status", "published") |> Map.put("receipt", nil)
       refute Publication.valid?(put_in(prepared["publication"]["entries"], [missing_receipt]), 20)
@@ -241,10 +112,6 @@ defmodule SymphonyElixir.ReviewFindingTest do
     end
   end
 
-  defp record(overrides \\ %{}) do
-    Map.merge(%{"head" => @head, "base" => @base, "target_branch" => "main", "finding_register" => %{}}, overrides)
-  end
-
   defp registered(findings), do: Finding.advance(nil, %{"findings" => findings, "responses" => []}, 1)
 
   defp version(head \\ @head), do: %{"head" => head, "base" => @base, "target" => "main"}
@@ -269,6 +136,8 @@ defmodule SymphonyElixir.ReviewFindingTest do
 
   defp publication_record(register) do
     %{
+      "review_protocol" => 3,
+      "review_result" => %{"protocol" => 3, "findings" => [], "responses" => [], "body" => "LGTM!"},
       "id" => "round-1",
       "round" => 1,
       "work" => %{"provider" => "gitlab", "host" => "review.invalid", "repository_id" => "10", "kind" => "mr", "number" => 7},
@@ -326,7 +195,8 @@ defmodule SymphonyElixir.ReviewFindingTest do
       "publisher_id" => 20,
       "projects" => %{"team/repo" => %{"id" => 10, "checkout" => Path.join(root, "source")}},
       "state_dir" => Path.join(root, "state"),
-      "instructions_file" => Path.join(root, "instructions"),
+      "instruction_files" => [Path.join(root, "instructions")],
+      "result_command" => SymphonyElixir.TestSupport.workflow_result_command(),
       "glab_bin" => Path.join(root, "glab")
     }
 

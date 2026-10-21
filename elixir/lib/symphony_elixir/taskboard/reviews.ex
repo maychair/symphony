@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Taskboard.Reviews do
   @moduledoc "Read-only MR/PR cards from the automatic lane, never from manual review journals."
   alias SymphonyElixir.ReviewLane.{GitLab, Listener, Publication}
-  alias SymphonyElixir.{ReviewResult, RuntimeContext}
+  alias SymphonyElixir.RuntimeContext
   alias SymphonyElixir.Taskboard.Provider
   alias SymphonyElixir.TaskWorkflow
 
@@ -112,9 +112,9 @@ defmodule SymphonyElixir.Taskboard.Reviews do
   defp complete_result?(record) do
     result = record["review_result"]
 
-    record["phase"] == "completed" and record["review_protocol"] == 2 and is_map(result) and
-      result["status"] in ["passed", "changes_requested"] and ReviewResult.validate(result, record) == :ok and
-      record["axes"] == result["axes"] and record["native_stop_confirmed"] == true
+    record["phase"] == "completed" and record["review_protocol"] == 3 and is_map(result) and
+      result["status"] in ["passed", "changes_requested"] and
+      Enum.all?(~w(head base policy_sha), &(record[&1] == result[&1])) and record["native_stop_confirmed"] == true
   end
 
   defp confirmed_publication?(record, config) do

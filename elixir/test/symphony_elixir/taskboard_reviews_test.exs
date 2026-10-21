@@ -1,7 +1,6 @@
 defmodule SymphonyElixir.TaskboardReviewsTest do
   use SymphonyElixir.TestSupport, runtime: false
   alias SymphonyElixir.ReviewLane.{Finding, Publication}
-  alias SymphonyElixir.ReviewResult
   alias SymphonyElixir.Taskboard
   alias SymphonyElixir.Taskboard.Reviews
   alias SymphonyElixir.TaskWorkflow
@@ -17,7 +16,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
       "project" => "team/repo",
       "iid" => 1,
       "round" => round,
-      "review_protocol" => 2,
+      "review_protocol" => 3,
       "work" => %{"provider" => provider, "host" => "review.invalid", "repository_id" => "10", "kind" => kind, "number" => 1},
       "head" => String.duplicate("a", 40),
       "base" => String.duplicate("b", 40),
@@ -47,7 +46,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
          }}
       end)
 
-    {:ok, result} = ReviewResult.aggregate(record, axes)
+    {:ok, result} = SymphonyElixir.TestSupport.fixture_review_result(record, axes)
     record = Map.merge(record, %{"axes" => axes, "review_result" => result, "native_stop_confirmed" => true, "phase" => "completed"})
     {:ok, record} = Publication.prepare(record, Map.take(result, ~w(findings responses)), 21)
 

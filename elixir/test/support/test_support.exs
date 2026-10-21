@@ -135,33 +135,35 @@ defmodule SymphonyElixir.TestSupport do
         cwd=q['params'].get('cwd');tid=q['params'].get('threadId',tid);turn=tid+'-turn'
         emit({'id':q['id'],'result':{'thread':thread()}})
       elif m=='command/exec':
-        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
+        assert q['params']['sandboxPolicy']
         r=subprocess.run(q['params']['command'],cwd=q['params']['cwd'],text=True,capture_output=True)
         emit({'id':q['id'],'result':{'exitCode':r.returncode,'stdout':r.stdout,'stderr':r.stderr}})
       elif m=='turn/start':
-        assert q['params']['sandboxPolicy']=={'type':'readOnly'}
+        assert q['params']['sandboxPolicy']
         save('inProgress');emit({'id':q['id'],'result':{'turn':{'id':turn}}})
         if (root/'disconnect').exists():sys.exit(0)
         if (root/'hang').exists():continue
-        if (root/'no-submit').exists():
+        if (root/'invalid-artifact').exists():tool('workflow_submit',{'result':{'axes':{}}})
+        elif (root/'no-submit').exists():
           save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
-        else:tool('review_read',{'kind':'diff'})
+        else:tool('workflow_submit',{'result':{'axes':{k:{'status':'complete','report':'Reviewed fixed source','sources':['source.txt'],'scope':['entire diff'],'gaps':[],'findings':[],'responses':[]} for k in ['standards','spec']}}})
       elif q.get('id')==100:
         assert q['result']['success'],q
-        step+=1
-        if step==1:tool('review_read',{'kind':'file','path':'source.txt'})
-        elif step==2:tool('review_axis_submit',{'status':'complete','report':'已核对完整差异和相关源文件。','findings':[]})
-        else:
-          save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
+        save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
     """)
 
     File.chmod!(server, 0o755)
   end
 
   # Native execution is exercised by runner fixtures. Listener-only tests supply
-  # two independent completed axes through the same engine result reducer.
+  # two completed axis fixtures through a test-owned external validator.
+  def workflow_result_command, do: [System.find_executable("python3"), Path.expand("../fixtures/workflow_artifact.py", __DIR__)]
+
+  def fixture_review_result(record, axes),
+    do: SymphonyElixir.WorkflowArtifact.evaluate(%{"result_command" => workflow_result_command()}, %{"record" => record, "axes" => axes})
+
   def submit_review(id, arguments) do
-    alias SymphonyElixir.ReviewLane.{Finding, Listener}
+    alias SymphonyElixir.ReviewLane.Listener
     key = String.replace_prefix(id, "review:", "")
     record = get_in(:sys.get_state(Listener), [:records, key])
     owner = if record, do: record["execution_owner"]
@@ -169,17 +171,23 @@ defmodule SymphonyElixir.TestSupport do
     if is_nil(owner) do
       Listener.submit(id, owner, arguments)
     else
-      with {:ok, submission} <- Finding.validate(arguments, record),
-           normalized = fixture_submission(submission, record),
-           axes = fixture_axes(record, normalized),
-           :ok <- Listener.checkpoint(id, owner, %{"axes" => axes, "native_stop_confirmed" => true}),
-           {:ok, result} <- SymphonyElixir.ReviewResult.aggregate(record, axes) do
+      arguments = normalize_fixture_arguments(arguments, record)
+      axes = fixture_axes(record, arguments)
+
+      with :ok <- Listener.checkpoint(id, owner, %{"native_stop_confirmed" => true}),
+           {:ok, result} <- fixture_review_result(record, axes) do
         Listener.submit(id, owner, %{"completion" => result})
       end
     end
   end
 
-  defp fixture_submission(%{} = submission, _record), do: submission
+  defp normalize_fixture_arguments(%{"findings" => findings} = arguments, record) when is_list(findings) do
+    if Enum.all?(findings, &is_binary/1),
+      do: Map.put(arguments, "findings", fixture_submission(findings, record)["findings"]),
+      else: arguments
+  end
+
+  defp normalize_fixture_arguments(arguments, _record), do: arguments
 
   defp fixture_submission(findings, record) do
     values =
@@ -201,16 +209,15 @@ defmodule SymphonyElixir.TestSupport do
     %{"findings" => values, "responses" => []}
   end
 
-  defp fixture_axes(record, submission) do
+  defp fixture_axes(_record, submission) do
     Map.new(["standards", "spec"], fn axis ->
       {axis,
        %{
          "status" => "complete",
          "report" => "已完成本轴核对。",
-         "thread_id" => record["id"] <> axis,
-         "turn_id" => record["id"] <> axis <> "-turn",
-         "native_stop_confirmed" => true,
-         "reads_verified" => true,
+         "sources" => ["fixture"],
+         "scope" => ["fixed diff"],
+         "gaps" => [],
          "findings" => if(axis == "standards", do: submission["findings"], else: []),
          "responses" => if(axis == "standards", do: submission["responses"] || [], else: [])
        }}

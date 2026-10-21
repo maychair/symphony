@@ -70,9 +70,6 @@ defmodule SymphonyElixir.ReviewLane.Policy do
 
   defp author_reply?(_, _, _), do: false
 
-  @spec marker(String.t(), non_neg_integer()) :: String.t()
-  def marker(id, index), do: "<!-- symphony-review:#{id}:#{index} -->"
-
   @doc "Version relevant author replies and resolution changes; a repeated poll is not another response."
   @spec response_digest([map()], [map()], pos_integer()) :: {:ok, String.t()} | {:error, atom()}
   def response_digest(findings, discussions, author) do
