@@ -91,8 +91,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp handle_request(:health, _from, state) do
+    disabled = discovery_disabled?(state)
+    health = if disabled and state.health == :listening, do: :disabled, else: state.health
+
     {:reply,
      Map.take(state, [:health, :last_event_at, :error])
+     |> Map.put(:health, health)
+     |> Map.put(:disabled, disabled)
      |> Map.put(:discovery, :native_scan)
      |> Map.put(:pending_hints, map_size(state.hints))
      |> Map.put(
@@ -106,15 +111,20 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp handle_request(:issues, _from, state) do
     state = state |> discover() |> consume_hints() |> reconcile()
-    issues = Enum.map(state.records, fn {_key, record} -> issue(record) end)
+    disabled = discovery_disabled?(state)
+    issues = Enum.map(state.records, fn {_key, record} -> issue(record, disabled) end)
     {:reply, {:ok, issues}, state}
   end
 
   defp handle_request({:request_review, project, iid}, _from, state) do
     if state.config && is_binary(project) && is_integer(iid) && iid > 0 && Map.has_key?(state.config["projects"], project) do
-      key = TaskWorkflow.digest([project, iid])
-      next = persist(%{state | hints: Map.put(state.hints, key, %{"project" => project, "iid" => iid}), last_event_at: DateTime.utc_now() |> DateTime.to_iso8601()})
-      {:reply, :ok, next}
+      if discovery_disabled?(state) do
+        {:reply, :ok, state}
+      else
+        key = TaskWorkflow.digest([project, iid])
+        next = persist(%{state | hints: Map.put(state.hints, key, %{"project" => project, "iid" => iid}), last_event_at: DateTime.utc_now() |> DateTime.to_iso8601()})
+        {:reply, :ok, next}
+      end
     else
       {:reply, {:error, :invalid_review_scope}, state}
     end
@@ -137,8 +147,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp handle_request({:begin, id}, {caller, _}, state) do
     state = reconcile(state)
 
-    case Map.get(state.records, record_key(id)) do
-      %{"phase" => "queued", "eligibility" => "current"} = record ->
+    case {discovery_disabled?(state), Map.get(state.records, record_key(id))} do
+      {true, _} ->
+        {:reply, {:error, :review_discovery_disabled}, state}
+
+      {false, %{"phase" => "queued", "eligibility" => "current"} = record} ->
         if stopped?(record) do
           record =
             Map.merge(record, %{
@@ -372,13 +385,23 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp config_current?(state) do
     with :ok <- Config.validate!(),
          {:ok, %{tracker: %{provider: %{"review_lane" => %{"enabled" => true} = config}}}} <- Config.settings() do
-      SymphonyElixir.ReviewLane.resolve(config) == state.config
+      Map.delete(SymphonyElixir.ReviewLane.resolve(config), "disabled") == Map.delete(state.config, "disabled")
     else
       _ -> false
     end
   end
 
   defp suspend(state), do: %{state | health: :failed, error: "Configuration changed or invalid; restart required"}
+
+  defp discovery_disabled?(state) do
+    case SymphonyElixir.ReviewLane.config() do
+      %{"disabled" => disabled} when is_boolean(disabled) ->
+        disabled
+
+      _ ->
+        Map.get(state.initial_config || state.config || %{}, "disabled", false) == true
+    end
+  end
 
   defp recover(state) do
     Enum.reduce(state.records, state, fn {_id, record}, current ->
@@ -496,8 +519,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp valid_subject?(_, _), do: false
 
   defp discover(state) do
-    state = %{state | health: :listening, error: nil}
+    if discovery_disabled?(state) do
+      %{state | health: :disabled, error: nil}
+    else
+      scan(%{state | health: :listening, error: nil})
+    end
+  end
 
+  defp scan(state) do
     Enum.reduce(Map.keys(state.config["projects"]) |> Enum.sort(), state, fn project, current ->
       case native(state.config).assigned(state.config, project) do
         {:ok, numbers} -> Enum.reduce(numbers, current, &discovered(&2, project, &1))
@@ -514,6 +543,10 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp consume_hints(state) do
+    if discovery_disabled?(state), do: state, else: consume_enabled_hints(state)
+  end
+
+  defp consume_enabled_hints(state) do
     Enum.reduce(state.hints, state, fn {key, hint}, current ->
       case candidate(current, {:ok, hint["project"], hint["iid"]}) do
         {:ok, next} -> persist(%{next | hints: Map.delete(next.hints, key)})
@@ -523,15 +556,25 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp candidate(state, {:ok, project, iid}) do
+    path = native(state.config).mr_path(project, iid)
+
     with {:ok, mr} <- read_mr(state.config, project, iid),
          true <- valid_mr?(mr, project, iid, state.config) or {:error, :invalid_native_review},
-         {:ok, true} <- lane_assignment(state.config, project, iid, mr) do
-      previous = state.records |> Map.values() |> Enum.filter(&(&1["project"] == project and &1["iid"] == iid))
-      if previous == [], do: queue(state, project, iid, mr, 1), else: {:ok, state}
+         {:ok, true} <- lane_assignment(state.config, project, iid, mr),
+         true <- absent_record?(state.records, project, iid),
+         {:ok, discussions} <- native(state.config).discussions(state.config, path),
+         false <- Policy.prior_review?(discussions, mr, state.config) do
+      queue(state, project, iid, mr, 1)
     else
       {:ok, false} -> {:ok, state}
+      false -> {:ok, state}
+      true -> {:ok, state}
       error -> error
     end
+  end
+
+  defp absent_record?(records, project, iid) do
+    not Enum.any?(Map.values(records), &(&1["project"] == project and &1["iid"] == iid))
   end
 
   # GitLab merges expose `opened/closed/merged` plus a durable reviewer list.
@@ -704,18 +747,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
          {:ok, responses} <- Policy.response_digest(findings, discussions, record["author_id"]),
          true <- publications_verified?(state, record) or {:error, :review_publication_unverified} do
       changed = changed_inputs?(state.config, record, mr, responses)
-
-      cond do
-        changed and stopped?(record) ->
-          previous = record |> Map.put("eligibility", "superseded") |> Map.put("phase", "superseded")
-          elem(queue(put_record(state, previous), record["project"], record["iid"], mr, record["round"] + 1, responses), 1)
-
-        changed ->
-          put_record(state, Map.put(record, "eligibility", "superseded"))
-
-        true ->
-          put_record(state, Map.put(record, "eligibility", "current"))
-      end
+      eligibility = if changed, do: "superseded", else: "current"
+      put_record(state, Map.put(record, "eligibility", eligibility))
     else
       {:error, reason} -> put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
     end
@@ -760,7 +793,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     sha
   end
 
-  defp issue(record) do
+  defp issue(record, disabled) do
     active = record["phase"] in ["queued", "running"] or (record["phase"] == "completed" and not stopped?(record))
     separator = if record["work"]["provider"] == "github", do: "#", else: "!"
 
@@ -773,7 +806,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       state: if(active, do: hd(SymphonyElixir.Config.settings!().tracker.active_states), else: "closed"),
       native_ref: Map.put(record, "execution_kind", "review_lane"),
       labels: SymphonyElixir.Config.settings!().tracker.required_labels,
-      dispatchable: active and record["eligibility"] == "current",
+      dispatchable: active and record["eligibility"] == "current" and (record["phase"] != "queued" or not disabled),
       url: record["url"]
     }
   end

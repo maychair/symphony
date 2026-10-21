@@ -84,16 +84,19 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert done.native_ref["phase"] == "completed"
 
     File.write!(Path.join(c.root, "changed-head"), "new")
-    assert {:ok, rounds} = Listener.issues()
-    assert Enum.any?(rounds, &(&1.native_ref["phase"] == "queued" and &1.id != issue.id))
+    assert {:ok, [retained]} = Listener.issues()
+    assert retained.id == issue.id
+    assert retained.native_ref["round"] == 1
+    assert retained.native_ref["eligibility"] == "superseded"
+    refute retained.dispatchable
 
     File.write!(Path.join(c.root, "timeline.json"), Jason.encode!([request_event(1, "review_requested"), request_event(2, "review_request_removed")]))
     File.write!(Path.join(c.root, "withdrawn"), "yes")
-    assert {:ok, withdrawn} = Listener.issues()
-    assert Enum.all?(withdrawn, &(&1.native_ref["eligibility"] in ["superseded", "unassigned"]))
+    assert {:ok, [withdrawn]} = Listener.issues()
+    assert withdrawn.native_ref["eligibility"] in ["superseded", "unassigned"]
   end
 
-  test "a GitHub author reply creates one new review round while unchanged polls do not", c do
+  test "a GitHub author reply does not create a new review round while unchanged polls remain stable", c do
     assert {:ok, [issue]} = Listener.issues()
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     assert :ok = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => ["已验证边界条件失败，请在 source.cpp:10 修复越界读取。"]})
@@ -102,10 +105,13 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
 
     comment = %{"id" => 500, "body" => "已修复越界读取并补回归检查。", "user" => %{"id" => 30}, "created_at" => "2026-01-03T00:00:00Z"}
     File.write!(Path.join(c.root, "comments.json"), Jason.encode!([comment]))
-    assert {:ok, rounds} = Listener.issues()
-    assert Enum.count(rounds, &(&1.native_ref["phase"] == "queued")) == 1
-    assert {:ok, repeated} = Listener.issues()
-    assert Enum.map(repeated, & &1.id) == Enum.map(rounds, & &1.id)
+    assert {:ok, [retained]} = Listener.issues()
+    assert retained.id == issue.id
+    assert retained.native_ref["round"] == 1
+    assert retained.native_ref["eligibility"] == "superseded"
+    refute retained.dispatchable
+    assert {:ok, [repeated]} = Listener.issues()
+    assert repeated.id == issue.id
   end
 
   test "GitHub scope loss and unknown reviewer history block publication", c do

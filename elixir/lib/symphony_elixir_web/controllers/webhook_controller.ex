@@ -45,8 +45,7 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- is_binary(secret) and byte_size(secret) >= 16,
          :ok <- authenticate(conn, provider, secret, body),
          :ok <- scope(settings, provider, conn.body_params) do
-      Orchestrator.request_refresh()
-      conn |> put_status(202) |> json(%{accepted: true})
+      acknowledge(conn, settings.disabled)
     else
       _ -> conn |> put_status(403) |> json(%{error: "webhook_rejected"})
     end
@@ -64,8 +63,7 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- GitHub.repository?(repository, config, project),
          true <- is_integer(number) and number > 0,
          :ok <- Listener.request_review(project, number) do
-      Orchestrator.request_refresh()
-      conn |> put_status(202) |> json(%{accepted: true})
+      acknowledge(conn, config["disabled"] == true)
     else
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end
@@ -85,11 +83,17 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- GitLab.web_url?(url, config, "/" <> project),
          true <- is_map(attributes),
          :ok <- Listener.request_review(project, attributes["iid"]) do
-      Orchestrator.request_refresh()
-      conn |> put_status(202) |> json(%{accepted: true})
+      acknowledge(conn, config["disabled"] == true)
     else
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end
+  end
+
+  defp acknowledge(conn, true), do: conn |> put_status(202) |> json(%{accepted: false, disabled: true})
+
+  defp acknowledge(conn, false) do
+    Orchestrator.request_refresh()
+    conn |> put_status(202) |> json(%{accepted: true})
   end
 
   defp authenticate(conn, "github", secret, body) do
