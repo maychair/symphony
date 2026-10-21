@@ -126,7 +126,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, 91) do
+    case await_response(port, 91, true) do
       {:ok, %{"exitCode" => 0, "stdout" => output}} when byte_size(output) <= 4_194_304 -> {:ok, output}
       {:ok, %{"exitCode" => 0}} -> {:error, :review_read_output_limit}
       {:ok, %{"exitCode" => code}} -> {:error, {:review_read_exit, code}}
@@ -894,6 +894,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     tool_executor = check_goal_handoff(port, tool_executor)
+
+    case take_deferred(port) do
+      {:ok, line} -> handle_incoming(port, on_message, line, timeout_ms, tool_executor, auto_approve_requests)
+      :empty -> receive_native(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp receive_native(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     remaining = remaining_time(tool_executor[:deadline], timeout_ms)
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
 
@@ -1651,18 +1659,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
   end
 
-  defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
+  defp await_response(port, request_id, defer \\ false) do
+    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "", defer)
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp with_timeout_response(port, request_id, timeout_ms, pending_line, defer) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(port, request_id, complete_line, timeout_ms, defer)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk), defer)
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
@@ -1672,7 +1680,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, data, timeout_ms, defer) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -1686,12 +1694,33 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:response_error, response_payload}}
 
       {:ok, %{} = other} ->
-        Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        if defer, do: defer_message(port, payload), else: Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
+        with_timeout_response(port, request_id, timeout_ms, "", defer)
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        with_timeout_response(port, request_id, timeout_ms, "", defer)
+    end
+  end
+
+  # A review tool issues an RPC on the turn's owning transport. Preserve other
+  # messages in order; re-sending them to the mailbox would put newer messages
+  # ahead of them and could lose a concurrent tool request behind completion.
+  defp defer_message(port, payload) do
+    key = {__MODULE__, :deferred, port}
+    Process.put(key, :queue.in(payload, Process.get(key, :queue.new())))
+  end
+
+  defp take_deferred(port) do
+    key = {__MODULE__, :deferred, port}
+
+    case :queue.out(Process.get(key, :queue.new())) do
+      {{:value, payload}, rest} ->
+        Process.put(key, rest)
+        {:ok, payload}
+
+      {:empty, _} ->
+        :empty
     end
   end
 
@@ -1723,6 +1752,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
+    Process.delete({__MODULE__, :deferred, port})
+
     case :erlang.port_info(port) do
       :undefined ->
         :ok

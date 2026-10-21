@@ -84,6 +84,9 @@ unresolved or foreign closing links remain explicit incomplete evidence. Any
 failed file read is sticky for that axis, including non-text input. Large text
 is paged inside the native read-only sandbox before crossing the RPC boundary;
 neither a large diff nor a large source file is subject to a whole-output cap.
+Read RPCs on the turn's owning transport retain concurrent tool requests and
+notifications in FIFO order until the turn loop can consume them; awaiting a
+source page must not discard another pending read or reorder it behind completion.
 Contradictory findings and resolution responses for the same identity in one
 round are refused before the finding register can advance.
 

@@ -1,6 +1,66 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  defmodule ReviewReadProbe do
+    alias SymphonyElixir.Codex.AppServer
+
+    def execute_agent_tool("probe", _args, _opts) do
+      case AppServer.review_read(Process.get(:review_probe_session), ["read"]) do
+        {:ok, output} -> %{"success" => true, "output" => output}
+        error -> %{"success" => false, "output" => inspect(error)}
+      end
+    end
+  end
+
+  test "a review read preserves concurrent native tool requests until the owning turn consumes them" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "parallel-read")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "parallel-server")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    count=0
+    def emit(v):print(json.dumps(v),flush=True)
+    def tool(i):emit({'id':i,'method':'item/tool/call','params':{'tool':'probe','arguments':{}}})
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      if m=='initialized':continue
+      if m=='initialize':r={}
+      elif m=='thread/start':r={'thread':{'id':'parallel'}}
+      elif m=='turn/start':
+        emit({'id':q['id'],'result':{'turn':{'id':'parallel-turn'}}});tool(76);continue
+      elif m=='command/exec':
+        if count==0:tool(77)
+        count+=1;r={'exitCode':0,'stdout':'source','stderr':''}
+      elif q.get('id') in [76,77]:
+        assert q['result']['success']
+        if q['id']==77:
+          assert count==2
+          emit({'method':'turn/completed','params':{'threadId':'parallel','turn':{'id':'parallel-turn','status':'completed'}}})
+        continue
+      else:raise AssertionError(m)
+      emit({'id':q['id'],'result':r})
+    """)
+
+    File.chmod!(binary, 0o755)
+    settings = [workspace_root: root, codex_command: binary, codex_turn_timeout_ms: 1_000]
+    write_workflow_file!(Workflow.workflow_file_path(), settings)
+    tools = [%{"name" => "probe", "inputSchema" => %{"type" => "object"}}]
+    binding = %{SymphonyElixir.ReviewAxis.tool_binding() | adapter: ReviewReadProbe, tool_specs: tools}
+    {:ok, session} = AppServer.start_session(workspace, review_only: true, dynamic_tool_binding: binding)
+    Process.put(:review_probe_session, session)
+
+    try do
+      issue = %Issue{id: "parallel", identifier: "PAR", title: "Review read"}
+      assert {:ok, _} = AppServer.run_turn(session, "Read twice", issue)
+    after
+      Process.delete(:review_probe_session)
+      AppServer.stop_session(session)
+    end
+  end
+
   test "review probes use native read-only execution and fail on unreadable output" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "review-probe")
