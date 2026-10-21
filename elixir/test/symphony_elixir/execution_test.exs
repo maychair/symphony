@@ -621,6 +621,7 @@ defmodule SymphonyElixir.ExecutionTest do
         emit({'id':q['id'],'result':{'goal':goal}})
         if p['status']=='active': emit({'method':'turn/started','params':{'threadId':'cancel-thread','turn':{'id':'cancel-turn'}}})
       elif m=='turn/interrupt': emit({'id':q['id'],'result':{}})
+      elif m=='thread/turns/list': emit({'id':q['id'],'result':{'data':[{'id':'cancel-turn','status':'interrupted' if goal['status']=='blocked' else 'inProgress'}],'nextCursor':None}})
       elif m=='thread/read': emit({'id':q['id'],'result':{'thread':{'id':'cancel-thread','turns':[{'id':'cancel-turn','status':'interrupted' if goal['status']=='blocked' else 'inProgress'}]}}})
     """)
 
@@ -671,6 +672,7 @@ defmodule SymphonyElixir.ExecutionTest do
         emit({'id':q['id'],'result':{'goal':goal}})
         if p['status']=='active': emit({'method':'turn/started','params':{'threadId':'cancel-thread','turn':{'id':'cancel-turn'}}})
       elif m=='turn/interrupt': emit({'id':q['id'],'result':{}})
+      elif m=='thread/turns/list': emit({'id':q['id'],'result':{'data':[{'id':'cancel-turn','status':'inProgress'}],'nextCursor':None}})
       elif m=='thread/read': emit({'id':q['id'],'result':{'thread':{'id':'cancel-thread','turns':[{'id':'cancel-turn','status':'inProgress'}]}}})
     """)
 
@@ -1070,6 +1072,7 @@ defmodule SymphonyElixir.ExecutionTest do
       elif m=='thread/goal/set':
         assert p['status']=='blocked'
         goal['status']='blocked';emit(q,{'goal':goal})
+      elif m=='thread/turns/list': emit(q,{'data':thread()['turns'],'nextCursor':None})
       elif m=='thread/read': emit(q,{'thread':thread()})
       elif m=='turn/interrupt':
         assert p['turnId']=='unobserved';interrupted=True;emit(q,{})

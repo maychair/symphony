@@ -14,7 +14,7 @@ defmodule SymphonyElixir.ReviewResult do
   @result_statuses ["passed", "changes_requested", "failed", "needs_input"]
   @result_fields ~w(protocol status head base policy_sha axes findings responses body)
   @axis_fields ~w(status findings responses report thread_id turn_id native_stop_confirmed reads_verified)
-  @runtime_axis_fields ~w(workspace worker_host thread_allocation_intent turn_allocation_intent native_stop_receipt native_stop_error read_failure)
+  @runtime_axis_fields ~w(workspace worker_host thread_allocation_intent turn_allocation_intent native_stop_receipt native_stop_error read_failure read_evidence)
   @failed_body "评审未通过。"
   @needs_input_body "评审需要补充输入。"
   @incomplete_body "该审查轴未完成。"

@@ -128,6 +128,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case await_response(port, 91) do
       {:ok, %{"exitCode" => 0, "stdout" => output}} when byte_size(output) <= 4_194_304 -> {:ok, output}
+      {:ok, %{"exitCode" => 0}} -> {:error, :review_read_output_limit}
+      {:ok, %{"exitCode" => code}} -> {:error, {:review_read_exit, code}}
       other -> {:error, {:review_read_failed, other}}
     end
   end
@@ -340,13 +342,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         await_response(session.port, @goal_interrupt_id)
       end
 
-      send_message(session.port, %{
-        "id" => @goal_inspect_id,
-        "method" => "thread/read",
-        "params" => %{"threadId" => session.thread_id, "includeTurns" => true}
-      })
-
-      case await_response(session.port, @goal_inspect_id) do
+      case read_thread(session.port, session.thread_id, @goal_inspect_id) do
         {:ok, %{"thread" => thread}} -> thread["id"] == session.thread_id and reconciled_turn?(thread, turn_id || :no_turns)
         _ -> false
       end
@@ -630,9 +626,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_interrupt_active(session, opts) do
     if opts[:interrupt_active] do
-      send_message(session.port, %{"id" => @goal_inspect_id, "method" => "thread/read", "params" => %{"threadId" => session.thread_id, "includeTurns" => true}})
-
-      case await_response(session.port, @goal_inspect_id) do
+      case read_thread(session.port, session.thread_id, @goal_inspect_id) do
         {:ok, %{"thread" => %{"id" => id, "turns" => turns}}} when id == session.thread_id and is_list(turns) ->
           turns |> Enum.filter(&(&1["status"] == "inProgress")) |> Enum.reduce_while(:ok, &interrupt_active_turn(session, &1, &2))
 
@@ -663,9 +657,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp inspect_thread(port, thread_id, opts) do
-    send_message(port, %{"id" => @thread_start_id, "method" => "thread/read", "params" => %{"threadId" => thread_id, "includeTurns" => true}})
-
-    case await_response(port, @thread_start_id) do
+    case read_thread(port, thread_id, @thread_start_id) do
       {:ok, %{"thread" => %{"id" => ^thread_id, "status" => %{"type" => status}} = thread}} when status in ["idle", "notLoaded"] ->
         case reconciled_observation(thread, opts) do
           {:ok, observation} ->
@@ -681,6 +673,40 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       error ->
         error
+    end
+  end
+
+  # Metadata-only reads do not hydrate paginated history. Never interpret their
+  # empty `turns` field as evidence that no native turn exists.
+  defp read_thread(port, thread_id, request_id) do
+    send_message(port, %{"id" => request_id, "method" => "thread/read", "params" => %{"threadId" => thread_id, "includeTurns" => false}})
+
+    with {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} <- await_response(port, request_id),
+         {:ok, turns} <- read_turns(port, thread_id, request_id, nil, MapSet.new(), []) do
+      {:ok, %{"thread" => Map.put(thread, "turns", turns)}}
+    else
+      error -> {:error, {:native_history_unavailable, error}}
+    end
+  end
+
+  defp read_turns(port, thread_id, request_id, cursor, seen, pages) do
+    send_message(port, %{
+      "id" => request_id,
+      "method" => "thread/turns/list",
+      "params" => %{"threadId" => thread_id, "cursor" => cursor, "limit" => 100, "itemsView" => "notLoaded", "sortDirection" => "asc"}
+    })
+
+    case await_response(port, request_id) do
+      {:ok, %{"data" => turns, "nextCursor" => next}} when is_list(turns) ->
+        cond do
+          not Enum.all?(turns, &match?(%{"id" => id, "status" => status} when is_binary(id) and is_binary(status), &1)) -> {:error, :invalid_native_turn_page}
+          is_nil(next) -> {:ok, pages |> Enum.reverse([turns]) |> List.flatten()}
+          not is_binary(next) or MapSet.member?(seen, next) -> {:error, :invalid_native_turn_cursor}
+          true -> read_turns(port, thread_id, request_id, next, MapSet.put(seen, next), [turns | pages])
+        end
+
+      error ->
+        {:error, {:native_turn_page_unavailable, error}}
     end
   end
 

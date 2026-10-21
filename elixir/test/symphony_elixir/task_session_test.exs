@@ -145,6 +145,7 @@ defmodule SymphonyElixir.TaskSessionTest do
             state['id']='owned-thread' if state['allocations']==1 else 'owned-thread-'+str(state['allocations'])
             state['goal']=None;state['turns']=[]
           emit(q,{'thread':{'id':state['id'],'status':{'type':'idle'},'turns':state['turns']}})
+      elif m=='thread/turns/list':emit(q,{'data':state['turns'],'nextCursor':None})
       elif m=='thread/goal/get':emit(q,{'goal':state['goal']})
       elif m=='turn/start':
         state['turns']=[{'id':'owned-turn','status':'completed'}]

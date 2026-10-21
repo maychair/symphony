@@ -37,10 +37,59 @@ defmodule SymphonyElixir.AppServerTest do
 
     try do
       assert {:ok, "source"} = AppServer.review_read(session, ["read"])
-      assert {:error, {:review_read_failed, _}} = AppServer.review_read(session, ["fail"])
+      assert {:error, {:review_read_exit, 1}} = AppServer.review_read(session, ["fail"])
     after
       AppServer.stop_session(session)
     end
+  end
+
+  test "stop pages native history, interrupts a later active turn and fences failed pages" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "paged-stop")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "paged-server")
+    trace = Path.join(root, "paged-requests.jsonl")
+
+    for mode <- ["complete", "failed-page", "repeated-cursor", "unknown-state"] do
+      File.write!(binary, """
+      #!/usr/bin/env python3
+      import json,sys
+      stopped=False;mode=#{inspect(mode)}
+      for line in sys.stdin:
+        q=json.loads(line);m=q.get('method');p=q.get('params',{})
+        with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+        if m=='initialized':continue
+        if m=='initialize':r={}
+        elif m=='thread/goal/get':r={'goal':None}
+        elif m=='thread/read':
+          assert p['includeTurns'] is False
+          r={'thread':{'id':'paged','status':{'type':'idle' if stopped else 'active'},'turns':[]}}
+        elif m=='thread/turns/list':
+          assert p['itemsView']=='notLoaded' and p['sortDirection']=='asc'
+          if p.get('cursor') is None:r={'data':[{'id':'old','status':'completed'}],'nextCursor':'page2'}
+          elif mode=='failed-page':
+            print(json.dumps({'id':q['id'],'error':{'code':-32601,'message':'unavailable'}}),flush=True);continue
+          else:r={'data':[{'id':'later','status':'unknown' if mode=='unknown-state' else 'interrupted' if stopped else 'inProgress'}],'nextCursor':'page2' if mode=='repeated-cursor' else None}
+        elif m=='turn/interrupt':
+          assert p['turnId']=='later';stopped=True;r={}
+        else:raise AssertionError('must not resume or allocate: '+str(m))
+        print(json.dumps({'id':q['id'],'result':r}),flush=True)
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+      result = SymphonyElixir.NativeStop.confirm(%{"thread_id" => "paged", "workspace" => workspace, "turn_id" => "old"})
+
+      if mode == "complete" do
+        assert {:ok, %{"native_stop_confirmed" => true, "turn_id" => "later"}} = result
+      else
+        assert {:error, _} = result
+      end
+    end
+
+    requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    refute Enum.any?(requests, &(&1["method"] in ["thread/start", "thread/resume", "turn/start"]))
+    assert Enum.any?(requests, &(&1["method"] == "turn/interrupt"))
   end
 
   test "new, reviewed and restored sessions prevent automatic profile reinjection" do
@@ -77,6 +126,7 @@ defmodule SymphonyElixir.AppServerTest do
         assert 'GITLAB_PAT' in c['shell_environment_policy.exclude']
         assert 'tool_output_token_limit' not in c
         r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
+      elif m=='thread/turns/list':r={'data':[],'nextCursor':None}
       elif m=='thread/read':r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
       else:raise AssertionError(m)
       print(json.dumps({'id':q['id'],'result':r}),flush=True)
@@ -185,6 +235,7 @@ defmodule SymphonyElixir.AppServerTest do
       if m=='initialized':continue
       if m=='initialize':result={}
       elif m=='thread/goal/get':result={'goal':None}
+      elif m=='thread/turns/list':result={'data':[],'nextCursor':None}
       elif m in ['thread/start','thread/read']:result={'thread':{'id':'stopped','status':{'type':'idle'},'turns':[]}}
       else:raise AssertionError('unexpected native execution: '+str(m))
       print(json.dumps({'id':q['id'],'result':result}),flush=True)
@@ -232,6 +283,7 @@ defmodule SymphonyElixir.AppServerTest do
       for line in sys.stdin:
         q=json.loads(line);m=q.get('method')
         if m=='initialize': print(json.dumps({'id':q['id'],'result':{}}),flush=True)
+        elif m=='thread/turns/list': print(json.dumps({'id':q['id'],'result':{'data':#{Jason.encode!(turns)},'nextCursor':None}}),flush=True)
         elif m=='thread/read': print(json.dumps({'id':q['id'],'result':{'thread':{'id':'inspect-thread','status':{'type':'notLoaded'},'turns':#{Jason.encode!(turns)}}}}),flush=True)
         elif m is not None and m!='initialized': raise AssertionError('inspection must not start native execution')
       """)

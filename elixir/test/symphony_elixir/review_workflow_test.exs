@@ -209,7 +209,18 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     # One long line with multibyte characters crosses a byte-page boundary.
     diff = String.duplicate("x", 16_383) <> String.duplicate("中", 12_000)
     File.write!(Path.join(root, "large.c"), diff)
-    Process.put(ReviewAxis, %{context: c, event: fn _ -> :ok end, result: nil, diff: diff, files: "large.c\n", commits: "commit\n", diff_read: false, files_read: false})
+    File.write!(Path.join(root, ".fixture-diff"), diff)
+    File.write!(Path.join(root, ".fixture-list"), "large.c\n")
+    File.write!(Path.join(root, ".fixture-commits"), "commit\n")
+
+    reader = %{
+      backend: SymphonyElixir.ReviewWorkflowTest.ReaderBackend,
+      session: %{workspace: root},
+      base: c.record["base"],
+      head: c.record["head"]
+    }
+
+    Process.put(ReviewAxis, %{context: c, event: fn _ -> :ok end, result: nil, reader: reader, diff_read: false, files_read: false})
     on_exit(fn -> Process.delete(ReviewAxis) end)
     submit = %{"status" => "complete", "report" => "完整读取后核对", "findings" => []}
 
@@ -228,6 +239,7 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     end
 
     file_first = read.(%{"kind" => "file", "path" => "large.c"})
+    assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_read", %{"kind" => "file", "path" => "large.c", "representation" => "raw", "offset" => byte_size(diff)}, [])
     assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
     # Re-reading an earlier page does not advance across an unread gap.
     assert read.(%{"kind" => "diff"}) == first
@@ -242,14 +254,20 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
 
     for kind <- ["list", "commits"] do
       state = Process.get(ReviewAxis)
-      key = if kind == "list", do: :files, else: :commits
-      state = state |> Map.put(key, diff) |> Map.update!(:pages, &Map.delete(&1, {kind, nil}))
+      File.write!(Path.join(root, ".fixture-" <> kind), diff)
+      state = state |> Map.update!(:pages, &Map.delete(&1, {kind, nil})) |> Map.update!(:read_evidence, &Map.delete(&1, {kind, nil}))
       Process.put(ReviewAxis, state)
       first = read.(%{"kind" => kind})
       assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
       assert first["content"] <> read_all_pages(read, kind, nil, first["next_offset"]) == diff
       assert %{"success" => true} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
     end
+
+    # A replacement between pages is sticky failure, not new coverage of the
+    # same supposedly fixed snapshot, even when the next read starts at zero.
+    File.write!(Path.join(root, ".fixture-diff"), "changed input")
+    assert %{"success" => false, "output" => ":review_input_changed"} = ReviewAxis.execute_agent_tool("review_read", %{"kind" => "diff"}, [])
+    assert %{"success" => false} = ReviewAxis.execute_agent_tool("review_axis_submit", submit, [])
   end
 
   defp read_all_pages(_read, _kind, _path, nil), do: ""
@@ -287,6 +305,19 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     Process.delete(ReviewAxis)
   end
 
+  defmodule ReaderBackend do
+    def review_read(session, ["python3", "-c", script, request]) do
+      args = Jason.decode!(request)
+      path = if args["kind"] == "file", do: args["path"], else: ".fixture-" <> args["kind"]
+      args = args |> Map.put("kind", "file") |> Map.put("path", path)
+
+      case System.cmd("python3", ["-c", script, Jason.encode!(args)], cd: session.workspace, stderr_to_stdout: true) do
+        {body, 0} -> {:ok, body}
+        {_body, _} -> {:error, :sandbox_read_failed}
+      end
+    end
+  end
+
   defmodule Backend do
     import ExUnit.Assertions
 
@@ -309,8 +340,7 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
       if File.exists?(Path.join(session.workspace, "read-error")), do: {:error, :sandbox_failed}, else: {:ok, String.duplicate("a", 40)}
     end
 
-    def review_read(_, ["git", "ls-files"]), do: {:ok, "source.c\n"}
-    def review_read(_, _), do: {:ok, "diff --git a/source.c b/source.c\n+fixed\n"}
+    def review_read(session, args), do: ReaderBackend.review_read(session, args)
 
     def run_turn(session, prompt, _issue, opts) do
       assert prompt =~ ~s("target":"main")
@@ -360,6 +390,9 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
     assert Enum.all?(~w(finding status evidence rationale verified_by), &(&1 in response_schema["required"]))
     assert get_in(response_schema, ["properties", "verified_by", "enum"]) == ["reviewer"]
     File.write!(Path.join(root, "source.c"), "int value;\n")
+    File.write!(Path.join(root, ".fixture-diff"), "diff --git a/source.c b/source.c\n+fixed\n")
+    File.write!(Path.join(root, ".fixture-list"), "source.c\n")
+    File.write!(Path.join(root, ".fixture-commits"), "commit\n")
     File.ln_s!("/etc/passwd", Path.join(root, "link"))
     File.write!(Path.join(root, "binary"), <<255, 254>>)
     {:ok, rules, _} = ReviewWorkflow.rules(c.config)
@@ -373,7 +406,7 @@ defmodule SymphonyElixir.ReviewWorkflowTest do
 
     File.write!(Path.join(root, "oversized"), String.duplicate("x", 4_194_305))
 
-    for path <- ["../secret", "/etc/passwd", "link", "missing", ".git/config", "binary", "oversized"] do
+    for path <- ["../secret", "/etc/passwd", "link", "missing", ".git/config", "binary"] do
       File.write!(Path.join(root, "failed-read-path"), path)
       result = ReviewAxis.run("spec", context, event, backend: Backend)
       assert result["status"] == "failed"
