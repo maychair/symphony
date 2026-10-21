@@ -1679,6 +1679,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     payload = to_string(data)
 
     case Jason.decode(payload) do
+      {:ok, %{"method" => _} = request} ->
+        continue_response(port, request_id, payload, request, timeout_ms, defer)
+
       {:ok, %{"id" => ^request_id, "error" => error}} ->
         {:error, {:response_error, error}}
 
@@ -1689,13 +1692,17 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:response_error, response_payload}}
 
       {:ok, %{} = other} ->
-        if defer, do: defer_message(port, payload), else: Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "", defer)
+        continue_response(port, request_id, payload, other, timeout_ms, defer)
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
         with_timeout_response(port, request_id, timeout_ms, "", defer)
     end
+  end
+
+  defp continue_response(port, request_id, payload, message, timeout_ms, defer) do
+    if defer, do: defer_message(port, payload), else: Logger.debug("Ignoring message while waiting for response: #{inspect(message)}")
+    with_timeout_response(port, request_id, timeout_ms, "", defer)
   end
 
   # A review tool issues an RPC on the turn's owning transport. Preserve other

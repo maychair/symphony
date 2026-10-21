@@ -21,7 +21,7 @@ defmodule SymphonyElixir.AppServerTest do
     File.write!(binary, """
     #!/usr/bin/env python3
     import json,sys
-    count=0
+    count=0;peer=int(sys.argv[1])
     def emit(v):print(json.dumps(v),flush=True)
     def tool(i):emit({'id':i,'method':'item/tool/call','params':{'tool':'probe','arguments':{}}})
     for line in sys.stdin:
@@ -32,11 +32,11 @@ defmodule SymphonyElixir.AppServerTest do
       elif m=='turn/start':
         emit({'id':q['id'],'result':{'turn':{'id':'parallel-turn'}}});tool(76);continue
       elif m=='command/exec':
-        if count==0:tool(77)
+        if count==0:tool(peer)
         count+=1;r={'exitCode':0,'stdout':'source','stderr':''}
-      elif q.get('id') in [76,77]:
+      elif q.get('id') in [76,peer]:
         assert q['result']['success']
-        if q['id']==77:
+        if q['id']==peer:
           assert count==2
           emit({'method':'turn/completed','params':{'threadId':'parallel','turn':{'id':'parallel-turn','status':'completed'}}})
         continue
@@ -45,19 +45,23 @@ defmodule SymphonyElixir.AppServerTest do
     """)
 
     File.chmod!(binary, 0o755)
-    settings = [workspace_root: root, codex_command: binary, codex_turn_timeout_ms: 1_000]
-    write_workflow_file!(Workflow.workflow_file_path(), settings)
-    tools = [%{"name" => "probe", "inputSchema" => %{"type" => "object"}}]
-    binding = %{SymphonyElixir.ReviewAxis.tool_binding() | adapter: ReviewReadProbe, tool_specs: tools}
-    {:ok, session} = AppServer.start_session(workspace, review_only: true, dynamic_tool_binding: binding)
-    Process.put(:review_probe_session, session)
 
-    try do
-      issue = %Issue{id: "parallel", identifier: "PAR", title: "Review read"}
-      assert {:ok, _} = AppServer.run_turn(session, "Read twice", issue)
-    after
-      Process.delete(:review_probe_session)
-      AppServer.stop_session(session)
+    for peer <- [77, 91] do
+      command = binary <> " " <> Integer.to_string(peer)
+      settings = [workspace_root: root, codex_command: command, codex_turn_timeout_ms: 1_000]
+      write_workflow_file!(Workflow.workflow_file_path(), settings)
+      tools = [%{"name" => "probe", "inputSchema" => %{"type" => "object"}}]
+      binding = %{SymphonyElixir.ReviewAxis.tool_binding() | adapter: ReviewReadProbe, tool_specs: tools}
+      {:ok, session} = AppServer.start_session(workspace, review_only: true, dynamic_tool_binding: binding)
+      Process.put(:review_probe_session, session)
+
+      try do
+        issue = %Issue{id: "parallel", identifier: "PAR", title: "Review read"}
+        assert {:ok, _} = AppServer.run_turn(session, "Read twice", issue)
+      after
+        Process.delete(:review_probe_session)
+        AppServer.stop_session(session)
+      end
     end
   end
 
