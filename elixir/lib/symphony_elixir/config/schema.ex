@@ -50,6 +50,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     embedded_schema do
       field(:kind, :string)
+      field(:disabled, :boolean, default: false)
       field(:endpoint, :string)
       field(:api_key, :string)
       field(:project_slug, :string)
@@ -68,6 +69,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :kind,
+          :disabled,
           :endpoint,
           :api_key,
           :project_slug,

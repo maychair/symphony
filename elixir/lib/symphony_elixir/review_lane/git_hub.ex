@@ -180,6 +180,7 @@ defmodule SymphonyElixir.ReviewLane.GitHub do
         %{
           "id" => id,
           "body" => body,
+          "state" => entry["state"],
           "resolved" => false,
           "created_at" => submitted_at,
           "author" => %{"id" => user["id"] || 0, "username" => user["login"] || "unknown"}

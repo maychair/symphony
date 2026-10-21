@@ -1844,7 +1844,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
-    runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())
+    runtime_seconds = running_seconds(Map.get(running_entry, :started_at), DateTime.utc_now())
 
     codex_totals =
       apply_token_delta(

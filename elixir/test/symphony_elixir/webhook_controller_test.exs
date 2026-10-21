@@ -51,11 +51,31 @@ defmodule SymphonyElixirWeb.WebhookControllerTest do
   @spec read_req_body(term(), keyword()) :: {:error, :closed}
   def read_req_body(:failure, _opts), do: {:error, :closed}
 
-  defp configure(provider, secret) do
+  test "tracker webhook acknowledges disabled state without dispatch refresh" do
+    secret = String.duplicate("s", 32)
+    configure("github", secret, true)
+
+    payload = %{"repository" => %{"full_name" => "team/repo"}}
+    body = Jason.encode!(payload)
+
+    conn =
+      Plug.Test.conn(:post, "/", body)
+      |> Conn.assign(:webhook_body, body)
+      |> Conn.put_req_header("x-hub-signature-256", "sha256=" <> Base.encode16(:crypto.mac(:hmac, :sha256, secret, body), case: :lower))
+
+    conn = %{conn | body_params: payload}
+
+    resp = WebhookController.receive_event(conn, %{"provider" => "github"})
+    assert resp.status == 202
+    assert Jason.decode!(resp.resp_body) == %{"accepted" => false, "disabled" => true}
+  end
+
+  defp configure(provider, secret, disabled \\ false) do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
       kind: #{provider}
+      disabled: #{disabled}
       active_states: [#{if provider == "gitlab", do: "opened", else: "open"}]
       terminal_states: [closed]
       provider:

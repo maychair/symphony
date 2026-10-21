@@ -86,4 +86,41 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     assert Policy.requested_reviewer?(%{"state" => "opened", "reviewers" => [%{"id" => 20}]}, 20)
     refute Policy.requested_reviewer?(%{"state" => "opened", "reviewers" => [%{"id" => 99, "username" => "reviewer"}]}, 20)
   end
+
+  test "prior_review? recognizes approvals and human or automated comments while ignoring unreviewed state" do
+    config = %{"reviewer_id" => 20, "publisher_id" => 50}
+    mr = %{"author" => %{"id" => 30}}
+
+    refute Policy.prior_review?([], mr, config)
+
+    # Approved MR checks
+    assert Policy.prior_review?([], Map.put(mr, "approved", true), config)
+    assert Policy.prior_review?([], Map.put(mr, "detailed_merge_status", "approved"), config)
+    assert Policy.prior_review?([], Map.put(mr, "approved_by", [%{"id" => 20}]), config)
+    assert Policy.prior_review?([], Map.put(mr, "reviews", [%{"state" => "APPROVED"}]), config)
+
+    # Discussions with automated review notes
+    auto_pub = %{"notes" => [%{"id" => 1, "body" => "LGTM!", "author" => %{"id" => 50}}]}
+    assert Policy.prior_review?([auto_pub], mr, config)
+    auto_comment = %{"notes" => [%{"id" => 1, "body" => "<!-- symphony-review: 123 -->\\nLGTM!", "author" => %{"id" => 99}}]}
+    assert Policy.prior_review?([auto_comment], mr, config)
+
+    # Discussions with human reviews
+    human_comment = %{"notes" => [%{"id" => 1, "body" => "Looks good to me, please fix typo.", "author" => %{"id" => 40}}]}
+    assert Policy.prior_review?([human_comment], mr, config)
+    reviewer_comment = %{"notes" => [%{"id" => 1, "body" => "Please add tests.", "author" => %{"id" => 20}}]}
+    assert Policy.prior_review?([reviewer_comment], mr, config)
+    github_approval_empty_body = %{"notes" => [%{"id" => 1, "body" => "", "state" => "APPROVED", "author" => %{"id" => 20}}]}
+    assert Policy.prior_review?([github_approval_empty_body], mr, config)
+
+    # System notes: approval vs non-approval
+    system_approved = %{"notes" => [%{"id" => 1, "system" => true, "body" => "approved this merge request", "author" => %{"id" => 20}}]}
+    assert Policy.prior_review?([system_approved], mr, config)
+    system_other = %{"notes" => [%{"id" => 1, "system" => true, "body" => "changed target branch", "author" => %{"id" => 30}}]}
+    refute Policy.prior_review?([system_other], mr, config)
+
+    # Author's own comments do not count as reviews
+    author_note = %{"notes" => [%{"id" => 1, "body" => "Here is my PR explanation", "author" => %{"id" => 30}}]}
+    refute Policy.prior_review?([author_note], mr, config)
+  end
 end

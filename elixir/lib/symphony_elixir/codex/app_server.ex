@@ -677,7 +677,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     send_message(port, %{"id" => request_id, "method" => "thread/read", "params" => %{"threadId" => thread_id, "includeTurns" => false}})
 
     with {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} <- await_response(port, request_id),
-         {:ok, turns} <- read_turns(port, thread_id, request_id, nil, MapSet.new(), []) do
+         {:ok, turns} <- read_turns(port, thread_id, request_id, nil, %{}, []) do
       {:ok, %{"thread" => Map.put(thread, "turns", turns)}}
     else
       error -> {:error, {:native_history_unavailable, error}}
@@ -696,8 +696,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         cond do
           not Enum.all?(turns, &match?(%{"id" => id, "status" => status} when is_binary(id) and is_binary(status), &1)) -> {:error, :invalid_native_turn_page}
           is_nil(next) -> {:ok, pages |> Enum.reverse([turns]) |> List.flatten()}
-          not is_binary(next) or MapSet.member?(seen, next) -> {:error, :invalid_native_turn_cursor}
-          true -> read_turns(port, thread_id, request_id, next, MapSet.put(seen, next), [turns | pages])
+          not is_binary(next) or Map.has_key?(seen, next) -> {:error, :invalid_native_turn_cursor}
+          true -> read_turns(port, thread_id, request_id, next, Map.put(seen, next, true), [turns | pages])
         end
 
       error ->

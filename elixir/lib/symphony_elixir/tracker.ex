@@ -70,7 +70,7 @@ defmodule SymphonyElixir.Tracker do
 
   @spec fetch_issues_by_states([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states, opts \\ []) do
-    with {:ok, issues} <- adapter().fetch_issues_by_states(states),
+    with {:ok, issues} <- candidate_issues(states),
          {:ok, reviews} <- review_issues(),
          {:ok, members} <- TaskPlanExecution.discover(opts) do
       parents = issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1) |> TaskPlanPreflight.project()
@@ -78,6 +78,10 @@ defmodule SymphonyElixir.Tracker do
       {parents, members} = parent_lifecycle(parents, members)
       {:ok, parents ++ Enum.filter(reviews ++ members, &(&1.state in states))}
     end
+  end
+
+  defp candidate_issues(states) do
+    if Config.settings!().tracker.disabled, do: {:ok, []}, else: adapter().fetch_issues_by_states(states)
   end
 
   @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
