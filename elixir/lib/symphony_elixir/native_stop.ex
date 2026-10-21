@@ -61,6 +61,7 @@ defmodule SymphonyElixir.NativeStop do
           "workspace" => workspace,
           "worker_host" => record["worker_host"],
           "source" => "thread/read",
+          "history_source" => "thread/turns/list",
           "observed_at" => DateTime.to_iso8601(DateTime.utc_now())
         }
 

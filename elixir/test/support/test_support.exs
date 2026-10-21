@@ -123,6 +123,8 @@ defmodule SymphonyElixir.TestSupport do
       with (root/'native-requests.jsonl').open('a') as f:f.write(json.dumps(q)+'\\n')
       if m=='initialize':emit({'id':q['id'],'result':{}})
       elif m=='thread/goal/get':emit({'id':q['id'],'result':{'goal':None}})
+      elif m=='thread/turns/list':
+        emit({'id':q['id'],'result':{'data':thread()['turns'],'nextCursor':None}})
       elif m=='thread/read':
         tid=q['params'].get('threadId',tid);turn=tid+'-turn'
         emit({'id':q['id'],'result':{'thread':thread()}})

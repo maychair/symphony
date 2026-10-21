@@ -126,8 +126,10 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, 91) do
+    case await_response(port, 91, true) do
       {:ok, %{"exitCode" => 0, "stdout" => output}} when byte_size(output) <= 4_194_304 -> {:ok, output}
+      {:ok, %{"exitCode" => 0}} -> {:error, :review_read_output_limit}
+      {:ok, %{"exitCode" => code}} -> {:error, {:review_read_exit, code}}
       other -> {:error, {:review_read_failed, other}}
     end
   end
@@ -326,36 +328,25 @@ defmodule SymphonyElixir.Codex.AppServer do
     turn_id = Keyword.get(opts, :latest_turn, fn -> nil end).()
 
     with :ok <- Keyword.get(opts, :before_goal_stop, fn -> :ok end).(),
-         {:ok, goal} <- halt_goal(session),
-         true <- goal["threadId"] == session.thread_id do
-      emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
-
-      if is_binary(turn_id) do
-        send_message(session.port, %{
-          "id" => @goal_interrupt_id,
-          "method" => "turn/interrupt",
-          "params" => %{"threadId" => session.thread_id, "turnId" => turn_id}
-        })
-
-        await_response(session.port, @goal_interrupt_id)
-      end
-
-      send_message(session.port, %{
-        "id" => @goal_inspect_id,
-        "method" => "thread/read",
-        "params" => %{"threadId" => session.thread_id, "includeTurns" => true}
-      })
-
-      case await_response(session.port, @goal_inspect_id) do
-        {:ok, %{"thread" => thread}} -> thread["id"] == session.thread_id and reconciled_turn?(thread, turn_id || :no_turns)
-        _ -> false
-      end
+         {:ok, _thread} <- halt_session(session, expected_turn_id: turn_id || :no_turns),
+         {:ok, goal} <- read_goal(session) do
+      confirm_halted_goal(goal, session, opts)
     else
       _ -> false
     end
   rescue
     _ -> false
   end
+
+  defp confirm_halted_goal(nil, _session, _opts), do: true
+
+  defp confirm_halted_goal(%{"status" => status} = goal, session, opts)
+       when status in ["paused", "blocked", "usageLimited", "budgetLimited", "complete"] do
+    emit_message(Keyword.get(opts, :on_message, &default_on_message/1), :goal_updated, %{goal: goal}, port_metadata(session.port, nil))
+    true
+  end
+
+  defp confirm_halted_goal(_, _, _), do: false
 
   defp halt_goal(session) do
     with {:ok, goal} when is_map(goal) <- read_goal(session) do
@@ -630,9 +621,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_interrupt_active(session, opts) do
     if opts[:interrupt_active] do
-      send_message(session.port, %{"id" => @goal_inspect_id, "method" => "thread/read", "params" => %{"threadId" => session.thread_id, "includeTurns" => true}})
-
-      case await_response(session.port, @goal_inspect_id) do
+      case read_thread(session.port, session.thread_id, @goal_inspect_id) do
         {:ok, %{"thread" => %{"id" => id, "turns" => turns}}} when id == session.thread_id and is_list(turns) ->
           turns |> Enum.filter(&(&1["status"] == "inProgress")) |> Enum.reduce_while(:ok, &interrupt_active_turn(session, &1, &2))
 
@@ -663,9 +652,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp inspect_thread(port, thread_id, opts) do
-    send_message(port, %{"id" => @thread_start_id, "method" => "thread/read", "params" => %{"threadId" => thread_id, "includeTurns" => true}})
-
-    case await_response(port, @thread_start_id) do
+    case read_thread(port, thread_id, @thread_start_id) do
       {:ok, %{"thread" => %{"id" => ^thread_id, "status" => %{"type" => status}} = thread}} when status in ["idle", "notLoaded"] ->
         case reconciled_observation(thread, opts) do
           {:ok, observation} ->
@@ -684,7 +671,49 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  # Metadata-only reads do not hydrate paginated history. Never interpret their
+  # empty `turns` field as evidence that no native turn exists.
+  defp read_thread(port, thread_id, request_id) do
+    send_message(port, %{"id" => request_id, "method" => "thread/read", "params" => %{"threadId" => thread_id, "includeTurns" => false}})
+
+    with {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} <- await_response(port, request_id),
+         {:ok, turns} <- read_turns(port, thread_id, request_id, nil, MapSet.new(), []) do
+      {:ok, %{"thread" => Map.put(thread, "turns", turns)}}
+    else
+      error -> {:error, {:native_history_unavailable, error}}
+    end
+  end
+
+  defp read_turns(port, thread_id, request_id, cursor, seen, pages) do
+    send_message(port, %{
+      "id" => request_id,
+      "method" => "thread/turns/list",
+      "params" => %{"threadId" => thread_id, "cursor" => cursor, "limit" => 100, "itemsView" => "notLoaded", "sortDirection" => "asc"}
+    })
+
+    case await_response(port, request_id) do
+      {:ok, %{"data" => turns, "nextCursor" => next}} when is_list(turns) ->
+        cond do
+          not Enum.all?(turns, &match?(%{"id" => id, "status" => status} when is_binary(id) and is_binary(status), &1)) -> {:error, :invalid_native_turn_page}
+          is_nil(next) -> {:ok, pages |> Enum.reverse([turns]) |> List.flatten()}
+          not is_binary(next) or MapSet.member?(seen, next) -> {:error, :invalid_native_turn_cursor}
+          true -> read_turns(port, thread_id, request_id, next, MapSet.put(seen, next), [turns | pages])
+        end
+
+      error ->
+        {:error, {:native_turn_page_unavailable, error}}
+    end
+  end
+
   defp reconciled_observation(thread, opts) do
+    if opts[:halt_only] == true and not halted_observation?(thread["turns"] || [], opts) do
+      {:error, :native_turn_not_reconciled}
+    else
+      reconcile_expected_turn(thread, opts)
+    end
+  end
+
+  defp reconcile_expected_turn(thread, opts) do
     turns = thread["turns"] || []
     expected = opts[:expected_turn_id]
     index = Enum.find_index(turns, &(&1["id"] == expected))
@@ -860,6 +889,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp receive_available(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     tool_executor = check_goal_handoff(port, tool_executor)
+
+    case take_deferred(port) do
+      {:ok, line} -> handle_incoming(port, on_message, line, timeout_ms, tool_executor, auto_approve_requests)
+      :empty -> receive_native(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp receive_native(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     remaining = remaining_time(tool_executor[:deadline], timeout_ms)
     wait_ms = if tool_executor[:goal_mode], do: min(1_000, min(timeout_ms, remaining)), else: min(timeout_ms, remaining)
 
@@ -1617,18 +1654,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
   end
 
-  defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
+  defp await_response(port, request_id, defer \\ false) do
+    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "", defer)
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp with_timeout_response(port, request_id, timeout_ms, pending_line, defer) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+        handle_response(port, request_id, complete_line, timeout_ms, defer)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk), defer)
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
@@ -1638,10 +1675,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, data, timeout_ms, defer) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
+      {:ok, %{"method" => _} = request} ->
+        continue_response(port, request_id, payload, request, timeout_ms, defer)
+
       {:ok, %{"id" => ^request_id, "error" => error}} ->
         {:error, {:response_error, error}}
 
@@ -1652,12 +1692,37 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:response_error, response_payload}}
 
       {:ok, %{} = other} ->
-        Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        continue_response(port, request_id, payload, other, timeout_ms, defer)
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        with_timeout_response(port, request_id, timeout_ms, "", defer)
+    end
+  end
+
+  defp continue_response(port, request_id, payload, message, timeout_ms, defer) do
+    if defer, do: defer_message(port, payload), else: Logger.debug("Ignoring message while waiting for response: #{inspect(message)}")
+    with_timeout_response(port, request_id, timeout_ms, "", defer)
+  end
+
+  # A review tool issues an RPC on the turn's owning transport. Preserve other
+  # messages in order; re-sending them to the mailbox would put newer messages
+  # ahead of them and could lose a concurrent tool request behind completion.
+  defp defer_message(port, payload) do
+    key = {__MODULE__, :deferred, port}
+    Process.put(key, :queue.in(payload, Process.get(key, :queue.new())))
+  end
+
+  defp take_deferred(port) do
+    key = {__MODULE__, :deferred, port}
+
+    case :queue.out(Process.get(key, :queue.new())) do
+      {{:value, payload}, rest} ->
+        Process.put(key, rest)
+        {:ok, payload}
+
+      {:empty, _} ->
+        :empty
     end
   end
 
@@ -1689,6 +1754,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
+    Process.delete({__MODULE__, :deferred, port})
+
     case :erlang.port_info(port) do
       :undefined ->
         :ok

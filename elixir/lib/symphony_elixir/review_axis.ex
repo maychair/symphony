@@ -2,7 +2,9 @@ defmodule SymphonyElixir.ReviewAxis do
   @moduledoc "One isolated native reviewer with bounded read-only tools and an explicit result."
   alias SymphonyElixir.{Codex.AppServer, NativeStop, PathSafety, ReviewLane}
   alias SymphonyElixir.ReviewLane.Finding
-  @page_bytes 16_384
+  @reader_path Path.expand("../../priv/review_read.py", __DIR__)
+  @external_resource @reader_path
+  @reader File.read!(@reader_path)
 
   @spec run(String.t(), map(), (map() -> :ok), keyword()) :: map()
   def run(axis, context, event, opts) do
@@ -45,11 +47,10 @@ defmodule SymphonyElixir.ReviewAxis do
         try do
           with {:ok, head} <- backend.review_read(session, ["git", "rev-parse", "HEAD"]),
                true <- String.trim(head) == record["head"],
-               {:ok, diff} <- backend.review_read(session, ["git", "diff", "--no-ext-diff", "--no-textconv", record["base"], record["head"], "--"]),
-               true <- String.trim(diff) != "",
-               {:ok, files} <- backend.review_read(session, ["git", "ls-files"]),
-               {:ok, commits} <- backend.review_read(session, ["git", "log", "--format=%H%n%B", record["base"] <> ".." <> record["head"]]) do
-            Process.put(__MODULE__, Map.merge(Process.get(__MODULE__), %{diff: diff, files: files, commits: commits}))
+               reader = %{backend: backend, session: session, base: record["base"], head: record["head"]},
+               {:ok, diff} <- native_page(reader, %{"kind" => "diff"}),
+               true <- diff["total_bytes"] > 0 do
+            Process.put(__MODULE__, Map.put(Process.get(__MODULE__), :reader, reader))
 
             handler = fn message -> native_message(axis, event, opts, message) end
 
@@ -64,6 +65,7 @@ defmodule SymphonyElixir.ReviewAxis do
               "thread_id" => session.thread_id,
               "turn_id" => Process.get({__MODULE__, :turn}),
               "reads_verified" => state.diff_read and state.files_read and state[:read_failure] != true,
+              "read_evidence" => Map.get(state, :read_evidence, %{}) |> Map.values(),
               "read_failure" => state[:read_failure] == true
             })
             |> Map.merge(confirm(backend, session))
@@ -166,7 +168,7 @@ defmodule SymphonyElixir.ReviewAxis do
         %{
           "name" => "review_read",
           "description" =>
-            "Read a bounded UTF-8 page of the pinned diff, tracked file list, commits or one relative file. Start offset=0; follow next_offset until null. Offsets are bytes, not lines. Path is only valid for kind=file. No shell or writes.",
+            "Read a bounded UTF-8 page of the pinned diff, tracked file list, commits or one relative file. Start offset=0; follow next_offset until null. Offsets are bytes of the selected representation. Structural view preserves code but replaces large quoted hex data with explicit size/hash markers. For original file bytes select representation=raw (bounded samples, not proof of full payload validation). Path is only valid for kind=file. No shell or writes.",
           "inputSchema" => %{
             "type" => "object",
             "additionalProperties" => false,
@@ -174,7 +176,8 @@ defmodule SymphonyElixir.ReviewAxis do
             "properties" => %{
               "kind" => %{"type" => "string", "enum" => ["diff", "list", "file", "commits"]},
               "path" => %{"type" => "string"},
-              "offset" => %{"type" => "integer", "minimum" => 0}
+              "offset" => %{"type" => "integer", "minimum" => 0},
+              "representation" => %{"type" => "string", "enum" => ["structural", "raw"]}
             }
           }
         },
@@ -209,8 +212,7 @@ defmodule SymphonyElixir.ReviewAxis do
     if Map.has_key?(args, "path") do
       {:error, :path_is_only_valid_for_file_reads}
     else
-      body = Map.fetch!(state, %{"diff" => :diff, "list" => :files, "commits" => :commits}[kind])
-      read_page(kind, nil, body, args, state)
+      source_page(kind, nil, args, state)
     end
   end
 
@@ -218,13 +220,11 @@ defmodule SymphonyElixir.ReviewAxis do
     with {:ok, root} <- PathSafety.canonicalize(state.context.repository),
          false <- Path.type(path) == :absolute,
          false <- ".." in Path.split(path),
-         {:ok, %{type: :regular, size: size}} when size <= 4_194_304 <- File.stat(Path.join(root, path)),
+         {:ok, %{type: :regular}} <- File.stat(Path.join(root, path)),
          {:ok, target} <- PathSafety.canonicalize(Path.join(root, path)),
          true <- String.starts_with?(target, root <> "/"),
-         false <- String.starts_with?(Path.relative_to(target, root), ".git/"),
-         {:ok, body} <- File.read(target),
-         true <- String.valid?(body) do
-      read_page("file", path, body, args, state)
+         false <- ".git" in Path.split(Path.relative_to(target, root)) do
+      source_page("file", path, args, state)
     else
       _ ->
         read_failure(state)
@@ -248,37 +248,83 @@ defmodule SymphonyElixir.ReviewAxis do
 
   defp execute(_, _, _), do: {:error, :unsupported_review_tool}
 
-  defp read_page(kind, path, body, args, state) do
-    offset = Map.get(args, "offset", 0)
-    key = {kind, path}
-    pages = Map.get(state, :pages, %{})
-    consumed = Map.get(pages, key, 0)
-    total = byte_size(body)
+  defp native_page(reader, args) do
+    request = Map.merge(args, %{"base" => reader.base, "head" => reader.head})
 
-    if is_integer(offset) and offset >= 0 and offset <= consumed and offset <= total and utf8_boundary?(body, offset) do
-      size = page_size(body, offset, min(@page_bytes, total - offset))
-      content = binary_part(body, offset, size)
-      finish = offset + size
-      pages = Map.put(pages, key, max(consumed, finish))
-      files = Enum.filter(pages, fn {{type, _}, _} -> type == "file" end)
-      sizes = Map.put(Map.get(state, :read_sizes, %{}), key, total)
-      files_read = files != [] and Enum.all?(pages, fn {key, read} -> read == sizes[key] end)
-      updated = state |> Map.put(:pages, pages) |> Map.put(:read_sizes, sizes) |> Map.put(:files_read, files_read)
-      updated = if kind == "diff", do: Map.put(updated, :diff_read, pages[key] == total), else: updated
-      Process.put(__MODULE__, updated)
-
-      {:ok, Jason.encode!(%{kind: kind, path: path, offset: offset, next_offset: if(finish < total, do: finish), total_bytes: total, content: content})}
+    with {:ok, output} <- reader.backend.review_read(reader.session, ["python3", "-c", @reader, Jason.encode!(request)]),
+         {:ok, %{"content" => content, "total_bytes" => total} = page} when is_binary(content) and is_integer(total) <- Jason.decode(output) do
+      {:ok, page}
     else
-      {:error, :invalid_or_skipped_read_offset}
+      error -> {:error, {:review_page_unavailable, error}}
     end
   end
 
-  defp page_size(body, offset, size) do
-    if utf8_boundary?(body, offset + size), do: size, else: page_size(body, offset, size - 1)
+  defp source_page(kind, path, args, %{reader: reader} = state) do
+    representation = args["representation"] || "structural"
+    offset = Map.get(args, "offset", 0)
+    consumed = get_in(state, [:pages, {kind, path}]) || 0
+
+    with :ok <- valid_representation(kind, representation),
+         :ok <- valid_offset(offset, consumed, representation) do
+      fetch_page(reader, kind, path, args, state)
+    end
   end
 
-  defp utf8_boundary?(body, offset) do
-    offset == byte_size(body) or Bitwise.band(:binary.at(body, offset), 0xC0) != 0x80
+  defp valid_representation("file", representation) when representation in ["structural", "raw"], do: :ok
+  defp valid_representation(_kind, "structural"), do: :ok
+  defp valid_representation(_, _), do: {:error, :invalid_read_representation}
+
+  defp valid_offset(offset, consumed, representation) do
+    if is_integer(offset) and offset >= 0 and (representation == "raw" or offset <= consumed),
+      do: :ok,
+      else: {:error, :invalid_or_skipped_read_offset}
+  end
+
+  defp fetch_page(reader, kind, path, args, state) do
+    previous = get_in(state, [:read_evidence, {kind, path}])
+
+    with {:ok, page} <- native_page(reader, args),
+         :ok <- unchanged_input(previous, page) do
+      record_page(kind, path, page, state)
+      {:ok, Jason.encode!(page)}
+    else
+      error ->
+        read_failure(state)
+        error
+    end
+  end
+
+  defp unchanged_input(nil, _), do: :ok
+  defp unchanged_input(%{"raw_sha256" => sha}, %{"raw_sha256" => sha}), do: :ok
+  defp unchanged_input(_, _), do: {:error, :review_input_changed}
+
+  defp record_page(kind, path, page, state) do
+    key = {kind, path}
+    finish = page["offset"] + byte_size(page["content"])
+    raw = page["representation"] == "raw"
+    pages = Map.put_new(Map.get(state, :pages, %{}), key, 0)
+    sizes = Map.get(state, :read_sizes, %{})
+    pages = if raw, do: pages, else: Map.update!(pages, key, &max(&1, finish))
+    sizes = if raw, do: sizes, else: Map.put(sizes, key, page["total_bytes"])
+    files_read = Enum.any?(pages, fn {{type, _}, _} -> type == "file" end) and Enum.all?(pages, fn {key, read} -> read == sizes[key] end)
+    updated = state |> Map.put(:pages, pages) |> Map.put(:read_sizes, sizes) |> Map.put(:files_read, files_read)
+    evidence = read_evidence(page, get_in(state, [:read_evidence, key]) || %{}, pages[key])
+    updated = Map.update(updated, :read_evidence, %{key => evidence}, &Map.put(&1, key, evidence))
+    updated = if kind == "diff", do: Map.put(updated, :diff_read, pages[key] == sizes[key]), else: updated
+    Process.put(__MODULE__, updated)
+  end
+
+  defp read_evidence(%{"representation" => "raw"} = page, previous, consumed) do
+    sample = Map.take(page, ["offset"]) |> Map.put("read_bytes", byte_size(page["content"]))
+
+    previous
+    |> Map.merge(Map.take(page, ["kind", "path", "raw_bytes", "raw_sha256"]))
+    |> Map.put("read_bytes", consumed)
+    |> Map.update("raw_samples", [sample], &Enum.uniq(&1 ++ [sample]))
+  end
+
+  defp read_evidence(page, previous, consumed) do
+    previous |> Map.merge(Map.take(page, ["kind", "path", "representation", "raw_bytes", "raw_sha256", "total_bytes"])) |> Map.put("read_bytes", consumed)
   end
 
   defp read_failure(state) do
@@ -289,6 +335,9 @@ defmodule SymphonyElixir.ReviewAxis do
   defp prompt(axis, context) do
     """
     Review only the #{axis} axis of this fixed snapshot. Read the complete diff and relevant files using review_read.
+    The default structural representation replaces only large quoted 0x hex payloads with opaque size/SHA-256 markers; all surrounding code is retained.
+    Inspect payload provenance, generation and consumers. Original file bytes remain available with representation=raw and a byte offset.
+    A digest or raw sample does not verify numerical correctness. If the requirements need payload validation that evidence cannot establish, submit failed/needs_input; do not claim full data validation.
     Reads return JSON pages. Start offset=0 and follow next_offset until null; never treat a first page as the full diff.
     Path is only valid for kind=file; diff is paged by byte offset. Read kind=list before choosing existing instruction files.
     Do not execute shell commands, edit, publish, approve, merge or start further agents.

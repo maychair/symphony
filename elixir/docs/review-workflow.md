@@ -81,7 +81,12 @@ if a later tool submits an empty finding set.
 Source acquisition uses the existing 30-second bounded command transport.
 Native closing Issue URLs are resolved only within the selected repository;
 unresolved or foreign closing links remain explicit incomplete evidence. Any
-failed file read is sticky for that axis, including oversized or non-text input.
+failed file read is sticky for that axis, including non-text input. Large text
+is paged inside the native read-only sandbox before crossing the RPC boundary;
+neither a large diff nor a large source file is subject to a whole-output cap.
+Read RPCs on the turn's owning transport retain concurrent tool requests and
+notifications in FIFO order until the turn loop can consume them; awaiting a
+source page must not discard another pending read or reorder it behind completion.
 Contradictory findings and resolution responses for the same identity in one
 round are refused before the finding register can advance.
 
@@ -128,6 +133,25 @@ Axis prompts supply the complete fixed finding version, including the target
 branch name. A rejected finding returns its actual validation reason so the
 reviewer can correct an invalid version without losing a substantiated finding.
 The completeness and fixed-version checks remain mandatory.
+
+The structural view preserves every character outside large quoted `0x` hex
+literals. Those literals are explicitly represented as opaque payloads with
+decoded byte length, SHA-256 and edge samples. The response also carries the
+original stream's byte count and SHA-256. This is a data representation, not a
+claim that numeric values have been validated. Reviewers inspect provenance,
+generators and consumers, and may request bounded original file bytes using
+`representation: raw`. Raw offsets refer to original bytes and allow samples;
+raw samples do not advance structural coverage or satisfy missing evidence.
+Only complete structural diff and requested source reads count toward axis
+completion. Missing required payload validation remains failed/needs_input.
+
+Native stop reads thread metadata without history hydration and follows every
+`thread/turns/list` page in ascending order, with item content omitted. An empty
+metadata `turns` array proves nothing. Missing pages, repeated cursors and active
+or unknown turn states retain the execution fence. Stop never resumes a thread.
+Goal error/cancellation callbacks use that same halt operation before recording
+stop confirmation, then read back the paused/blocked/terminal Goal state. A
+terminal last turn alone cannot hide an earlier unknown or active turn.
 
 Native review CLI and Git commands receive the captured repository environment
 without changing the service process environment. Manual journal identity uses

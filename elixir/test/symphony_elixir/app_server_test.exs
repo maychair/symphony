@@ -1,6 +1,70 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  defmodule ReviewReadProbe do
+    alias SymphonyElixir.Codex.AppServer
+
+    def execute_agent_tool("probe", _args, _opts) do
+      case AppServer.review_read(Process.get(:review_probe_session), ["read"]) do
+        {:ok, output} -> %{"success" => true, "output" => output}
+        error -> %{"success" => false, "output" => inspect(error)}
+      end
+    end
+  end
+
+  test "a review read preserves concurrent native tool requests until the owning turn consumes them" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "parallel-read")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "parallel-server")
+
+    File.write!(binary, """
+    #!/usr/bin/env python3
+    import json,sys
+    count=0;peer=int(sys.argv[1])
+    def emit(v):print(json.dumps(v),flush=True)
+    def tool(i):emit({'id':i,'method':'item/tool/call','params':{'tool':'probe','arguments':{}}})
+    for line in sys.stdin:
+      q=json.loads(line);m=q.get('method')
+      if m=='initialized':continue
+      if m=='initialize':r={}
+      elif m=='thread/start':r={'thread':{'id':'parallel'}}
+      elif m=='turn/start':
+        emit({'id':q['id'],'result':{'turn':{'id':'parallel-turn'}}});tool(76);continue
+      elif m=='command/exec':
+        if count==0:tool(peer)
+        count+=1;r={'exitCode':0,'stdout':'source','stderr':''}
+      elif q.get('id') in [76,peer]:
+        assert q['result']['success']
+        if q['id']==peer:
+          assert count==2
+          emit({'method':'turn/completed','params':{'threadId':'parallel','turn':{'id':'parallel-turn','status':'completed'}}})
+        continue
+      else:raise AssertionError(m)
+      emit({'id':q['id'],'result':r})
+    """)
+
+    File.chmod!(binary, 0o755)
+
+    for peer <- [77, 91] do
+      command = binary <> " " <> Integer.to_string(peer)
+      settings = [workspace_root: root, codex_command: command, codex_turn_timeout_ms: 1_000]
+      write_workflow_file!(Workflow.workflow_file_path(), settings)
+      tools = [%{"name" => "probe", "inputSchema" => %{"type" => "object"}}]
+      binding = %{SymphonyElixir.ReviewAxis.tool_binding() | adapter: ReviewReadProbe, tool_specs: tools}
+      {:ok, session} = AppServer.start_session(workspace, review_only: true, dynamic_tool_binding: binding)
+      Process.put(:review_probe_session, session)
+
+      try do
+        issue = %Issue{id: "parallel", identifier: "PAR", title: "Review read"}
+        assert {:ok, _} = AppServer.run_turn(session, "Read twice", issue)
+      after
+        Process.delete(:review_probe_session)
+        AppServer.stop_session(session)
+      end
+    end
+  end
+
   test "review probes use native read-only execution and fail on unreadable output" do
     root = Path.dirname(Workflow.workflow_file_path())
     workspace = Path.join(root, "review-probe")
@@ -37,10 +101,60 @@ defmodule SymphonyElixir.AppServerTest do
 
     try do
       assert {:ok, "source"} = AppServer.review_read(session, ["read"])
-      assert {:error, {:review_read_failed, _}} = AppServer.review_read(session, ["fail"])
+      assert {:error, {:review_read_exit, 1}} = AppServer.review_read(session, ["fail"])
     after
       AppServer.stop_session(session)
     end
+  end
+
+  test "stop pages native history, interrupts a later active turn and fences failed pages" do
+    root = Path.dirname(Workflow.workflow_file_path())
+    workspace = Path.join(root, "paged-stop")
+    File.mkdir_p!(workspace)
+    binary = Path.join(root, "paged-server")
+    trace = Path.join(root, "paged-requests.jsonl")
+
+    for mode <- ["complete", "failed-page", "repeated-cursor", "unknown-state", "unknown-prefix", "unknown-prefix-missing"] do
+      File.write!(binary, """
+      #!/usr/bin/env python3
+      import json,sys
+      mode=#{inspect(mode)};stopped=mode.startswith("unknown-prefix")
+      for line in sys.stdin:
+        q=json.loads(line);m=q.get('method');p=q.get('params',{})
+        with open(#{inspect(trace)},'a') as f:f.write(json.dumps(q)+'\\n')
+        if m=='initialized':continue
+        if m=='initialize':r={}
+        elif m=='thread/goal/get':r={'goal':None}
+        elif m=='thread/read':
+          assert p['includeTurns'] is False
+          r={'thread':{'id':'paged','status':{'type':'idle' if stopped else 'active'},'turns':[]}}
+        elif m=='thread/turns/list':
+          assert p['itemsView']=='notLoaded' and p['sortDirection']=='asc'
+          if p.get('cursor') is None:r={'data':[{'id':'old','status':'unknown' if mode.startswith('unknown-prefix') else 'completed'}],'nextCursor':'page2'}
+          elif mode=='failed-page':
+            print(json.dumps({'id':q['id'],'error':{'code':-32601,'message':'unavailable'}}),flush=True);continue
+          else:r={'data':[{'id':'later','status':'unknown' if mode=='unknown-state' else 'interrupted' if stopped else 'inProgress'}],'nextCursor':'page2' if mode=='repeated-cursor' else None}
+        elif m=='turn/interrupt':
+          assert p['turnId']=='later';stopped=True;r={}
+        else:raise AssertionError('must not resume or allocate: '+str(m))
+        print(json.dumps({'id':q['id'],'result':r}),flush=True)
+      """)
+
+      File.chmod!(binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: root, codex_command: binary)
+      expected = if mode == "unknown-prefix", do: "later", else: if(mode == "unknown-prefix-missing", do: "missing", else: "old")
+      result = SymphonyElixir.NativeStop.confirm(%{"thread_id" => "paged", "workspace" => workspace, "turn_id" => expected})
+
+      if mode == "complete" do
+        assert {:ok, %{"native_stop_confirmed" => true, "turn_id" => "later"}} = result
+      else
+        assert {:error, _} = result
+      end
+    end
+
+    requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    refute Enum.any?(requests, &(&1["method"] in ["thread/start", "thread/resume", "turn/start"]))
+    assert Enum.any?(requests, &(&1["method"] == "turn/interrupt"))
   end
 
   test "new, reviewed and restored sessions prevent automatic profile reinjection" do
@@ -77,6 +191,7 @@ defmodule SymphonyElixir.AppServerTest do
         assert 'GITLAB_PAT' in c['shell_environment_policy.exclude']
         assert 'tool_output_token_limit' not in c
         r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
+      elif m=='thread/turns/list':r={'data':[],'nextCursor':None}
       elif m=='thread/read':r={'thread':{'id':'isolated','status':{'type':'idle'},'turns':[]}}
       else:raise AssertionError(m)
       print(json.dumps({'id':q['id'],'result':r}),flush=True)
@@ -185,6 +300,7 @@ defmodule SymphonyElixir.AppServerTest do
       if m=='initialized':continue
       if m=='initialize':result={}
       elif m=='thread/goal/get':result={'goal':None}
+      elif m=='thread/turns/list':result={'data':[],'nextCursor':None}
       elif m in ['thread/start','thread/read']:result={'thread':{'id':'stopped','status':{'type':'idle'},'turns':[]}}
       else:raise AssertionError('unexpected native execution: '+str(m))
       print(json.dumps({'id':q['id'],'result':result}),flush=True)
@@ -232,6 +348,7 @@ defmodule SymphonyElixir.AppServerTest do
       for line in sys.stdin:
         q=json.loads(line);m=q.get('method')
         if m=='initialize': print(json.dumps({'id':q['id'],'result':{}}),flush=True)
+        elif m=='thread/turns/list': print(json.dumps({'id':q['id'],'result':{'data':#{Jason.encode!(turns)},'nextCursor':None}}),flush=True)
         elif m=='thread/read': print(json.dumps({'id':q['id'],'result':{'thread':{'id':'inspect-thread','status':{'type':'notLoaded'},'turns':#{Jason.encode!(turns)}}}}),flush=True)
         elif m is not None and m!='initialized': raise AssertionError('inspection must not start native execution')
       """)

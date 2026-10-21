@@ -9,6 +9,11 @@ Issues. Review cards use native reviewer eligibility and confirmed publication,
 independently of Issue routing labels. Manual review records are excluded; board
 reads never trigger execution. See [review workflow](docs/review-workflow.md).
 
+Review source transport pages large text inside the native read-only sandbox.
+Opaque hex literals expose explicit size/hash evidence and bounded original-byte
+inspection; missing required data validation remains non-pass. Native stop checks
+metadata and every paginated turn rather than hydrating full thread history.
+
 This directory contains the current Elixir/OTP implementation of Symphony, based on
 [`SPEC.md`](../SPEC.md) at the repository root.
 
