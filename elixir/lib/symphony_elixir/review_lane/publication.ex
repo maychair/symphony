@@ -12,7 +12,7 @@ defmodule SymphonyElixir.ReviewLane.Publication do
 
   defp unified_result(%{"review_protocol" => 3} = record, submission) do
     with true <- is_map(record["review_result"]) and is_binary(record["review_result"]["body"]) and record["review_result"]["protocol"] == 3,
-         true <- submission == Map.take(record["review_result"], ~w(findings responses)) do
+         true <- submission == record["review_result"] do
       :ok
     else
       _ -> {:error, :invalid_review_result}
@@ -42,18 +42,13 @@ defmodule SymphonyElixir.ReviewLane.Publication do
   @spec valid?(map(), pos_integer()) :: boolean()
   def valid?(%{"publication" => %{"version" => version, "actor" => actor, "entries" => saved}} = record, actor) when is_list(saved) and version == 3 do
     unified_result(record, record["submission"]) == :ok and
-      version == 3 and valid_submission?(record["submission"]) and
+      version == 3 and
       record["publication"]["context"] == context(record) and
       length(saved) == length(entries(record)) and
       Enum.zip(saved, entries(record)) |> Enum.all?(fn {entry, expected} -> valid_entry?(entry, expected, record, actor) end)
   end
 
   def valid?(record, _actor), do: is_nil(record["publication"]) and is_nil(record["submission"])
-
-  defp valid_submission?(%{"findings" => findings, "responses" => responses}) when is_list(findings) and is_list(responses),
-    do: length(findings) <= 50 and Enum.all?(findings, &is_map/1) and Enum.all?(responses, &is_map/1)
-
-  defp valid_submission?(_), do: false
 
   @doc "Read every recorded intent, retaining confirmed partial receipts even when another intent is uncertain."
   @spec recover(map(), map(), (map() -> any())) :: {:ok, map()} | {:error, term(), map()}
@@ -212,12 +207,10 @@ defmodule SymphonyElixir.ReviewLane.Publication do
   defp entries(%{"review_protocol" => 3, "review_result" => result}),
     do: [%{"index" => 0, "kind" => "unified", "body" => result["body"], "status" => "prepared"}]
 
-  defp finding_entry?(%{"kind" => "unified"}, record), do: record["review_result"]["findings"] != []
-
   defp put_entry(record, entry, checkpoint) do
     updated = put_in(record["publication"]["entries"], List.replace_at(record["publication"]["entries"], entry["index"], entry))
     receipts = Enum.filter(updated["publication"]["entries"], &(&1["status"] == "published"))
-    updated = updated |> Map.put("receipts", Enum.map(receipts, & &1["receipt"])) |> Map.put("findings", receipts |> Enum.filter(&finding_entry?(&1, record)) |> Enum.map(& &1["receipt"]))
+    updated = Map.put(updated, "receipts", Enum.map(receipts, & &1["receipt"]))
     if updated != record, do: checkpoint.(updated)
     updated
   end

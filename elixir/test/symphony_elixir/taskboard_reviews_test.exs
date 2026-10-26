@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.TaskboardReviewsTest do
   use SymphonyElixir.TestSupport, runtime: false
-  alias SymphonyElixir.ReviewLane.{Finding, Publication}
+  alias SymphonyElixir.ReviewLane.Publication
   alias SymphonyElixir.Taskboard
   alias SymphonyElixir.Taskboard.Reviews
   alias SymphonyElixir.TaskWorkflow
@@ -48,7 +48,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
 
     {:ok, result} = SymphonyElixir.TestSupport.fixture_review_result(record, axes)
     record = Map.merge(record, %{"axes" => axes, "review_result" => result, "native_stop_confirmed" => true, "phase" => "completed"})
-    {:ok, record} = Publication.prepare(record, Map.take(result, ~w(findings responses)), 21)
+    {:ok, record} = Publication.prepare(record, result, 21)
 
     entries =
       Enum.map(record["publication"]["entries"], fn entry ->
@@ -134,7 +134,7 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     assert card.column == "Done"
     assert card.review.conclusion == "changes_requested"
 
-    prior = Finding.advance(nil, %{"findings" => [finding], "responses" => []}, 1)
+    prior = completed(r, [finding])["review_result"]["finding_register"]
     recheck = Map.put(record(2), "finding_register", prior)
     response = %{"finding" => "S1", "status" => "still_valid", "evidence" => "当前源码仍可触发原反例", "rationale" => "原问题未修复", "verified_by" => "reviewer"}
     completed_recheck = completed(recheck, [], [response])

@@ -84,8 +84,10 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
     assert {:error, :invalid_gitlab_project_path} =
              GitLabClient.validate_settings(tracker_settings(%{"project_path" => "group / project"}))
 
-    assert {:error, :missing_gitlab_api_key} =
-             GitLabClient.validate_settings(tracker_settings(%{"api_key" => 123}))
+    assert :ok = GitLabClient.validate_settings(tracker_settings(%{"api_key" => nil}))
+
+    assert {:error, :invalid_gitlab_command} =
+             GitLabClient.validate_settings(tracker_settings(%{"glab_bin" => 123}))
 
     assert {:error, :invalid_gitlab_api_url} =
              GitLabClient.validate_settings(tracker_settings(%{"api_url" => "not a url"}))
@@ -109,7 +111,8 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
                tracker_settings(%{"project_path" => " group/project ", "api_key" => " token "}),
                fn "GET", "/projects/group%2Fproject/issues", _query, nil, settings ->
                  assert settings.project_path == "group/project"
-                 assert settings.api_key == "token"
+                 refute Map.has_key?(settings, :api_key)
+                 assert settings.glab_bin == "glab"
                  {:ok, %{status: 200, body: []}}
                end
              )
@@ -397,7 +400,7 @@ defmodule SymphonyElixir.GitLab.AdapterTest do
     assert malformed_response["success"] == false
 
     Enum.each(
-      [:missing_gitlab_api_key, {:gitlab_api_request, :timeout}, :unexpected_failure],
+      [:invalid_gitlab_command, {:command_failed, "glab", 124}, :unexpected_failure],
       fn reason ->
         failure =
           GitLabAgentTool.execute(

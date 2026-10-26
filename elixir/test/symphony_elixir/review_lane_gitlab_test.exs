@@ -1,7 +1,20 @@
 defmodule SymphonyElixir.ReviewLaneGitLabTest do
   use SymphonyElixir.TestSupport
+  alias SymphonyElixir.Command
   alias SymphonyElixir.ReviewLane.{GitHub, GitLab}
   alias SymphonyElixir.RuntimeContext
+
+  test "both provider adapters retain native output larger than 8 MiB" do
+    cli = Path.join(Path.dirname(Workflow.workflow_file_path()), "large-native-response")
+    File.write!(cli, "#!/usr/bin/env python3\nimport json\nprint(json.dumps({'body':'x'*(9*1024*1024)}))\n")
+    File.chmod!(cli, 0o755)
+    config = %{"host" => "review.invalid", "glab_bin" => cli, "gh_bin" => cli}
+
+    for adapter <- [GitLab, GitHub] do
+      assert {:ok, %{"body" => body}} = adapter.request(config, "GET", "user")
+      assert body == String.duplicate("x", 9 * 1024 * 1024)
+    end
+  end
 
   test "the review adapter cannot invoke native actions, foreign writes or quick actions inside comments" do
     config = %{"host" => "review.invalid", "projects" => %{"team/repo" => %{"id" => 10}}, "glab_bin" => "must-not-be-called"}
@@ -56,7 +69,7 @@ defmodule SymphonyElixir.ReviewLaneGitLabTest do
               assert {:ok, %{"id" => ^id}} = GitHub.request(config, "GET", "user")
             end)
 
-            assert {:ok, name} = GitLab.command("git", ["config", "--get", "user.name"])
+            assert {:ok, name} = Command.run("git", ["config", "--get", "user.name"])
             assert String.trim(name) == directory
           end)
         end)
@@ -108,7 +121,7 @@ defmodule SymphonyElixir.ReviewLaneGitLabTest do
     System.put_env("PATH", root)
 
     try do
-      assert {:error, {:command_unavailable, _}} = GitLab.command("missing", [])
+      assert {:error, {:command_unavailable, _}} = Command.run("missing", [])
     after
       restore_env("PATH", previous)
     end

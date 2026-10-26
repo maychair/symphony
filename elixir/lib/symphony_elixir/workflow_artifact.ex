@@ -19,7 +19,7 @@ defmodule SymphonyElixir.WorkflowArtifact do
         File.write!(input, Jason.encode!(payload))
 
         case System.cmd("timeout", ["--signal=TERM", "30s", executable | args ++ ["--input", input]], stderr_to_stdout: false) do
-          {output, 0} when byte_size(output) <= 1_048_576 -> decode(output)
+          {output, 0} -> decode(output)
           _ -> {:error, :workflow_artifact_rejected}
         end
       after

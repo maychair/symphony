@@ -18,16 +18,16 @@ defmodule SymphonyElixir.ReviewRequestTest do
     {:ok, root: root, source: source, base: base, head: head}
   end
 
-  test "manual local input uses an isolated merge-base snapshot and explicit requirements", c do
+  test "local input uses an isolated merge-base snapshot and preserves supplied context", c do
     git(c.source, ["checkout", "-qb", "diverged", c.base])
     File.write!(Path.join(c.source, "other.txt"), "other branch")
     git(c.source, ["add", "."])
     git(c.source, ["commit", "-qm", "diverged"])
-    request = %{"kind" => "local", "repository" => c.source, "base" => "diverged", "head" => c.head, "target_branch" => "main", "issue" => %{"description" => "明确的验收要求"}}
+    request = %{"kind" => "local", "repository" => c.source, "base" => "diverged", "head" => c.head, "target_branch" => "main", "mr" => %{"description" => "明确的验收要求"}}
     assert {:ok, context} = ReviewRequest.prepare(request, %{})
     assert context.record["base"] == c.base
     assert context.record["head"] == c.head
-    assert context.mr["symphony_issue_evidence"]["status"] == "available"
+    assert context.mr == request["mr"]
     assert File.read!(Path.join(context.repository, "source.txt")) == "head"
     refute context.repository == c.source
     assert git(c.source, ["branch", "--show-current"]) == "diverged"
@@ -62,21 +62,20 @@ defmodule SymphonyElixir.ReviewRequestTest do
     end
 
     assert {:error, _} = ReviewRequest.prepare(request, nil)
-    assert {:ok, unavailable} = ReviewRequest.prepare(request, %{})
-    assert unavailable.mr["symphony_issue_evidence"]["status"] == "unavailable"
-    ReviewRequest.cleanup(unavailable)
-    assert {:ok, truncated} = ReviewRequest.prepare(Map.put(request, "issue_evidence", List.duplicate(%{"body" => "text"}, 5)), %{})
-    assert truncated.mr["symphony_issue_evidence"]["status"] == "incomplete"
-    ReviewRequest.cleanup(truncated)
+    assert {:ok, context} = ReviewRequest.prepare(request, %{})
+    assert context.mr == %{}
+    ReviewRequest.cleanup(context)
     assert git(c.source, ["rev-parse", "HEAD"]) == c.head
   end
 
-  test "MR preparation pins native identity, reads linked requirements and uses the same snapshot path", c do
+  test "MR preparation pins native identity and leaves requirement reading to the workflow", c do
     {config, request} = native_fixture(c)
     assert {:ok, context} = ReviewRequest.prepare(request, config)
     assert context.record["head"] == c.head
     assert context.record["base"] == c.base
-    assert context.mr["symphony_issue_evidence"]["items"] |> hd() |> Map.fetch!("description") == "真实需求"
+    assert context.mr["description"] == "Closes #1"
+    refute Map.has_key?(context.mr, "symphony_issue_evidence")
+    refute File.read!(Path.join(c.root, "native-reads.jsonl")) =~ "/issues/"
     assert :ok = ReviewRequest.cleanup(context)
 
     for {key, value} <- [{"project", "other/repo"}, {"host", "foreign.invalid"}, {"provider", "github"}, {"number", 0}, {"record", %{"iid" => 2}}, {"record", %{"head" => c.base}}] do
@@ -88,12 +87,8 @@ defmodule SymphonyElixir.ReviewRequestTest do
     assert {:error, :review_identity_mismatch} = ReviewRequest.prepare(request, config)
   end
 
-  test "missing or truncated remote requirements remain incomplete and unsafe remotes cannot be used", c do
+  test "unsafe remotes cannot be used", c do
     {config, request} = native_fixture(c)
-    set_response(c, "projects/team%2Frepo/issues/1", "EXIT")
-    assert {:ok, context} = ReviewRequest.prepare(request, config)
-    assert context.mr["symphony_issue_evidence"]["status"] == "incomplete"
-    ReviewRequest.cleanup(context)
 
     for url <- [nil, "https://foreign.invalid/team/repo.git", "https://user@review.invalid/team/repo.git", "https://review.invalid/other/repo.git"] do
       set_response(c, "projects/team%2Frepo", %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "https://review.invalid/team/repo", "ssh_url_to_repo" => url})
@@ -144,45 +139,22 @@ defmodule SymphonyElixir.ReviewRequestTest do
     end
   end
 
-  test "native closing URLs load requirements and foreign links remain explicit incomplete input", c do
+  test "native descriptions with many Issue links and long evidence reach the workflow unchanged", c do
     {config, request} = native_fixture(c)
     path = "projects/team%2Frepo/merge_requests/1"
     mr = c.root |> Path.join("responses.json") |> File.read!() |> Jason.decode!() |> Map.fetch!(path)
-    set_response(c, path, Map.put(mr, "description", "Closes https://review.invalid/team/repo/-/issues/1"))
+    description = "Closes #1 Closes #2 Closes #3 Closes #4 Closes #5\n" <> String.duplicate("evidence", 10_000)
+    mr = Map.put(mr, "description", description)
+    set_response(c, path, mr)
     assert {:ok, context} = ReviewRequest.prepare(request, config)
-    assert context.mr["symphony_issue_evidence"]["status"] == "available"
-    assert hd(context.mr["symphony_issue_evidence"]["items"])["description"] == "真实需求"
+    assert context.mr == mr
+    refute File.read!(Path.join(c.root, "native-reads.jsonl")) =~ "/issues/"
     ReviewRequest.cleanup(context)
-
-    for link <- ["https://foreign.invalid/team/repo/-/issues/1", "https://review.invalid/other/repo/-/issues/1", "https://review.invalid/team/repo/-/issues/1?token=secret"] do
-      set_response(c, path, Map.put(mr, "description", "Closes " <> link))
-      assert {:ok, incomplete} = ReviewRequest.prepare(request, config)
-      assert incomplete.mr["symphony_issue_evidence"]["status"] == "incomplete"
-      assert incomplete.mr["symphony_issue_evidence"]["unresolved_links"] == [link]
-      ReviewRequest.cleanup(incomplete)
-    end
-  end
-
-  test "explicit evidence, unknown native responses and resource bounds retain missing-input facts", c do
-    {config, request} = native_fixture(c)
-    assert {:ok, explicit} = ReviewRequest.prepare(Map.put(request, "issue", %{"description" => "明确验收约定"}), config)
-    assert explicit.mr["symphony_issue_evidence"]["additional_links"] == [1]
-    ReviewRequest.cleanup(explicit)
-    mr = %{"project_id" => 10, "iid" => 1, "sha" => c.head, "diff_refs" => %{"base_sha" => c.base}, "target_branch" => "main", "description" => ""}
-    set_response(c, "projects/team%2Frepo/merge_requests/1", mr)
-    assert {:ok, no_links} = ReviewRequest.prepare(Map.put(request, "issue_evidence", [12]), config)
-    assert no_links.mr["symphony_issue_evidence"]["status"] == "incomplete"
-    ReviewRequest.cleanup(no_links)
-    set_response(c, "projects/team%2Frepo/merge_requests/1", Map.put(mr, "description", "Closes #1 Closes #2 Closes #3 Closes #4 Closes #5"))
-    set_response(c, "projects/team%2Frepo/issues/1", [])
-    assert {:ok, truncated} = ReviewRequest.prepare(request, config)
-    assert truncated.mr["symphony_issue_evidence"]["truncated"]
-    ReviewRequest.cleanup(truncated)
-    set_response(c, "projects/team%2Frepo/merge_requests/1", [])
+    set_response(c, path, [])
     assert {:error, :invalid_native_review} = ReviewRequest.prepare(request, config)
   end
 
-  test "GitHub closing URLs use the same requirement acquisition path", c do
+  test "GitHub review preserves native requirement links for the workflow", c do
     {config, request} = native_fixture(c)
     config = config |> Map.put("provider", "github") |> Map.put("gh_bin", config["glab_bin"])
     set_response(c, "repos/team/repo", %{"id" => 10, "full_name" => "team/repo", "html_url" => "https://review.invalid/team/repo", "ssh_url" => "git@review.invalid:team/repo.git"})
@@ -202,10 +174,10 @@ defmodule SymphonyElixir.ReviewRequestTest do
       set_response(c, path <> "?per_page=100&page=1", [])
     end
 
-    set_response(c, "repos/team/repo/issues/1", %{"number" => 1, "body" => "GitHub 原始任务要求"})
     assert {:ok, context} = ReviewRequest.prepare(request, config)
-    assert context.mr["symphony_issue_evidence"]["status"] == "available"
-    assert hd(context.mr["symphony_issue_evidence"]["items"])["description"] == "GitHub 原始任务要求"
+    assert context.mr["description"] == "Fixes https://review.invalid/team/repo/issues/1"
+    refute Map.has_key?(context.mr, "symphony_issue_evidence")
+    refute "repos/team/repo/issues/1" in String.split(File.read!(Path.join(c.root, "native-reads.jsonl")), "\n")
     ReviewRequest.cleanup(context)
   end
 
@@ -253,7 +225,6 @@ defmodule SymphonyElixir.ReviewRequestTest do
     })
 
     set_response(c, "projects/team%2Frepo/merge_requests/1/discussions?per_page=100&page=1", [])
-    set_response(c, "projects/team%2Frepo/issues/1", %{"iid" => 1, "description" => "真实需求"})
     bin = Path.join(c.root, "bin")
     File.mkdir_p!(bin)
     executable = System.find_executable("git")

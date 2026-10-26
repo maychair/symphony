@@ -339,13 +339,19 @@ defmodule SymphonyElixir.NativeWork do
 
   defp valid_repository?(repository) do
     path = repository["path"]
-    credential = repository["credential"]
 
     is_binary(path) and Regex.match?(~r/\A[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\z/, path) and
       Enum.all?(String.split(path, "/"), &(&1 not in [".", ".."])) and
       (repository["provider"] == "gitlab" or length(String.split(path, "/")) == 2) and
-      is_binary(credential) and Regex.match?(~r/\A\$[A-Za-z_][A-Za-z0-9_]*\z/, credential) and
+      valid_credential?(repository) and
       valid_endpoint?(repository)
+  end
+
+  defp valid_credential?(%{"provider" => "gitlab"}), do: true
+
+  defp valid_credential?(repository) do
+    credential = repository["credential"]
+    is_binary(credential) and Regex.match?(~r/\A\$[A-Za-z_][A-Za-z0-9_]*\z/, credential)
   end
 
   defp valid_endpoint?(%{"api_url" => api_url} = repository) when is_binary(api_url) do
@@ -465,7 +471,7 @@ defmodule SymphonyElixir.NativeWork do
   defp settings(repository),
     do: %{
       kind: "gitlab",
-      provider: %{"project_path" => repository["path"], "api_url" => repository["api_url"], "api_key" => repository["credential"], "allow_insecure_http" => repository["allow_insecure_http"] == true}
+      provider: %{"project_path" => repository["path"], "api_url" => repository["api_url"], "glab_bin" => repository["glab_bin"], "allow_insecure_http" => repository["allow_insecure_http"] == true}
     }
 
   defp request("github", method, path, query, settings), do: GitHub.request(method, path, query, nil, tracker_settings: settings)

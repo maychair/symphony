@@ -72,11 +72,11 @@ defmodule SymphonyElixir.ReviewLane.Policy do
 
   @doc "Version relevant author replies and resolution changes; a repeated poll is not another response."
   @spec response_digest([map()], [map()], pos_integer()) :: {:ok, String.t()} | {:error, atom()}
-  def response_digest(findings, discussions, author) do
-    findings
+  def response_digest(receipts, discussions, author) do
+    receipts
     |> Enum.uniq_by(&{&1["discussion_id"], &1["note_id"]})
-    |> Enum.reduce_while({:ok, []}, fn finding, {:ok, acc} ->
-      case response(finding, discussions, author) do
+    |> Enum.reduce_while({:ok, []}, fn receipt, {:ok, acc} ->
+      case response(receipt, discussions, author) do
         {:ok, nil} -> {:cont, {:ok, acc}}
         {:ok, value} -> {:cont, {:ok, [value | acc]}}
         error -> {:halt, error}
@@ -88,11 +88,11 @@ defmodule SymphonyElixir.ReviewLane.Policy do
     end
   end
 
-  defp response(finding, discussions, author) do
-    with %{} = discussion <- Enum.find(discussions, &(&1["id"] == finding["discussion_id"])),
+  defp response(receipt, discussions, author) do
+    with %{} = discussion <- Enum.find(discussions, &(&1["id"] == receipt["discussion_id"])),
          notes when is_list(notes) <- discussion["notes"],
          true <- Enum.all?(notes, &is_map/1),
-         %{} = own <- Enum.find(notes, &(&1["id"] == finding["note_id"])),
+         %{} = own <- Enum.find(notes, &(&1["id"] == receipt["note_id"])),
          true <- is_boolean(own["resolved"]) do
       replies =
         notes
@@ -104,10 +104,10 @@ defmodule SymphonyElixir.ReviewLane.Policy do
         |> Enum.sort_by(& &1["id"])
 
       if own["resolved"] or replies != [],
-        do: {:ok, %{"discussion" => finding["discussion_id"], "note" => own["id"], "resolved" => own["resolved"], "replies" => replies}},
+        do: {:ok, %{"discussion" => receipt["discussion_id"], "note" => own["id"], "resolved" => own["resolved"], "replies" => replies}},
         else: {:ok, nil}
     else
-      _ -> {:error, :review_finding_source_missing}
+      _ -> {:error, :review_receipt_source_missing}
     end
   end
 end

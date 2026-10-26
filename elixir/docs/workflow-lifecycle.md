@@ -116,10 +116,11 @@ work with a visible error; they must not fall through to coding execution.
 
 `tracker.provider.plan_roots` lists explicitly selected parent `WorkRef` objects.
 `plan_repositories` contains the permitted repository read contexts. Each entry
-has `provider`, `host`, `repository_id`, `path`, `api_url` and `credential` (an
-explicit `$ENVIRONMENT_VARIABLE` reference). Explicit GitHub/GitLab environment
-references must resolve their named variable; a missing variable cannot fall back
-to the global token or repository setting for another execution context.
+has `provider`, `host`, `repository_id`, `path` and `api_url`. GitHub additionally
+requires `credential`, an explicit `$ENVIRONMENT_VARIABLE` reference that must
+resolve its named variable without falling back to a global token. GitLab uses
+the native `glab` credential store and optional `glab_bin`, as the Issue and review
+adapters do; external launch configuration selects the identity.
 No repository or endpoint is learned
 from Issue prose. Credentials remain outside journals and are included in the
 executor secret-environment exclusion list. For example:

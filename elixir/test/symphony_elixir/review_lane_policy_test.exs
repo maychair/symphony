@@ -69,8 +69,8 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     discussion = %{"id" => "d", "notes" => [own]}
     assert {:ok, empty} = Policy.response_digest([], [], 30)
     assert {:ok, ^empty} = Policy.response_digest(finding, [discussion], 30)
-    assert {:error, :review_finding_source_missing} = Policy.response_digest(finding, [], 30)
-    assert {:error, :review_finding_source_missing} = Policy.response_digest(finding, [%{discussion | "notes" => []}], 30)
+    assert {:error, :review_receipt_source_missing} = Policy.response_digest(finding, [], 30)
+    assert {:error, :review_receipt_source_missing} = Policy.response_digest(finding, [%{discussion | "notes" => []}], 30)
     reply = %{"id" => 2, "body" => "修复了边界条件", "author" => %{"id" => 30}, "created_at" => "2026-01-02T00:00:00Z"}
     replied = %{discussion | "notes" => [own, reply]}
     assert {:ok, digest} = Policy.response_digest(finding, [replied], 30)

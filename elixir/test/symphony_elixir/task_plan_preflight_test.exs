@@ -7,8 +7,11 @@ defmodule SymphonyElixir.TaskPlanPreflightTest do
     do: %{"provider" => provider, "host" => provider <> ".test", "repository_id" => repo, "kind" => "issue", "number" => number}
 
   defp repository(work, path) do
+    identity = if work["provider"] == "github", do: %{"credential" => "$PLAN_FIXTURE_TOKEN"}, else: %{"glab_bin" => "fixture-glab"}
+
     Map.take(work, ~w(provider host repository_id))
-    |> Map.merge(%{"path" => path, "api_url" => "https://#{work["host"]}/api/" <> if(work["provider"] == "github", do: "v3", else: "v4"), "credential" => "$PLAN_FIXTURE_TOKEN"})
+    |> Map.merge(%{"path" => path, "api_url" => "https://#{work["host"]}/api/" <> if(work["provider"] == "github", do: "v3", else: "v4")})
+    |> Map.merge(identity)
   end
 
   defp scope(work, parent) do
@@ -101,6 +104,12 @@ defmodule SymphonyElixir.TaskPlanPreflightTest do
     request = fn provider, method, path, _query, settings ->
       assert method == "GET"
       assert settings.kind == provider
+
+      if provider == "gitlab" do
+        assert settings.provider["glab_bin"] == "fixture-glab"
+        refute Map.has_key?(settings.provider, "api_key")
+      end
+
       {:ok, %{status: 200, body: rewrite.({provider, path}, Map.fetch!(fixture.objects, {provider, path}))}}
     end
 

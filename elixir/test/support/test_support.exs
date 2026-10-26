@@ -144,6 +144,7 @@ defmodule SymphonyElixir.TestSupport do
         if (root/'disconnect').exists():sys.exit(0)
         if (root/'hang').exists():continue
         if (root/'invalid-artifact').exists():tool('workflow_submit',{'result':{'axes':{}}})
+        elif (root/'submission.json').exists():tool('workflow_submit',{'result':json.loads((root/'submission.json').read_text())})
         elif (root/'no-submit').exists():
           save('completed');emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':turn,'status':'completed'}}})
         else:tool('workflow_submit',{'result':{'axes':{k:{'status':'complete','report':'Reviewed fixed source','sources':['source.txt'],'scope':['entire diff'],'gaps':[],'findings':[],'responses':[]} for k in ['standards','spec']}}})

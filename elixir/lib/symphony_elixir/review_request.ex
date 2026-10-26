@@ -5,6 +5,7 @@ defmodule SymphonyElixir.ReviewRequest do
   Preparation owns source acquisition and provider reads only. Instruction loading and native execution belong to the caller.
   """
 
+  alias SymphonyElixir.Command
   alias SymphonyElixir.ReviewLane.{GitHub, GitLab}
 
   @review_ref_prefix %{"gitlab" => "refs/merge-requests/", "github" => "refs/pull/"}
@@ -59,10 +60,8 @@ defmodule SymphonyElixir.ReviewRequest do
          {:ok, discussions} <- native.discussions(config, native.mr_path(project, number)),
          {:ok, workspace} <- request_workspace(request),
          {:ok, repository} <- snapshot_mr(workspace, record, config) do
-      {:ok, evidence} = linked_issue_evidence(mr, record, request, config, project)
-      mr = Map.put(mr, "symphony_issue_evidence", evidence)
       record = record_defaults(record, %{"base" => view.base, "head" => view.head, "target_branch" => view.target_branch})
-      record = record |> Map.put("issue_evidence", evidence) |> Map.put("_temporary_review_workspace", request["workspace"] == nil)
+      record = Map.put(record, "_temporary_review_workspace", request["workspace"] == nil)
       {:ok, %{record: record, repository: repository, config: config, mr: mr, discussions: discussions}}
     end
   end
@@ -84,10 +83,8 @@ defmodule SymphonyElixir.ReviewRequest do
          {:ok, discussions} <- optional_list(request, "discussions"),
          {:ok, workspace} <- request_workspace(request),
          {:ok, repository} <- snapshot_local(workspace, source, base, head) do
-      {:ok, evidence} = explicit_or_unavailable_evidence(request)
-      mr = mr |> Map.put("symphony_issue_evidence", evidence)
       record = record_defaults(record, %{"base" => base, "head" => head, "target_branch" => target_branch})
-      record = record |> Map.put("issue_evidence", evidence) |> Map.put("_temporary_review_workspace", request["workspace"] == nil)
+      record = Map.put(record, "_temporary_review_workspace", request["workspace"] == nil)
       {:ok, %{record: record, repository: repository, config: config, mr: mr, discussions: discussions}}
     end
   end
@@ -194,143 +191,6 @@ defmodule SymphonyElixir.ReviewRequest do
     end
   end
 
-  defp linked_issue_evidence(mr, record, request, config, project) do
-    explicit = explicit_evidence(request)
-    {refs, unresolved} = linked_issue_refs(mr, record, request, config, project)
-
-    result =
-      case {explicit, refs} do
-        {evidence, []} when evidence != nil ->
-          {:ok, evidence}
-
-        {evidence, refs} when evidence != nil ->
-          {:ok, Map.put(evidence, "additional_links", refs)}
-
-        {nil, []} ->
-          {:ok, unavailable_evidence(:no_linked_issue_reference)}
-
-        {nil, refs} ->
-          {:ok, evidence} = fetch_issues(config, project, Enum.take(refs, 4))
-          if length(refs) > 4, do: {:ok, Map.merge(evidence, %{"status" => "incomplete", "truncated" => true})}, else: {:ok, evidence}
-      end
-
-    case result do
-      {:ok, evidence} when unresolved != [] -> {:ok, Map.merge(evidence, %{"status" => "incomplete", "unresolved_links" => unresolved})}
-      other -> other
-    end
-  end
-
-  defp explicit_or_unavailable_evidence(request) do
-    case explicit_evidence(request) do
-      nil -> {:ok, unavailable_evidence(:no_linked_issue_reference)}
-      evidence -> {:ok, evidence}
-    end
-  end
-
-  defp explicit_evidence(request) do
-    cond do
-      is_list(request["issue_evidence"]) and request["issue_evidence"] != [] ->
-        explicit_items(request["issue_evidence"])
-
-      is_map(request["issue"]) ->
-        explicit_items([request["issue"]])
-
-      true ->
-        nil
-    end
-  end
-
-  defp explicit_items(items) do
-    evidence = Enum.map(Enum.take(items, 4), &bounded_issue/1)
-    status = if length(items) <= 4 and Enum.all?(evidence, &(&1["status"] == "available")), do: "available", else: "incomplete"
-    %{"status" => status, "items" => evidence}
-  end
-
-  defp linked_issue_refs(mr, record, request, config, project) do
-    direct = [request["issue_iid"], request["issue_number"], record["issue_iid"], record["issue_number"]]
-    description = if is_binary(mr["description"]), do: mr["description"], else: ""
-    parsed = Regex.scan(~r/(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(\#[1-9][0-9]*\b|https?:\/\/[^\s<>\])]+)/, description, capture: :all_but_first)
-
-    {linked, unresolved} =
-      Enum.reduce(List.flatten(parsed), {[], []}, fn token, {ids, missing} ->
-        case linked_issue_number(token, config, project) do
-          {:ok, number} -> {[number | ids], missing}
-          :error -> {ids, [token | missing]}
-        end
-      end)
-
-    refs =
-      (direct ++ linked)
-      |> Enum.reduce([], fn value, acc ->
-        case positive_integer(value) do
-          {:ok, number} -> [number | acc]
-          _ -> acc
-        end
-      end)
-      |> Enum.uniq()
-      |> Enum.sort()
-
-    {refs, Enum.uniq(unresolved)}
-  end
-
-  defp linked_issue_number("#" <> number, _config, _project), do: positive_integer(number)
-
-  defp linked_issue_number(url, config, project) do
-    prefix = if config["provider"] == "github", do: "/#{project}/issues/", else: "/#{project}/-/issues/"
-    path = URI.parse(url).path || ""
-
-    with true <- String.starts_with?(path, prefix),
-         {:ok, number} <- positive_integer(String.replace_prefix(path, prefix, "")),
-         true <- GitLab.web_url?(url, config, prefix <> Integer.to_string(number)) do
-      {:ok, number}
-    else
-      _ -> :error
-    end
-  end
-
-  defp fetch_issues(config, project, refs) do
-    native = provider!(config)
-
-    items =
-      Enum.map(refs, fn iid ->
-        path =
-          case config["provider"] do
-            "github" -> "repos/#{project}/issues/#{iid}"
-            _ -> "projects/#{URI.encode_www_form(project)}/issues/#{iid}"
-          end
-
-        case native.request(config, "GET", path) do
-          {:ok, issue} when is_map(issue) -> bounded_issue(issue)
-          {:error, reason} -> %{"status" => "unavailable", "iid" => iid, "reason" => inspect(reason)}
-          _ -> %{"status" => "unavailable", "iid" => iid, "reason" => "invalid_issue_response"}
-        end
-      end)
-
-    status = if Enum.all?(items, &(&1["status"] == "available")), do: "available", else: "incomplete"
-    {:ok, %{"status" => status, "items" => items}}
-  end
-
-  defp bounded_issue(issue) when is_map(issue) do
-    description = issue["description"] || issue["body"]
-    available = is_binary(description) and String.trim(description) != "" and String.length(description) <= 65_536
-
-    %{
-      "status" => if(available, do: "available", else: "incomplete"),
-      "iid" => issue["iid"] || issue["number"],
-      "title" => bounded_text(issue["title"], 512),
-      "description" => bounded_text(issue["description"] || issue["body"], 65_536),
-      "state" => bounded_text(issue["state"], 64),
-      "web_url" => bounded_text(issue["web_url"] || issue["html_url"], 2048)
-    }
-  end
-
-  defp bounded_issue(_issue), do: %{"status" => "unavailable", "reason" => "invalid_issue_response"}
-
-  defp bounded_text(value, limit) when is_binary(value), do: String.slice(value, 0, limit)
-  defp bounded_text(_value, _limit), do: nil
-
-  defp unavailable_evidence(reason), do: %{"status" => "unavailable", "reason" => Atom.to_string(reason), "items" => []}
-
   defp record_defaults(record, values) do
     record
     |> Map.merge(values)
@@ -379,7 +239,7 @@ defmodule SymphonyElixir.ReviewRequest do
 
   defp valid_remote?(_remote, _config, _record), do: false
 
-  defp git_command(args), do: GitLab.command("git", args)
+  defp git_command(args), do: Command.run("git", args)
 
   defp git(repository, args), do: git_command(["-C", repository | args])
 

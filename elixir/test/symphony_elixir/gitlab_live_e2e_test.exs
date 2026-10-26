@@ -14,7 +14,7 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
   @tag skip: @live_e2e_skip_reason
   test "closes and retains an approved real GitLab issue through gitlab_api" do
     project_id = required_env!("SYMPHONY_LIVE_GITLAB_PROJECT_ID")
-    token = required_env!("GITLAB_PAT")
+    settings = tracker_settings(project_id)
     run_id = "symphony-gitlab-live-e2e-#{System.unique_integer([:positive])}"
     test_root = Path.join(System.tmp_dir!(), run_id)
     workflow_root = Path.join(test_root, "workflow")
@@ -27,7 +27,7 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     File.mkdir_p!(workflow_root)
 
     issue_iid = required_env!("SYMPHONY_LIVE_GITLAB_ISSUE_IID")
-    issue_payload = get_issue!(project_id, token, issue_iid)
+    issue_payload = get_issue!(project_id, settings, issue_iid)
     assert issue_payload["state"] == "opened", "prepare an open, approved test Issue before running"
     expected_comment = "Symphony 真实测试：Agent 已读取本 Issue，并完成隔离目录的结果验证。"
 
@@ -68,9 +68,9 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
         assert File.read!(Path.join(runtime_info.workspace_path, @result_file)) ==
                  expected_result(issue.identifier, project_id)
 
-        assert %{"state" => "closed"} = get_issue!(project_id, token, issue.id)
+        assert %{"state" => "closed"} = get_issue!(project_id, settings, issue.id)
 
-        assert notes!(project_id, token, issue.id)
+        assert notes!(project_id, settings, issue.id)
                |> Enum.any?(&(&1["body"] == expected_comment))
 
         issue_path = "/projects/#{project_id}/issues/#{issue.id}"
@@ -83,8 +83,8 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
       end,
       [
         fn ->
-          assert :ok = close_issue(project_id, token, issue_iid)
-          assert %{"state" => "closed"} = get_issue!(project_id, token, issue_iid)
+          assert :ok = close_issue(project_id, settings, issue_iid)
+          assert %{"state" => "closed"} = get_issue!(project_id, settings, issue_iid)
         end,
         fn -> Workflow.set_workflow_file_path(original_workflow_path) end,
         fn -> restart_agent_runtime_if_needed(runtime_pid) end,
@@ -98,7 +98,7 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
   defp tracker_settings(project_id) do
     %{
       kind: "gitlab",
-      provider: %{"project_path" => project_id, "api_key" => "test-token"},
+      provider: %{"project_path" => project_id, "api_url" => api_url(), "allow_insecure_http" => System.get_env("SYMPHONY_LIVE_GITLAB_ALLOW_INSECURE_HTTP") == "1"},
       active_states: ["opened"],
       terminal_states: ["closed"]
     }
@@ -115,7 +115,6 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
           api_url: #{Jason.encode!(api_url())}
           allow_insecure_http: #{System.get_env("SYMPHONY_LIVE_GITLAB_ALLOW_INSECURE_HTTP") == "1"}
           project_path: #{Jason.encode!(project_id)}
-          api_key: "$GITLAB_PAT"
         active_states: ["opened"]
         terminal_states: ["closed"]
       workspace:
@@ -189,15 +188,15 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     "identifier=#{identifier}\nproject_id=#{project_id}\ngitlab_pat_present=no\ngitlab_access_token_present=no\n"
   end
 
-  defp get_issue!(project_id, token, issue_iid) do
-    case get_issue(project_id, token, issue_iid) do
+  defp get_issue!(project_id, settings, issue_iid) do
+    case get_issue(project_id, settings, issue_iid) do
       %{} = issue -> issue
       :not_found -> flunk("GitLab issue read unexpectedly returned 404")
     end
   end
 
-  defp get_issue(project_id, token, issue_iid) do
-    case gitlab_request(:get, "/projects/#{project_id}/issues/#{issue_iid}", token, nil) do
+  defp get_issue(project_id, settings, issue_iid) do
+    case gitlab_request(:get, "/projects/#{project_id}/issues/#{issue_iid}", settings, nil) do
       {:ok, %{status: status, body: %{} = issue}} when status in 200..299 -> issue
       {:ok, %{status: 404}} -> :not_found
       {:ok, %{status: status}} -> flunk("GitLab issue read failed with HTTP #{status}")
@@ -205,12 +204,12 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     end
   end
 
-  defp notes!(project_id, token, issue_iid) do
+  defp notes!(project_id, settings, issue_iid) do
     response =
       gitlab_request!(
         :get,
         "/projects/#{project_id}/issues/#{issue_iid}/notes",
-        token,
+        settings,
         nil,
         %{"per_page" => 100}
       )
@@ -221,11 +220,11 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     end
   end
 
-  defp close_issue(project_id, token, issue_iid) do
+  defp close_issue(project_id, settings, issue_iid) do
     case gitlab_request(
            :put,
            "/projects/#{project_id}/issues/#{issue_iid}",
-           token,
+           settings,
            %{"state_event" => "close"}
          ) do
       {:ok, %{status: status}} when status in 200..299 -> :ok
@@ -235,32 +234,16 @@ defmodule SymphonyElixir.GitLab.LiveE2ETest do
     end
   end
 
-  defp gitlab_request!(method, path, token, body, query) do
-    case gitlab_request(method, path, token, body, query) do
+  defp gitlab_request!(method, path, settings, body, query) do
+    case gitlab_request(method, path, settings, body, query) do
       {:ok, %{status: status} = response} when status in 200..299 -> response
       {:ok, %{status: status}} -> flunk("GitLab request failed with HTTP #{status}")
       {:error, reason} -> flunk("GitLab request failed before a response: #{inspect(reason)}")
     end
   end
 
-  defp gitlab_request(method, path, token, body, query \\ %{}) do
-    request_opts = [
-      method: method,
-      url: api_url() <> path,
-      headers: [
-        {"Accept", "application/json"},
-        {"PRIVATE-TOKEN", token}
-      ],
-      params: query,
-      connect_options: [timeout: 30_000]
-    ]
-
-    request_opts = if is_nil(body), do: request_opts, else: Keyword.put(request_opts, :json, body)
-
-    case Req.request(request_opts) do
-      {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
-      {:error, reason} -> {:error, reason}
-    end
+  defp gitlab_request(method, path, settings, body, query \\ %{}) do
+    GitLabClient.request(method |> Atom.to_string() |> String.upcase(), path, query, body, tracker_settings: settings)
   end
 
   defp receive_runtime_info!(issue_id) do

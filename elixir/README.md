@@ -223,6 +223,8 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Issue execution always uses an isolated directory under `workspace.root`; provider settings
+  cannot select the primary source checkout as the execution directory.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
@@ -348,7 +350,9 @@ codex:
 ### GitLab adapter
 
 - Configure `tracker.kind: gitlab` with `tracker.provider.project_path`, optional `api_url`, and
-  `api_key` (default `GITLAB_PAT`); use `opened` and `closed` tracker states.
+  optional `glab_bin` (default `glab`); use `opened` and `closed` tracker states.
+  Issue and review requests use native glab credentials. The external launcher supplies the
+  credential directory and executable; Symphony does not read tokens or a workspace identity file.
 - Symphony reads project issues by IID and exposes route-safe `GL-<iid>` identifiers.
 - `gitlab_api` forwards raw GitLab REST requests with host-side auth and keeps configured tracker
   credentials and provider authentication aliases out of the Codex child.
@@ -446,7 +450,7 @@ failures are reported together. Prepare the Issue through approved repository to
 
 ```bash
 cd elixir
-export GITLAB_PAT=...
+export GLAB_CONFIG_DIR=... # Existing native credentials; no token in the Workflow
 export SYMPHONY_LIVE_GITLAB_PROJECT_ID=...
 export SYMPHONY_LIVE_GITLAB_ISSUE_IID=...
 # Self-hosted: SYMPHONY_LIVE_GITLAB_API_URL must point to /api/v4.
