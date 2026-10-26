@@ -119,7 +119,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubTest do
 
     # invalid discussions path
     assert {:error, :invalid_github_path} = GitHub.discussions(config, "invalid/path")
-    assert {:error, {:command_unavailable, _}} = GitHub.command(nil, [])
+    assert {:error, {:command_unavailable, _}} = SymphonyElixir.Command.run(nil, [])
     refute GitHub.repository?(nil, config, "team/repo")
   end
 

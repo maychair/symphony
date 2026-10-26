@@ -5,12 +5,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
   alias SymphonyElixir.Linear.Client
 
-  test "workspace bootstrap can be implemented in after_create hook" do
+  test "workspace bootstrap stays isolated even with obsolete primary checkout settings" do
     test_root =
       Path.join(
         System.tmp_dir!(),
         "symphony-elixir-workspace-hook-bootstrap-#{System.unique_integer([:positive])}"
       )
+
+    previous_target = System.get_env("SYMPHONY_TARGET_REPO")
 
     try do
       template_repo = Path.join(test_root, "source")
@@ -31,11 +33,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         hook_after_create: "git clone --depth 1 #{template_repo} ."
       )
 
+      path = Workflow.workflow_file_path()
+      content = File.read!(path)
+      File.write!(path, String.replace(content, "tracker:\n", "tracker:\n  provider:\n    workbench_primary_checkout: true\n"))
+      WorkflowStore.force_reload()
+      System.put_env("SYMPHONY_TARGET_REPO", template_repo)
+      assert Config.settings!().tracker.provider["workbench_primary_checkout"] == true
+
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
+      assert workspace == Path.join(workspace_root, "S-1")
       assert File.exists?(Path.join(workspace, ".git"))
       assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
+      File.write!(Path.join(workspace, "README.md"), "workspace edit\n")
+      assert File.read!(Path.join(template_repo, "README.md")) == "hook clone\n"
     after
+      restore_env("SYMPHONY_TARGET_REPO", previous_target)
       File.rm_rf(test_root)
     end
   end

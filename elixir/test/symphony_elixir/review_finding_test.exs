@@ -1,65 +1,43 @@
 defmodule SymphonyElixir.ReviewFindingTest do
   @moduledoc """
-  Structured standalone finding contract (§17.1) and its publication mapping (§18.1).
-
-  A finding keeps a stable identity across rounds, records the version it applies
-  to and the violated criterion, separates advice from required conditions, and is
-  only settled by the reviewer. Old string-list submissions are rejected.
+  Preserve externally validated review results and confirm native publication.
+  Business rules are exercised by the configured validator, not the engine.
   """
 
   use SymphonyElixir.TestSupport, runtime: false
 
-  alias SymphonyElixir.ReviewLane.{Finding, Listener, Publication}
+  alias SymphonyElixir.ReviewLane.{Listener, Publication}
 
   @head String.duplicate("c", 40)
   @base String.duplicate("b", 40)
 
-  describe "register and verdict" do
-    test "identity survives rounds and the verdict separates advice from required conditions" do
-      register = registered([finding(), %{finding() | "id" => "F2", "required" => false}])
-      assert Finding.register?(register)
-      refute Finding.register?(nil)
-      refute Finding.register?(%{"F1" => %{"id" => "F2"}})
-
-      verdict = Finding.verdict(register)
-      assert verdict["blocking"]
-      refute verdict["decision_required"]
-      assert verdict["required_open"] == ["F1"]
-      assert verdict["suggestions"] == ["F2"]
-      assert verdict["resolved"] == []
-    end
-
-    test "rounds advance an existing register instead of dropping open conditions" do
-      register = registered([finding()])
-      still = %{"finding" => "F1", "status" => "still_valid", "evidence" => "新版本仍然越界", "rationale" => nil, "verified_by" => "reviewer"}
-      open = Finding.advance(register, %{"findings" => [], "responses" => [still]}, 2)
-      assert Finding.verdict(open)["blocking"]
-      assert Finding.verdict(open)["required_open"] == ["F1"]
-
-      fixed = %{"finding" => "F1", "status" => "fixed", "evidence" => "已补充边界测试", "rationale" => nil, "verified_by" => "reviewer"}
-      assert Finding.verdict(Finding.advance(register, %{"findings" => [], "responses" => [fixed]}, 2))["resolved"] == ["F1"]
-
-      undecided = %{"finding" => "F1", "status" => "undecidable", "evidence" => nil, "rationale" => "证据不足", "verified_by" => "reviewer"}
-      advanced = Finding.advance(register, %{"findings" => [], "responses" => [undecided]}, 2)
-      assert Finding.verdict(advanced)["decision_required"]
-      assert Finding.verdict(advanced)["undecidable"] == ["F1"]
-    end
-  end
-
   describe "publication mapping" do
+    test "publication records native receipts without knowing the result's business schema" do
+      {root, config} = start_review_fixture()
+      result = %{"protocol" => 3, "body" => "Workflow conclusion", "assessment" => %{"outcome" => "accepted"}}
+      record = Map.merge(publication_record(), %{"review_result" => result, "project" => "team/repo", "iid" => 7})
+      assert {:ok, prepared} = Publication.prepare(record, result, 20)
+      assert {:ok, published} = Publication.publish(prepared, config, & &1, fn _ -> :ok end)
+      assert length(published["receipts"]) == 1
+      refute Map.has_key?(published, "findings")
+      assert published["review_result"] == result
+      assert {:ok, recovered} = Publication.recover(published, config, & &1)
+      assert recovered == published
+      assert length(Jason.decode!(File.read!(Path.join(root, "discussions.json")))) == 1
+    end
+
     test "publication uses the single validated body rather than rendering another conclusion" do
       submission = %{"findings" => [finding()], "responses" => []}
-      record = publication_record(%{}) |> Map.put("review_result", Map.merge(submission, %{"protocol" => 3, "body" => "Validated findings body"}))
-      assert {:ok, prepared} = Publication.prepare(record, submission, 20)
+      record = publication_record() |> Map.put("review_result", Map.merge(submission, %{"protocol" => 3, "body" => "Validated findings body"}))
+      assert {:ok, prepared} = Publication.prepare(record, record["review_result"], 20)
       assert [%{"body" => "Validated findings body"}] = prepared["publication"]["entries"]
     end
 
     test "old result protocols cannot publish and native-command bodies are refused" do
-      old = Map.delete(publication_record(%{}), "review_protocol")
+      old = Map.delete(publication_record(), "review_protocol")
       assert {:error, :unsupported_review_result} = Publication.prepare(old, ["old finding"], 20)
-      submission = %{"findings" => [], "responses" => []}
-      record = put_in(publication_record(%{}), ["review_result", "body"], "example\n/approve")
-      assert {:error, :invalid_review_publication_body} = Publication.prepare(record, submission, 20)
+      record = put_in(publication_record(), ["review_result", "body"], "example\n/approve")
+      assert {:error, :invalid_review_publication_body} = Publication.prepare(record, record["review_result"], 20)
     end
 
     test "publication validity distinguishes no intent from an inconsistent one" do
@@ -69,14 +47,14 @@ defmodule SymphonyElixir.ReviewFindingTest do
     end
 
     test "publication validity refuses malformed entries and missing published receipts" do
-      assert {:ok, prepared} = Publication.prepare(publication_record(%{}), %{"findings" => [], "responses" => []}, 20)
+      assert {:ok, prepared} = Publication.prepare(publication_record(), publication_record()["review_result"], 20)
       assert Publication.valid?(prepared, 20)
 
       [entry] = prepared["publication"]["entries"]
       refute Publication.valid?(put_in(prepared["publication"]["entries"], [nil]), 20)
       refute Publication.valid?(put_in(prepared["publication"]["entries"], [%{entry | "status" => "corrupt"}]), 20)
       refute Publication.valid?(put_in(prepared["publication"]["entries"], [Map.put(entry, "native_candidate", %{"note_id" => 1})]), 20)
-      malformed = prepared |> Map.put("submission", %{"findings" => nil, "responses" => []}) |> put_in(["review_result", "findings"], nil)
+      malformed = prepared |> put_in(["review_result", "body"], nil)
       refute Publication.valid?(malformed, 20)
 
       missing_receipt = entry |> Map.put("status", "published") |> Map.put("receipt", nil)
@@ -100,19 +78,17 @@ defmodule SymphonyElixir.ReviewFindingTest do
       assert length(discussions) == 1
 
       record = review_record(config, issue)
-      assert Finding.register?(record["finding_register"])
-      assert record["verdict"]["blocking"]
+      assert record["finding_register"] == %{"from_validator" => 1}
+      assert record["verdict"] == %{"policy_result" => "changes_requested"}
 
       stop_supervised!(Listener)
       start_supervised!({Listener, config: config})
       await_listener()
       {:ok, [restored]} = Listener.issues()
       assert restored.native_ref["phase"] == "completed"
-      assert restored.native_ref["verdict"]["blocking"]
+      assert restored.native_ref["verdict"] == record["verdict"]
     end
   end
-
-  defp registered(findings), do: Finding.advance(nil, %{"findings" => findings, "responses" => []}, 1)
 
   defp version(head \\ @head), do: %{"head" => head, "base" => @base, "target" => "main"}
 
@@ -134,7 +110,7 @@ defmodule SymphonyElixir.ReviewFindingTest do
     )
   end
 
-  defp publication_record(register) do
+  defp publication_record do
     %{
       "review_protocol" => 3,
       "review_result" => %{"protocol" => 3, "findings" => [], "responses" => [], "body" => "LGTM!"},
@@ -144,9 +120,7 @@ defmodule SymphonyElixir.ReviewFindingTest do
       "head" => @head,
       "base" => @base,
       "response_sha" => String.duplicate("a", 64),
-      "policy_sha" => String.duplicate("b", 64),
-      "finding_register" => register,
-      "verdict" => Finding.verdict(register)
+      "policy_sha" => String.duplicate("b", 64)
     }
   end
 

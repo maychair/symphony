@@ -8,7 +8,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   """
   use GenServer
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{Finding, GitHub, GitLab, Journal, Owner, Policy, Publication}
+  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy, Publication}
 
   @worker_fields ~w(policy_sha native_stop_error thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
@@ -439,7 +439,6 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp record?(id, %{} = record, config) do
     valid_subject?(record, config) and record_shape?(record, config) and Publication.valid?(record, config["publisher_id"]) and
       target_branch?(record["target_branch"]) and
-      (is_nil(record["finding_register"]) or Finding.register?(record["finding_register"])) and
       record["work"] == work(config, record["project"], record["iid"]) and
       id == record["id"] and id == round_id(record["work"], record["round"], config)
   end
@@ -449,7 +448,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp record_shape?(record, config) do
     is_integer(record["round"]) and record["round"] > 0 and
       record["phase"] in ~w(queued running publishing completed failed fenced ended superseded) and
-      is_list(record["findings"]) and Enum.all?(record["findings"], &is_map/1) and
+      is_list(record["receipts"]) and Enum.all?(record["receipts"], &is_map/1) and
       Enum.all?(~w(head base), &valid_sha?(record[&1])) and Enum.all?(~w(policy_sha response_sha), &digest?(record[&1])) and
       auxiliary_fields?(record, config)
   end
@@ -594,7 +593,6 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp queue(state, project, iid, mr, round, response_sha \\ TaskWorkflow.digest([])) do
     work = work(state.config, project, iid)
     id = round_id(work, round, state.config)
-    register = %{}
 
     record = %{
       "review_protocol" => 3,
@@ -609,14 +607,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       "response_sha" => response_sha,
       "policy_sha" => policy_sha(state.config),
       "eligibility" => "current",
-      "finding_register" => register,
-      "verdict" => Finding.verdict(register),
+      "finding_register" => %{},
       "author_id" => mr["author"]["id"],
       "url" => mr["web_url"],
       "title" => mr["title"],
       "created_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "updated_at" => mr["updated_at"],
-      "findings" => [],
+      "receipts" => [],
       "phase" => "queued"
     }
 
@@ -707,11 +704,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp published_review?(_), do: false
 
   defp reconcile_assigned(state, record, mr, path) do
-    findings = findings_for(state, record)
+    receipts = receipts_for(state, record)
 
     with {:ok, discussions} <- native(state.config).discussions(state.config, path),
-         discussions = bind_replies(state.config, findings, discussions, record["author_id"]),
-         {:ok, responses} <- Policy.response_digest(findings, discussions, record["author_id"]),
+         discussions = bind_replies(state.config, receipts, discussions, record["author_id"]),
+         {:ok, responses} <- Policy.response_digest(receipts, discussions, record["author_id"]),
          true <- publications_verified?(state, record) or {:error, :review_publication_unverified} do
       changed = changed_inputs?(state.config, record, mr, responses)
       eligibility = if changed, do: "superseded", else: "current"
@@ -721,8 +718,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
-  defp findings_for(state, record) do
-    state.records |> Map.values() |> Enum.filter(&(&1["project"] == record["project"] and &1["iid"] == record["iid"])) |> Enum.flat_map(& &1["findings"])
+  defp receipts_for(state, record) do
+    state.records |> Map.values() |> Enum.filter(&(&1["project"] == record["project"] and &1["iid"] == record["iid"])) |> Enum.flat_map(& &1["receipts"])
   end
 
   defp publications_verified?(state, record) do
@@ -774,10 +771,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     with true <- publishable?(record),
          {:ok, ^completion} <- SymphonyElixir.WorkflowArtifact.evaluate(state.config, %{"record" => record, "result" => completion}),
          true <- stopped?(record),
-         submission = Map.take(completion, ~w(findings responses)),
-         record = record |> Map.put("review_result", completion) |> register(submission),
-         {:ok, record} <- Publication.prepare(record, submission, state.config["publisher_id"]) do
-      record = record |> Map.put_new("response_findings", findings_for(state, record)) |> Map.put("phase", "publishing")
+         record = record |> Map.put("review_result", completion) |> Map.merge(Map.take(completion, ~w(finding_register verdict))),
+         {:ok, record} <- Publication.prepare(record, completion, state.config["publisher_id"]) do
+      record = record |> Map.put_new("response_receipts", receipts_for(state, record)) |> Map.put("phase", "publishing")
       finish_publication(put_record(state, record), record, :worker)
     else
       {:error, reason} -> {:error, reason, state}
@@ -787,13 +783,6 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp publish(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
   defp publishable?(record), do: is_map(record) and record["phase"] in ["running", "publishing", "completed"]
-
-  # Only the independent reviewer channel resolves a finding; the register is
-  # advanced before the publication intent is stored.
-  defp register(record, submission) do
-    register = Finding.advance(record["finding_register"], submission, record["round"])
-    record |> Map.put("finding_register", register) |> Map.put("verdict", Finding.verdict(register))
-  end
 
   defp finish_publication(state, record, mode \\ :recovery) do
     guard = fn current ->
@@ -877,10 +866,10 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp same_responses(record, discussions, config) do
     expected = record["response_sha"]
-    findings = (record["response_findings"] || []) ++ record["findings"]
-    discussions = bind_replies(config, findings, discussions, record["author_id"])
+    receipts = (record["response_receipts"] || []) ++ record["receipts"]
+    discussions = bind_replies(config, receipts, discussions, record["author_id"])
 
-    case Policy.response_digest(findings, discussions, record["author_id"]) do
+    case Policy.response_digest(receipts, discussions, record["author_id"]) do
       {:ok, ^expected} -> :ok
       _ -> {:error, :review_responses_changed}
     end
@@ -905,16 +894,16 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   # GitHub stores review bodies and issue comments as separate native objects
   # without a shared discussion ID. Bind author notes conservatively to every
-  # open finding in the reviewed round; Policy still filters by author and time.
-  defp bind_replies(%{"provider" => "github"}, findings, discussions, author_id),
-    do: merge_replies(findings, discussions, author_id)
+  # published comment in the reviewed round; Policy still filters by author and time.
+  defp bind_replies(%{"provider" => "github"}, receipts, discussions, author_id),
+    do: merge_replies(receipts, discussions, author_id)
 
-  defp bind_replies(_config, _findings, discussions, _author_id), do: discussions
+  defp bind_replies(_config, _receipts, discussions, _author_id), do: discussions
 
   defp merge_replies([], discussions, _author_id), do: discussions
 
-  defp merge_replies(findings, discussions, author_id) do
-    own = findings |> Enum.map(& &1["discussion_id"]) |> MapSet.new()
+  defp merge_replies(receipts, discussions, author_id) do
+    own = receipts |> Enum.map(& &1["discussion_id"]) |> MapSet.new()
 
     replies =
       for discussion <- discussions,

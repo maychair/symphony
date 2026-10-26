@@ -1,7 +1,6 @@
 defmodule SymphonyElixir.GitArtifactTest do
   use ExUnit.Case, async: true
   alias SymphonyElixir.{GitArtifact, GitArtifactFixture, NativeWork}
-  alias SymphonyElixir.GitLab.Client, as: GitLabClient
 
   defp fixture(provider, files \\ %{"result" => "expected\n", "dir/binary" => <<0, 255, 16>>, "dir/data.json" => "{\"value\":1}"}) do
     root = Path.join(System.tmp_dir!(), "git-artifact-#{System.unique_integer([:positive])}")
@@ -143,17 +142,6 @@ defmodule SymphonyElixir.GitArtifactTest do
     assert {:error, :git_tree_limit} = read(context)
   end
 
-  test "the actual GitLab HTTP client preserves raw blob bytes even when their content type is JSON" do
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, {:active, false}, {:reuseaddr, true}, {:ip, {127, 0, 0, 1}}])
-    {:ok, port} = :inet.port(listener)
-    body = "{\"value\": 1}\n"
-    task = Task.async(fn -> serve_raw(listener, body) end)
-    settings = %{kind: "gitlab", provider: %{"project_path" => "team/repo", "api_key" => "fixture-token", "api_url" => "http://127.0.0.1:#{port}/api/v4", "allow_insecure_http" => true}}
-    path = "/projects/team%2Frepo/repository/blobs/" <> String.duplicate("1", 40) <> "/raw"
-    assert {:ok, %{status: 200, body: ^body}} = GitLabClient.request("GET", path, %{}, nil, tracker_settings: settings)
-    assert :ok = Task.await(task)
-  end
-
   test "a spent retrieval deadline stops later native requests and never accepts an over-budget snapshot" do
     context = fixture("gitlab")
 
@@ -167,20 +155,5 @@ defmodule SymphonyElixir.GitArtifactTest do
     assert {:error, :git_artifact_timeout} = read(context, artifact_timeout_ms: 10)
     reads = Agent.get(context.state, & &1.reads)
     refute Enum.any?(reads, fn {path, _} -> String.ends_with?(path, "/repository/tree") end)
-  end
-
-  defp serve_raw(listener, body) do
-    {:ok, socket} = :gen_tcp.accept(listener, 5_000)
-    {:ok, request} = :gen_tcp.recv(socket, 0, 5_000)
-    assert request =~ "/raw HTTP/1.1"
-
-    response =
-      "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" <>
-        "content-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <> body
-
-    :ok = :gen_tcp.send(socket, response)
-    :gen_tcp.close(socket)
-  after
-    :gen_tcp.close(listener)
   end
 end

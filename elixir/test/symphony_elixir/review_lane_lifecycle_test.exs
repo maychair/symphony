@@ -835,7 +835,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert retained.id == issue.id
     assert retained.native_ref["round"] == 1
     assert retained.native_ref["phase"] == "fenced"
-    assert length(retained.native_ref["findings"]) == 1
+    assert length(retained.native_ref["receipts"]) == 1
     assert length(posts(c)) == 1
     refute retained.dispatchable
   end
@@ -859,7 +859,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(Path.join(c.root, "changed-head"), "new head cannot erase a receipt conflict")
     {:ok, [unknown]} = Listener.issues()
     assert unknown.native_ref["eligibility"] == "unknown"
-    assert unknown.native_ref["error"] =~ "review_publication_unverified"
+    assert unknown.native_ref["error"] =~ "review_receipt_source_missing"
     File.write!(path, Jason.encode!([discussion]))
     assert {:ok, [retained]} = Listener.issues()
     assert retained.native_ref["round"] == 1
@@ -1292,6 +1292,13 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   @tag native_review: true
   test "review runner executes the configured workflow once without engine-owned axes", c do
     %{issue: issue} = runner_fixture(c)
+
+    assessment =
+      Map.new(["standards", "spec"], fn axis ->
+        {axis, %{"status" => "complete", "report" => "Reviewed source", "sources" => ["source.txt"], "scope" => ["diff"], "gaps" => [], "findings" => [], "responses" => []}}
+      end)
+
+    File.write!(Path.join(c.root, "submission.json"), Jason.encode!(%{"assessment" => assessment}))
     assert :ok = Runner.run(issue, self())
     assert_received {:worker_runtime_info, _, %{workspace_path: snapshot}}
     assert File.read!(Path.join(snapshot, "source.txt")) == "changed candidate"
@@ -1541,7 +1548,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(Path.join(c.root, "discussions.json"), "[]")
     assert {:ok, [unknown]} = Listener.issues()
     assert unknown.native_ref["eligibility"] == "unknown"
-    assert unknown.native_ref["error"] =~ "review_finding_source_missing"
+    assert unknown.native_ref["error"] =~ "review_receipt_source_missing"
   end
 
   defp owner_for(id), do: get_in(:sys.get_state(Listener), [:records, String.replace_prefix(id, "review:", ""), "execution_owner"])

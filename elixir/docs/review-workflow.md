@@ -15,6 +15,20 @@ and a private JSON file, validates the workflow artifact and returns canonical J
 The integration supplies this same tool to manual review. No engine build or
 running Symphony service is needed for manual review.
 
+The submitted artifact is passed through with the fixed execution `record`.
+The validator owns business fields, finding resolution and technical verdicts;
+Symphony persists the returned `finding_register` and `verdict` without deriving
+or validating their business schema. Subsequent rounds pass that retained state
+back to the same configured validator. Execution ownership, native stop and
+publication readback remain engine responsibilities.
+
+The workflow reads linked requirements through its provider tools and assesses
+their coverage. Source preparation passes native MR text unchanged; it does not
+select Issue links, truncate requirements or judge their completeness. Artifact
+transport preserves the validator's full JSON output without a separate size cap.
+Publication tracks confirmed native comment receipts without inspecting findings;
+reply changes are observed for every published comment, including clean reviews.
+
 The session exposes ordinary native tools and `workflow_submit`, which records
 one artifact. Submission alone does not complete a run. The native turn must end,
 stop must be confirmed, the configured validator must accept the result, and the

@@ -63,20 +63,10 @@ defmodule SymphonyElixir.ReviewLane.GitHub do
     args = ["api", "--hostname", config["host"], "--method", method, path]
     args = args ++ Enum.flat_map(fields, fn {key, value} -> ["--raw-field", "#{key}=#{value}"] end)
 
-    case command(config["gh_bin"] || "gh", args) do
+    case SymphonyElixir.Command.run(config["gh_bin"] || "gh", args) do
       {:ok, output} -> Jason.decode(output)
       error -> error
     end
-  end
-
-  @spec command(String.t(), [String.t()]) :: {:ok, String.t()} | {:error, term()}
-  def command(executable, args) do
-    case System.cmd("timeout", ["--signal=TERM", "30s", executable | args], stderr_to_stdout: false, env: Map.to_list(SymphonyElixir.RuntimeContext.environment())) do
-      {output, 0} when byte_size(output) <= 8_388_608 -> {:ok, output}
-      {_output, status} -> {:error, {:command_failed, executable, status}}
-    end
-  rescue
-    error -> {:error, {:command_unavailable, Exception.message(error)}}
   end
 
   @spec mr_path(String.t(), pos_integer()) :: String.t()

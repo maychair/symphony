@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.TaskPlanDispatchTest do
   use SymphonyElixir.TestSupport
   alias SymphonyElixir.{Execution, TaskPlan, TaskWorkflow}
+  alias SymphonyElixir.GitHub.Client, as: GitHubClient
 
   test "unconfigured plans and unavailable selected credentials never enter the native read transport" do
     work = %{"provider" => "github", "host" => "github.test", "repository_id" => "1", "kind" => "issue", "number" => 1}
@@ -16,14 +17,19 @@ defmodule SymphonyElixir.TaskPlanDispatchTest do
       repository = Map.take(work, ~w(provider host repository_id))
       repository = Map.merge(repository, %{"path" => "team/project", "api_url" => "https://#{work["host"]}/api/#{api}", "credential" => "$" <> env})
 
-      {client, key, error} =
-        if provider == "github",
-          do: {SymphonyElixir.GitHub.Client, "token", :missing_github_token},
-          else: {SymphonyElixir.GitLab.Client, "api_key", :missing_gitlab_api_key}
+      repository =
+        if provider == "github" do
+          settings = %{provider: %{"repo" => "team/project", "token" => "$" <> env}}
+          request = fn _, _, _, _, _ -> flunk("missing selected credential fell back to another identity") end
 
-      settings = %{provider: %{"repo" => "team/project", "project_path" => "team/project", key => "$" <> env}}
-      request = fn _, _, _, _, _ -> flunk("missing selected credential fell back to another identity") end
-      assert {:error, ^error} = client.request("GET", "/", %{}, nil, tracker_settings: settings, request_fun: request)
+          assert {:error, :missing_github_token} =
+                   GitHubClient.request("GET", "/", %{}, nil, tracker_settings: settings, request_fun: request)
+
+          repository
+        else
+          repository |> Map.delete("credential") |> Map.put("glab_bin", "/nonexistent/symphony-test-glab")
+        end
+
       assert {:error, :native_read_failed} = SymphonyElixir.NativeWork.read(work, repositories: [repository])
     end
   end

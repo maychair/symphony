@@ -63,7 +63,7 @@ defmodule SymphonyElixir.ReviewLane.Runner do
       {:ok, artifact, runtime} ->
         :ok = checkpoint(issue, Map.drop(runtime, ~w(thread_allocation_intent turn_allocation_intent)))
 
-        with {:ok, completion} <- WorkflowArtifact.evaluate(context.config, %{"record" => input, "axes" => artifact["axes"]}),
+        with {:ok, completion} <- WorkflowArtifact.evaluate(context.config, Map.put(artifact, "record", input)),
              :ok <- Listener.submit(issue.id, issue.native_ref["execution_owner"], %{"completion" => completion}) do
           :ok
         else

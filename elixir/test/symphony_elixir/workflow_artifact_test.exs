@@ -19,8 +19,9 @@ defmodule SymphonyElixir.WorkflowArtifactTest do
 
     argument = "$(touch #{marker})"
     config = %{"result_command" => [System.find_executable("python3"), script, argument]}
-    assert {:ok, result} = WorkflowArtifact.evaluate(config, %{"value" => "private content"})
-    assert result["payload"] == %{"value" => "private content"}
+    payload = %{"value" => String.duplicate("evidence", 160_000)}
+    assert {:ok, result} = WorkflowArtifact.evaluate(config, payload)
+    assert result["payload"] == payload
     assert result["argument"] == argument
     refute File.exists?(result["input"])
     refute File.exists?(marker)
@@ -29,7 +30,7 @@ defmodule SymphonyElixir.WorkflowArtifactTest do
   test "missing, failed and malformed validators fail closed" do
     assert {:error, :workflow_result_command_required} = WorkflowArtifact.evaluate(%{}, %{})
 
-    for program <- ["print('not json')", "print('[]')", "raise SystemExit(2)", "print('x'*1048577)"] do
+    for program <- ["print('not json')", "print('[]')", "raise SystemExit(2)"] do
       command = [System.find_executable("python3"), "-c", program]
       assert {:error, _} = WorkflowArtifact.evaluate(%{"result_command" => command}, %{})
     end

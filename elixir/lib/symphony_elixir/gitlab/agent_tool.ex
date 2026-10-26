@@ -208,19 +208,10 @@ defmodule SymphonyElixir.GitLab.AgentTool do
     }
   end
 
-  defp tool_error_payload(:missing_gitlab_api_key) do
+  defp tool_error_payload(:invalid_gitlab_command) do
     %{
       "error" => %{
-        "message" => "Symphony is missing GitLab auth. Set tracker.provider.api_key or export GITLAB_PAT."
-      }
-    }
-  end
-
-  defp tool_error_payload({:gitlab_api_request, reason}) do
-    %{
-      "error" => %{
-        "message" => "GitLab API request failed before receiving a successful response.",
-        "reason" => inspect(reason)
+        "message" => "tracker.provider.glab_bin must select a native GitLab CLI executable. Configure credentials in its native store."
       }
     }
   end

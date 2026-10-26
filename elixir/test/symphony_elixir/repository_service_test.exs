@@ -127,7 +127,7 @@ defmodule SymphonyElixir.RepositoryServiceTest do
     {:ok, contexts} = RepositoryService.load(manifest)
     contexts = Enum.map(contexts, &Map.put(&1, :secrets, ["SYMPHONY_CREDENTIAL_A", "SYMPHONY_CREDENTIAL_B"]))
     start_supervised!({RepositoryService, contexts})
-    wait_until(fn -> Enum.all?(entries, &File.exists?(Path.join(root, &1["id"] <> "-worker.txt"))) end)
+    wait_until(fn -> Enum.all?(entries, &(File.read(Path.join(root, &1["id"] <> "-worker.txt")) == {:ok, &1["id"] <> "|unset|unset"})) end)
 
     for entry <- entries do
       assert File.read!(Path.join(root, entry["id"] <> "-worker.txt")) == entry["id"] <> "|unset|unset"

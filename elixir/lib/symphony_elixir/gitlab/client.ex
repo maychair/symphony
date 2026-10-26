@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.GitLab.Client do
-  alias SymphonyElixir.RuntimeContext
+  alias SymphonyElixir.{Command, RuntimeContext}
 
   @moduledoc """
   Thin GitLab REST client for project-scoped issue polling.
@@ -295,22 +295,52 @@ defmodule SymphonyElixir.GitLab.Client do
   end
 
   defp perform_request(method, path, query, body, settings) do
-    with {:ok, request_method} <- request_method(method) do
-      request_opts = [
-        method: request_method,
-        url: settings.api_url <> path,
-        headers: gitlab_headers(settings.api_key),
-        params: query,
-        decode_body: not String.ends_with?(path, "/raw"),
-        connect_options: [timeout: 30_000]
-      ]
+    with {:ok, _method} <- request_method(method) do
+      endpoint = settings.api_url <> path
+      separator = if String.contains?(endpoint, "?"), do: "&", else: "?"
+      endpoint = if query == %{}, do: endpoint, else: endpoint <> separator <> URI.encode_query(query)
+      args = ["api", "--hostname", URI.parse(settings.api_url).host, "--method", method, "--include", endpoint]
 
-      request_opts = if is_nil(body), do: request_opts, else: Keyword.put(request_opts, :json, body)
+      {output, exit_code} = with_body(body, fn body_args -> Command.capture(settings.glab_bin, args ++ body_args) end)
+      decode_response(output, exit_code, path, settings.glab_bin)
+    end
+  rescue
+    error -> {:error, {:command_unavailable, Exception.message(error)}}
+  end
 
-      case Req.request(request_opts) do
-        {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
-        {:error, reason} -> {:error, {:gitlab_api_request, reason}}
-      end
+  defp with_body(nil, fun), do: fun.([])
+
+  defp with_body(body, fun) do
+    directory = Path.join(System.tmp_dir!(), "symphony-gitlab-" <> Base.encode16(:crypto.strong_rand_bytes(16)))
+    File.mkdir!(directory)
+
+    try do
+      File.chmod!(directory, 0o700)
+      input = Path.join(directory, "body.json")
+      File.write!(input, Jason.encode!(body))
+      fun.(["--header", "Content-Type: application/json", "--input", input])
+    after
+      File.rm_rf!(directory)
+    end
+  end
+
+  defp decode_response(output, exit_code, path, executable) do
+    with [headers, body] <- String.split(output, ~r/\r?\n\r?\n/, parts: 2),
+         [_, status] <- Regex.run(~r/\AHTTP\/\S+ ([0-9]{3})(?: |\r?\n)/, headers),
+         status = String.to_integer(status),
+         true <- exit_code == 0 or status in 400..599,
+         {:ok, payload} <- decode_body(body, path) do
+      {:ok, %{status: status, body: payload}}
+    else
+      _ -> {:error, {:command_failed, executable, exit_code}}
+    end
+  end
+
+  defp decode_body(body, path) do
+    cond do
+      String.ends_with?(path, "/raw") -> {:ok, body}
+      body == "" -> {:ok, nil}
+      true -> Jason.decode(body)
     end
   end
 
@@ -319,10 +349,10 @@ defmodule SymphonyElixir.GitLab.Client do
     api_url = provider["api_url"] || @default_api_url
     project_path = resolve_setting(provider["project_path"], RuntimeContext.get_env("GITLAB_PROJECT_PATH"))
 
-    api_key = resolve_setting(provider["api_key"], RuntimeContext.get_env("GITLAB_PAT"))
+    glab_bin = provider["glab_bin"] || "glab"
 
     cond do
-      not (valid_api_url?(api_url) or (provider["allow_insecure_http"] == true and match?(%URI{scheme: "http", host: host} when is_binary(host), URI.parse(api_url)))) ->
+      not (valid_api_url?(api_url) or insecure_api_url?(api_url, provider)) ->
         {:error, :invalid_gitlab_api_url}
 
       not present_string?(project_path) ->
@@ -331,14 +361,14 @@ defmodule SymphonyElixir.GitLab.Client do
       not valid_project_path?(project_path) ->
         {:error, :invalid_gitlab_project_path}
 
-      not present_string?(api_key) ->
-        {:error, :missing_gitlab_api_key}
+      not present_string?(glab_bin) ->
+        {:error, :invalid_gitlab_command}
 
       true ->
         {:ok,
          %{
            api_url: String.trim_trailing(api_url, "/"),
-           api_key: api_key,
+           glab_bin: glab_bin,
            project_path: project_path
          }}
     end
@@ -346,6 +376,10 @@ defmodule SymphonyElixir.GitLab.Client do
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(_tracker_settings), do: %{}
+
+  defp insecure_api_url?(api_url, provider) do
+    provider["allow_insecure_http"] == true and match?(%URI{scheme: "http", host: host} when is_binary(host), URI.parse(api_url))
+  end
 
   defp resolve_setting(nil, fallback), do: normalize_string(fallback)
 
@@ -395,13 +429,6 @@ defmodule SymphonyElixir.GitLab.Client do
   defp project_issues_path(settings), do: "/projects/#{encoded(settings.project_path)}/issues"
 
   defp project_issue_path(settings, iid), do: "#{project_issues_path(settings)}/#{iid}"
-
-  defp gitlab_headers(api_key) do
-    [
-      {"Accept", "application/json"},
-      {"Authorization", "Bearer " <> api_key}
-    ]
-  end
 
   defp gitlab_state_query(states) do
     has_opened? = MapSet.member?(states, "opened")
