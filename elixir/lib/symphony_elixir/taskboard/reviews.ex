@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Taskboard.Reviews do
   @moduledoc "Read-only MR/PR cards from the automatic lane, never from manual review journals."
-  alias SymphonyElixir.ReviewLane.{GitLab, Listener, Publication}
+  alias SymphonyElixir.ReviewLane.{GitLab, Listener}
   alias SymphonyElixir.RuntimeContext
   alias SymphonyElixir.Taskboard.Provider
   alias SymphonyElixir.TaskWorkflow
@@ -60,16 +60,16 @@ defmodule SymphonyElixir.Taskboard.Reviews do
     latest = hd(history)
 
     if latest["eligibility"] not in ["closed", "merged", "unassigned"] do
-      {column, status} = state(latest, config)
+      {column, status} = state(latest)
       separator = if config["provider"] == "github", do: "#", else: "!"
-      review = round_summary(latest, config)
+      review = round_summary(latest)
 
       %{
         item_type: "review",
         issue_id: "review:" <> TaskWorkflow.digest(latest["work"]),
         issue_identifier: "Review #{separator}#{latest["iid"]}",
         title: latest["title"] || "Review #{latest["project"]}#{separator}#{latest["iid"]}",
-        summary: Provider.summary(latest["error"] || latest["publication_error"] || get_in(latest, ["review_result", "body"])),
+        summary: Provider.summary(text(latest["error"] || get_in(latest, ["workflow_result", "body"]))),
         description: nil,
         priority: nil,
         tracker_state: latest["phase"],
@@ -87,73 +87,41 @@ defmodule SymphonyElixir.Taskboard.Reviews do
         artifacts: review.artifacts,
         projection: nil,
         human_action: %{required: column == "Human Review", summary: guidance(column, status)},
-        review: Map.put(review, :history, Enum.map(history, &round_summary(&1, config))),
+        review: Map.put(review, :history, Enum.map(history, &round_summary/1)),
         updated_at: latest["updated_at"] || latest["created_at"],
         created_at: latest["created_at"]
       }
     end
   end
 
-  defp state(record, config) do
+  defp state(record) do
     cond do
       record["eligibility"] != "current" -> {"Human Review", "blocked"}
-      record["publication_error"] != nil -> {"Human Review", "publication unconfirmed"}
       record["phase"] == "queued" -> {"Todo", "queued"}
-      record["phase"] in ["running", "publishing"] -> {"In Progress", record["phase"]}
-      completed?(record, config) -> {"Done", "review completed"}
-      true -> {"Human Review", "review incomplete"}
+      record["phase"] == "running" -> {"In Progress", "running"}
+      record["phase"] == "completed" and record["native_stop_confirmed"] == true and is_map(record["workflow_result"]) -> {"Done", "workflow completed"}
+      true -> {"Human Review", "workflow incomplete"}
     end
   end
 
-  defp completed?(record, config) do
-    complete_result?(record) and confirmed_publication?(record, config)
-  end
+  defp round_summary(record) do
+    result = record["workflow_result"] || %{}
 
-  defp complete_result?(record) do
-    result = record["review_result"]
-
-    record["phase"] == "completed" and record["review_protocol"] == 3 and is_map(result) and
-      result["status"] in ["passed", "changes_requested"] and
-      Enum.all?(~w(head base policy_sha), &(record[&1] == result[&1])) and record["native_stop_confirmed"] == true
-  end
-
-  defp confirmed_publication?(record, config) do
-    publication = record["publication"]
-    proof = %{"head" => record["head"], "base" => record["base"], "target_branch" => record["target_branch"], "publication_sha" => TaskWorkflow.digest(publication)}
-
-    is_map(publication) and record["review_completion"] == proof and
-      Publication.valid?(record, config["publisher_id"]) and publication["entries"] != [] and
-      Enum.all?(publication["entries"], &(&1["status"] == "published" and is_map(&1["receipt"])))
-  end
-
-  defp round_summary(record, config) do
     %{
       round: record["round"],
       head: record["head"],
       base: record["base"],
       target_branch: record["target_branch"],
       phase: record["phase"],
-      conclusion: get_in(record, ["review_result", "status"]) || "incomplete",
-      artifacts: artifacts(record, config)
+      conclusion: text(result["status"]) || "incomplete",
+      artifacts: for(%{"url" => url} = artifact <- List.wrap(result["artifacts"]), is_binary(url), do: %{kind: "review", label: text(artifact["label"]) || "Review report", url: url})
     }
   end
 
-  defp artifacts(record, config) do
-    if is_map(record["publication"]) and Publication.valid?(record, config["publisher_id"]) do
-      for entry <- record["publication"]["entries"], entry["status"] == "published", is_map(entry["receipt"]) do
-        report_link(record, entry["receipt"])
-      end
-    else
-      []
-    end
-  end
+  defp text(value) when is_binary(value), do: value
+  defp text(_value), do: nil
 
-  defp report_link(record, receipt) do
-    anchor = if record["work"]["provider"] == "github", do: "pullrequestreview-" <> String.replace_prefix(receipt["discussion_id"], "pull_review_", ""), else: "note_#{receipt["note_id"]}"
-    %{kind: "review", label: "Review report · round #{record["round"]}", url: record["url"] <> "#" <> anchor}
-  end
-
-  defp guidance("Done", _status), do: "本轮审查及结论发布已完成；具体问题与建议见审查报告。"
+  defp guidance("Done", _status), do: "本轮工作流已结束；审查结论及交付情况见 Agent 结果。"
   defp guidance("Human Review", status), do: "自动审查需要处理：#{status}。"
   defp guidance(_column, _status), do: "按现有自动审查规则执行。"
 end

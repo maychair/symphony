@@ -21,6 +21,8 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     }
 
     assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config}})
+    assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => config |> Map.delete("result_command") |> Map.put("projects", %{"team/repo" => %{"id" => 10}})}})
+    assert :ok = ReviewLane.validate_config(%{provider: %{"review_lane" => Map.put(config, "publish_results", false)}})
 
     for {key, value} <- [{"axes", ["standards"]}, {"pass_on_error", true}, {"lgtm_body", "custom pass"}, {"publisher_approve", true}] do
       assert {:error, :unknown_review_configuration} = ReviewLane.validate_config(%{provider: %{"review_lane" => Map.put(config, key, value)}})
@@ -47,8 +49,9 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
           {"projects", %{"team/repo" => %{"checkout" => "relative"}}, :review_lane_invalid_projects},
           {"state_dir", "relative", :review_lane_absolute_state_required},
           {"poll_interval_ms", -1, :review_lane_poll_interval_required},
-          {"result_command", nil, :workflow_result_command_required},
-          {"result_command", ["python3", 1], :workflow_result_command_required},
+          {"publish_results", "false", :review_lane_publish_results_boolean_required},
+          {"result_command", ["python3", 1], :invalid_workflow_result_command},
+          {"result_command", "not-argv", :invalid_workflow_result_command},
           {"model_settings", "invalid", :invalid_workflow_model_settings},
           {"model_settings", %{"sandbox_mode" => "danger-full-access"}, :invalid_workflow_model_settings},
           {"instruction_files", [root], :workflow_instructions_unavailable}
@@ -61,33 +64,6 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     assert %{"key" => ["fixture", 2]} == ReviewLane.resolve(%{"key" => ["$SYMPHONY_TEST_REVIEW_VALUE", 2]})
     assert ReviewLane.job?(%Issue{id: "review:id", native_ref: %{"execution_kind" => "review_lane"}})
     refute ReviewLane.job?(%Issue{id: "normal"})
-  end
-
-  test "response versions distinguish new replies, edits and resolution from repeated or irrelevant observations" do
-    finding = [%{"discussion_id" => "d", "note_id" => 1}]
-    own = %{"id" => 1, "created_at" => "2026-01-01T00:00:00Z", "resolved" => false}
-    discussion = %{"id" => "d", "notes" => [own]}
-    assert {:ok, empty} = Policy.response_digest([], [], 30)
-    assert {:ok, ^empty} = Policy.response_digest(finding, [discussion], 30)
-    assert {:error, :review_receipt_source_missing} = Policy.response_digest(finding, [], 30)
-    assert {:error, :review_receipt_source_missing} = Policy.response_digest(finding, [%{discussion | "notes" => []}], 30)
-    reply = %{"id" => 2, "body" => "修复了边界条件", "author" => %{"id" => 30}, "created_at" => "2026-01-02T00:00:00Z"}
-    replied = %{discussion | "notes" => [own, reply]}
-    assert {:ok, digest} = Policy.response_digest(finding, [replied], 30)
-    refute digest == empty
-    assert {:ok, ^digest} = Policy.response_digest(finding ++ finding, [replied], 30)
-    edited = update_in(replied["notes"], fn [first, note] -> [first, Map.put(note, "body", "补充复现步骤")] end)
-    assert {:ok, different} = Policy.response_digest(finding, [edited], 30)
-    refute different == digest
-    assert {:ok, resolved} = Policy.response_digest(finding, [%{discussion | "notes" => [%{own | "resolved" => true}]}], 30)
-    refute resolved == empty
-
-    for changes <- [%{"system" => true}, %{"body" => " "}, %{"body" => "<!-- symphony-review:owned:0 -->"}, %{"author" => %{"id" => 99}}] do
-      assert {:ok, ^empty} = Policy.response_digest(finding, [%{discussion | "notes" => [own, Map.merge(reply, changes)]}], 30)
-    end
-
-    assert Policy.requested_reviewer?(%{"state" => "opened", "reviewers" => [%{"id" => 20}]}, 20)
-    refute Policy.requested_reviewer?(%{"state" => "opened", "reviewers" => [%{"id" => 99, "username" => "reviewer"}]}, 20)
   end
 
   test "prior_review? recognizes approvals and human or automated comments while ignoring unreviewed state" do

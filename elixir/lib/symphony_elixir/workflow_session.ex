@@ -115,7 +115,7 @@ defmodule SymphonyElixir.WorkflowSession do
       tool_specs: [
         %{
           "name" => "workflow_submit",
-          "description" => "Submit the workflow artifact. This records a result, not completion or publication; the caller validates it after the native turn stops.",
+          "description" => "Record the result after completing the supplied workflow and its cleanup. This does not perform validation, publication or resource release.",
           "inputSchema" => %{"type" => "object", "properties" => %{"result" => %{"type" => "object"}}, "required" => ["result"], "additionalProperties" => false}
         }
       ]
@@ -127,7 +127,7 @@ defmodule SymphonyElixir.WorkflowSession do
     case Process.get(__MODULE__) do
       %{result: nil} = state ->
         Process.put(__MODULE__, %{state | result: result})
-        %{"success" => true, "output" => "Artifact recorded. Finish the turn; validation and delivery remain pending."}
+        %{"success" => true, "output" => "Result recorded. Finish the turn; the caller will confirm native stop."}
 
       _ ->
         %{"success" => false, "output" => "No active workflow or an artifact was already submitted."}

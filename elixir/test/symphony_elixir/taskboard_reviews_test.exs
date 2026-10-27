@@ -1,6 +1,5 @@
 defmodule SymphonyElixir.TaskboardReviewsTest do
   use SymphonyElixir.TestSupport, runtime: false
-  alias SymphonyElixir.ReviewLane.Publication
   alias SymphonyElixir.Taskboard
   alias SymphonyElixir.Taskboard.Reviews
   alias SymphonyElixir.TaskWorkflow
@@ -16,7 +15,6 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
       "project" => "team/repo",
       "iid" => 1,
       "round" => round,
-      "review_protocol" => 3,
       "work" => %{"provider" => provider, "host" => "review.invalid", "repository_id" => "10", "kind" => kind, "number" => 1},
       "head" => String.duplicate("a", 40),
       "base" => String.duplicate("b", 40),
@@ -47,25 +45,9 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
       end)
 
     {:ok, result} = SymphonyElixir.TestSupport.fixture_review_result(record, axes)
-    record = Map.merge(record, %{"axes" => axes, "review_result" => result, "native_stop_confirmed" => true, "phase" => "completed"})
-    {:ok, record} = Publication.prepare(record, result, 21)
-
-    entries =
-      Enum.map(record["publication"]["entries"], fn entry ->
-        receipt = %{
-          "work" => record["work"],
-          "actor" => 21,
-          "body_sha" => TaskWorkflow.digest(entry["body"]),
-          "discussion_id" => if(record["work"]["provider"] == "github", do: "pull_review_11", else: "11"),
-          "note_id" => 11,
-          "created_at" => "2026-10-20T00:00:00Z"
-        }
-
-        Map.merge(entry, %{"status" => "published", "receipt" => receipt})
-      end)
-
-    record = put_in(record, ["publication", "entries"], entries)
-    Map.put(record, "review_completion", %{"head" => record["head"], "base" => record["base"], "target_branch" => "main", "publication_sha" => TaskWorkflow.digest(record["publication"])})
+    url = record["url"] <> if(record["work"]["provider"] == "github", do: "#pullrequestreview-11", else: "#note_11")
+    result = Map.put(result, "artifacts", [%{"url" => url, "label" => "Review report"}])
+    Map.merge(record, %{"workflow_result" => result, "native_stop_confirmed" => true, "phase" => "completed"})
   end
 
   defp cards(records, cfg \\ config()) do
@@ -89,29 +71,21 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     assert [] == cards([previous, Map.put(latest, "eligibility", "unassigned")])
   end
 
-  test "execution, missing input, stale scope and publication uncertainty never invent Done" do
+  test "execution, missing result and stale scope never invent Done" do
     done = completed(record())
 
     for {patch, column} <- [
           {%{"phase" => "running"}, "In Progress"},
-          {%{"phase" => "publishing"}, "In Progress"},
           {%{"phase" => "failed"}, "Human Review"},
           {%{"phase" => "fenced"}, "Human Review"},
           {%{"eligibility" => "unknown"}, "Human Review"},
           {%{"eligibility" => "superseded"}, "Human Review"},
-          {%{"publication_error" => "unconfirmed"}, "Human Review"},
-          {%{"review_completion" => nil}, "Human Review"},
           {%{"native_stop_confirmed" => false}, "Human Review"},
-          {%{"review_protocol" => nil}, "Human Review"}
+          {%{"workflow_result" => nil}, "Human Review"}
         ] do
       assert [card] = cards([Map.merge(done, patch)])
       assert card.column == column
     end
-
-    tampered = put_in(done, ["publication", "entries", Access.at(0), "receipt", "actor"], 99)
-    assert [%{column: "Human Review", artifacts: []}] = cards([tampered])
-    wrong_result = put_in(done, ["review_result", "head"], String.duplicate("c", 40))
-    assert [%{column: "Human Review"}] = cards([wrong_result])
   end
 
   test "a complete review with findings is delivered, without approving the MR" do
@@ -134,14 +108,14 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     assert card.column == "Done"
     assert card.review.conclusion == "changes_requested"
 
-    prior = completed(r, [finding])["review_result"]["finding_register"]
+    prior = completed(r, [finding])["workflow_result"]["finding_register"]
     recheck = Map.put(record(2), "finding_register", prior)
     response = %{"finding" => "S1", "status" => "still_valid", "evidence" => "当前源码仍可触发原反例", "rationale" => "原问题未修复", "verified_by" => "reviewer"}
     completed_recheck = completed(recheck, [], [response])
     [recheck_card] = cards([completed_recheck])
     assert recheck_card.column == "Done"
     assert recheck_card.review.conclusion == "changes_requested"
-    refute completed_recheck["review_result"]["body"] == "LGTM!"
+    refute completed_recheck["workflow_result"]["body"] == "LGTM!"
   end
 
   test "native provider identity and allowlist filter records; manual journals are not a data source" do
@@ -162,6 +136,15 @@ defmodule SymphonyElixir.TaskboardReviewsTest do
     assert {[], []} = Reviews.merge([], {:ok, %{config: nil, records: [r]}})
     assert {[], []} = Reviews.merge([], {:ok, %{config: %{"enabled" => false}, records: [r]}})
     assert {[], [%{error: _}]} = Reviews.merge([], {:error, :busy})
+  end
+
+  test "opaque workflow fields do not become board text or crash the projection" do
+    result = %{"body" => %{"custom" => true}, "status" => ["custom"], "artifacts" => [%{"url" => "https://review.invalid/report", "label" => %{}}]}
+    r = record() |> Map.merge(%{"workflow_result" => result, "phase" => "completed", "native_stop_confirmed" => true})
+    assert [card] = cards([r])
+    assert card.summary == nil
+    assert card.review.conclusion == "incomplete"
+    assert [%{label: "Review report"}] = card.artifacts
   end
 
   test "a repository with no automatic listener has no review cards" do
