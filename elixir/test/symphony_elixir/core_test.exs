@@ -190,6 +190,22 @@ defmodule SymphonyElixir.CoreTest do
     assert Workflow.workflow_file_path() == app_workflow_path
   end
 
+  test "workflow load preserves Unicode in configuration and prompts across line endings" do
+    workflow_path = Workflow.workflow_file_path()
+    prompt = "入口验证与引用跳转\n任务描述：保持源码不变。"
+
+    for newline <- ["\n", "\r\n", "\u0085", "\u2028"], front_matter? <- [false, true] do
+      prefix = if front_matter?, do: "---\nlabel: 入口\n---\n", else: ""
+      File.write!(workflow_path, String.replace(prefix <> prompt, "\n", newline))
+
+      assert {:ok, workflow} = Workflow.load(workflow_path)
+      assert workflow.prompt_template == prompt
+      assert workflow.prompt == prompt
+      assert workflow.config == if(front_matter?, do: %{"label" => "入口"}, else: %{})
+      assert Jason.decode!(Jason.encode!(%{prompt: workflow.prompt_template}))["prompt"] == prompt
+    end
+  end
+
   test "workflow load accepts prompt-only files without front matter" do
     workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "PROMPT_ONLY_WORKFLOW.md")
     File.write!(workflow_path, "Prompt only\n")
