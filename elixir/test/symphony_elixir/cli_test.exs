@@ -171,6 +171,6 @@ defmodule SymphonyElixir.CLITest do
     output = capture_io(fn -> assert {:ok, :preflight} = CLI.evaluate(["--preflight"], deps) end)
     report = output |> String.split("\n", trim: true) |> List.last() |> Jason.decode!()
     protocols = Enum.flat_map(report["workflow_capability"], & &1["capabilities"])
-    assert Enum.any?(protocols, &(&1["name"] == "review_workflow" and &1["version"] == 3))
+    assert Enum.any?(protocols, &(&1["name"] == "review_workflow" and &1["version"] == 4))
   end
 end

@@ -157,72 +157,21 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   # Native execution is exercised by runner fixtures. Listener-only tests supply
-  # two completed axis fixtures through a test-owned external validator.
+  # opaque results; the scheduler does not validate a review schema.
   def workflow_result_command, do: [System.find_executable("python3"), Path.expand("../fixtures/workflow_artifact.py", __DIR__)]
 
   def fixture_review_result(record, axes),
     do: SymphonyElixir.WorkflowArtifact.evaluate(%{"result_command" => workflow_result_command()}, %{"record" => record, "axes" => axes})
 
-  def submit_review(id, arguments) do
+  def submit_review(id, result) do
     alias SymphonyElixir.ReviewLane.Listener
     key = String.replace_prefix(id, "review:", "")
     record = get_in(:sys.get_state(Listener), [:records, key])
     owner = if record, do: record["execution_owner"]
 
-    if is_nil(owner) do
-      Listener.submit(id, owner, arguments)
-    else
-      arguments = normalize_fixture_arguments(arguments, record)
-      axes = fixture_axes(record, arguments)
-
-      with :ok <- Listener.checkpoint(id, owner, %{"native_stop_confirmed" => true}),
-           {:ok, result} <- fixture_review_result(record, axes) do
-        Listener.submit(id, owner, %{"completion" => result})
-      end
+    with :ok <- Listener.checkpoint(id, owner, %{"native_stop_confirmed" => true}) do
+      Listener.submit(id, owner, %{"completion" => result})
     end
-  end
-
-  defp normalize_fixture_arguments(%{"findings" => findings} = arguments, record) when is_list(findings) do
-    if Enum.all?(findings, &is_binary/1),
-      do: Map.put(arguments, "findings", fixture_submission(findings, record)["findings"]),
-      else: arguments
-  end
-
-  defp normalize_fixture_arguments(arguments, _record), do: arguments
-
-  defp fixture_submission(findings, record) do
-    values =
-      Enum.with_index(findings, fn body, index ->
-        %{
-          "schema_version" => 1,
-          "id" => "fixture-#{index}",
-          "required" => true,
-          "criterion" => "测试约定",
-          "version" => %{"head" => record["head"], "base" => record["base"], "target" => record["target_branch"]},
-          "location" => "source.cpp:10",
-          "evidence" => body,
-          "impact" => "可复现的行为不符合约定。",
-          "resolution" => "修复行为并通过回归验证。",
-          "regression_of" => nil
-        }
-      end)
-
-    %{"findings" => values, "responses" => []}
-  end
-
-  defp fixture_axes(_record, submission) do
-    Map.new(["standards", "spec"], fn axis ->
-      {axis,
-       %{
-         "status" => "complete",
-         "report" => "已完成本轴核对。",
-         "sources" => ["fixture"],
-         "scope" => ["fixed diff"],
-         "gaps" => [],
-         "findings" => if(axis == "standards", do: submission["findings"], else: []),
-         "responses" => if(axis == "standards", do: submission["responses"] || [], else: [])
-       }}
-    end)
   end
 
   def restore_env(key, nil), do: System.delete_env(key)

@@ -24,11 +24,12 @@ defmodule SymphonyElixir.ReviewLane do
     config = resolve(raw)
 
     allowed =
-      ~w(enabled disabled provider host reviewer_id publisher_id projects state_dir poll_interval_ms instruction_files result_command model_settings glab_bin gh_bin allow_insecure_http webhook_secret)
+      ~w(enabled disabled publish_results provider host reviewer_id publisher_id projects state_dir poll_interval_ms instruction_files result_command model_settings glab_bin gh_bin allow_insecure_http webhook_secret)
 
     checks = [
       {Enum.all?(Map.keys(config), &(&1 in allowed)), :unknown_review_configuration},
       {is_boolean(Map.get(config, "disabled", false)), :review_lane_disabled_boolean_required},
+      {is_boolean(Map.get(config, "publish_results", true)), :review_lane_publish_results_boolean_required},
       {config["provider"] in ["gitlab", "github"], :review_lane_provider_unsupported},
       {valid_host?(config["host"]), :review_lane_host_required},
       {positive?(config["reviewer_id"]), :review_lane_reviewer_id_required},
@@ -37,7 +38,7 @@ defmodule SymphonyElixir.ReviewLane do
       {valid_projects?(config["projects"]), :review_lane_invalid_projects},
       {absolute_path?(config["state_dir"]), :review_lane_absolute_state_required},
       {positive?(Map.get(config, "poll_interval_ms", 60_000)), :review_lane_poll_interval_required},
-      {command?(config["result_command"]), :workflow_result_command_required},
+      {is_nil(config["result_command"]) or command?(config["result_command"]), :invalid_workflow_result_command},
       {model_settings?(config["model_settings"] || %{}), :invalid_workflow_model_settings}
     ]
 
@@ -72,9 +73,9 @@ defmodule SymphonyElixir.ReviewLane do
   defp valid_projects?(projects) when is_map(projects), do: Enum.all?(projects, &valid_project?/1)
   defp valid_projects?(_projects), do: false
 
-  defp valid_project?({project, %{"checkout" => checkout, "id" => id}}) when is_binary(project) do
+  defp valid_project?({project, %{"id" => id}}) when is_binary(project) do
     Regex.match?(~r{^[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)+$}, project) and
-      positive?(id) and absolute_path?(checkout) and File.dir?(checkout)
+      positive?(id)
   end
 
   defp valid_project?(_project), do: false

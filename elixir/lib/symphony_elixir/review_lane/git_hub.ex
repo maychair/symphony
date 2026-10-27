@@ -118,7 +118,7 @@ defmodule SymphonyElixir.ReviewLane.GitHub do
 
   @doc """
   Read all review comments, pull reviews, and issue comments for a pull request,
-  returning them in a normalized discussions shape compatible with Policy and Publication.
+  returning them in a normalized discussions shape for native discovery.
   """
   @spec discussions(map(), String.t()) :: {:ok, [map()]} | {:error, term()}
   def discussions(config, path) do

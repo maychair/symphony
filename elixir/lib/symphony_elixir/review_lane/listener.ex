@@ -4,11 +4,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   @moduledoc """
   Scheduler-owned native discovery and durable MR review execution journal.
   The existing MR is the work item; the journal owns execution identities and receipts.
-  Uncertain execution or publication stays fenced across restarts.
+  Uncertain native execution stays fenced across restarts. Review work belongs to the Agent.
   """
   use GenServer
   alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy, Publication}
+  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy}
 
   @worker_fields ~w(policy_sha native_stop_error thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
@@ -102,7 +102,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
      |> Map.put(:pending_hints, map_size(state.hints))
      |> Map.put(
        :fenced_runs,
-       Enum.filter(Map.values(state.records), &(&1["phase"] in ["running", "publishing", "failed", "fenced"]))
+       Enum.filter(Map.values(state.records), &(&1["phase"] in ["running", "failed", "fenced"]))
        |> Enum.map(&Map.take(&1, ["id", "phase", "error", "thread_id", "turn_id"]))
      ), state}
   end
@@ -176,7 +176,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp handle_request({:submit, id, owner, arguments}, {caller, _}, state) do
     if owned?(state.records[record_key(id)], owner, caller) do
-      case publish(state, id, arguments) do
+      case complete(state, id, arguments) do
         {:ok, next} -> {:reply, :ok, next}
         {:error, reason, next} -> {:reply, {:error, reason}, next}
       end
@@ -245,17 +245,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp monitor_owner(state, record, pid) do
-    owners =
-      Enum.reduce(state.owners, state.owners, fn {ref, {id, _}}, owners ->
-        if id == record["id"] do
-          Process.demonitor(ref, [:flush])
-          Map.delete(owners, ref)
-        else
-          owners
-        end
-      end)
-
-    %{state | owners: Map.put(owners, Process.monitor(pid), {record["id"], record["execution_owner"]})}
+    %{state | owners: Map.put(state.owners, Process.monitor(pid), {record["id"], record["execution_owner"]})}
   end
 
   defp recover_owners(state) do
@@ -382,7 +372,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp recover(state) do
     Enum.reduce(state.records, state, fn {_id, record}, current ->
-      if record["phase"] in ["running", "publishing", "failed"] or (record["phase"] == "completed" and not stopped?(record)) do
+      if record["phase"] == "running" or (record["phase"] in ["failed", "completed"] and not stopped?(record)) do
         put_record(current, record |> Map.put("previous_phase", record["phase"]) |> Map.put("phase", "fenced"))
       else
         current
@@ -419,10 +409,10 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp restore_records(state, config, data) do
     cond do
-      data["schema_version"] == 2 ->
-        {:error, :review_journal_migration_required}
+      data["schema_version"] in [2, 3] ->
+        {:error, :review_journal_fresh_state_required}
 
-      data["schema_version"] != 3 or scope(data["scope"] || %{}) != scope(config) ->
+      data["schema_version"] != 4 or scope(data["scope"] || %{}) != scope(config) ->
         {:error, :invalid_review_journal}
 
       records?(data["records"], config) and hints?(data["hints"], config) ->
@@ -437,7 +427,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp records?(_, _), do: false
 
   defp record?(id, %{} = record, config) do
-    valid_subject?(record, config) and record_shape?(record, config) and Publication.valid?(record, config["publisher_id"]) and
+    valid_subject?(record, config) and record_shape?(record) and
       target_branch?(record["target_branch"]) and
       record["work"] == work(config, record["project"], record["iid"]) and
       id == record["id"] and id == round_id(record["work"], record["round"], config)
@@ -445,39 +435,17 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp record?(_, _, _), do: false
 
-  defp record_shape?(record, config) do
+  defp record_shape?(record) do
     is_integer(record["round"]) and record["round"] > 0 and
-      record["phase"] in ~w(queued running publishing completed failed fenced ended superseded) and
-      is_list(record["receipts"]) and Enum.all?(record["receipts"], &is_map/1) and
-      Enum.all?(~w(head base), &valid_sha?(record[&1])) and Enum.all?(~w(policy_sha response_sha), &digest?(record[&1])) and
-      auxiliary_fields?(record, config)
+      record["phase"] in ~w(queued running completed failed fenced ended superseded) and
+      Enum.all?(~w(head base), &valid_sha?(record[&1])) and digest?(record["policy_sha"]) and
+      auxiliary_fields?(record)
   end
 
-  defp auxiliary_fields?(record, config) do
+  defp auxiliary_fields?(record) do
     (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"])) and
-      completion?(record) and review_gap?(record) and unified_result?(record, config)
+      (is_nil(record["workflow_result"]) or is_map(record["workflow_result"]))
   end
-
-  defp unified_result?(%{"review_protocol" => 3, "review_result" => result} = record, config) do
-    SymphonyElixir.WorkflowArtifact.evaluate(config, %{"record" => record, "result" => result}) == {:ok, result} and
-      (is_nil(record["review_completion"]) or result["status"] in ["passed", "changes_requested"])
-  end
-
-  defp unified_result?(record, _config), do: record["review_protocol"] == 3 and is_nil(record["review_result"]) and is_nil(record["review_completion"])
-
-  defp completion?(%{"review_completion" => completion} = record) when is_map(completion) do
-    completion == completion_proof(record) and published_review?(record)
-  end
-
-  defp completion?(record), do: is_nil(record["review_completion"])
-
-  defp review_gap?(%{"review_gap" => gap}) when is_map(gap) do
-    gap["status"] in ["none", "missing_current_review"] and
-      Enum.all?(~w(head base), &valid_sha?(gap[&1])) and target_branch?(gap["target_branch"]) and
-      (is_nil(gap["completion"]) or is_map(gap["completion"]))
-  end
-
-  defp review_gap?(record), do: is_nil(record["review_gap"])
 
   defp digest?(value), do: is_binary(value) and Regex.match?(~r/^[a-f0-9]{64}$/, value)
 
@@ -590,12 +558,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     native(config).web_url?(url, config, web_url_path(config, project, iid))
   end
 
-  defp queue(state, project, iid, mr, round, response_sha \\ TaskWorkflow.digest([])) do
+  defp queue(state, project, iid, mr, round) do
     work = work(state.config, project, iid)
     id = round_id(work, round, state.config)
 
     record = %{
-      "review_protocol" => 3,
       "id" => id,
       "project" => project,
       "work" => work,
@@ -604,16 +571,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       "head" => mr["sha"],
       "base" => mr["diff_refs"]["base_sha"],
       "target_branch" => mr["target_branch"],
-      "response_sha" => response_sha,
       "policy_sha" => policy_sha(state.config),
       "eligibility" => "current",
-      "finding_register" => %{},
       "author_id" => mr["author"]["id"],
       "url" => mr["web_url"],
       "title" => mr["title"],
       "created_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "updated_at" => mr["updated_at"],
-      "receipts" => [],
       "phase" => "queued"
     }
 
@@ -628,40 +592,27 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp round_id(work, round, config), do: TaskWorkflow.digest(%{"work" => work, "round" => round, "reviewer" => config["reviewer_id"]})
 
   defp reconcile(state) do
-    state = recover_publications(state)
-
     state.records
     |> Map.values()
     |> Enum.group_by(&{&1["project"], &1["iid"]})
     |> Enum.map(fn {_, rounds} -> Enum.max_by(rounds, & &1["round"]) end)
     |> Enum.reduce(state, &reconcile_record(&2, &1))
-    |> continue_publications()
   end
 
   defp reconcile_record(state, record) do
-    path = native(state.config).mr_path(record["project"], record["iid"])
-
     with {:ok, mr} <- read_mr(state.config, record["project"], record["iid"]),
          true <- valid_mr?(mr, record["project"], record["iid"], state.config) or {:error, :invalid_native_review} do
       metadata = %{"title" => mr["title"], "updated_at" => mr["updated_at"]}
-      reconcile_native(state, Map.merge(record, metadata), mr, path)
+      reconcile_unmerged(state, Map.merge(record, metadata), mr)
     else
       {:error, reason} -> put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
     end
   end
 
-  defp reconcile_native(state, record, mr, path) do
-    if mr["state"] == "merged" do
-      put_record(state, merged_review(record, mr))
-    else
-      reconcile_unmerged(state, record, mr, path)
-    end
-  end
-
-  defp reconcile_unmerged(state, record, mr, path) do
+  defp reconcile_unmerged(state, record, mr) do
     case lane_assignment(state.config, record["project"], record["iid"], mr) do
       {:ok, true} ->
-        reconcile_assigned(state, record, mr, path)
+        reconcile_assigned(state, record, mr)
 
       {:ok, false} ->
         reason = if mr["state"] in ["closed", "merged"], do: mr["state"], else: "unassigned"
@@ -672,63 +623,12 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
-  defp merged_review(record, mr) do
-    current =
-      published_review?(record) and record["review_completion"] == completion_proof(record) and
-        is_nil(record["publication_error"]) and mr["sha"] == record["head"] and
-        mr["diff_refs"]["base_sha"] == record["base"] and not target_changed?(record, mr)
+  defp reconcile_assigned(state, record, mr) do
+    changed =
+      mr["sha"] != record["head"] or target_changed?(record, mr) or
+        mr["diff_refs"]["base_sha"] != record["base"] or policy_changed?(state.config, record) or record["phase"] == "ended"
 
-    gap = %{
-      "status" => if(current, do: "none", else: "missing_current_review"),
-      "head" => mr["sha"],
-      "base" => mr["diff_refs"]["base_sha"],
-      "target_branch" => mr["target_branch"],
-      "completion" => if(current, do: record["review_completion"])
-    }
-
-    record |> Map.put("eligibility", "merged") |> Map.put("phase", "ended") |> Map.put("review_gap", gap)
-  end
-
-  defp completion_proof(record) do
-    %{
-      "head" => record["head"],
-      "base" => record["base"],
-      "target_branch" => record["target_branch"],
-      "publication_sha" => TaskWorkflow.digest(record["publication"])
-    }
-  end
-
-  defp published_review?(%{"publication" => %{"entries" => entries}}) when is_list(entries),
-    do: entries != [] and Enum.all?(entries, &(&1["status"] == "published" and is_map(&1["receipt"])))
-
-  defp published_review?(_), do: false
-
-  defp reconcile_assigned(state, record, mr, path) do
-    receipts = receipts_for(state, record)
-
-    with {:ok, discussions} <- native(state.config).discussions(state.config, path),
-         discussions = bind_replies(state.config, receipts, discussions, record["author_id"]),
-         {:ok, responses} <- Policy.response_digest(receipts, discussions, record["author_id"]),
-         true <- publications_verified?(state, record) or {:error, :review_publication_unverified} do
-      changed = changed_inputs?(state.config, record, mr, responses)
-      eligibility = if changed, do: "superseded", else: "current"
-      put_record(state, Map.put(record, "eligibility", eligibility))
-    else
-      {:error, reason} -> put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
-    end
-  end
-
-  defp receipts_for(state, record) do
-    state.records |> Map.values() |> Enum.filter(&(&1["project"] == record["project"] and &1["iid"] == record["iid"])) |> Enum.flat_map(& &1["receipts"])
-  end
-
-  defp publications_verified?(state, record) do
-    state.records |> Map.values() |> Enum.filter(&(&1["project"] == record["project"] and &1["iid"] == record["iid"])) |> Enum.all?(&is_nil(&1["publication_error"]))
-  end
-
-  defp changed_inputs?(config, record, mr, responses) do
-    mr["sha"] != record["head"] or target_changed?(record, mr) or mr["diff_refs"]["base_sha"] != record["base"] or
-      responses != record["response_sha"] or policy_changed?(config, record) or record["phase"] == "ended"
+    put_record(state, Map.put(record, "eligibility", if(changed, do: "superseded", else: "current")))
   end
 
   defp policy_changed?(config, record), do: policy_sha(config) != record["policy_sha"]
@@ -739,7 +639,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp stopped?(record) do
     record["native_stop_confirmed"] == true or
-      (is_nil(record["native_stop_confirmed"]) and record["phase"] not in ["running", "publishing", "failed", "fenced"] and is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true)
+      (is_nil(record["native_stop_confirmed"]) and record["phase"] not in ["running", "failed", "fenced"] and is_nil(record["thread_id"]) and record["thread_allocation_intent"] != true)
   end
 
   defp policy_sha(config) do
@@ -756,7 +656,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       kind: :review,
       identifier: "review-#{String.slice(record["id"], 0, 16)}",
       title: "Review #{record["project"]}#{separator}#{record["iid"]}",
-      description: Jason.encode!(Map.take(record, ["project", "iid", "head", "base", "round", "review_gap"])),
+      description: Jason.encode!(Map.take(record, ["project", "iid", "head", "base", "round"])),
       state: if(active, do: hd(SymphonyElixir.Config.settings!().tracker.active_states), else: "closed"),
       native_ref: Map.put(record, "execution_kind", "review_lane"),
       labels: SymphonyElixir.Config.settings!().tracker.required_labels,
@@ -765,115 +665,23 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     }
   end
 
-  defp publish(state, id, %{"completion" => completion}) do
+  defp complete(state, id, %{"completion" => result}) when is_map(result) do
     record = state.records[record_key(id)]
 
-    with true <- publishable?(record),
-         {:ok, ^completion} <- SymphonyElixir.WorkflowArtifact.evaluate(state.config, %{"record" => record, "result" => completion}),
-         true <- stopped?(record),
-         record = record |> Map.put("review_result", completion) |> Map.merge(Map.take(completion, ~w(finding_register verdict))),
-         {:ok, record} <- Publication.prepare(record, completion, state.config["publisher_id"]) do
-      record = record |> Map.put_new("response_receipts", receipts_for(state, record)) |> Map.put("phase", "publishing")
-      finish_publication(put_record(state, record), record, :worker)
-    else
-      {:error, reason} -> {:error, reason, state}
-      false -> {:error, :incomplete_review, state}
+    cond do
+      record["phase"] not in ["running", "completed"] or not stopped?(record) ->
+        {:error, :incomplete_review, state}
+
+      is_map(record["workflow_result"]) and record["workflow_result"] != result ->
+        {:error, :changed_submission, state}
+
+      true ->
+        phase = if result["status"] in ["failed", "needs_input"], do: "failed", else: "completed"
+        {:ok, put_record(state, Map.merge(record, %{"workflow_result" => result, "phase" => phase}))}
     end
   end
 
-  defp publish(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
-  defp publishable?(record), do: is_map(record) and record["phase"] in ["running", "publishing", "completed"]
-
-  defp finish_publication(state, record, mode \\ :recovery) do
-    guard = fn current ->
-      with :ok <- publication_scope(current, state), do: publication_owner(current, mode)
-    end
-
-    case Publication.publish(record, state.config, &put_record(state, &1), guard) do
-      {:ok, current} ->
-        failed = get_in(current, ["review_result", "status"]) in ["failed", "needs_input"]
-        current = current |> Map.put("phase", if(failed, do: "failed", else: "completed")) |> Map.delete("publication_error")
-        current = Map.put(current, "review_completion", if(failed, do: nil, else: completion_proof(current)))
-        {:ok, put_record(state, current)}
-
-      {:error, reason, current} ->
-        current = current |> Map.put("phase", "fenced") |> Map.put("publication_error", inspect(reason))
-        {:error, reason, put_record(state, current)}
-    end
-  end
-
-  defp publication_owner(_record, :recovery), do: :ok
-
-  defp publication_owner(record, :worker) do
-    pid = Owner.local_pid(record["execution_owner"])
-    if is_pid(pid) and Process.alive?(pid), do: :ok, else: {:error, :review_execution_owner_exited}
-  end
-
-  defp recover_publications(state) do
-    Enum.reduce(state.records, state, fn {_id, record}, current ->
-      if is_map(record["publication"]), do: recover_publication(current, record), else: current
-    end)
-  end
-
-  defp recover_publication(state, record) do
-    case Publication.recover(record, state.config, &put_record(state, &1)) do
-      {:ok, record} ->
-        put_record(state, Map.delete(record, "publication_error"))
-
-      {:error, reason, record} ->
-        phase = if record["phase"] in ["ended", "superseded"], do: record["phase"], else: "fenced"
-        put_record(state, record |> Map.put("phase", phase) |> Map.put("publication_error", inspect(reason)))
-    end
-  end
-
-  defp continue_publications(state), do: Enum.reduce(state.records, state, fn {_id, record}, current -> continue_publication(current, record) end)
-
-  defp continue_publication(state, record) do
-    if record["phase"] in ["publishing", "fenced", "failed"] and record["eligibility"] == "current" and
-         record["native_stop_confirmed"] == true and is_map(record["publication"]) and is_nil(record["publication_error"]) do
-      case finish_publication(state, record) do
-        {:ok, next} -> next
-        {:error, _, next} -> next
-      end
-    else
-      state
-    end
-  end
-
-  defp same_review?(mr, record, config) do
-    mr["sha"] == record["head"] and not target_changed?(record, mr) and
-      get_in(mr, ["diff_refs", "base_sha"]) == record["base"] and
-      policy_sha(config) == record["policy_sha"]
-  end
-
-  defp publication_scope(record, state) do
-    config = state.config
-    module = native(config)
-    path = module.mr_path(record["project"], record["iid"])
-
-    with true <- current_config?(state) || {:error, :review_lane_configuration_changed_restart_required},
-         {:ok, mr} <- read_mr(config, record["project"], record["iid"]),
-         true <- valid_mr?(mr, record["project"], record["iid"], config) || {:error, :mr_head_changed},
-         true <- mr["state"] == "opened" || {:error, :review_not_open},
-         true <- same_review?(mr, record, config) || {:error, :mr_head_changed},
-         :ok <- require_assignment(lane_assignment(config, record["project"], record["iid"], mr)),
-         {:ok, user} <- module.request(config, "GET", "user"),
-         true <- user["id"] == config["publisher_id"] || {:error, identity_mismatch(config)},
-         {:ok, discussions} <- module.discussions(config, path) do
-      same_responses(record, discussions, config)
-    end
-  end
-
-  defp same_responses(record, discussions, config) do
-    expected = record["response_sha"]
-    receipts = (record["response_receipts"] || []) ++ record["receipts"]
-    discussions = bind_replies(config, receipts, discussions, record["author_id"])
-
-    case Policy.response_digest(receipts, discussions, record["author_id"]) do
-      {:ok, ^expected} -> :ok
-      _ -> {:error, :review_responses_changed}
-    end
-  end
+  defp complete(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
 
   defp native(%{"provider" => "github"}), do: GitHub
   defp native(_config), do: GitLab
@@ -886,39 +694,6 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp web_url_path(%{"provider" => "github"}, project, iid), do: "/#{project}/pull/#{iid}"
   defp web_url_path(_config, project, iid), do: "/#{project}/-/merge_requests/#{iid}"
 
-  defp identity_mismatch(%{"provider" => "github"}), do: :github_identity_mismatch
-  defp identity_mismatch(_config), do: :gitlab_identity_mismatch
-  defp require_assignment({:ok, true}), do: :ok
-  defp require_assignment({:ok, false}), do: {:error, :review_assignment_withdrawn}
-  defp require_assignment({:error, _reason} = error), do: error
-
-  # GitHub stores review bodies and issue comments as separate native objects
-  # without a shared discussion ID. Bind author notes conservatively to every
-  # published comment in the reviewed round; Policy still filters by author and time.
-  defp bind_replies(%{"provider" => "github"}, receipts, discussions, author_id),
-    do: merge_replies(receipts, discussions, author_id)
-
-  defp bind_replies(_config, _receipts, discussions, _author_id), do: discussions
-
-  defp merge_replies([], discussions, _author_id), do: discussions
-
-  defp merge_replies(receipts, discussions, author_id) do
-    own = receipts |> Enum.map(& &1["discussion_id"]) |> MapSet.new()
-
-    replies =
-      for discussion <- discussions,
-          not MapSet.member?(own, discussion["id"]),
-          note <- discussion["notes"] || [],
-          get_in(note, ["author", "id"]) == author_id,
-          do: note
-
-    Enum.map(discussions, fn discussion ->
-      if MapSet.member?(own, discussion["id"]),
-        do: Map.update(discussion, "notes", replies, &(&1 ++ replies)),
-        else: discussion
-    end)
-  end
-
   defp record_key("review:" <> key), do: key
   defp record_key(key), do: key
 
@@ -926,10 +701,14 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     if state.records[record["id"]] == record, do: state, else: persist(%{state | records: Map.put(state.records, record["id"], record)})
   end
 
-  defp scope(config), do: Map.take(config, ["provider", "host", "reviewer_id", "publisher_id", "projects", "allow_insecure_http"])
+  defp scope(config) do
+    config
+    |> Map.take(["provider", "host", "reviewer_id", "publisher_id", "projects", "allow_insecure_http"])
+    |> Map.put("publish_results", Map.get(config, "publish_results", true))
+  end
 
   defp persist(state) do
-    body = Jason.encode!(%{"schema_version" => 3, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints})
+    body = Jason.encode!(%{"schema_version" => 4, "scope" => scope(state.config), "records" => state.records, "hints" => state.hints})
     :ok = Journal.write!(state.journal, body)
     state
   end

@@ -37,14 +37,6 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     elif path.startswith('repos/team/repo/issues/1/comments?'):out=json.loads((r/'comments.json').read_text())
     elif path.startswith('repos/team/repo/pulls/1/comments?'):out=[]
     elif path.startswith('repos/team/repo/pulls/1/reviews?'):out=reviews
-    elif path=='repos/team/repo/pulls/1/reviews' and method=='POST':
-      fields=dict(v.split('=',1) for i,v in enumerate(a) if i>0 and a[i-1]=='--raw-field')
-      assert fields['event']=='COMMENT' and fields['commit_id']==head
-      journal=json.loads((r/'state'/'review-lane.json').read_text())
-      entries=[e for rec in journal['records'].values() for e in rec.get('publication',{}).get('entries',[])]
-      assert any(e['body']==fields['body'] and e['status']=='sending' for e in entries)
-      out={'id':len(reviews)+1,'body':fields['body'],'user':{'id':20},'submitted_at':'2026-01-02T00:00:00Z'}
-      reviews.append(out);(r/'reviews.json').write_text(json.dumps(reviews))
     else:sys.exit(3)
     print(json.dumps(out))
     """)
@@ -71,7 +63,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     {:ok, root: root, config: config}
   end
 
-  test "assigned GitHub PR publishes comments with native readback, reacts to pushes, and stops on withdrawal", c do
+  test "assigned GitHub PR records the workflow result without posting, reacts to pushes, and stops on withdrawal", c do
     assert {:ok, [issue]} = Listener.issues()
     assert issue.native_ref["work"]["provider"] == "github"
     assert issue.native_ref["work"]["kind"] == "pr"
@@ -79,7 +71,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert issue.title == "Review team/repo#1"
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     assert :ok = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
-    assert length(Jason.decode!(File.read!(Path.join(c.root, "reviews.json")))) == 1
+    assert Jason.decode!(File.read!(Path.join(c.root, "reviews.json"))) == []
     assert :ok = Listener.checkpoint(issue.id, owner_for(issue.id), %{"native_stop_confirmed" => true})
     assert {:ok, [done]} = Listener.issues()
     assert done.native_ref["phase"] == "completed"
@@ -101,7 +93,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, [issue]} = Listener.issues()
     assert {:ok, _, _} = Listener.begin_run(issue.id)
     assert :ok = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => ["已验证边界条件失败，请在 source.cpp:10 修复越界读取。"]})
-    assert length(Jason.decode!(File.read!(Path.join(c.root, "reviews.json")))) == 1
+    assert Jason.decode!(File.read!(Path.join(c.root, "reviews.json"))) == []
     assert :ok = Listener.checkpoint(issue.id, owner_for(issue.id), %{"native_stop_confirmed" => true})
 
     comment = %{"id" => 500, "body" => "已修复越界读取并补回归检查。", "user" => %{"id" => 30}, "created_at" => "2026-01-03T00:00:00Z"}
@@ -109,20 +101,17 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, [retained]} = Listener.issues()
     assert retained.id == issue.id
     assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
+    assert retained.native_ref["eligibility"] == "current"
     refute retained.dispatchable
     assert {:ok, [repeated]} = Listener.issues()
     assert repeated.id == issue.id
   end
 
-  test "GitHub scope loss and unknown reviewer history block publication", c do
+  test "GitHub unknown reviewer history blocks admission", c do
     assert {:ok, [issue]} = Listener.issues()
     assert {:ok, _, _} = Listener.begin_run(issue.id)
-    File.write!(Path.join(c.root, "wrong-user"), "yes")
-    assert {:error, :github_identity_mismatch} = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
     assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
 
-    File.rm!(Path.join(c.root, "wrong-user"))
     File.write!(Path.join(c.root, "withdrawn"), "yes")
     File.write!(Path.join(c.root, "timeline.json"), "[]")
     assert {:ok, [unknown]} = Listener.issues()
@@ -137,70 +126,18 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert closed.native_ref["phase"] == "ended"
   end
 
-  test "withdrawal before a GitHub review send blocks publication", c do
-    assert {:ok, [issue]} = Listener.issues()
-    assert {:ok, _, _} = Listener.begin_run(issue.id)
-    File.write!(Path.join(c.root, "withdrawn"), "yes")
-    File.write!(Path.join(c.root, "timeline.json"), Jason.encode!([request_event(1, "review_requested"), request_event(2, "review_request_removed")]))
-    assert {:error, :review_assignment_withdrawn} = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
-    assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
-  end
-
-  test "missing GitHub reviewer history blocks publication without guessing", c do
-    assert {:ok, [issue]} = Listener.issues()
-    assert {:ok, _, _} = Listener.begin_run(issue.id)
-    File.write!(Path.join(c.root, "withdrawn"), "yes")
-    File.write!(Path.join(c.root, "timeline.json"), "[]")
-    assert {:error, :review_assignment_unconfirmed} = SymphonyElixir.TestSupport.submit_review(issue.id, %{"findings" => []})
-    assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
-  end
-
-  test "GitHub review runs through a fixed Git snapshot and native app-server submission", c do
-    source = c.config["projects"]["team/repo"]["checkout"]
-    git = System.find_executable("git")
-    {_, 0} = System.cmd(git, ["init", "-q", source])
-    File.write!(Path.join(source, "source.txt"), "fixed GitHub candidate")
-    {_, 0} = System.cmd(git, ["-C", source, "add", "source.txt"])
-    {_, 0} = System.cmd(git, ["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture"])
-    {base, 0} = System.cmd(git, ["-C", source, "rev-parse", "HEAD"])
-    base = String.trim(base)
-    File.write!(Path.join(source, "source.txt"), "changed candidate")
-    {_, 0} = System.cmd(git, ["-C", source, "add", "source.txt"])
-    {_, 0} = System.cmd(git, ["-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Change"])
-    {head, 0} = System.cmd(git, ["-C", source, "rev-parse", "HEAD"])
-    head = String.trim(head)
-    File.write!(Path.join(c.root, "head"), head)
-    File.write!(Path.join(c.root, "base"), base)
-    bin = Path.join(c.root, "bin")
-    File.mkdir!(bin)
-
-    File.write!(Path.join(bin, "git"), """
-    #!/usr/bin/env python3
-    import os,sys,pathlib
-    a=sys.argv[1:]
-    if 'fetch' in a:
-      assert a[-1]=='refs/pull/1/head',a
-      pathlib.Path(#{inspect(Path.join(c.root, "fetch-ref"))}).write_text(a[-1])
-      a=a[:a.index('fetch')]+['fetch',#{inspect(source)},'HEAD']
-    os.execv(#{inspect(git)},[#{inspect(git)}]+a)
-    """)
-
-    File.chmod!(Path.join(bin, "git"), 0o755)
-    previous = System.get_env("PATH")
-    System.put_env("PATH", bin <> ":" <> previous)
-    on_exit(fn -> restore_env("PATH", previous) end)
+  test "GitHub review starts an ordinary native session without acquiring source", c do
     server = Path.join(c.root, "native-review-server")
-
     SymphonyElixir.TestSupport.write_review_server(server, c.root)
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", workspace_root: Path.join(c.root, "workspaces"), codex_command: server)
     {:ok, [issue]} = Listener.issues()
     assert :ok = Runner.run(issue, self())
-    assert_received {:worker_runtime_info, _, %{workspace_path: snapshot}}
-    assert File.read!(Path.join(snapshot, "source.txt")) == "changed candidate"
-    assert File.read!(Path.join(c.root, "fetch-ref")) == "refs/pull/1/head"
+    assert_received {:worker_runtime_info, _, %{workspace_path: scratch}}
+    refute File.exists?(Path.join(scratch, "source"))
     {:ok, [complete]} = Listener.issues()
     assert complete.native_ref["phase"] == "completed"
-    assert length(Jason.decode!(File.read!(Path.join(c.root, "reviews.json")))) == 1
+    assert is_map(complete.native_ref["workflow_result"])
+    assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
   end
 
   test "GitHub review webhooks use lane identity and durable hints independently of the task tracker", c do

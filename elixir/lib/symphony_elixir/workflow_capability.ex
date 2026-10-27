@@ -13,7 +13,7 @@ defmodule SymphonyElixir.WorkflowCapability do
     {"provider_discovery", "Provider 与发现", [{"work_ref", 1}]},
     {"parent_child_coordination", "父子协调", [{"plan_manifest", 2}]},
     {"verification_delivery", "验证与交付", [{"task_workflow", 2}]},
-    {"review_loop", "Review 闭环", [{"review_lane", 3}, {"review_finding", 1}, {"review_workflow", 3}]},
+    {"review_loop", "Review 闭环", [{"review_lane", 4}, {"review_finding", 1}, {"review_workflow", 4}]},
     {"projection_closure", "投影与收尾", [{"closure_fence", 1}, {"taskboard_projection", 1}]},
     {"deployment", "部署", [{"workflow_capability", @version}]}
   ]
@@ -47,20 +47,20 @@ defmodule SymphonyElixir.WorkflowCapability do
       status: :manual_verification_required,
       automatic: false,
       review_lane: %{
-        from: 2,
-        to: 3,
-        status: :migration_required,
-        reason: "Schema 2 cannot establish current ownership and publication receipts; field renaming is insufficient."
+        from: 3,
+        to: 4,
+        status: :fresh_state_required,
+        reason: "Review is Agent-owned. Keep earlier journals audit-only and start fresh state; do not convert or replay results."
       },
       upgrade: [
-        "Keep active executions on their original protocol until a safe handoff; verify native sessions before takeover.",
-        "Reconcile object ownership, in-flight reviews and publication receipts before switching listeners.",
-        "Preserve historical authorization provenance; mark unverifiable versions as insufficient evidence."
+        "Stop active executions and confirm native stop before switching listeners.",
+        "Retain historical journals and publication receipts for audit only.",
+        "Use fresh state and newly generated workflow results; do not migrate artifacts."
       ],
       rollback: [
         "Retain the original executable and journal independently of the checkout until handoff is verified.",
         "Reconcile native sessions and listener ownership before resuming the retained instance; never overlap execution.",
-        "Do not feed schema 3 records to a schema 2 listener or fabricate missing session-stop evidence."
+        "Keep each executable with its original journal; never feed schema 4 records to an older listener."
       ]
     }
   end

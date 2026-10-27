@@ -39,8 +39,8 @@ defmodule SymphonyElixir.WorkflowCapabilityTest do
              {"plan_contract", 2} => 1,
              {"plan_manifest", 2} => 2,
              {"review_finding", 1} => 1,
-             {"review_lane", 3} => 3,
-             {"review_workflow", 3} => 3,
+             {"review_lane", 4} => 4,
+             {"review_workflow", 4} => 4,
              {"task_workflow", 2} => 2,
              {"taskboard_projection", 1} => 1,
              {"work_ref", 1} => 1,
@@ -93,13 +93,13 @@ defmodule SymphonyElixir.WorkflowCapabilityTest do
     migration = WorkflowCapability.migration()
     assert migration.status == :manual_verification_required
     refute migration.automatic
-    assert %{from: 2, to: 3, status: :migration_required, reason: reason} = migration.review_lane
-    assert reason =~ "field renaming is insufficient"
-    assert Enum.join(migration.upgrade) =~ "safe handoff"
+    assert %{from: 3, to: 4, status: :fresh_state_required, reason: reason} = migration.review_lane
+    assert reason =~ "audit-only"
+    assert Enum.join(migration.upgrade) =~ "fresh state"
     assert Enum.join(migration.upgrade) =~ "publication receipts"
     assert Enum.join(migration.rollback) =~ "independently of the checkout"
     assert Enum.join(migration.rollback) =~ "never overlap execution"
-    assert Enum.join(migration.rollback) =~ "schema 2 listener"
+    assert Enum.join(migration.rollback) =~ "schema 4 records"
   end
 
   test "runtime state includes capability inventory without removing build or listener identity" do
