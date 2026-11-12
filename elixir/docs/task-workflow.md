@@ -166,15 +166,10 @@ review waits for human review. A verified publication request may specify
 release that review wait. Remaining work then passes admission again. Without
 that explicit continuation, review comments and merge do not requeue execution.
 Use native `Related to` for separate acceptance, mixed tasks and multiple MRs.
-For the final MR, the Workspace publisher accepts `--handoff --manifest-file FILE`.
-Prepare every delivery item before publication and use paired `$publication`
-placeholders in the current MR item's URL and version. The publisher binds that
-verified MR and saves the complete manifest in the same atomic review request.
-Symphony verifies the contract and item coverage, posts a human-readable full
-checklist with its versioned manifest, and stops execution. Do not combine final
-submission with intermediate continuation. Stopped-run polls recover unfinished
-review requests, including an already merged MR or a notice beyond the first
-comments page, without allocating a replacement executor.
+For the final MR, publish and verify it through the caller's publication entry.
+Use the verified MR URL and source revision in the delivery manifest. Submit the
+manifest through the versioned Issue decision below. Keep final submission
+separate from intermediate continuation.
 
 The final handoff includes a `需要你做什么` section. It links the submitted
 artifacts, states when a report-only task correctly has no MR, and names the
@@ -198,9 +193,7 @@ Publish an overall `manifest` decision using this complete `--decision-file` obj
 
 For a manifest, both `contract` fields are required and must name the same
 authorization: the top-level field binds the decision, and `data.contract` binds
-the delivery manifest. The MR publisher's `--manifest-file` instead takes only
-the `data` object shown above, with paired `$publication` placeholders for the
-current MR. It constructs the complete decision when posting the handoff.
+the delivery manifest.
 
 The complete manifest covers all declared deliverables and criteria, and each
 item's kind and native artifact type must match the agreement. All required MRs

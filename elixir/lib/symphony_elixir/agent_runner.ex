@@ -309,9 +309,9 @@ defmodule SymphonyElixir.AgentRunner do
     #{brief}
     That file contains the workflow, task scope, acceptance criteria and authority.
     Read the current repository Issue and its comments through the native provider tool.
-    For GitLab MR delivery, use the configured publication entry with --handoff.
-    Symphony completes the review handoff automatically; do not post a duplicate notice.
-    Use task_handoff directly for a concrete decision, blocker or other delivery provider.
+    Publish authorized deliverables through the entry specified in the workflow.
+    Follow the workflow's delivery protocol using the verified publication result.
+    Use task_handoff for a review request, decision or blocker when a handoff is still needed.
     Continue authorized work until validated delivery or a specific real blocker.
     Follow all verification, resource admission, publication and acceptance gates.
     A normal turn ending or idle parent chat is not a blocker.
