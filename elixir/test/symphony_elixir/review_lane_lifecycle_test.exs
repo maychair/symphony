@@ -1083,7 +1083,14 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     project = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "https://review.invalid/team/repo"}
     payload = %{"object_kind" => "merge_request", "project" => project, "object_attributes" => %{"iid" => 1}}
     assert WebhookController.receive_event(%{conn | body_params: payload}, %{"provider" => "gitlab"}).status == 202
-    note = %{"object_kind" => "note", "project" => project, "merge_request" => %{"iid" => 1}}
+
+    note = %{
+      "object_kind" => "note",
+      "project" => project,
+      "object_attributes" => %{"noteable_type" => "MergeRequest", "action" => "create"},
+      "merge_request" => %{"iid" => 1}
+    }
+
     assert WebhookController.receive_event(%{conn | body_params: note}, %{"provider" => "gitlab"}).status == 202
 
     for invalid <- [put_in(payload["project"]["id"], 99), put_in(payload["object_attributes"]["iid"], 0), Map.delete(payload, "object_attributes")] do
@@ -1094,6 +1101,53 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     native = %{conn | params: %{"provider" => "mail"}}
     assert WebhookController.init(:receive_event) == :receive_event
     assert WebhookController.call(native, :receive_event).status == 403
+  end
+
+  test "GitLab Issue comments use tracker authentication even when Review is enabled", c do
+    config = Map.put(c.config, "webhook_secret", String.duplicate("r", 32))
+    tracker_secret = String.duplicate("t", 32)
+
+    File.write!(Workflow.workflow_file_path(), """
+    ---
+    tracker:
+      kind: gitlab
+      disabled: true
+      active_states: [opened]
+      terminal_states: [closed]
+      provider:
+        api_url: https://review.invalid/api/v4
+        project_path: team/repo
+        webhook_secret: #{Jason.encode!(tracker_secret)}
+        review_lane: #{Jason.encode!(config)}
+    ---
+    Review and task fixture
+    """)
+
+    :ok = WorkflowStore.force_reload()
+    assert SymphonyElixir.ReviewLane.config() == config
+    project = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "https://review.invalid/team/repo"}
+
+    note = %{
+      "object_kind" => "note",
+      "project" => project,
+      "object_attributes" => %{"noteable_type" => "Issue", "action" => "update"},
+      "issue" => %{"iid" => 42}
+    }
+
+    request = fn payload, secret ->
+      conn = Plug.Test.conn(:post, "/", payload) |> Plug.Conn.put_req_header("x-gitlab-token", secret)
+      WebhookController.receive_event(conn, %{"provider" => "gitlab"})
+    end
+
+    assert request.(note, config["webhook_secret"]).status == 403
+    response = request.(note, tracker_secret)
+    assert response.status == 202
+    assert Jason.decode!(response.resp_body) == %{"accepted" => false, "disabled" => true}
+
+    commit_note = put_in(note["object_attributes"]["noteable_type"], "Commit")
+    ignored = request.(commit_note, tracker_secret)
+    assert ignored.status == 202
+    assert Jason.decode!(ignored.resp_body) == %{"accepted" => false, "ignored" => true}
   end
 
   test "unreadable journal and invalid repository discovery remain explicit failures", c do

@@ -54,6 +54,14 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 In native Goal mode, it retains the running entry until the worker confirms native
 shutdown and finalizes the durable journal; an unconfirmed stop remains an incident.
 
+### GitLab webhook routing
+
+GitLab Comment webhooks include both Issue and MR comments. Issue comments use
+the tracker webhook configuration even when the Review lane is enabled. MR
+comments use the Review lane's webhook configuration when enabled. If one
+project hook supplies both kinds of comments, configure its secret on both
+consumers. Commit and snippet comments do not refresh Issue scheduling.
+
 ### Merged-delivery cleanup
 
 `workspace.merge_cleanup_command` is an optional trusted operator command,

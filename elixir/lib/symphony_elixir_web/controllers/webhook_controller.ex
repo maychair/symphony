@@ -34,7 +34,12 @@ defmodule SymphonyElixirWeb.WebhookController do
       (is_map(conn.body_params["pull_request"]) or is_map(get_in(conn.body_params, ["issue", "pull_request"])))
   end
 
-  defp review_event?(conn, "gitlab"), do: conn.body_params["object_kind"] in ["merge_request", "note"]
+  defp review_event?(%{body_params: %{"object_kind" => "merge_request"}}, "gitlab"), do: true
+
+  defp review_event?(%{body_params: %{"object_kind" => "note", "object_attributes" => %{"noteable_type" => "MergeRequest"}}}, "gitlab"),
+    do: true
+
+  defp review_event?(_conn, "gitlab"), do: false
 
   defp receive_tracker(conn, provider) do
     settings = Config.settings!().tracker
@@ -45,11 +50,25 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- is_binary(secret) and byte_size(secret) >= 16,
          :ok <- authenticate(conn, provider, secret, body),
          :ok <- scope(settings, provider, conn.body_params) do
-      acknowledge(conn, settings.disabled, merge_hint(provider, conn.body_params))
+      acknowledge_tracker(conn, provider, settings.disabled)
     else
       _ -> conn |> put_status(403) |> json(%{error: "webhook_rejected"})
     end
   end
+
+  defp acknowledge_tracker(%{body_params: %{"object_kind" => "note"}} = conn, "gitlab", disabled) do
+    case conn.body_params do
+      %{"object_attributes" => %{"noteable_type" => "Issue"}, "issue" => %{"iid" => iid}}
+      when is_integer(iid) and iid > 0 ->
+        acknowledge_refresh(conn, disabled)
+
+      _ ->
+        conn |> put_status(202) |> json(%{accepted: false, ignored: true})
+    end
+  end
+
+  defp acknowledge_tracker(conn, provider, disabled),
+    do: acknowledge(conn, disabled, merge_hint(provider, conn.body_params))
 
   defp receive_review(conn, "github", config) do
     repository = conn.body_params["repository"] || %{}
