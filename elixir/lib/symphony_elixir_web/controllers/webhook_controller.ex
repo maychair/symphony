@@ -45,7 +45,7 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- is_binary(secret) and byte_size(secret) >= 16,
          :ok <- authenticate(conn, provider, secret, body),
          :ok <- scope(settings, provider, conn.body_params) do
-      acknowledge(conn, settings.disabled)
+      acknowledge(conn, settings.disabled, merge_hint(provider, conn.body_params))
     else
       _ -> conn |> put_status(403) |> json(%{error: "webhook_rejected"})
     end
@@ -63,7 +63,7 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- GitHub.repository?(repository, config, project),
          true <- is_integer(number) and number > 0,
          :ok <- Listener.request_review(project, number) do
-      acknowledge(conn, config["disabled"] == true)
+      acknowledge(conn, config["disabled"] == true, nil)
     else
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end
@@ -83,15 +83,38 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- GitLab.web_url?(url, config, "/" <> project),
          true <- is_map(attributes),
          :ok <- Listener.request_review(project, attributes["iid"]) do
-      acknowledge(conn, config["disabled"] == true)
+      acknowledge(conn, config["disabled"] == true, merge_hint(provider, conn.body_params))
     else
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end
   end
 
-  defp acknowledge(conn, true), do: conn |> put_status(202) |> json(%{accepted: false, disabled: true})
+  defp merge_hint("gitlab", %{
+         "object_kind" => "merge_request",
+         "project" => %{"id" => project_id, "path_with_namespace" => project},
+         "object_attributes" => %{"action" => "merge", "state" => "merged", "iid" => iid}
+       })
+       when is_integer(project_id) and project_id > 0 and is_integer(iid) and iid > 0 and is_binary(project) do
+    %{provider: "gitlab", project_id: project_id, project: project, iid: iid}
+  end
 
-  defp acknowledge(conn, false) do
+  defp merge_hint(_, _), do: nil
+
+  defp acknowledge(conn, disabled, hint) do
+    case enqueue_merge_hint(hint) do
+      :queued when disabled -> conn |> put_status(202) |> json(%{accepted: true})
+      :queued -> acknowledge_refresh(conn, false)
+      :disabled -> acknowledge_refresh(conn, disabled)
+      :unavailable -> conn |> put_status(503) |> json(%{error: "merge_cleanup_unavailable"})
+    end
+  end
+
+  defp enqueue_merge_hint(nil), do: :disabled
+  defp enqueue_merge_hint(hint), do: Orchestrator.request_merge_cleanup(hint)
+
+  defp acknowledge_refresh(conn, true), do: conn |> put_status(202) |> json(%{accepted: false, disabled: true})
+
+  defp acknowledge_refresh(conn, false) do
     Orchestrator.request_refresh()
     conn |> put_status(202) |> json(%{accepted: true})
   end

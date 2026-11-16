@@ -39,6 +39,8 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :merge_cleanup_ref,
       :task_reconcile_ref,
+      merge_cleanup_pending: MapSet.new(),
+      merge_cleanup_in_flight: MapSet.new(),
       task_supervisor: SymphonyElixir.TaskSupervisor,
       plan_options: [],
       running: %{},
@@ -150,12 +152,12 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info({ref, {_output, status}}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
     Process.demonitor(ref, [:flush])
     if status != 0, do: Logger.warning("Merged-workspace cleanup command failed status=#{status}; retained execution records")
-    {:noreply, %{state | merge_cleanup_ref: nil}}
+    {:noreply, finish_merge_cleanup(state, status == 0)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{merge_cleanup_ref: ref} = state) when is_reference(ref) do
     Logger.warning("Merged-workspace cleanup command stopped reason=#{inspect(reason)}")
-    {:noreply, %{state | merge_cleanup_ref: nil}}
+    {:noreply, finish_merge_cleanup(state, false)}
   end
 
   def handle_info(
@@ -1370,10 +1372,31 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_start_merge_cleanup(%{merge_cleanup_ref: nil} = state) do
-    %{state | merge_cleanup_ref: SymphonyElixir.MergedWorkspaceCleanup.start(state.task_supervisor)}
+    case SymphonyElixir.MergedWorkspaceCleanup.start(state.task_supervisor, state.merge_cleanup_pending) do
+      nil -> state
+      ref -> %{state | merge_cleanup_ref: ref, merge_cleanup_in_flight: state.merge_cleanup_pending, merge_cleanup_pending: MapSet.new()}
+    end
   end
 
   defp maybe_start_merge_cleanup(state), do: state
+
+  defp put_merge_hint(state, hint) do
+    if MapSet.member?(state.merge_cleanup_in_flight, hint) do
+      state
+    else
+      %{state | merge_cleanup_pending: MapSet.put(state.merge_cleanup_pending, hint)}
+    end
+  end
+
+  defp finish_merge_cleanup(state, true) do
+    state = %{state | merge_cleanup_ref: nil, merge_cleanup_in_flight: MapSet.new()}
+    if MapSet.size(state.merge_cleanup_pending) > 0, do: maybe_start_merge_cleanup(state), else: state
+  end
+
+  defp finish_merge_cleanup(state, false) do
+    pending = MapSet.union(state.merge_cleanup_pending, state.merge_cleanup_in_flight)
+    %{state | merge_cleanup_ref: nil, merge_cleanup_pending: pending, merge_cleanup_in_flight: MapSet.new()}
+  end
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -1593,6 +1616,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Queue an authenticated native merge hint for the configured cleanup command."
+  @spec request_merge_cleanup(map()) :: :queued | :disabled | :unavailable
+  def request_merge_cleanup(hint) do
+    server = RuntimeContext.server(__MODULE__)
+
+    if GenServer.whereis(server) do
+      GenServer.call(server, {:request_merge_cleanup, hint})
+    else
+      :unavailable
+    end
+  end
+
   @spec retry_now(String.t()) :: :ok | :not_retrying | :unavailable
   def retry_now(issue_id), do: retry_now(RuntimeContext.server(__MODULE__), issue_id)
 
@@ -1718,6 +1753,15 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:request_merge_cleanup, hint}, _from, state) do
+    if SymphonyElixir.MergedWorkspaceCleanup.enabled?() do
+      pending = put_merge_hint(state, hint)
+      {:reply, :queued, maybe_start_merge_cleanup(pending)}
+    else
+      {:reply, :disabled, state}
+    end
   end
 
   def handle_call({:retry_now, issue_id}, _from, state) do

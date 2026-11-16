@@ -11,10 +11,9 @@ work. See [the review workflow](elixir/docs/review-workflow.md).
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
-The Elixir implementation supports an opt-in merged-delivery cleanup command on
-its existing polling cycle. Operators can verify merged reviews and retire only
-the corresponding safe local worktrees while retaining execution evidence; see
-[the lifecycle contract](elixir/README.md#merged-delivery-cleanup).
+The Elixir implementation can pass authenticated GitLab merge hints to an opt-in
+[cleanup command](elixir/README.md#merged-delivery-cleanup). This also covers merges
+from manual work when the configured command can resolve the owning task.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 

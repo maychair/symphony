@@ -2372,9 +2372,7 @@ unknown outcomes and explicit identities rather than infer success from wrappers
 
 ## Optional merged-delivery cleanup extension
 
-An implementation may accept `workspace.merge_cleanup_command`, a trusted operator command disabled by default. On the existing polling cycle it starts at most one asynchronous pass at a time, without delaying task dispatch or reconciliation. Failures release the single-flight slot so later polls may reconcile again.
-
-The command must confirm native merge success independently of Issue closure, match the stopped execution and exact workspace/branch, preserve execution evidence, and stop on dirty or unpublished changes. Ordinary workspace retention is unchanged. Provider-specific commands own safe deletion, durable partial-failure recovery and operator notification; they must not create tasks or restart Agents.
+An implementation may accept `workspace.merge_cleanup_command`, a trusted operator command disabled by default. It runs at most one asynchronous pass at a time. An authenticated and scoped GitLab merge webhook can request an immediate pass and supply the native project identity and MR IID. The command can receive these hints even with tracker dispatch disabled. Hints are advisory; the command confirms native merge and task identity, applies local policy and returns the ended task's ownership without removing the checkout. It must tolerate repeated notifications and never return a different task's ownership. Ordinary workspace retention is unchanged.
 
 Repository tracker extension: `tracker.assignee` restricts GitLab/GitHub routing to that sole native owner. Ownership checks compose with required labels across admission, reconciliation, retry/recovery and continuation. Other tracker assignment semantics remain provider-owned.
 

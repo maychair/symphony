@@ -57,20 +57,23 @@ shutdown and finalizes the durable journal; an unconfirmed stop remains an incid
 ### Merged-delivery cleanup
 
 `workspace.merge_cleanup_command` is an optional trusted operator command,
-disabled by default. The existing poll cycle starts one asynchronous pass at a
-time; slow or failed cleanup does not block task reconciliation. Startup and
-subsequent polls use the same path, and changing configuration affects later
-passes. The command must independently confirm the native review is merged,
-the recorded task is stopped, and the exact local worktree/branch are safe to
-remove. Closing an Issue alone is not merge evidence. Ordinary `workspace.retain`
-semantics remain unchanged.
+disabled by default. The existing periodic pass calls it without arguments.
+An authenticated, repository-scoped GitLab merge webhook can also request an
+immediate pass. The command then receives one JSON object in its first shell
+argument (`$1`) with `provider`, numeric `project_id`, namespace-qualified
+`project`, and numeric MR `iid`.
 
-The command owns provider-specific merge checks, exclusive execution fencing,
-data protection, durable cleanup receipts and operator notices. It must preserve
-execution records, stop on dirty or unpublished work, avoid forced removal, and
-support restart/partial-failure recovery. A successful command exit means a pass
-finished, not that every candidate was removed. This is lifecycle reconciliation,
-not another task source or Agent retry loop.
+Cleanup remains single flight. Merge hints arriving during a pass are queued
+in memory, and a failed pass can retry on the existing poll interval. Duplicate
+deliveries are possible, so the command must be safe to repeat. It must read back
+the native MR, confirm the merge, identify the task through its native relation,
+and apply the configured assignee policy. Returning an ended task's ownership
+must preserve the checkout contents and the current ownership of any other task.
+
+A repository can set `tracker.disabled: true` to keep issue dispatch off while
+its authenticated merge events still reach a configured cleanup command. No
+execution session or scheduler-owned checkout is required for the webhook hint.
+Ordinary `workspace.retain` semantics are unchanged.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
