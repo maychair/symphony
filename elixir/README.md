@@ -71,6 +71,15 @@ does not list native reviews, and dispatch reads its queued records from
 memory. Admission and native allocation still verify the selected MR.
 Changing the mode takes effect when the Review listener restarts.
 
+For ordinary development Issues, `tracker.provider.event_driven: true`
+selects scoped notifications instead of tracker scans. The scheduler durably
+records the notified Issue number before acknowledging the hook, reads that
+Issue from GitLab, and uses the existing admission checks. On restart it
+rechecks its recorded Issues. Failed reads retry after the configured polling
+interval without listing project Issues. Enable the Review event mode as well
+if Review is configured. Changing the Issue event mode requires an
+Orchestrator restart.
+
 ### Merged-delivery cleanup
 
 `workspace.merge_cleanup_command` is an optional trusted operator command,

@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.AgentRunner do
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
   alias SymphonyElixir.RuntimeContext
 
   @moduledoc """
@@ -386,8 +387,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp start_task_observation(record, now) do
-    if now >= Process.get(:workflow_refresh_at, now) do
-      Process.put(:workflow_refresh_at, now + Config.settings!().polling.interval_ms)
+    if task_observation_due?(record, now) do
       {:ok, current} = RunJournal.read(record["directory"])
       owner = self()
 
@@ -399,6 +399,27 @@ defmodule SymphonyElixir.AgentRunner do
         )
 
       Process.put(:workflow_observer, {pid, monitor, now})
+    end
+  end
+
+  defp task_observation_due?(record, now) do
+    settings = Config.settings!()
+
+    if GitLabAdapter.event_driven?(settings.tracker) do
+      id = record["issue_id"]
+
+      receive do
+        {:gitlab_issue_changed, ^id} -> true
+      after
+        0 -> false
+      end
+    else
+      if now >= Process.get(:workflow_refresh_at, now) do
+        Process.put(:workflow_refresh_at, now + settings.polling.interval_ms)
+        true
+      else
+        false
+      end
     end
   end
 

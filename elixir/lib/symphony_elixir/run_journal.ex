@@ -288,6 +288,57 @@ defmodule SymphonyElixir.RunJournal do
   @spec directory(Path.t(), String.t()) :: Path.t()
   def directory(root, issue_id), do: Path.join(root, key(issue_id))
 
+  @doc "Record a GitLab Issue that needs native observation without admitting an execution."
+  @spec remember_issue_event(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def remember_issue_event(root, project, iid) do
+    path = issue_event_path(root, project, iid)
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- write_synced(path <> ".pending", iid) do
+      File.rename(path <> ".pending", path)
+    end
+  end
+
+  @doc "Restore accepted GitLab Issue observations in the configured repository."
+  @spec issue_events(Path.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def issue_events(root, project) do
+    directory = issue_event_directory(root, project)
+
+    case File.ls(directory) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&String.ends_with?(&1, ".event"))
+        |> Enum.reduce_while({:ok, []}, &read_issue_event(directory, &1, &2))
+
+      {:error, :enoent} ->
+        {:ok, []}
+
+      error ->
+        error
+    end
+  end
+
+  defp read_issue_event(directory, entry, {:ok, ids}) do
+    with {:ok, iid} <- File.read(Path.join(directory, entry)),
+         true <- Regex.match?(~r/\A[1-9][0-9]*\z/, iid) and key(iid) <> ".event" == entry do
+      {:cont, {:ok, [iid | ids]}}
+    else
+      error -> {:halt, {:error, {:invalid_issue_event, entry, error}}}
+    end
+  end
+
+  @doc "Remove an observed Issue when it leaves the configured task lifecycle."
+  @spec forget_issue_event(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def forget_issue_event(root, project, iid) do
+    case File.rm(issue_event_path(root, project, iid)) do
+      {:error, :enoent} -> :ok
+      result -> result
+    end
+  end
+
+  defp issue_event_path(root, project, iid), do: Path.join(issue_event_directory(root, project), key(iid) <> ".event")
+  defp issue_event_directory(root, project), do: Path.join([root, ".gitlab-issues", key(project)])
+
   defp admission(nil, issue_id) do
     {:ok, host} = :inet.gethostname()
 

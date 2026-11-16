@@ -1,4 +1,5 @@
 defmodule SymphonyElixir.Orchestrator do
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
   alias SymphonyElixir.RuntimeContext
 
   @moduledoc """
@@ -10,7 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.{Execution, TaskPlanExecution}
+  alias SymphonyElixir.{Execution, RunJournal, TaskPlanExecution, TaskReconciler}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -39,6 +40,9 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :merge_cleanup_ref,
       :task_reconcile_ref,
+      :event_project,
+      issue_event_ids: MapSet.new(),
+      issue_event_candidates: %{},
       merge_cleanup_pending: MapSet.new(),
       merge_cleanup_in_flight: MapSet.new(),
       task_supervisor: SymphonyElixir.TaskSupervisor,
@@ -81,13 +85,28 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup(state.plan_options)
-        state = schedule_tick(state, 0)
-
-        {:ok, state}
+        initialize_dispatch(state, config.tracker)
 
       {:error, reason} ->
         {:stop, reason}
+    end
+  end
+
+  defp initialize_dispatch(state, tracker) do
+    if GitLabAdapter.event_driven?(tracker) do
+      project = tracker.provider["project_path"]
+
+      case RunJournal.issue_events(Execution.journal_root(), project) do
+        {:ok, ids} ->
+          next = %{state | event_project: project, issue_event_ids: MapSet.new(ids), next_poll_due_at_ms: nil}
+          {:ok, schedule_tick(next, 0)}
+
+        {:error, reason} ->
+          {:stop, {:issue_event_recovery_failed, reason}}
+      end
+    else
+      run_terminal_workspace_cleanup(state.plan_options)
+      {:ok, schedule_tick(state, 0)}
     end
   end
 
@@ -124,6 +143,20 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     :ok = schedule_poll_cycle_start()
+    {:noreply, state}
+  end
+
+  def handle_info(:run_poll_cycle, %{event_project: project} = state) when is_binary(project) do
+    state =
+      state
+      |> refresh_runtime_config()
+      |> consume_issue_events()
+      |> dispatch_notified_work()
+      |> dispatch_pending_cleanup()
+      |> Map.put(:poll_check_in_progress, false)
+      |> retry_pending_events()
+
+    notify_dashboard()
     {:noreply, state}
   end
 
@@ -174,6 +207,7 @@ defmodule SymphonyElixir.Orchestrator do
         session_id = running_entry_session_id(running_entry)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state = if state.event_project, do: wake_dispatch(state), else: state
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -410,6 +444,98 @@ defmodule SymphonyElixir.Orchestrator do
       false ->
         state
     end
+  end
+
+  defp consume_issue_events(state) do
+    if issue_events_enabled?(), do: Enum.reduce(state.issue_event_ids, state, &consume_issue_event/2), else: state
+  end
+
+  defp consume_issue_event(id, state) do
+    case Tracker.fetch_gitlab_event_issue(id) do
+      {:ok, issues} ->
+        issue = find_issue_by_id(issues, id)
+
+        case apply_issue_event(state, id, issue) do
+          {:ok, next} -> %{next | issue_event_ids: MapSet.delete(next.issue_event_ids, id)}
+          {:error, reason} -> retain_issue_event(state, id, reason)
+        end
+
+      {:error, reason} ->
+        retain_issue_event(state, id, reason)
+    end
+  end
+
+  defp retain_issue_event(state, id, reason) do
+    Logger.warning("GitLab Issue observation failed issue_id=#{id} reason=#{inspect(reason)}")
+    %{state | issue_event_candidates: Map.delete(state.issue_event_candidates, id)}
+  end
+
+  defp apply_issue_event(state, id, %Issue{} = issue) do
+    active = active_state_set()
+    terminal = terminal_state_set()
+
+    with :ok <- TaskReconciler.refresh_notified(id, state.running[id]) do
+      state = reconcile_notified_issue(state, issue, active, terminal)
+
+      if candidate_issue?(issue, active, terminal) do
+        {:ok, %{state | issue_event_candidates: Map.put(state.issue_event_candidates, id, issue)}}
+      else
+        forget_issue_event(state, id)
+      end
+    end
+  end
+
+  defp apply_issue_event(state, id, nil) do
+    next =
+      state
+      |> reconcile_missing_running_issue_ids(if(Map.has_key?(state.running, id), do: [id], else: []), [])
+      |> reconcile_missing_blocked_issue_ids(if(Map.has_key?(state.blocked, id), do: [id], else: []), [])
+
+    forget_issue_event(next, id)
+  end
+
+  defp reconcile_notified_issue(state, issue, active, terminal) do
+    cond do
+      Map.has_key?(state.running, issue.id) -> reconcile_issue_state(issue, state, active, terminal)
+      Map.has_key?(state.blocked, issue.id) -> reconcile_blocked_issue_state(issue, state, active, terminal)
+      true -> state
+    end
+  end
+
+  defp forget_issue_event(state, id) do
+    with :ok <- RunJournal.forget_issue_event(Execution.journal_root(), state.event_project, id) do
+      {:ok, %{state | issue_event_candidates: Map.delete(state.issue_event_candidates, id)}}
+    end
+  end
+
+  defp dispatch_notified_work(state) do
+    state = reconcile_stalled_running_issues(state)
+
+    case Tracker.queued_reviews() do
+      {:ok, reviews} ->
+        state = Enum.reduce(reviews, state, &reconcile_notified_issue(&2, &1, active_state_set(), terminal_state_set()))
+        candidates = if issue_events_enabled?(), do: Map.values(state.issue_event_candidates), else: []
+        next = choose_issues(candidates ++ reviews, state)
+        %{next | issue_event_candidates: Map.drop(next.issue_event_candidates, Map.keys(next.running))}
+
+      {:error, reason} ->
+        Logger.warning("Could not read queued reviews: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp retry_pending_events(state) do
+    if (issue_events_enabled?() and MapSet.size(state.issue_event_ids) > 0) or MapSet.size(state.merge_cleanup_pending) > 0 do
+      schedule_tick(state, state.poll_interval_ms)
+    else
+      state
+    end
+  end
+
+  defp issue_events_enabled?, do: not Config.settings!().tracker.disabled
+
+  defp dispatch_pending_cleanup(state) do
+    if MapSet.size(state.merge_cleanup_pending) > 0, do: maybe_start_merge_cleanup(state), else: state
   end
 
   defp maybe_reconcile_tasks(%State{task_reconcile_ref: nil} = state) do
@@ -1088,7 +1214,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_issue_for_dispatch(issue, plan_options) do
-    fetch = &Tracker.fetch_issues_by_ids(&1, plan_options)
+    fetch = fn [id] -> fetch_issue_for_dispatch(id, plan_options) end
 
     case revalidate_issue_for_dispatch(issue, fetch, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
@@ -1106,6 +1232,14 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  defp fetch_issue_for_dispatch(id, plan_options) do
+    if GitLabAdapter.event_driven?(Config.settings!().tracker) and Regex.match?(~r/\A[1-9][0-9]*\z/, id) do
+      Tracker.fetch_gitlab_event_issue(id)
+    else
+      Tracker.fetch_issues_by_ids([id], plan_options)
     end
   end
 
@@ -1273,7 +1407,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_issues_by_ids([issue_id], state.plan_options) do
+    case fetch_issue_for_dispatch(issue_id, state.plan_options) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -1395,7 +1529,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp finish_merge_cleanup(state, false) do
     pending = MapSet.union(state.merge_cleanup_pending, state.merge_cleanup_in_flight)
-    %{state | merge_cleanup_ref: nil, merge_cleanup_pending: pending, merge_cleanup_in_flight: MapSet.new()}
+    next = %{state | merge_cleanup_ref: nil, merge_cleanup_pending: pending, merge_cleanup_in_flight: MapSet.new()}
+    if is_binary(state.event_project) and not refresh_pending?(next), do: retry_pending_events(next), else: next
   end
 
   defp notify_dashboard do
@@ -1628,6 +1763,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Persist a scoped GitLab Issue hint before acknowledging its delivery."
+  @spec request_issue_event(pos_integer()) :: :queued | :unavailable
+  def request_issue_event(iid) when is_integer(iid) and iid > 0 do
+    GenServer.call(RuntimeContext.server(__MODULE__), {:issue_event, Integer.to_string(iid)})
+  catch
+    :exit, _reason -> :unavailable
+  end
+
   @doc "Wake dispatch after an asynchronous producer has queued work."
   @spec notify_work_ready() :: :ok
   def notify_work_ready, do: GenServer.cast(RuntimeContext.server(__MODULE__), :work_ready)
@@ -1766,6 +1909,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call({:issue_event, id}, _from, state) do
+    tracker = Config.settings!().tracker
+
+    with project when is_binary(project) <- state.event_project,
+         true <- GitLabAdapter.event_driven?(tracker) and not tracker.disabled,
+         true <- tracker.provider["project_path"] == project,
+         :ok <- RunJournal.remember_issue_event(Execution.journal_root(), project, id) do
+      next = %{state | issue_event_ids: MapSet.put(state.issue_event_ids, id)}
+      {:reply, :queued, wake_dispatch(next)}
+    else
+      _ -> {:reply, :unavailable, state}
+    end
+  end
+
   def handle_call({:retry_now, issue_id}, _from, state) do
     case Map.get(state.retry_attempts, issue_id) do
       %{retry_token: retry_token, timer_ref: timer_ref} when is_reference(retry_token) ->
@@ -1860,8 +2017,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def handle_cast(:work_ready, state) do
-    {:noreply, if(refresh_pending?(state), do: state, else: schedule_tick(state, 0))}
+    {:noreply, wake_dispatch(state)}
   end
+
+  defp wake_dispatch(state), do: if(refresh_pending?(state), do: state, else: schedule_tick(state, 0))
 
   defp refresh_pending?(state) do
     now = System.monotonic_time(:millisecond)

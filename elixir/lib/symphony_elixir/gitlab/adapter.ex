@@ -11,6 +11,10 @@ defmodule SymphonyElixir.GitLab.Adapter do
   @active_states ["opened"]
   @terminal_states ["closed"]
 
+  @spec event_driven?(map()) :: boolean()
+  def event_driven?(%{kind: "gitlab", provider: %{"event_driven" => true}}), do: true
+  def event_driven?(_), do: false
+
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) do
     with :ok <-

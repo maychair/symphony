@@ -4,6 +4,7 @@ tracker:
   # assignee: "20"
   kind: linear
   provider:
+    # GitLab can opt into scoped Issue events with event_driven: true.
     # Optional review_lane uses instruction_files: [absolute Workflow, Playbook]
     # Optional result_command: [executable, validator] is passed to the Agent.
     # The engine never runs review preparation, validation or publication.

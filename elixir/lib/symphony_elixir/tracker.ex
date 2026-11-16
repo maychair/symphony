@@ -84,6 +84,18 @@ defmodule SymphonyElixir.Tracker do
     if Config.settings!().tracker.disabled, do: {:ok, []}, else: adapter().fetch_issues_by_states(states)
   end
 
+  @doc "Read only the notified GitLab Issue, leaving plan and Review scheduling to their own consumers."
+  @spec fetch_gitlab_event_issue(String.t()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_gitlab_event_issue(id) do
+    with {:ok, issues} <- SymphonyElixir.GitLab.Adapter.fetch_issues_by_ids([id]) do
+      {:ok, issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1)}
+    end
+  end
+
+  @doc "Read the already queued Review jobs independently of Issue and plan discovery."
+  @spec queued_reviews() :: {:ok, [Issue.t()]} | {:error, term()}
+  def queued_reviews, do: review_issues()
+
   @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids, opts \\ []) do
     {review_ids, normal_ids} = Enum.split_with(issue_ids, &String.starts_with?(&1, "review:"))

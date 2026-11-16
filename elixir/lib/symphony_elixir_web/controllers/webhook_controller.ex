@@ -3,6 +3,7 @@ defmodule SymphonyElixirWeb.WebhookController do
   use Phoenix.Controller, formats: [:json]
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
 
   alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Listener}
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
@@ -50,11 +51,38 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- is_binary(secret) and byte_size(secret) >= 16,
          :ok <- authenticate(conn, provider, secret, body),
          :ok <- scope(settings, provider, conn.body_params) do
-      acknowledge_tracker(conn, provider, settings.disabled)
+      if GitLabAdapter.event_driven?(settings),
+        do: acknowledge_gitlab_event(conn, settings.disabled),
+        else: acknowledge_tracker(conn, provider, settings.disabled)
     else
       _ -> conn |> put_status(403) |> json(%{error: "webhook_rejected"})
     end
   end
+
+  defp acknowledge_gitlab_event(conn, true), do: acknowledge(conn, true, merge_hint("gitlab", conn.body_params))
+
+  defp acknowledge_gitlab_event(conn, false) do
+    case issue_event(conn.body_params) do
+      iid when is_integer(iid) -> acknowledge_issue_event(conn, Orchestrator.request_issue_event(iid))
+      nil -> acknowledge_non_issue_event(conn, merge_hint("gitlab", conn.body_params))
+    end
+  end
+
+  defp issue_event(%{"object_kind" => "issue", "object_attributes" => %{"iid" => iid, "action" => action}})
+       when is_integer(iid) and iid > 0 and action in ["open", "update", "close", "reopen"],
+       do: iid
+
+  defp issue_event(%{"object_kind" => "note", "object_attributes" => %{"noteable_type" => "Issue", "action" => action}, "issue" => %{"iid" => iid}})
+       when is_integer(iid) and iid > 0 and action in ["create", "update"],
+       do: iid
+
+  defp issue_event(_), do: nil
+
+  defp acknowledge_issue_event(conn, :queued), do: conn |> put_status(202) |> json(%{accepted: true})
+  defp acknowledge_issue_event(conn, :unavailable), do: conn |> put_status(503) |> json(%{error: "issue_event_unavailable"})
+
+  defp acknowledge_non_issue_event(conn, nil), do: conn |> put_status(202) |> json(%{accepted: false, ignored: true})
+  defp acknowledge_non_issue_event(conn, hint), do: acknowledge(conn, true, hint)
 
   defp acknowledge_tracker(%{body_params: %{"object_kind" => "note"}} = conn, "gitlab", disabled) do
     case conn.body_params do

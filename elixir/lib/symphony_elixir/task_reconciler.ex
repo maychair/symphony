@@ -48,6 +48,24 @@ defmodule SymphonyElixir.TaskReconciler do
     :ok
   end
 
+  @doc "Notify the owning worker or refresh the existing record for one Issue."
+  @spec refresh_notified(String.t(), map() | nil) :: :ok | {:error, term()}
+  def refresh_notified(id, nil) do
+    with true <- enabled?(),
+         {:ok, %{} = record} <- RunJournal.read(RunJournal.directory(Execution.journal_root(), id)),
+         true <- legacy_record?(record) do
+      locked_refresh(record)
+    else
+      {:error, _} = error -> error
+      _ -> :ok
+    end
+  end
+
+  def refresh_notified(id, %{pid: pid}) do
+    if enabled?(), do: send(pid, {:gitlab_issue_changed, id})
+    :ok
+  end
+
   defp poll_record(path, active_ids) do
     with {:ok, record} when is_map(record) <- RunJournal.read(Path.dirname(path)),
          false <- MapSet.member?(active_ids, record["issue_id"]),
