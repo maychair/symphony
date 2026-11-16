@@ -80,6 +80,11 @@ interval without listing project Issues. Enable the Review event mode as well
 if Review is configured. Changing the Issue event mode requires an
 Orchestrator restart.
 
+Issue close and reopen notifications also wake ordinary tasks whose recorded
+workflow depends on that Issue. MR notifications wake tasks with an existing
+dependency, handoff, or delivery bound to that MR. The task workflow reads the
+native source and decides whether its condition is satisfied.
+
 ### Merged-delivery cleanup
 
 `workspace.merge_cleanup_command` is an optional trusted operator command,
@@ -90,8 +95,10 @@ argument (`$1`) with `provider`, numeric `project_id`, namespace-qualified
 `project`, and numeric MR `iid`.
 
 Cleanup remains single flight. Merge hints arriving during a pass are queued
-in memory, and a failed pass can retry on the existing poll interval. Duplicate
-deliveries are possible, so the command must be safe to repeat. It must read back
+and a failed pass can retry after the configured interval. In GitLab event
+mode, the execution journal retains pending merge hints across restarts, even
+when Issue dispatch is disabled. Without event mode, queued hints are held
+in memory. Duplicate deliveries are possible, so the command must be safe to repeat. It must read back
 the native MR, confirm the merge, identify the task through its native relation,
 and apply the configured assignee policy. Returning an ended task's ownership
 must preserve the checkout contents and the current ownership of any other task.

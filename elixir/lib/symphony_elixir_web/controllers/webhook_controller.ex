@@ -63,26 +63,46 @@ defmodule SymphonyElixirWeb.WebhookController do
 
   defp acknowledge_gitlab_event(conn, false) do
     case issue_event(conn.body_params) do
-      iid when is_integer(iid) -> acknowledge_issue_event(conn, Orchestrator.request_issue_event(iid))
-      nil -> acknowledge_non_issue_event(conn, merge_hint("gitlab", conn.body_params))
+      {iid, terminal_change?} -> acknowledge_issue_event(conn, Orchestrator.request_issue_event(iid, terminal_change?))
+      nil -> acknowledge_non_issue_event(conn, false, false)
     end
   end
 
   defp issue_event(%{"object_kind" => "issue", "object_attributes" => %{"iid" => iid, "action" => action}})
        when is_integer(iid) and iid > 0 and action in ["open", "update", "close", "reopen"],
-       do: iid
+       do: {iid, action in ["close", "reopen"]}
 
   defp issue_event(%{"object_kind" => "note", "object_attributes" => %{"noteable_type" => "Issue", "action" => action}, "issue" => %{"iid" => iid}})
        when is_integer(iid) and iid > 0 and action in ["create", "update"],
-       do: iid
+       do: {iid, false}
 
   defp issue_event(_), do: nil
 
   defp acknowledge_issue_event(conn, :queued), do: conn |> put_status(202) |> json(%{accepted: true})
   defp acknowledge_issue_event(conn, :unavailable), do: conn |> put_status(503) |> json(%{error: "issue_event_unavailable"})
 
-  defp acknowledge_non_issue_event(conn, nil), do: conn |> put_status(202) |> json(%{accepted: false, ignored: true})
-  defp acknowledge_non_issue_event(conn, hint), do: acknowledge(conn, true, hint)
+  defp acknowledge_non_issue_event(conn, disabled, review_delivered) do
+    dependency = if disabled, do: :ignored, else: enqueue_merge_dependents(conn.body_params)
+    cleanup = enqueue_merge_hint(merge_hint("gitlab", conn.body_params))
+
+    cond do
+      dependency == :unavailable -> acknowledge_issue_event(conn, :unavailable)
+      cleanup == :unavailable -> conn |> put_status(503) |> json(%{error: "merge_cleanup_unavailable"})
+      dependency == :queued or cleanup == :queued or review_delivered -> acknowledge_issue_event(conn, :queued)
+      true -> conn |> put_status(202) |> json(%{accepted: false, ignored: true})
+    end
+  end
+
+  defp enqueue_merge_dependents(%{
+         "object_kind" => "merge_request",
+         "project" => %{"path_with_namespace" => project},
+         "object_attributes" => %{"action" => action, "iid" => iid}
+       })
+       when is_binary(project) and is_integer(iid) and iid > 0 and action in ["open", "update", "merge", "close", "reopen"] do
+    Orchestrator.request_merge_dependents(project, iid)
+  end
+
+  defp enqueue_merge_dependents(_), do: :ignored
 
   defp acknowledge_tracker(%{body_params: %{"object_kind" => "note"}} = conn, "gitlab", disabled) do
     case conn.body_params do
@@ -130,7 +150,11 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- GitLab.web_url?(url, config, "/" <> project),
          true <- is_map(attributes),
          :ok <- Listener.request_review(project, attributes["iid"]) do
-      acknowledge(conn, config["disabled"] == true, merge_hint(provider, conn.body_params))
+      tracker = Config.settings!().tracker
+
+      if GitLabAdapter.event_driven?(tracker),
+        do: acknowledge_non_issue_event(conn, tracker.disabled, config["disabled"] != true),
+        else: acknowledge(conn, config["disabled"] == true, merge_hint(provider, conn.body_params))
     else
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end

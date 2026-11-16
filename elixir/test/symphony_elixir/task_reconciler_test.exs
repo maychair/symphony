@@ -209,7 +209,11 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute record["workflow"]["charging"]
     :ok = Execution.finish(issue, opts, {:error, :scheduler_stop})
     Agent.update(server, &%{&1 | dependency: %{"state" => "closed"}})
-    assert :ok = TaskReconciler.poll(MapSet.new())
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("elsewhere/project", "issue", 7)
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("group/project", "mr", 7)
+    assert {:ok, [issue_id]} = TaskReconciler.dependent_issue_ids("group/project", "issue", 7)
+    assert issue_id == issue.id
+    assert :ok = TaskReconciler.refresh_notified(issue_id, nil)
     record = current(record)
     refute record["workflow"]["restrictions"]["dep"]
     assert record["workflow"]["state"] == "waiting"
@@ -1043,6 +1047,9 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = TaskReconciler.refresh(record, false)
     refute record["workflow"]["delivery_ready"]
     refute TaskWorkflow.valid_conclusion?(record["workflow"])
+    assert {:ok, [issue_id]} = TaskReconciler.dependent_issue_ids("group/project", "mr", 9)
+    assert issue_id == issue.id
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("group/project", "mr", 10)
     assert Agent.get(server, & &1.raw["state"]) == "opened"
 
     # Requiring both checks and review on every item is the safeguard under test;

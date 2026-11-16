@@ -291,10 +291,12 @@ defmodule SymphonyElixir.RunJournal do
   @doc "Record a GitLab Issue that needs native observation without admitting an execution."
   @spec remember_issue_event(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def remember_issue_event(root, project, iid) do
-    path = issue_event_path(root, project, iid)
+    write_event(issue_event_path(root, project, iid), iid)
+  end
 
+  defp write_event(path, body) do
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         :ok <- write_synced(path <> ".pending", iid) do
+         :ok <- write_synced(path <> ".pending", body) do
       File.rename(path <> ".pending", path)
     end
   end
@@ -302,13 +304,15 @@ defmodule SymphonyElixir.RunJournal do
   @doc "Restore accepted GitLab Issue observations in the configured repository."
   @spec issue_events(Path.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
   def issue_events(root, project) do
-    directory = issue_event_directory(root, project)
+    read_events(issue_event_directory(root, project), &decode_issue_event/1)
+  end
 
+  defp read_events(directory, decode) do
     case File.ls(directory) do
       {:ok, entries} ->
         entries
         |> Enum.filter(&String.ends_with?(&1, ".event"))
-        |> Enum.reduce_while({:ok, []}, &read_issue_event(directory, &1, &2))
+        |> Enum.reduce_while({:ok, []}, &read_event(directory, &1, &2, decode))
 
       {:error, :enoent} ->
         {:ok, []}
@@ -318,19 +322,28 @@ defmodule SymphonyElixir.RunJournal do
     end
   end
 
-  defp read_issue_event(directory, entry, {:ok, ids}) do
-    with {:ok, iid} <- File.read(Path.join(directory, entry)),
-         true <- Regex.match?(~r/\A[1-9][0-9]*\z/, iid) and key(iid) <> ".event" == entry do
-      {:cont, {:ok, [iid | ids]}}
+  defp read_event(directory, entry, {:ok, events}, decode) do
+    with {:ok, body} <- File.read(Path.join(directory, entry)),
+         {:ok, id, value} <- decode.(body),
+         true <- key(id) <> ".event" == entry do
+      {:cont, {:ok, [value | events]}}
     else
-      error -> {:halt, {:error, {:invalid_issue_event, entry, error}}}
+      error -> {:halt, {:error, {:invalid_gitlab_event, entry, error}}}
     end
+  end
+
+  defp decode_issue_event(iid) do
+    if Regex.match?(~r/\A[1-9][0-9]*\z/, iid), do: {:ok, iid, iid}, else: {:error, :invalid_iid}
   end
 
   @doc "Remove an observed Issue when it leaves the configured task lifecycle."
   @spec forget_issue_event(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
   def forget_issue_event(root, project, iid) do
-    case File.rm(issue_event_path(root, project, iid)) do
+    forget_event(issue_event_path(root, project, iid))
+  end
+
+  defp forget_event(path) do
+    case File.rm(path) do
       {:error, :enoent} -> :ok
       result -> result
     end
@@ -338,6 +351,39 @@ defmodule SymphonyElixir.RunJournal do
 
   defp issue_event_path(root, project, iid), do: Path.join(issue_event_directory(root, project), key(iid) <> ".event")
   defp issue_event_directory(root, project), do: Path.join([root, ".gitlab-issues", key(project)])
+
+  @doc "Record a scoped GitLab merge before acknowledging its cleanup request."
+  @spec remember_merge_event(Path.t(), String.t(), map()) :: :ok | {:error, term()}
+  def remember_merge_event(root, project, %{provider: "gitlab", project: project, project_id: project_id, iid: iid} = hint)
+      when is_integer(project_id) and project_id > 0 and is_integer(iid) and iid > 0 do
+    write_event(merge_event_path(root, project, iid), Jason.encode!(Map.take(hint, [:provider, :project, :project_id, :iid])))
+  end
+
+  def remember_merge_event(_root, _project, _hint), do: {:error, :invalid_merge_hint}
+
+  @doc "Restore unfinished merge cleanup requests for the configured repository."
+  @spec merge_events(Path.t(), String.t()) :: {:ok, [map()]} | {:error, term()}
+  def merge_events(root, project) do
+    read_events(merge_event_directory(root, project), &decode_merge_event(&1, project))
+  end
+
+  defp decode_merge_event(body, project) do
+    case Jason.decode(body) do
+      {:ok, %{"provider" => "gitlab", "project" => ^project, "project_id" => project_id, "iid" => iid}}
+      when is_integer(project_id) and project_id > 0 and is_integer(iid) and iid > 0 ->
+        {:ok, Integer.to_string(iid), %{provider: "gitlab", project: project, project_id: project_id, iid: iid}}
+
+      _ ->
+        {:error, :invalid_merge_hint}
+    end
+  end
+
+  @doc "Acknowledge a scoped merge whose cleanup command completed."
+  @spec forget_merge_event(Path.t(), String.t(), pos_integer()) :: :ok | {:error, term()}
+  def forget_merge_event(root, project, iid), do: forget_event(merge_event_path(root, project, iid))
+
+  defp merge_event_path(root, project, iid), do: Path.join(merge_event_directory(root, project), key(Integer.to_string(iid)) <> ".event")
+  defp merge_event_directory(root, project), do: Path.join([root, ".gitlab-merges", key(project)])
 
   defp admission(nil, issue_id) do
     {:ok, host} = :inet.gethostname()

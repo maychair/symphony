@@ -96,13 +96,21 @@ defmodule SymphonyElixir.Orchestrator do
     if GitLabAdapter.event_driven?(tracker) do
       project = tracker.provider["project_path"]
 
-      case RunJournal.issue_events(Execution.journal_root(), project) do
-        {:ok, ids} ->
-          next = %{state | event_project: project, issue_event_ids: MapSet.new(ids), next_poll_due_at_ms: nil}
-          {:ok, schedule_tick(next, 0)}
+      root = Execution.journal_root()
 
-        {:error, reason} ->
-          {:stop, {:issue_event_recovery_failed, reason}}
+      with {:ok, ids} <- RunJournal.issue_events(root, project),
+           {:ok, merges} <- RunJournal.merge_events(root, project) do
+        next = %{
+          state
+          | event_project: project,
+            issue_event_ids: MapSet.new(ids),
+            merge_cleanup_pending: MapSet.new(merges),
+            next_poll_due_at_ms: nil
+        }
+
+        {:ok, schedule_tick(next, 0)}
+      else
+        {:error, reason} -> {:stop, {:gitlab_event_recovery_failed, reason}}
       end
     else
       run_terminal_workspace_cleanup(state.plan_options)
@@ -525,7 +533,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_pending_events(state) do
-    if (issue_events_enabled?() and MapSet.size(state.issue_event_ids) > 0) or MapSet.size(state.merge_cleanup_pending) > 0 do
+    if (issue_events_enabled?() and MapSet.size(state.issue_event_ids) > 0) or cleanup_pending?(state) do
       schedule_tick(state, state.poll_interval_ms)
     else
       state
@@ -536,6 +544,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_pending_cleanup(state) do
     if MapSet.size(state.merge_cleanup_pending) > 0, do: maybe_start_merge_cleanup(state), else: state
+  end
+
+  defp cleanup_pending?(state) do
+    MapSet.size(state.merge_cleanup_pending) > 0 and SymphonyElixir.MergedWorkspaceCleanup.enabled?()
   end
 
   defp maybe_reconcile_tasks(%State{task_reconcile_ref: nil} = state) do
@@ -1522,9 +1534,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp accept_merge_cleanup(state, hint) do
+    case persist_merge_cleanup(state, hint) do
+      :ok -> {:reply, :queued, maybe_start_merge_cleanup(put_merge_hint(state, hint))}
+      {:error, _reason} -> {:reply, :unavailable, state}
+    end
+  end
+
+  defp persist_merge_cleanup(%{event_project: project}, hint) when is_binary(project),
+    do: RunJournal.remember_merge_event(Execution.journal_root(), project, hint)
+
+  defp persist_merge_cleanup(_state, _hint), do: :ok
+
   defp finish_merge_cleanup(state, true) do
-    state = %{state | merge_cleanup_ref: nil, merge_cleanup_in_flight: MapSet.new()}
-    if MapSet.size(state.merge_cleanup_pending) > 0, do: maybe_start_merge_cleanup(state), else: state
+    case acknowledge_merge_events(state) do
+      :ok ->
+        next = %{state | merge_cleanup_ref: nil, merge_cleanup_in_flight: MapSet.new()}
+        dispatch_pending_cleanup(next)
+
+      {:error, reason} ->
+        Logger.warning("Could not acknowledge completed GitLab merge cleanup: #{inspect(reason)}")
+        finish_merge_cleanup(state, false)
+    end
   end
 
   defp finish_merge_cleanup(state, false) do
@@ -1532,6 +1563,19 @@ defmodule SymphonyElixir.Orchestrator do
     next = %{state | merge_cleanup_ref: nil, merge_cleanup_pending: pending, merge_cleanup_in_flight: MapSet.new()}
     if is_binary(state.event_project) and not refresh_pending?(next), do: retry_pending_events(next), else: next
   end
+
+  defp acknowledge_merge_events(%{event_project: project, merge_cleanup_in_flight: hints}) when is_binary(project) do
+    root = Execution.journal_root()
+
+    Enum.reduce_while(hints, :ok, fn hint, :ok ->
+      case RunJournal.forget_merge_event(root, project, hint.iid) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp acknowledge_merge_events(_state), do: :ok
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -1761,12 +1805,22 @@ defmodule SymphonyElixir.Orchestrator do
     else
       :unavailable
     end
+  catch
+    :exit, _reason -> :unavailable
   end
 
   @doc "Persist a scoped GitLab Issue hint before acknowledging its delivery."
-  @spec request_issue_event(pos_integer()) :: :queued | :unavailable
-  def request_issue_event(iid) when is_integer(iid) and iid > 0 do
-    GenServer.call(RuntimeContext.server(__MODULE__), {:issue_event, Integer.to_string(iid)})
+  @spec request_issue_event(pos_integer(), boolean()) :: :queued | :unavailable
+  def request_issue_event(iid, wake_dependents? \\ false) when is_integer(iid) and iid > 0 do
+    GenServer.call(RuntimeContext.server(__MODULE__), {:issue_event, iid, wake_dependents?})
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  @doc "Queue ordinary Issues already bound to the notified native MR."
+  @spec request_merge_dependents(String.t(), pos_integer()) :: :queued | :ignored | :unavailable
+  def request_merge_dependents(project, iid) do
+    GenServer.call(RuntimeContext.server(__MODULE__), {:merge_dependents, project, iid})
   catch
     :exit, _reason -> :unavailable
   end
@@ -1901,27 +1955,43 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:request_merge_cleanup, hint}, _from, state) do
-    if SymphonyElixir.MergedWorkspaceCleanup.enabled?() do
-      pending = put_merge_hint(state, hint)
-      {:reply, :queued, maybe_start_merge_cleanup(pending)}
-    else
-      {:reply, :disabled, state}
+    cond do
+      not SymphonyElixir.MergedWorkspaceCleanup.enabled?() ->
+        {:reply, :disabled, state}
+
+      is_binary(state.event_project) and hint.project != state.event_project ->
+        {:reply, :disabled, state}
+
+      true ->
+        accept_merge_cleanup(state, hint)
     end
   end
 
-  def handle_call({:issue_event, id}, _from, state) do
+  def handle_call({:issue_event, iid, wake_dependents?}, _from, state) do
     tracker = Config.settings!().tracker
 
     with project when is_binary(project) <- state.event_project,
          true <- GitLabAdapter.event_driven?(tracker) and not tracker.disabled,
          true <- tracker.provider["project_path"] == project,
-         :ok <- RunJournal.remember_issue_event(Execution.journal_root(), project, id) do
-      next = %{state | issue_event_ids: MapSet.put(state.issue_event_ids, id)}
-      {:reply, :queued, wake_dispatch(next)}
+         {:ok, dependents} <- notified_issue_dependents(project, iid, wake_dependents?) do
+      enqueue_issue_ids(state, [Integer.to_string(iid) | dependents])
     else
       _ -> {:reply, :unavailable, state}
     end
   end
+
+  def handle_call({:merge_dependents, project, iid}, _from, %{event_project: project} = state) when is_binary(project) do
+    if issue_events_enabled?() do
+      case TaskReconciler.dependent_issue_ids(project, "mr", iid) do
+        {:ok, ids} -> enqueue_issue_ids(state, ids)
+        {:error, _reason} -> {:reply, :unavailable, state}
+      end
+    else
+      {:reply, :ignored, state}
+    end
+  end
+
+  def handle_call({:merge_dependents, _project, _iid}, _from, state), do: {:reply, :ignored, state}
 
   def handle_call({:retry_now, issue_id}, _from, state) do
     case Map.get(state.retry_attempts, issue_id) do
@@ -2021,6 +2091,33 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp wake_dispatch(state), do: if(refresh_pending?(state), do: state, else: schedule_tick(state, 0))
+
+  defp notified_issue_dependents(project, iid, true), do: TaskReconciler.dependent_issue_ids(project, "issue", iid)
+  defp notified_issue_dependents(_project, _iid, false), do: {:ok, []}
+
+  defp enqueue_issue_ids(state, []), do: {:reply, :ignored, state}
+
+  defp enqueue_issue_ids(state, ids) do
+    root = Execution.journal_root()
+    project = state.event_project
+    persisted = Enum.reduce_while(Enum.uniq(ids), :ok, &write_issue_hint(root, project, &1, &2))
+
+    case persisted do
+      :ok ->
+        next = %{state | issue_event_ids: MapSet.union(state.issue_event_ids, MapSet.new(ids))}
+        {:reply, :queued, wake_dispatch(next)}
+
+      {:error, _reason} ->
+        {:reply, :unavailable, state}
+    end
+  end
+
+  defp write_issue_hint(root, project, id, :ok) do
+    case RunJournal.remember_issue_event(root, project, id) do
+      :ok -> {:cont, :ok}
+      error -> {:halt, error}
+    end
+  end
 
   defp refresh_pending?(state) do
     now = System.monotonic_time(:millisecond)
