@@ -13,6 +13,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
       assignee: "1"
       provider:
         project_path: group/project
+        api_url: https://gitlab.test/api/v4
         api_key: fixture
         task_workflow: true
       required_labels: [symphony:ready]
@@ -230,6 +231,20 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     before = File.read!(Path.join(record["directory"], "run.json"))
     assert :ok = TaskReconciler.poll(MapSet.new())
     assert File.read!(Path.join(record["directory"], "run.json")) == before
+  end
+
+  test "targeted task notifications preserve the owning worker and surface unreadable journals", %{issue: issue} do
+    root = Execution.journal_root()
+    assert :ok = TaskReconciler.refresh_notified(issue.id, %{pid: self()})
+    assert_receive {:gitlab_issue_changed, id}
+    assert id == issue.id
+
+    assert {:ok, _} = RunJournal.admit(root, "91")
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("group/project", "issue", 7)
+
+    File.mkdir_p!(Path.join(RunJournal.directory(root, issue.id), "run.json"))
+    assert {:error, :eisdir} = TaskReconciler.refresh_notified(issue.id, nil)
+    assert {:error, {:dependency_journal_unavailable, :eisdir}} = TaskReconciler.dependent_issue_ids("group/project", "issue", 7)
   end
 
   test "bot relay pauses and resumes the same journal across reload without impersonating its owner", %{server: server, issue: issue, contract: contract} do

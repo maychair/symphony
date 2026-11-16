@@ -832,6 +832,49 @@ defmodule SymphonyElixir.TaskSessionTest do
   end
 
   @tag :unadmitted
+  test "transient plan reads retry only the affected root and stop until a new event", c do
+    opts = scheduler_options(c, true)
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), ~r/^polling:\n  interval_ms: .*$/m, "polling:\n  interval_ms: 30"))
+    WorkflowStore.force_reload()
+    failures = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
+    request = opts[:request]
+
+    opts =
+      Keyword.put(opts, :request, fn provider, method, target, params, settings ->
+        case {target, Agent.get(failures, & &1)} do
+          {"/repos/team/repo/issues/1", attempt} when attempt < 4 ->
+            Agent.update(failures, &(&1 + 1))
+            if attempt == 0, do: {:error, :offline}, else: {:ok, %{status: 503}}
+
+          _ ->
+            request.(provider, method, target, params, settings)
+        end
+      end)
+
+    File.write!(c.mode, "hold")
+    scheduler = start_scheduler(opts)
+    await_scheduler(fn -> :sys.get_state(scheduler).plan_event_retries[c.parent] == {3, nil} end)
+    assert Agent.get(failures, & &1) == 4
+    refute File.exists?(c.record["directory"])
+    assert :sys.get_state(scheduler).next_poll_due_at_ms == nil
+
+    send(scheduler, {:retry_event_plan, c.parent, make_ref()})
+    assert :sys.get_state(scheduler).plan_event_retries[c.parent] == {3, nil}
+    GenServer.cast(scheduler, {:plan_source_changed, c.parent})
+
+    await_scheduler(fn ->
+      case RunJournal.read(c.record["directory"]) do
+        {:ok, %{"turn_id" => "owned-turn"}} -> true
+        _ -> false
+      end
+    end)
+
+    assert :sys.get_state(scheduler).plan_event_retries == %{}
+    assert :sys.get_state(scheduler).next_poll_due_at_ms == nil
+  end
+
+  @tag :unadmitted
   test "discovery contains invalid native plans and refuses unrouted or paused workers without allocation", c do
     assert {:ok, []} = TaskPlanExecution.discover()
     refute File.exists?(c.record["directory"])
@@ -1271,6 +1314,27 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert {:ok, _} = observed_result(observer)
     Process.sleep(1_050)
     assert {:error, :observation_expired} = TaskObserver.take(observer)
+    assert :ok = TaskObserver.stop(observer)
+  end
+
+  test "an invalidation during a native observation is consumed once after that read", c do
+    scheduler_options(c, true)
+    opts = blocked_reader(c, observation_interval_ms: 20)
+    {:ok, observer} = TaskObserver.start_link(c.record, c.registry, opts)
+    assert :ok = TaskObserver.activate(observer)
+    assert_receive {:reader, first}
+    assert :ok = TaskObserver.invalidate(observer)
+    assert :ok = TaskObserver.invalidate(observer)
+    send(first, :release)
+    assert {:ok, _} = observed_result(observer)
+    assert {:ok, _} = TaskObserver.take(observer)
+
+    assert_receive {:reader, second}
+    assert second != first
+    send(second, :release)
+    assert {:ok, _} = observed_result(observer)
+    assert {:ok, _} = TaskObserver.take(observer)
+    refute_receive {:reader, _}, 100
     assert :ok = TaskObserver.stop(observer)
   end
 

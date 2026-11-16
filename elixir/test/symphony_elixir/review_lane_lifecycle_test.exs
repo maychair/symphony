@@ -90,7 +90,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
 
     config =
       if test_context[:event_driven],
-        do: Map.merge(config, %{"event_driven" => true, "poll_interval_ms" => 30_000}),
+        do: Map.merge(config, %{"event_driven" => true, "poll_interval_ms" => test_context[:event_retry_ms] || 30_000}),
         else: config
 
     File.write!(Workflow.workflow_file_path(), """
@@ -114,6 +114,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   test "GitLab review discovery reads only hinted reviews and reconciles head changes without a scan", c do
     assert Listener.health().discovery == :webhook
     assert {:ok, []} = Listener.issues()
+    assert {:error, :review_execution_fenced} = Listener.begin_run("missing")
     refute File.exists?(Path.join(c.root, "requests.jsonl"))
 
     :ok = Listener.request_review("team/repo", 1)
@@ -133,6 +134,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert %{"eligibility" => "superseded", "round" => 1} = await_review_record("superseded")
     assert {:ok, [superseded]} = Listener.issues()
     refute superseded.dispatchable
+    assert {:error, :review_execution_fenced} = Listener.begin_run(superseded.id)
   end
 
   @tag event_driven: true
@@ -149,6 +151,28 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert [%{"phase" => "queued"}] = await_board_records()
     assert Listener.health().pending_hints == 0
     refute Enum.any?(review_requests(c), fn [_, path] -> String.contains?(path, "/merge_requests?") end)
+  end
+
+  @tag event_driven: true, event_retry_ms: 60
+  test "a failed observation fences an existing review and waits for a new hint after retries", c do
+    :ok = Listener.request_review("team/repo", 1)
+    assert [%{"phase" => "queued"}] = await_board_records()
+    path = Path.join(c.root, "responses.json")
+    request = "projects/team%2Frepo/merge_requests/1"
+    File.write!(path, Jason.encode!(%{("GET " <> request) => "EXIT"}))
+
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "unknown"} = await_review_record("unknown")
+    assert {:ok, [issue]} = Listener.issues()
+    refute issue.dispatchable
+    assert eventually_review(fn -> :sys.get_state(Listener).hint_failures |> Map.values() == [4] end)
+    assert Listener.health().pending_hints == 1
+    assert Enum.count(review_requests(c), &(&1 == ["GET", request])) == 5
+
+    File.rm!(path)
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "current", "round" => 1} = await_review_record("current")
+    assert Listener.health().pending_hints == 0
   end
 
   defp review_requests(c) do
@@ -1225,6 +1249,31 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     ignored = request.(commit_note, tracker_secret)
     assert ignored.status == 202
     assert Jason.decode!(ignored.resp_body) == %{"accepted" => false, "ignored" => true}
+
+    workflow = Workflow.workflow_file_path()
+    File.write!(workflow, String.replace(File.read!(workflow), "  provider:\n", "  provider:\n    event_driven: true\n"))
+    :ok = WorkflowStore.force_reload()
+    :sys.replace_state(Listener, &%{&1 | config: config})
+
+    mr_note =
+      note
+      |> Map.delete("issue")
+      |> Map.put("merge_request", %{"iid" => 1})
+      |> put_in(["object_attributes", "noteable_type"], "MergeRequest")
+
+    routed = request.(mr_note, config["webhook_secret"])
+    assert routed.status == 202
+    assert Jason.decode!(routed.resp_body) == %{"accepted" => true}
+
+    :sys.replace_state(Listener, &%{&1 | config: nil})
+    assert request.(mr_note, config["webhook_secret"]).status == 503
+    stop_supervised!(Listener)
+    assert request.(mr_note, config["webhook_secret"]).status == 503
+
+    disabled = Map.put(config, "disabled", true)
+    File.write!(workflow, String.replace(File.read!(workflow), Jason.encode!(config), Jason.encode!(disabled)))
+    :ok = WorkflowStore.force_reload()
+    assert request.(mr_note, config["webhook_secret"]).status == 202
   end
 
   test "unreadable journal and invalid repository discovery remain explicit failures", c do

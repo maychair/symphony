@@ -4,6 +4,7 @@ defmodule SymphonyElixirWeb.WebhookController do
   alias Plug.Conn
   alias SymphonyElixir.{Config, Orchestrator}
   alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
+  alias SymphonyElixir.GitLab.Client, as: GitLabClient
 
   alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Listener}
   @spec read_body(Conn.t(), keyword()) :: {:ok, binary(), Conn.t()} | {:more, binary(), Conn.t()} | {:error, term()}
@@ -151,7 +152,8 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- is_integer(expected_id) and native_id == expected_id,
          true <- GitLab.web_url?(url, config, "/" <> project),
          true <- is_map(attributes),
-         :ok <- Listener.request_review(project, attributes["iid"]) do
+         iid when is_integer(iid) and iid > 0 <- attributes["iid"],
+         :ok <- request_gitlab_review(config, project, iid) do
       notify_plan_event(provider, conn.body_params)
       tracker = Config.settings!().tracker
 
@@ -159,8 +161,20 @@ defmodule SymphonyElixirWeb.WebhookController do
         do: acknowledge_non_issue_event(conn, tracker.disabled, config["disabled"] != true),
         else: acknowledge(conn, config["disabled"] == true, merge_hint(provider, conn.body_params))
     else
+      :unavailable -> conn |> put_status(503) |> json(%{error: "review_event_unavailable"})
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
     end
+  end
+
+  defp request_gitlab_review(%{"disabled" => true}, _project, _iid), do: :ok
+
+  defp request_gitlab_review(_config, project, iid) do
+    case Listener.request_review(project, iid) do
+      :ok -> :ok
+      {:error, _} -> :unavailable
+    end
+  catch
+    :exit, _ -> :unavailable
   end
 
   defp notify_plan_event("gitlab", %{"project" => %{"id" => id, "web_url" => url}} = payload)
@@ -245,11 +259,18 @@ defmodule SymphonyElixirWeb.WebhookController do
     if get_in(payload, ["repository", "full_name"]) == settings["repo"], do: :ok, else: {:error, :repository_mismatch}
   end
 
-  defp scope(%{provider: settings}, "gitlab", payload) do
-    actual = URI.parse(get_in(payload, ["project", "web_url"]) || "")
-    expected = URI.parse(settings["api_url"] || "https://gitlab.com/api/v4")
-    if actual.host == expected.host and get_in(payload, ["project", "path_with_namespace"]) == settings["project_path"], do: :ok, else: {:error, :repository_mismatch}
+  defp scope(settings, "gitlab", %{"project" => %{"web_url" => url, "path_with_namespace" => project}}) when is_binary(url) do
+    with {:ok, {api_url, ^project}} <- GitLabClient.event_scope(settings),
+         actual <- URI.parse(url),
+         expected <- URI.parse(api_url),
+         true <- actual.host == expected.host and actual.port == expected.port and is_nil(actual.userinfo) do
+      :ok
+    else
+      _ -> {:error, :repository_mismatch}
+    end
   end
+
+  defp scope(_settings, "gitlab", _), do: {:error, :repository_mismatch}
 
   defp resolve("$" <> name), do: System.get_env(name)
   defp resolve(value), do: value

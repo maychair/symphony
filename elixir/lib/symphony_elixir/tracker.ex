@@ -10,6 +10,8 @@ defmodule SymphonyElixir.Tracker do
   """
 
   alias SymphonyElixir.{Config, TaskPlan, TaskPlanExecution, TaskPlanPreflight}
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
+  alias SymphonyElixir.GitLab.Client, as: GitLabClient
   alias SymphonyElixir.ReviewLane.{Listener, Ownership}
   alias SymphonyElixir.Tracker.Issue
 
@@ -85,9 +87,12 @@ defmodule SymphonyElixir.Tracker do
   end
 
   @doc "Read only the notified GitLab Issue, leaving plan and Review scheduling to their own consumers."
-  @spec fetch_gitlab_event_issue(String.t()) :: {:ok, [Issue.t()]} | {:error, term()}
-  def fetch_gitlab_event_issue(id) do
-    with {:ok, issues} <- SymphonyElixir.GitLab.Adapter.fetch_issues_by_ids([id]) do
+  @spec fetch_gitlab_event_issue(String.t(), {String.t(), String.t()}) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_gitlab_event_issue(id, scope) do
+    tracker = Config.settings!().tracker
+
+    with true <- GitLabClient.event_scope(tracker) == {:ok, scope} or {:error, :gitlab_event_scope_changed},
+         {:ok, issues} <- GitLabAdapter.fetch_issues_by_ids([id], tracker) do
       {:ok, issues |> Enum.reject(&("symphony-review" in &1.labels)) |> Enum.map(&TaskPlan.project/1)}
     end
   end

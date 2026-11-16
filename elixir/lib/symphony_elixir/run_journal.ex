@@ -7,6 +7,7 @@ defmodule SymphonyElixir.RunJournal do
   """
 
   alias SymphonyElixir.ExecutionOwner
+  @type event_scope :: {String.t(), String.t()}
 
   @spec admit(Path.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def admit(root, issue_id, opts \\ []) do
@@ -289,7 +290,7 @@ defmodule SymphonyElixir.RunJournal do
   def directory(root, issue_id), do: Path.join(root, key(issue_id))
 
   @doc "Record a GitLab Issue that needs native observation without admitting an execution."
-  @spec remember_issue_event(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  @spec remember_issue_event(Path.t(), event_scope(), String.t()) :: :ok | {:error, term()}
   def remember_issue_event(root, project, iid) do
     write_event(issue_event_path(root, project, iid), iid)
   end
@@ -302,7 +303,7 @@ defmodule SymphonyElixir.RunJournal do
   end
 
   @doc "Restore accepted GitLab Issue observations in the configured repository."
-  @spec issue_events(Path.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  @spec issue_events(Path.t(), event_scope()) :: {:ok, [String.t()]} | {:error, term()}
   def issue_events(root, project) do
     read_events(issue_event_directory(root, project), &decode_issue_event/1)
   end
@@ -337,7 +338,7 @@ defmodule SymphonyElixir.RunJournal do
   end
 
   @doc "Remove an observed Issue when it leaves the configured task lifecycle."
-  @spec forget_issue_event(Path.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  @spec forget_issue_event(Path.t(), event_scope(), String.t()) :: :ok | {:error, term()}
   def forget_issue_event(root, project, iid) do
     forget_event(issue_event_path(root, project, iid))
   end
@@ -350,21 +351,21 @@ defmodule SymphonyElixir.RunJournal do
   end
 
   defp issue_event_path(root, project, iid), do: Path.join(issue_event_directory(root, project), key(iid) <> ".event")
-  defp issue_event_directory(root, project), do: Path.join([root, ".gitlab-issues", key(project)])
+  defp issue_event_directory(root, scope), do: event_directory(root, ".gitlab-issues", scope)
 
   @doc "Record a scoped GitLab merge before acknowledging its cleanup request."
-  @spec remember_merge_event(Path.t(), String.t(), map()) :: :ok | {:error, term()}
-  def remember_merge_event(root, project, %{provider: "gitlab", project: project, project_id: project_id, iid: iid} = hint)
+  @spec remember_merge_event(Path.t(), event_scope(), map()) :: :ok | {:error, term()}
+  def remember_merge_event(root, {_, project} = scope, %{provider: "gitlab", project: project, project_id: project_id, iid: iid} = hint)
       when is_integer(project_id) and project_id > 0 and is_integer(iid) and iid > 0 do
-    write_event(merge_event_path(root, project, iid), Jason.encode!(Map.take(hint, [:provider, :project, :project_id, :iid])))
+    write_event(merge_event_path(root, scope, iid), Jason.encode!(Map.take(hint, [:provider, :project, :project_id, :iid])))
   end
 
   def remember_merge_event(_root, _project, _hint), do: {:error, :invalid_merge_hint}
 
   @doc "Restore unfinished merge cleanup requests for the configured repository."
-  @spec merge_events(Path.t(), String.t()) :: {:ok, [map()]} | {:error, term()}
-  def merge_events(root, project) do
-    read_events(merge_event_directory(root, project), &decode_merge_event(&1, project))
+  @spec merge_events(Path.t(), event_scope()) :: {:ok, [map()]} | {:error, term()}
+  def merge_events(root, {_, project} = scope) do
+    read_events(merge_event_directory(root, scope), &decode_merge_event(&1, project))
   end
 
   defp decode_merge_event(body, project) do
@@ -379,11 +380,13 @@ defmodule SymphonyElixir.RunJournal do
   end
 
   @doc "Acknowledge a scoped merge whose cleanup command completed."
-  @spec forget_merge_event(Path.t(), String.t(), pos_integer()) :: :ok | {:error, term()}
+  @spec forget_merge_event(Path.t(), event_scope(), pos_integer()) :: :ok | {:error, term()}
   def forget_merge_event(root, project, iid), do: forget_event(merge_event_path(root, project, iid))
 
   defp merge_event_path(root, project, iid), do: Path.join(merge_event_directory(root, project), key(Integer.to_string(iid)) <> ".event")
-  defp merge_event_directory(root, project), do: Path.join([root, ".gitlab-merges", key(project)])
+  defp merge_event_directory(root, scope), do: event_directory(root, ".gitlab-merges", scope)
+
+  defp event_directory(root, kind, {endpoint, project}), do: Path.join([root, kind, key(endpoint <> <<0>> <> project)])
 
   defp admission(nil, issue_id) do
     {:ok, host} = :inet.gethostname()

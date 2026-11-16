@@ -49,6 +49,7 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
           {"projects", %{"team/repo" => %{"checkout" => "relative"}}, :review_lane_invalid_projects},
           {"state_dir", "relative", :review_lane_absolute_state_required},
           {"poll_interval_ms", -1, :review_lane_poll_interval_required},
+          {"event_driven", "true", :review_lane_event_mode_requires_gitlab},
           {"publish_results", "false", :review_lane_publish_results_boolean_required},
           {"result_command", ["python3", 1], :invalid_workflow_result_command},
           {"result_command", "not-argv", :invalid_workflow_result_command},

@@ -374,6 +374,12 @@ defmodule SymphonyElixir.GitLab.Client do
     end
   end
 
+  @doc "Resolve the same GitLab repository identity used for native Issue reads."
+  @spec event_scope(map()) :: {:ok, {String.t(), String.t()}} | {:error, term()}
+  def event_scope(tracker_settings) do
+    with {:ok, settings} <- settings(tracker_settings), do: {:ok, {settings.api_url, settings.project_path}}
+  end
+
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(_tracker_settings), do: %{}
 

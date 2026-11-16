@@ -69,20 +69,24 @@ defmodule SymphonyElixir.TaskReconciler do
   @doc "Resolve already bound ordinary-task dependencies in the current execution journal."
   @spec dependent_issue_ids(String.t(), String.t(), pos_integer()) :: {:ok, [String.t()]} | {:error, term()}
   def dependent_issue_ids(project, kind, iid) do
-    if enabled?() do
+    with true <- enabled?(),
+         {:ok, {api_url, ^project}} <- Client.event_scope(Config.settings!().tracker) do
+      scope = {URI.parse(api_url), project}
+
       Execution.journal_root()
       |> Path.join("*/run.json")
       |> Path.wildcard()
-      |> Enum.reduce_while({:ok, []}, &bound_dependent(&1, &2, project, kind, iid))
+      |> Enum.reduce_while({:ok, []}, &bound_dependent(&1, &2, scope, kind, iid))
     else
-      {:ok, []}
+      _ -> {:ok, []}
     end
   end
 
-  defp bound_dependent(path, {:ok, ids}, project, kind, iid) do
+  defp bound_dependent(path, {:ok, ids}, {api, project}, kind, iid) do
     case RunJournal.read(Path.dirname(path)) do
       {:ok, %{"issue_id" => id, "issue_url" => url} = record} when is_binary(id) and is_binary(url) ->
-        belongs = URI.parse(url).path == "/#{project}/-/issues/#{id}"
+        uri = URI.parse(url)
+        belongs = {uri.host, uri.port, uri.path} == {api.host, api.port, "/#{project}/-/issues/#{id}"}
         bound = belongs and legacy_record?(record) and bound_to?(record, kind, iid)
         {:cont, {:ok, if(bound, do: [id | ids], else: ids)}}
 

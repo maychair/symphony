@@ -66,7 +66,7 @@ Set `tracker.provider.review_lane.event_driven: true` in a GitLab workflow
 to discover and reconcile reviews from scoped MR and MR comment webhooks.
 The Review listener keeps hints in its existing journal, reads only the
 named MR, and wakes the scheduler when the resulting review record changes.
-A failed hint uses `poll_interval_ms` as its retry delay. An idle listener
+A failed read retries up to three times at `poll_interval_ms`. An idle listener
 does not list native reviews, and dispatch reads its queued records from
 memory. Admission and native allocation still verify the selected MR.
 Changing the mode takes effect when the Review listener restarts.
@@ -75,10 +75,13 @@ For ordinary development Issues, `tracker.provider.event_driven: true`
 selects scoped notifications instead of tracker scans. The scheduler durably
 records the notified Issue number before acknowledging the hook, reads that
 Issue from GitLab, and uses the existing admission checks. On restart it
-rechecks its recorded Issues. Failed reads retry after the configured polling
-interval without listing project Issues. Enable the Review event mode as well
+rechecks its recorded Issues. Failed reads retry up to three times at the
+configured polling interval without listing project Issues. Enable the Review event mode as well
 if Review is configured. Changing the Issue event mode requires an
-Orchestrator restart.
+Orchestrator restart. Accepted events belong to the configured GitLab API
+endpoint and project. An endpoint, project, or journal-root change requires a
+restart before accepting work. The worker watchdog checks local activity
+while workers are running and does not query GitLab.
 
 Issue close and reopen notifications also wake ordinary tasks whose recorded
 workflow depends on that Issue. MR notifications wake tasks with an existing
@@ -91,7 +94,9 @@ result, or a change to the configured roots wakes the affected plan. Other
 repository runtimes can forward authenticated GitLab events to that plan
 using the provider, host, project ID, object type, and number. Running members
 refresh their business controls on notification while keeping the existing
-initial read, execution deadline and native stop checks.
+initial read, execution deadline and native stop checks. A transient plan read
+schedules up to three retries for that root with exponential backoff starting
+at the configured polling interval. A new notification restarts that allowance.
 
 ### Merged-delivery cleanup
 
@@ -102,9 +107,9 @@ immediate pass. The command then receives one JSON object in its first shell
 argument (`$1`) with `provider`, numeric `project_id`, namespace-qualified
 `project`, and numeric MR `iid`.
 
-Cleanup remains single flight. Merge hints arriving during a pass are queued
-and a failed pass can retry after the configured interval. In GitLab event
-mode, the execution journal retains pending merge hints across restarts, even
+Cleanup remains single flight. Merge hints arriving during a pass are queued.
+In GitLab event mode, a failed pass retries up to three times at the configured
+interval, and the execution journal retains pending hints across restarts, even
 when Issue dispatch is disabled. Without event mode, queued hints are held
 in memory. Duplicate deliveries are possible, so the command must be safe to repeat. It must read back
 the native MR, confirm the merge, identify the task through its native relation,
@@ -115,6 +120,12 @@ A repository can set `tracker.disabled: true` to keep issue dispatch off while
 its authenticated merge events still reach a configured cleanup command. No
 execution session or scheduler-owned checkout is required for the webhook hint.
 Ordinary `workspace.retain` semantics are unchanged.
+
+After retries are exhausted, a new webhook or a process restart replays the
+recorded Issue, Review, or merge hint. Startup also reconciles configured plan
+roots. For a missed delivery, replay the webhook from GitLab or trigger a new
+native event for the affected object. Startup reads only previously recorded
+work and configured roots.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
