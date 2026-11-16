@@ -37,8 +37,9 @@ defmodule SymphonyElixir.ReviewLane.Policy do
     body = to_string(note["body"] || "")
     publisher_id = config["publisher_id"]
 
-    (is_integer(publisher_id) and author_id == publisher_id) or
-      String.contains?(body, "<!-- symphony-review:")
+    note["system"] != true and
+      ((is_integer(publisher_id) and author_id == publisher_id) or
+         String.contains?(body, "<!-- symphony-review:"))
   end
 
   defp human_review_note?(note, mr, config) do
