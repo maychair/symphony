@@ -7,7 +7,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   Uncertain native execution stays fenced across restarts. Review work belongs to the Agent.
   """
   use GenServer
-  alias SymphonyElixir.{Config, TaskWorkflow, Tracker.Issue}
+  alias SymphonyElixir.{Config, Orchestrator, TaskWorkflow, Tracker.Issue}
   alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy}
 
   @worker_fields ~w(policy_sha native_stop_error thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
@@ -47,6 +47,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       health: :disabled,
       records: %{},
       hints: %{},
+      hint_failures: %{},
+      hint_timer: nil,
       owners: %{},
       journal: nil,
       last_event_at: nil,
@@ -98,7 +100,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
      Map.take(state, [:health, :last_event_at, :error])
      |> Map.put(:health, health)
      |> Map.put(:disabled, disabled)
-     |> Map.put(:discovery, :native_scan)
+     |> Map.put(:discovery, if(event_driven?(state), do: :webhook, else: :native_scan))
      |> Map.put(:pending_hints, map_size(state.hints))
      |> Map.put(
        :fenced_runs,
@@ -110,7 +112,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp handle_request(:issues, _from, %{config: nil} = state), do: {:reply, {:ok, []}, state}
 
   defp handle_request(:issues, _from, state) do
-    state = state |> discover() |> consume_hints() |> reconcile()
+    state = if event_driven?(state), do: state, else: scan_and_reconcile(state)
     disabled = discovery_disabled?(state)
     issues = Enum.map(state.records, fn {_key, record} -> issue(record, disabled) end)
     {:reply, {:ok, issues}, state}
@@ -122,8 +124,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
         {:reply, :ok, state}
       else
         key = TaskWorkflow.digest([project, iid])
-        next = persist(%{state | hints: Map.put(state.hints, key, %{"project" => project, "iid" => iid}), last_event_at: DateTime.utc_now() |> DateTime.to_iso8601()})
-        {:reply, :ok, next}
+        hints = Map.put(state.hints, key, %{"project" => project, "iid" => iid})
+        next = persist(%{state | hints: hints, hint_failures: Map.delete(state.hint_failures, key), last_event_at: DateTime.utc_now() |> DateTime.to_iso8601()})
+        {:reply, :ok, schedule_hints(%{next | hint_timer: nil}, 0)}
       end
     else
       {:reply, {:error, :invalid_review_scope}, state}
@@ -145,7 +148,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp handle_request({:begin, id}, {caller, _}, state) do
-    state = reconcile(state)
+    state = refresh_for_execution(state, state.records[record_key(id)])
 
     case {discovery_disabled?(state), Map.get(state.records, record_key(id))} do
       {true, _} ->
@@ -218,7 +221,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp checkpoint_owned(state, record, changes) do
     if allocation_request?(record, changes) do
-      next = if current_config?(state), do: reconcile(state), else: suspend(state)
+      next = if current_config?(state), do: refresh_for_execution(state, record), else: suspend(state)
       current = next.records[record["id"]]
 
       if allocation_allowed?(next, current, changes) do
@@ -295,8 +298,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
         case load(state, config) do
           {:ok, next} ->
             Process.send_after(self(), :check_config, 1_000)
-            Process.send_after(self(), :poll, 0)
-            {:noreply, %{(next |> recover() |> recover_owners()) | health: :listening}}
+            {:noreply, activate_discovery(%{(next |> recover() |> recover_owners()) | health: :listening})}
 
           {:error, reason} ->
             {:noreply, %{state | health: :failed, error: inspect(reason)}}
@@ -311,14 +313,30 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   def handle_info(:poll, %{config: nil} = state), do: {:noreply, state}
 
   def handle_info(:poll, state) do
-    Process.send_after(self(), :poll, state.config["poll_interval_ms"] || 60_000)
-    next = if current_config?(state), do: state |> discover() |> consume_hints() |> reconcile(), else: suspend(state)
-    {:noreply, next}
+    if event_driven?(state) do
+      {:noreply, state}
+    else
+      Process.send_after(self(), :poll, state.config["poll_interval_ms"] || 60_000)
+      next = if current_config?(state), do: scan_and_reconcile(state), else: suspend(state)
+      {:noreply, next}
+    end
+  end
+
+  def handle_info({:review_hints, token}, %{hint_timer: token} = state) do
+    state = %{state | hint_timer: nil}
+
+    if current_config?(state) and not discovery_disabled?(state) do
+      next = consume_enabled_hints(%{state | error: nil})
+      if next.records != state.records, do: Orchestrator.notify_work_ready()
+      {:noreply, schedule_hints(next, next.config["poll_interval_ms"] || 60_000)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info(:check_config, state) do
     Process.send_after(self(), :check_config, 1_000)
-    {:noreply, if(current_config?(state), do: state, else: suspend(state))}
+    {:noreply, if(current_config?(state), do: schedule_hints(state, 0), else: suspend(state))}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
@@ -369,6 +387,32 @@ defmodule SymphonyElixir.ReviewLane.Listener do
         Map.get(state.initial_config || state.config || %{}, "disabled", false) == true
     end
   end
+
+  defp event_driven?(state), do: is_map(state.config) and state.config["event_driven"] == true
+
+  defp activate_discovery(state) do
+    if event_driven?(state) do
+      if map_size(state.records) > 0, do: Orchestrator.notify_work_ready()
+      schedule_hints(state, 0)
+    else
+      Process.send_after(self(), :poll, 0)
+      state
+    end
+  end
+
+  defp schedule_hints(%{hint_timer: nil} = state, delay) when map_size(state.hints) > 0 do
+    if event_driven?(state) and not discovery_disabled?(state) and Enum.any?(Map.keys(state.hints), &retry_hint?(state, &1)) do
+      token = make_ref()
+      Process.send_after(self(), {:review_hints, token}, delay)
+      %{state | hint_timer: token}
+    else
+      state
+    end
+  end
+
+  defp schedule_hints(state, _delay), do: state
+
+  defp retry_hint?(state, key), do: Map.get(state.hint_failures, key, 0) < 4
 
   defp recover(state) do
     Enum.reduce(state.records, state, fn {_id, record}, current ->
@@ -490,13 +534,43 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     if discovery_disabled?(state), do: state, else: consume_enabled_hints(state)
   end
 
+  defp scan_and_reconcile(state), do: state |> discover() |> consume_hints() |> reconcile()
+
   defp consume_enabled_hints(state) do
-    Enum.reduce(state.hints, state, fn {key, hint}, current ->
-      case candidate(current, {:ok, hint["project"], hint["iid"]}) do
-        {:ok, next} -> persist(%{next | hints: Map.delete(next.hints, key)})
-        {:error, reason} -> %{current | error: inspect(reason)}
+    state.hints
+    |> Enum.filter(fn {key, _} -> not event_driven?(state) or retry_hint?(state, key) end)
+    |> Enum.reduce(state, &consume_hint/2)
+  end
+
+  defp consume_hint({key, hint}, state) do
+    case process_hint(state, hint["project"], hint["iid"]) do
+      {:ok, next} -> persist(%{next | hints: Map.delete(next.hints, key), hint_failures: Map.delete(next.hint_failures, key)})
+      {:error, reason} -> failed_hint(state, key, reason)
+      {:error, reason, next} -> failed_hint(next, key, reason)
+    end
+  end
+
+  defp failed_hint(state, key, reason) do
+    failures = if event_driven?(state), do: Map.update(state.hint_failures, key, 1, &(&1 + 1)), else: state.hint_failures
+    %{state | error: inspect(reason), hint_failures: failures}
+  end
+
+  defp process_hint(state, project, iid) do
+    if event_driven?(state) do
+      case latest_record(state, project, iid) do
+        nil -> candidate(state, {:ok, project, iid})
+        record -> observe_hinted_record(state, record)
       end
-    end)
+    else
+      candidate(state, {:ok, project, iid})
+    end
+  end
+
+  defp latest_record(state, project, iid) do
+    state.records
+    |> Map.values()
+    |> Enum.filter(&(&1["project"] == project and &1["iid"] == iid))
+    |> Enum.max_by(& &1["round"], fn -> nil end)
   end
 
   defp candidate(state, {:ok, project, iid}) do
@@ -600,26 +674,50 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp reconcile_record(state, record) do
+    case observe_hinted_record(state, record) do
+      {:ok, next} -> next
+      {:error, _, next} -> next
+    end
+  end
+
+  defp observe_hinted_record(state, record) do
+    case observe_record(state, record) do
+      {:ok, next} ->
+        {:ok, next}
+
+      {:error, reason} ->
+        next = put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
+        {:error, reason, next}
+    end
+  end
+
+  defp observe_record(state, record) do
     with {:ok, mr} <- read_mr(state.config, record["project"], record["iid"]),
          true <- valid_mr?(mr, record["project"], record["iid"], state.config) or {:error, :invalid_native_review} do
       metadata = %{"title" => mr["title"], "updated_at" => mr["updated_at"]}
       reconcile_unmerged(state, Map.merge(record, metadata), mr)
-    else
-      {:error, reason} -> put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
+    end
+  end
+
+  defp refresh_for_execution(state, record) do
+    cond do
+      not event_driven?(state) -> reconcile(state)
+      is_map(record) -> reconcile_record(state, record)
+      true -> state
     end
   end
 
   defp reconcile_unmerged(state, record, mr) do
     case lane_assignment(state.config, record["project"], record["iid"], mr) do
       {:ok, true} ->
-        reconcile_assigned(state, record, mr)
+        {:ok, reconcile_assigned(state, record, mr)}
 
       {:ok, false} ->
         reason = if mr["state"] in ["closed", "merged"], do: mr["state"], else: "unassigned"
-        put_record(state, record |> Map.put("eligibility", reason) |> Map.put("phase", "ended"))
+        {:ok, put_record(state, record |> Map.put("eligibility", reason) |> Map.put("phase", "ended"))}
 
       {:error, reason} ->
-        put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
+        {:error, reason}
     end
   end
 

@@ -48,6 +48,70 @@ defmodule SymphonyElixir.TaskReconciler do
     :ok
   end
 
+  @doc "Notify the owning worker or refresh the existing record for one Issue."
+  @spec refresh_notified(String.t(), map() | nil) :: :ok | {:error, term()}
+  def refresh_notified(id, nil) do
+    with true <- enabled?(),
+         {:ok, %{} = record} <- RunJournal.read(RunJournal.directory(Execution.journal_root(), id)),
+         true <- legacy_record?(record) do
+      locked_refresh(record)
+    else
+      {:error, _} = error -> error
+      _ -> :ok
+    end
+  end
+
+  def refresh_notified(id, %{pid: pid}) do
+    if enabled?(), do: send(pid, {:gitlab_issue_changed, id})
+    :ok
+  end
+
+  @doc "Resolve already bound ordinary-task dependencies in the current execution journal."
+  @spec dependent_issue_ids(String.t(), String.t(), pos_integer()) :: {:ok, [String.t()]} | {:error, term()}
+  def dependent_issue_ids(project, kind, iid) do
+    with true <- enabled?(),
+         {:ok, {api_url, ^project}} <- Client.event_scope(Config.settings!().tracker) do
+      scope = {URI.parse(api_url), project}
+
+      Execution.journal_root()
+      |> Path.join("*/run.json")
+      |> Path.wildcard()
+      |> Enum.reduce_while({:ok, []}, &bound_dependent(&1, &2, scope, kind, iid))
+    else
+      _ -> {:ok, []}
+    end
+  end
+
+  defp bound_dependent(path, {:ok, ids}, {api, project}, kind, iid) do
+    case RunJournal.read(Path.dirname(path)) do
+      {:ok, %{"issue_id" => id, "issue_url" => url} = record} when is_binary(id) and is_binary(url) ->
+        uri = URI.parse(url)
+        belongs = {uri.host, uri.port, uri.path} == {api.host, api.port, "/#{project}/-/issues/#{id}"}
+        bound = belongs and legacy_record?(record) and bound_to?(record, kind, iid)
+        {:cont, {:ok, if(bound, do: [id | ids], else: ids)}}
+
+      {:ok, _} ->
+        {:cont, {:ok, ids}}
+
+      {:error, reason} ->
+        {:halt, {:error, {:dependency_journal_unavailable, reason}}}
+    end
+  end
+
+  defp bound_to?(record, kind, iid) do
+    flow = record["workflow"] || %{}
+    conditions = Enum.map(Map.values(flow["restrictions"] || %{}), & &1["condition"])
+
+    Enum.any?(conditions, &match?(%{"kind" => ^kind, "number" => ^iid}, &1)) or
+      (kind == "mr" and bound_merge?(record, flow, iid))
+  end
+
+  defp bound_merge?(record, flow, iid) do
+    url = String.replace_suffix(record["issue_url"], "/issues/#{record["issue_id"]}", "/merge_requests/#{iid}")
+    items = List.wrap(get_in(flow, ["manifest", "items"])) ++ List.wrap(flow["intermediate"])
+    Enum.any?(items, &(&1["url"] == url)) or get_in(record, ["handoff", "url"]) == url
+  end
+
   defp poll_record(path, active_ids) do
     with {:ok, record} when is_map(record) <- RunJournal.read(Path.dirname(path)),
          false <- MapSet.member?(active_ids, record["issue_id"]),

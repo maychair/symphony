@@ -11,6 +11,11 @@ work. See [the review workflow](elixir/docs/review-workflow.md).
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+GitLab repositories can opt into [webhook-driven scheduling](elixir/README.md#gitlab-webhook-routing)
+for development Issues, configured plans, and MR reviews. Symphony reads the
+affected native objects, applies the existing admission rules, and resumes
+recorded work after a restart.
+
 The Elixir implementation can pass authenticated GitLab merge hints to an opt-in
 [cleanup command](elixir/README.md#merged-delivery-cleanup). This also covers merges
 from manual work when the configured command can resolve the owning task.

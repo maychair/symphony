@@ -42,6 +42,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     import sys,json,pathlib,time
     r=pathlib.Path(#{inspect(root)});a=sys.argv[1:];name=pathlib.Path(sys.argv[0]).name
     path=a[a.index('--method')+2];method=a[a.index('--method')+1]
+    if #{if test_context[:event_driven], do: "True", else: "False"}:
+      with (r/'requests.jsonl').open('a') as log:log.write(json.dumps([method,path])+'\\n')
     if method=='GET' and (r/'hold-scan').exists():
       (r/'scan-held').write_text('ready');deadline=time.monotonic()+15
       while not (r/'release-scan').exists() and time.monotonic()<deadline:time.sleep(0.01)
@@ -86,6 +88,11 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       "glab_bin" => Path.join(root, "glab")
     }
 
+    config =
+      if test_context[:event_driven],
+        do: Map.merge(config, %{"event_driven" => true, "poll_interval_ms" => test_context[:event_retry_ms] || 30_000}),
+        else: config
+
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
@@ -101,6 +108,100 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     start_supervised!({Listener, config: config})
     await_listener()
     {:ok, root: root, config: config}
+  end
+
+  @tag event_driven: true
+  test "GitLab review discovery reads only hinted reviews and reconciles head changes without a scan", c do
+    assert Listener.health().discovery == :webhook
+    assert {:ok, []} = Listener.issues()
+    assert {:error, :review_execution_fenced} = Listener.begin_run("missing")
+    refute File.exists?(Path.join(c.root, "requests.jsonl"))
+
+    :ok = Listener.request_review("team/repo", 1)
+    [record] = await_board_records()
+    assert record["eligibility"] == "current"
+    assert record["phase"] == "queued"
+    calls = review_requests(c)
+    assert ["GET", "projects/team%2Frepo/merge_requests/1"] in calls
+    refute Enum.any?(calls, fn [_, path] -> String.contains?(path, "/merge_requests?") end)
+
+    File.touch!(Path.join(c.root, "changed-head"))
+    assert {:ok, [issue]} = Listener.issues()
+    assert issue.dispatchable
+    assert review_requests(c) == calls
+
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "superseded", "round" => 1} = await_review_record("superseded")
+    assert {:ok, [superseded]} = Listener.issues()
+    refute superseded.dispatchable
+    assert {:error, :review_execution_fenced} = Listener.begin_run(superseded.id)
+  end
+
+  @tag event_driven: true
+  test "a failed review hint remains in the journal and resumes after listener restart", c do
+    File.touch!(Path.join(c.root, "fail-read"))
+    :ok = Listener.request_review("team/repo", 1)
+    assert eventually_review(fn -> Listener.health().error != nil end)
+    assert Listener.health().pending_hints == 1
+    assert {:ok, []} = Listener.issues()
+
+    :ok = stop_supervised(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    assert [%{"phase" => "queued"}] = await_board_records()
+    assert Listener.health().pending_hints == 0
+    refute Enum.any?(review_requests(c), fn [_, path] -> String.contains?(path, "/merge_requests?") end)
+  end
+
+  @tag event_driven: true, event_retry_ms: 60
+  test "a failed observation fences an existing review and waits for a new hint after retries", c do
+    :ok = Listener.request_review("team/repo", 1)
+    assert [%{"phase" => "queued"}] = await_board_records()
+    path = Path.join(c.root, "responses.json")
+    request = "projects/team%2Frepo/merge_requests/1"
+    File.write!(path, Jason.encode!(%{("GET " <> request) => "EXIT"}))
+
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "unknown"} = await_review_record("unknown")
+    assert {:ok, [issue]} = Listener.issues()
+    refute issue.dispatchable
+    assert eventually_review(fn -> :sys.get_state(Listener).hint_failures |> Map.values() == [4] end)
+    assert Listener.health().pending_hints == 1
+    assert Enum.count(review_requests(c), &(&1 == ["GET", request])) == 5
+
+    File.rm!(path)
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "current", "round" => 1} = await_review_record("current")
+    assert Listener.health().pending_hints == 0
+  end
+
+  defp review_requests(c) do
+    c.root
+    |> Path.join("requests.jsonl")
+    |> File.stream!()
+    |> Enum.map(&Jason.decode!/1)
+  end
+
+  defp await_review_record(eligibility) do
+    assert eventually_review(fn ->
+             {:ok, %{records: records}} = Listener.board_snapshot()
+             Enum.any?(records, &(&1["eligibility"] == eligibility))
+           end)
+
+    {:ok, %{records: [record]}} = Listener.board_snapshot()
+    record
+  end
+
+  defp eventually_review(predicate, tries \\ 500)
+  defp eventually_review(predicate, 0), do: predicate.()
+
+  defp eventually_review(predicate, tries) do
+    if predicate.() do
+      true
+    else
+      Process.sleep(10)
+      eventually_review(predicate, tries - 1)
+    end
   end
 
   test "a current canonical review does not requeue after its shared policy changes", c do
@@ -1083,7 +1184,14 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     project = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "https://review.invalid/team/repo"}
     payload = %{"object_kind" => "merge_request", "project" => project, "object_attributes" => %{"iid" => 1}}
     assert WebhookController.receive_event(%{conn | body_params: payload}, %{"provider" => "gitlab"}).status == 202
-    note = %{"object_kind" => "note", "project" => project, "merge_request" => %{"iid" => 1}}
+
+    note = %{
+      "object_kind" => "note",
+      "project" => project,
+      "object_attributes" => %{"noteable_type" => "MergeRequest", "action" => "create"},
+      "merge_request" => %{"iid" => 1}
+    }
+
     assert WebhookController.receive_event(%{conn | body_params: note}, %{"provider" => "gitlab"}).status == 202
 
     for invalid <- [put_in(payload["project"]["id"], 99), put_in(payload["object_attributes"]["iid"], 0), Map.delete(payload, "object_attributes")] do
@@ -1094,6 +1202,78 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     native = %{conn | params: %{"provider" => "mail"}}
     assert WebhookController.init(:receive_event) == :receive_event
     assert WebhookController.call(native, :receive_event).status == 403
+  end
+
+  test "GitLab Issue comments use tracker authentication even when Review is enabled", c do
+    config = Map.put(c.config, "webhook_secret", String.duplicate("r", 32))
+    tracker_secret = String.duplicate("t", 32)
+
+    File.write!(Workflow.workflow_file_path(), """
+    ---
+    tracker:
+      kind: gitlab
+      disabled: true
+      active_states: [opened]
+      terminal_states: [closed]
+      provider:
+        api_url: https://review.invalid/api/v4
+        project_path: team/repo
+        webhook_secret: #{Jason.encode!(tracker_secret)}
+        review_lane: #{Jason.encode!(config)}
+    ---
+    Review and task fixture
+    """)
+
+    :ok = WorkflowStore.force_reload()
+    assert SymphonyElixir.ReviewLane.config() == config
+    project = %{"id" => 10, "path_with_namespace" => "team/repo", "web_url" => "https://review.invalid/team/repo"}
+
+    note = %{
+      "object_kind" => "note",
+      "project" => project,
+      "object_attributes" => %{"noteable_type" => "Issue", "action" => "update"},
+      "issue" => %{"iid" => 42}
+    }
+
+    request = fn payload, secret ->
+      conn = Plug.Test.conn(:post, "/", payload) |> Plug.Conn.put_req_header("x-gitlab-token", secret)
+      WebhookController.receive_event(conn, %{"provider" => "gitlab"})
+    end
+
+    assert request.(note, config["webhook_secret"]).status == 403
+    response = request.(note, tracker_secret)
+    assert response.status == 202
+    assert Jason.decode!(response.resp_body) == %{"accepted" => false, "disabled" => true}
+
+    commit_note = put_in(note["object_attributes"]["noteable_type"], "Commit")
+    ignored = request.(commit_note, tracker_secret)
+    assert ignored.status == 202
+    assert Jason.decode!(ignored.resp_body) == %{"accepted" => false, "ignored" => true}
+
+    workflow = Workflow.workflow_file_path()
+    File.write!(workflow, String.replace(File.read!(workflow), "  provider:\n", "  provider:\n    event_driven: true\n"))
+    :ok = WorkflowStore.force_reload()
+    :sys.replace_state(Listener, &%{&1 | config: config})
+
+    mr_note =
+      note
+      |> Map.delete("issue")
+      |> Map.put("merge_request", %{"iid" => 1})
+      |> put_in(["object_attributes", "noteable_type"], "MergeRequest")
+
+    routed = request.(mr_note, config["webhook_secret"])
+    assert routed.status == 202
+    assert Jason.decode!(routed.resp_body) == %{"accepted" => true}
+
+    :sys.replace_state(Listener, &%{&1 | config: nil})
+    assert request.(mr_note, config["webhook_secret"]).status == 503
+    stop_supervised!(Listener)
+    assert request.(mr_note, config["webhook_secret"]).status == 503
+
+    disabled = Map.put(config, "disabled", true)
+    File.write!(workflow, String.replace(File.read!(workflow), Jason.encode!(config), Jason.encode!(disabled)))
+    :ok = WorkflowStore.force_reload()
+    assert request.(mr_note, config["webhook_secret"]).status == 202
   end
 
   test "unreadable journal and invalid repository discovery remain explicit failures", c do

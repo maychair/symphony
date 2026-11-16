@@ -29,6 +29,26 @@ defmodule SymphonyElixir.TaskPlanExecution do
 
   defp roots(opts), do: Keyword.get_lazy(opts, :roots, fn -> Config.settings!().tracker.provider["plan_roots"] || [] end)
 
+  @doc "Return the configured plan roots for initial event-mode reconciliation."
+  @spec event_roots(keyword()) :: {:ok, [WorkRef.t()]} | {:error, :invalid_plan_roots}
+  def event_roots(opts) do
+    roots = roots(opts)
+    if valid_roots?(roots), do: {:ok, Enum.uniq(roots)}, else: {:error, :invalid_plan_roots}
+  end
+
+  @doc "Refresh one affected plan and expose the native refs that can invalidate it."
+  @spec event_snapshot(WorkRef.t(), keyword()) :: %{jobs: [Issue.t()], sources: MapSet.t(), retry?: boolean()}
+  def event_snapshot(parent, opts) do
+    jobs = discover_plan(parent, opts)
+    sources = [parent | Enum.flat_map(jobs, &event_sources/1)]
+    %{jobs: jobs, sources: MapSet.new(sources), retry?: Enum.any?(jobs, &(get_in(&1.native_ref, ["event_retry"]) == true))}
+  end
+
+  defp event_sources(issue) do
+    native = issue.native_ref || %{}
+    Enum.reject([native["work"] | List.wrap(native["event_sources"])], &is_nil/1)
+  end
+
   defp discover_plan(parent, opts) do
     state = Keyword.get_lazy(opts, :active_state, fn -> List.first(Config.settings!().tracker.active_states) end)
 
@@ -76,7 +96,7 @@ defmodule SymphonyElixir.TaskPlanExecution do
         _ -> false
       end
 
-    {flow, closure} = outcome(parent, member, configured)
+    {flow, closure, sources, retry?} = outcome(parent, member, configured)
 
     %Issue{
       id: "member:" <> WorkRef.key(member.work),
@@ -94,6 +114,8 @@ defmodule SymphonyElixir.TaskPlanExecution do
         "lifecycle" => flow,
         "closure" => closure_name(closure),
         "closure_projection" => closure,
+        "event_sources" => sources,
+        "event_retry" => retry?,
         "recovery_required" => recovery
       }
     }
@@ -108,18 +130,31 @@ defmodule SymphonyElixir.TaskPlanExecution do
   # the current native state is reported separately from any historical receipt.
   defp outcome(parent, member, configured) do
     case Assessment.assess(parent, member, configured) do
-      {:ok, assessment} -> reconcile(assessment, parent, member, configured)
-      {:error, reason} -> {%{"dispatchable" => false, "error" => inspect(reason)}, unconfirmed(reason, state_of(member))}
+      {:ok, assessment} ->
+        {flow, closure, retry?} = reconcile(assessment, parent, member, configured)
+        {flow, closure, change_targets(assessment.evidence), retry?}
+
+      {:error, reason} ->
+        flow = %{"dispatchable" => false, "error" => inspect(reason)}
+        {flow, unconfirmed(reason, state_of(member)), [], temporary_read_failure?(reason)}
     end
+  end
+
+  defp change_targets(evidence) do
+    evidence
+    |> get_in(["candidate", "artifacts"])
+    |> List.wrap()
+    |> Enum.map(& &1["target"])
+    |> Enum.filter(&(WorkRef.validate(&1) == :ok and &1["kind"] in ["mr", "pr"]))
   end
 
   defp reconcile(assessment, parent, member, configured) do
     opts = Keyword.put(configured.opts, :reobserve, fn -> Assessment.assess(parent, member, configured) end)
 
     case TaskClosure.reconcile(assessment.record, assessment.flow, opts) do
-      {:ok, %{closure: closure}} -> {assessment.flow, closure}
-      :not_applicable -> {assessment.flow, not_applicable(state_of(member))}
-      {:error, reason} -> {assessment.flow, unconfirmed(reason, state_of(member))}
+      {:ok, %{closure: closure}} -> {assessment.flow, closure, false}
+      :not_applicable -> {assessment.flow, not_applicable(state_of(member)), false}
+      {:error, reason} -> {assessment.flow, unconfirmed(reason, state_of(member)), temporary_read_failure?(reason)}
     end
   end
 
@@ -259,6 +294,7 @@ defmodule SymphonyElixir.TaskPlanExecution do
         "parent" => parent,
         "restricted" => true,
         "reason" => reason,
+        "event_retry" => temporary_read_failure?(entry.reason),
         "lifecycle" => blocked_lifecycle(entry.reason, reason)
       }
     }
@@ -276,9 +312,21 @@ defmodule SymphonyElixir.TaskPlanExecution do
       title: "Plan requires reconciliation",
       kind: :plan,
       state: state,
-      native_ref: %{"work" => parent, "plan_preflight" => %{"status" => "blocked", "reason" => inspect(reason)}}
+      native_ref: %{
+        "work" => parent,
+        "event_retry" => temporary_read_failure?(reason),
+        "plan_preflight" => %{"status" => "blocked", "reason" => inspect(reason)}
+      }
     }
   end
+
+  defp temporary_read_failure?(reason)
+       when reason in [:native_read_failed, :parent_changed_during_preflight, :execution_evidence_changed_during_read],
+       do: true
+
+  defp temporary_read_failure?({:native_read_status, status}), do: status == 429 or status >= 500
+  defp temporary_read_failure?({:member_execution_configuration, _, reason}), do: temporary_read_failure?(reason)
+  defp temporary_read_failure?(_), do: false
 
   defp parent_lifecycle(parent, snapshot, state, lifecycle) do
     %Issue{

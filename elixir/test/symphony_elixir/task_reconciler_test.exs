@@ -13,6 +13,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
       assignee: "1"
       provider:
         project_path: group/project
+        api_url: https://gitlab.test/api/v4
         api_key: fixture
         task_workflow: true
       required_labels: [symphony:ready]
@@ -209,7 +210,11 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     refute record["workflow"]["charging"]
     :ok = Execution.finish(issue, opts, {:error, :scheduler_stop})
     Agent.update(server, &%{&1 | dependency: %{"state" => "closed"}})
-    assert :ok = TaskReconciler.poll(MapSet.new())
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("elsewhere/project", "issue", 7)
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("group/project", "mr", 7)
+    assert {:ok, [issue_id]} = TaskReconciler.dependent_issue_ids("group/project", "issue", 7)
+    assert issue_id == issue.id
+    assert :ok = TaskReconciler.refresh_notified(issue_id, nil)
     record = current(record)
     refute record["workflow"]["restrictions"]["dep"]
     assert record["workflow"]["state"] == "waiting"
@@ -226,6 +231,20 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     before = File.read!(Path.join(record["directory"], "run.json"))
     assert :ok = TaskReconciler.poll(MapSet.new())
     assert File.read!(Path.join(record["directory"], "run.json")) == before
+  end
+
+  test "targeted task notifications preserve the owning worker and surface unreadable journals", %{issue: issue} do
+    root = Execution.journal_root()
+    assert :ok = TaskReconciler.refresh_notified(issue.id, %{pid: self()})
+    assert_receive {:gitlab_issue_changed, id}
+    assert id == issue.id
+
+    assert {:ok, _} = RunJournal.admit(root, "91")
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("group/project", "issue", 7)
+
+    File.mkdir_p!(Path.join(RunJournal.directory(root, issue.id), "run.json"))
+    assert {:error, :eisdir} = TaskReconciler.refresh_notified(issue.id, nil)
+    assert {:error, {:dependency_journal_unavailable, :eisdir}} = TaskReconciler.dependent_issue_ids("group/project", "issue", 7)
   end
 
   test "bot relay pauses and resumes the same journal across reload without impersonating its owner", %{server: server, issue: issue, contract: contract} do
@@ -1043,6 +1062,9 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     {:ok, record} = TaskReconciler.refresh(record, false)
     refute record["workflow"]["delivery_ready"]
     refute TaskWorkflow.valid_conclusion?(record["workflow"])
+    assert {:ok, [issue_id]} = TaskReconciler.dependent_issue_ids("group/project", "mr", 9)
+    assert issue_id == issue.id
+    assert {:ok, []} = TaskReconciler.dependent_issue_ids("group/project", "mr", 10)
     assert Agent.get(server, & &1.raw["state"]) == "opened"
 
     # Requiring both checks and review on every item is the safeguard under test;

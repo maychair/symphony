@@ -216,16 +216,31 @@ defmodule SymphonyElixir.TaskSessionTest do
   defp current(c), do: elem(SymphonyElixir.RunJournal.read(c.record["directory"]), 1)
   defp requests(c), do: c.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
 
-  defp scheduler_options(c) do
+  defp scheduler_options(c, event_driven \\ false) do
     policy = c.registry[WorkRef.key(c.work)].policy
     repositories = Enum.map(c.opts[:repositories], &Map.put(&1, "execution", %{"policy" => policy}))
     provider = %{"plan_roots" => [c.parent], "plan_repositories" => repositories}
     path = Workflow.workflow_file_path()
-    workflow = String.replace(File.read!(path), "tracker:\n", "tracker:\n  provider: " <> Jason.encode!(provider) <> "\n")
+    {provider, workflow} = scheduler_tracker(provider, File.read!(path), event_driven)
+    workflow = String.replace(workflow, "tracker:\n", "tracker:\n  provider: " <> Jason.encode!(provider) <> "\n")
     workflow = String.replace(workflow, "agent:\n", "agent:\n  run_journal_dir: " <> Jason.encode!(Path.dirname(c.record["directory"])) <> "\n")
     File.write!(path, workflow)
     WorkflowStore.force_reload()
     Keyword.delete(c.opts, :repositories)
+  end
+
+  defp scheduler_tracker(provider, workflow, false), do: {provider, workflow}
+
+  defp scheduler_tracker(provider, workflow, true) do
+    provider = Map.merge(provider, %{"event_driven" => true, "api_url" => "https://gitlab.invalid/api/v4", "project_path" => "team/repo"})
+
+    workflow =
+      workflow
+      |> String.replace(~r/^  kind:.*$/m, "  kind: gitlab")
+      |> String.replace(~r/^  active_states:.*$/m, "  active_states: [opened]")
+      |> String.replace(~r/^  terminal_states:.*$/m, "  terminal_states: [closed]")
+
+    {provider, workflow}
   end
 
   defp start_scheduler(opts) do
@@ -785,6 +800,81 @@ defmodule SymphonyElixir.TaskSessionTest do
   end
 
   @tag :unadmitted
+  test "an event wakes the bound plan member without polling unrelated work", c do
+    File.write!(c.mode, "hold")
+    opts = Keyword.put(scheduler_options(c, true), :observation_interval_ms, 20)
+    scheduler = start_scheduler(opts)
+    id = "member:" <> WorkRef.key(c.work)
+
+    await_scheduler(fn ->
+      case RunJournal.read(c.record["directory"]) do
+        {:ok, %{"turn_id" => "owned-turn"}} -> true
+        _ -> false
+      end
+    end)
+
+    original = :sys.get_state(scheduler).running[id].pid
+    assert :sys.get_state(scheduler).next_poll_due_at_ms == nil
+    # Let the activation observation settle before changing the native decision.
+    Process.sleep(1_200)
+
+    pause = note(block("plan-decision", %{"action" => "pause", "revision" => c.plan["revision"]}), 2)
+    Agent.update(c.state, &Map.update!(&1, "/repos/team/repo/issues/1/comments", fn notes -> notes ++ [pause] end))
+    GenServer.cast(scheduler, {:plan_source_changed, %{c.work | "repository_id" => "11"}})
+    Process.sleep(1_200)
+    assert :sys.get_state(scheduler).running[id].pid == original
+    assert :sys.get_state(scheduler).next_poll_due_at_ms == nil
+
+    GenServer.cast(scheduler, {:plan_source_changed, c.work})
+    await_scheduler(fn -> :sys.get_state(scheduler).running == %{} end)
+    assert current(c)["native_stop_confirmed"]
+    assert Enum.count(requests(c), &(&1["method"] == "thread/start")) == 1
+  end
+
+  @tag :unadmitted
+  test "transient plan reads retry only the affected root and stop until a new event", c do
+    opts = scheduler_options(c, true)
+    path = Workflow.workflow_file_path()
+    File.write!(path, String.replace(File.read!(path), ~r/^polling:\n  interval_ms: .*$/m, "polling:\n  interval_ms: 30"))
+    WorkflowStore.force_reload()
+    failures = start_supervised!({Agent, fn -> 0 end}, id: make_ref())
+    request = opts[:request]
+
+    opts =
+      Keyword.put(opts, :request, fn provider, method, target, params, settings ->
+        case {target, Agent.get(failures, & &1)} do
+          {"/repos/team/repo/issues/1", attempt} when attempt < 4 ->
+            Agent.update(failures, &(&1 + 1))
+            if attempt == 0, do: {:error, :offline}, else: {:ok, %{status: 503}}
+
+          _ ->
+            request.(provider, method, target, params, settings)
+        end
+      end)
+
+    File.write!(c.mode, "hold")
+    scheduler = start_scheduler(opts)
+    await_scheduler(fn -> :sys.get_state(scheduler).plan_event_retries[c.parent] == {3, nil} end)
+    assert Agent.get(failures, & &1) == 4
+    refute File.exists?(c.record["directory"])
+    assert :sys.get_state(scheduler).next_poll_due_at_ms == nil
+
+    send(scheduler, {:retry_event_plan, c.parent, make_ref()})
+    assert :sys.get_state(scheduler).plan_event_retries[c.parent] == {3, nil}
+    GenServer.cast(scheduler, {:plan_source_changed, c.parent})
+
+    await_scheduler(fn ->
+      case RunJournal.read(c.record["directory"]) do
+        {:ok, %{"turn_id" => "owned-turn"}} -> true
+        _ -> false
+      end
+    end)
+
+    assert :sys.get_state(scheduler).plan_event_retries == %{}
+    assert :sys.get_state(scheduler).next_poll_due_at_ms == nil
+  end
+
+  @tag :unadmitted
   test "discovery contains invalid native plans and refuses unrouted or paused workers without allocation", c do
     assert {:ok, []} = TaskPlanExecution.discover()
     refute File.exists?(c.record["directory"])
@@ -1224,6 +1314,27 @@ defmodule SymphonyElixir.TaskSessionTest do
     assert {:ok, _} = observed_result(observer)
     Process.sleep(1_050)
     assert {:error, :observation_expired} = TaskObserver.take(observer)
+    assert :ok = TaskObserver.stop(observer)
+  end
+
+  test "an invalidation during a native observation is consumed once after that read", c do
+    scheduler_options(c, true)
+    opts = blocked_reader(c, observation_interval_ms: 20)
+    {:ok, observer} = TaskObserver.start_link(c.record, c.registry, opts)
+    assert :ok = TaskObserver.activate(observer)
+    assert_receive {:reader, first}
+    assert :ok = TaskObserver.invalidate(observer)
+    assert :ok = TaskObserver.invalidate(observer)
+    send(first, :release)
+    assert {:ok, _} = observed_result(observer)
+    assert {:ok, _} = TaskObserver.take(observer)
+
+    assert_receive {:reader, second}
+    assert second != first
+    send(second, :release)
+    assert {:ok, _} = observed_result(observer)
+    assert {:ok, _} = TaskObserver.take(observer)
+    refute_receive {:reader, _}, 100
     assert :ok = TaskObserver.stop(observer)
   end
 

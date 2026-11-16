@@ -10,6 +10,8 @@ defmodule SymphonyElixir.WorkflowStore do
 
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
@@ -136,6 +138,7 @@ defmodule SymphonyElixir.WorkflowStore do
   defp reload_path(path, state) do
     case load_state(path) do
       {:ok, new_state} ->
+        if GitLabAdapter.event_driven?(new_state.settings.tracker), do: Orchestrator.notify_work_ready()
         {:ok, new_state}
 
       {:error, reason} ->

@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.Orchestrator do
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
+  alias SymphonyElixir.GitLab.Client, as: GitLabClient
   alias SymphonyElixir.RuntimeContext
 
   @moduledoc """
@@ -10,12 +12,13 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.{Execution, TaskPlanExecution}
+  alias SymphonyElixir.{Execution, RunJournal, TaskPlanExecution, TaskReconciler, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @execution_stop_grace_ms 60_000
+  @event_max_retries 3
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -39,8 +42,19 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :merge_cleanup_ref,
       :task_reconcile_ref,
+      :event_project,
+      :event_scope,
+      :event_journal_root,
+      :event_watchdog_ref,
+      issue_event_ids: MapSet.new(),
+      issue_event_failures: %{},
+      issue_event_candidates: %{},
+      pending_plan_roots: MapSet.new(),
+      event_plans: %{},
+      plan_event_retries: %{},
       merge_cleanup_pending: MapSet.new(),
       merge_cleanup_in_flight: MapSet.new(),
+      merge_cleanup_failures: %{},
       task_supervisor: SymphonyElixir.TaskSupervisor,
       plan_options: [],
       running: %{},
@@ -81,13 +95,39 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup(state.plan_options)
-        state = schedule_tick(state, 0)
-
-        {:ok, state}
+        initialize_dispatch(state, config.tracker)
 
       {:error, reason} ->
         {:stop, reason}
+    end
+  end
+
+  defp initialize_dispatch(state, tracker) do
+    if GitLabAdapter.event_driven?(tracker) do
+      root = Execution.journal_root()
+
+      with {:ok, {_, project} = scope} <- GitLabClient.event_scope(tracker),
+           {:ok, ids} <- RunJournal.issue_events(root, scope),
+           {:ok, merges} <- RunJournal.merge_events(root, scope),
+           {:ok, roots} <- TaskPlanExecution.event_roots(state.plan_options) do
+        next = %{
+          state
+          | event_project: project,
+            event_scope: scope,
+            event_journal_root: root,
+            issue_event_ids: MapSet.new(ids),
+            pending_plan_roots: MapSet.new(roots),
+            merge_cleanup_pending: MapSet.new(merges),
+            next_poll_due_at_ms: nil
+        }
+
+        {:ok, schedule_tick(next, 0)}
+      else
+        {:error, reason} -> {:stop, {:gitlab_event_recovery_failed, reason}}
+      end
+    else
+      run_terminal_workspace_cleanup(state.plan_options)
+      {:ok, schedule_tick(state, 0)}
     end
   end
 
@@ -127,6 +167,13 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  def handle_info(:run_poll_cycle, %{event_project: project} = state) when is_binary(project) do
+    state = if event_scope_current?(state), do: run_event_cycle(state), else: stop_event_workers(state)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
@@ -137,6 +184,23 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info(:event_worker_watchdog, state) do
+    next = %{state | event_watchdog_ref: nil} |> reconcile_stalled_running_issues() |> arm_event_watchdog()
+    next = if map_size(next.running) < map_size(state.running), do: wake_dispatch(next), else: next
+    {:noreply, next}
+  end
+
+  def handle_info({:retry_event_plan, parent, token}, state) do
+    case state.plan_event_retries[parent] do
+      {_, ^token} ->
+        next = %{state | pending_plan_roots: MapSet.put(state.pending_plan_roots, parent)}
+        {:noreply, wake_dispatch(next)}
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   def handle_info({ref, :task_reconciled}, %{task_reconcile_ref: ref} = state) when is_reference(ref) do
@@ -174,6 +238,7 @@ defmodule SymphonyElixir.Orchestrator do
         session_id = running_entry_session_id(running_entry)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
+        state = work_finished(state, running_entry.issue)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -410,6 +475,196 @@ defmodule SymphonyElixir.Orchestrator do
       false ->
         state
     end
+  end
+
+  defp run_event_cycle(state) do
+    state
+    |> refresh_runtime_config()
+    |> consume_issue_events()
+    |> reconcile_event_roots()
+    |> consume_plan_events()
+    |> dispatch_notified_work()
+    |> dispatch_pending_cleanup()
+    |> Map.put(:poll_check_in_progress, false)
+    |> retry_pending_events()
+  end
+
+  defp event_scope_current?(state) do
+    tracker = Config.settings!().tracker
+
+    GitLabAdapter.event_driven?(tracker) and
+      GitLabClient.event_scope(tracker) == {:ok, state.event_scope} and
+      Execution.journal_root() == state.event_journal_root
+  end
+
+  defp stop_event_workers(state) do
+    Enum.reduce(Map.keys(state.running), %{state | poll_check_in_progress: false}, &stop_reconciled_issue(&2, &1, false))
+  end
+
+  defp consume_issue_events(state) do
+    if issue_events_enabled?(), do: Enum.reduce(state.issue_event_ids, state, &consume_issue_event/2), else: state
+  end
+
+  defp consume_issue_event(id, state) do
+    case Tracker.fetch_gitlab_event_issue(id, state.event_scope) do
+      {:ok, issues} ->
+        issue = find_issue_by_id(issues, id)
+
+        case apply_issue_event(state, id, issue) do
+          {:ok, next} ->
+            %{next | issue_event_ids: MapSet.delete(next.issue_event_ids, id), issue_event_failures: Map.delete(next.issue_event_failures, id)}
+
+          {:error, reason} ->
+            retain_issue_event(state, id, reason)
+        end
+
+      {:error, reason} ->
+        retain_issue_event(state, id, reason)
+    end
+  end
+
+  defp retain_issue_event(state, id, reason) do
+    Logger.warning("GitLab Issue observation failed issue_id=#{id} reason=#{inspect(reason)}")
+    failures = Map.update(state.issue_event_failures, id, 1, &(&1 + 1))
+
+    {ids, failures} =
+      if failures[id] > @event_max_retries,
+        do: {MapSet.delete(state.issue_event_ids, id), Map.delete(failures, id)},
+        else: {state.issue_event_ids, failures}
+
+    %{state | issue_event_candidates: Map.delete(state.issue_event_candidates, id), issue_event_ids: ids, issue_event_failures: failures}
+  end
+
+  defp apply_issue_event(state, id, %Issue{} = issue) do
+    active = active_state_set()
+    terminal = terminal_state_set()
+
+    with :ok <- TaskReconciler.refresh_notified(id, state.running[id]) do
+      state = reconcile_notified_issue(state, issue, active, terminal)
+
+      if candidate_issue?(issue, active, terminal) do
+        {:ok, %{state | issue_event_candidates: Map.put(state.issue_event_candidates, id, issue)}}
+      else
+        forget_issue_event(state, id)
+      end
+    end
+  end
+
+  defp apply_issue_event(state, id, nil) do
+    next =
+      state
+      |> reconcile_missing_running_issue_ids(if(Map.has_key?(state.running, id), do: [id], else: []), [])
+      |> reconcile_missing_blocked_issue_ids(if(Map.has_key?(state.blocked, id), do: [id], else: []), [])
+
+    forget_issue_event(next, id)
+  end
+
+  defp reconcile_notified_issue(state, issue, active, terminal) do
+    cond do
+      Map.has_key?(state.running, issue.id) -> reconcile_issue_state(issue, state, active, terminal)
+      Map.has_key?(state.blocked, issue.id) -> reconcile_blocked_issue_state(issue, state, active, terminal)
+      true -> state
+    end
+  end
+
+  defp forget_issue_event(state, id) do
+    with :ok <- RunJournal.forget_issue_event(state.event_journal_root, state.event_scope, id) do
+      {:ok, %{state | issue_event_candidates: Map.delete(state.issue_event_candidates, id)}}
+    end
+  end
+
+  defp dispatch_notified_work(state) do
+    state = reconcile_stalled_running_issues(state)
+    plans = Enum.flat_map(Map.values(state.event_plans), & &1.jobs)
+    candidates = if issue_events_enabled?(), do: Map.values(state.issue_event_candidates), else: []
+
+    case Tracker.event_jobs(candidates, plans, state.plan_options) do
+      {:ok, jobs} ->
+        state = Enum.reduce(jobs, state, &reconcile_notified_issue(&2, &1, active_state_set(), terminal_state_set()))
+        next = choose_issues(jobs, state)
+        %{next | issue_event_candidates: Map.drop(next.issue_event_candidates, Map.keys(next.running))}
+
+      {:error, reason} ->
+        Logger.warning("Could not read queued reviews: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp consume_plan_events(state) do
+    Enum.reduce(state.pending_plan_roots, %{state | pending_plan_roots: MapSet.new()}, &refresh_event_plan/2)
+  end
+
+  defp reconcile_event_roots(state) do
+    case TaskPlanExecution.event_roots(state.plan_options) do
+      {:ok, roots} ->
+        pending = MapSet.intersection(state.pending_plan_roots, MapSet.new(roots))
+        plans = Map.take(state.event_plans, roots)
+        added = MapSet.new(roots -- Map.keys(plans))
+        retries = Map.take(state.plan_event_retries, roots)
+        next = stop_removed_plan_workers(state, roots)
+        %{next | event_plans: plans, pending_plan_roots: MapSet.union(pending, added), plan_event_retries: retries}
+
+      {:error, _} ->
+        next = stop_removed_plan_workers(state, [])
+        %{next | event_plans: %{}, pending_plan_roots: MapSet.new(), plan_event_retries: %{}}
+    end
+  end
+
+  defp stop_removed_plan_workers(state, roots) do
+    Enum.reduce(state.running, state, fn {id, entry}, current ->
+      parent = get_in(entry.issue.native_ref, ["parent"])
+      if is_map(parent) and parent not in roots, do: stop_reconciled_issue(current, id, false), else: current
+    end)
+  end
+
+  defp refresh_event_plan(parent, state) do
+    snapshot = TaskPlanExecution.event_snapshot(parent, state.plan_options)
+    previous = get_in(state.event_plans, [parent, :sources]) || MapSet.new()
+    snapshot = %{snapshot | sources: MapSet.union(previous, snapshot.sources)}
+    retries = update_plan_event_retry(state, parent, snapshot.retry?)
+    %{state | event_plans: Map.put(state.event_plans, parent, snapshot), plan_event_retries: retries}
+  end
+
+  defp update_plan_event_retry(state, parent, true) do
+    {attempt, _} = Map.get(state.plan_event_retries, parent, {0, nil})
+
+    if attempt < @event_max_retries do
+      token = make_ref()
+      delay = state.poll_interval_ms * (1 <<< attempt)
+      Process.send_after(self(), {:retry_event_plan, parent, token}, delay)
+      Map.put(state.plan_event_retries, parent, {attempt + 1, token})
+    else
+      Map.put(state.plan_event_retries, parent, {attempt, nil})
+    end
+  end
+
+  defp update_plan_event_retry(state, parent, false), do: Map.delete(state.plan_event_retries, parent)
+
+  defp work_finished(%{event_project: nil} = state, _issue), do: state
+
+  defp work_finished(state, %Issue{native_ref: %{"parent" => parent}}) when is_map(parent),
+    do: wake_dispatch(%{state | pending_plan_roots: MapSet.put(state.pending_plan_roots, parent)})
+
+  defp work_finished(state, _issue), do: wake_dispatch(state)
+
+  defp retry_pending_events(state) do
+    if (issue_events_enabled?() and MapSet.size(state.issue_event_ids) > 0) or cleanup_pending?(state) do
+      schedule_tick(state, state.poll_interval_ms)
+    else
+      state
+    end
+  end
+
+  defp issue_events_enabled?, do: not Config.settings!().tracker.disabled
+
+  defp dispatch_pending_cleanup(state) do
+    if MapSet.size(state.merge_cleanup_pending) > 0 and (is_nil(state.event_project) or event_scope_current?(state)),
+      do: maybe_start_merge_cleanup(state),
+      else: state
+  end
+
+  defp cleanup_pending?(state) do
+    MapSet.size(state.merge_cleanup_pending) > 0 and SymphonyElixir.MergedWorkspaceCleanup.enabled?()
   end
 
   defp maybe_reconcile_tasks(%State{task_reconcile_ref: nil} = state) do
@@ -764,6 +1019,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp arm_event_watchdog(%{event_project: project, event_watchdog_ref: nil, running: running} = state)
+       when is_binary(project) and map_size(running) > 0 do
+    stall_timeout = Config.settings!().codex.stall_timeout_ms
+
+    if stall_timeout > 0 do
+      delay = min(state.poll_interval_ms, stall_timeout)
+      %{state | event_watchdog_ref: Process.send_after(self(), :event_worker_watchdog, delay)}
+    else
+      state
+    end
+  end
+
+  defp arm_event_watchdog(state), do: state
+
   defp maybe_restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
     goal_mode = Execution.enabled?() or TaskPlanExecution.job?(running_entry[:issue])
 
@@ -1075,20 +1344,35 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case refresh_issue_for_dispatch(issue, state.plan_options) do
+    case refresh_issue_for_dispatch(issue, state) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
       {:skip, _reason} ->
-        state
+        %{state | issue_event_candidates: Map.delete(state.issue_event_candidates, issue.id)}
 
-      {:error, _reason} ->
-        state
+      {:error, reason} ->
+        retry_dispatch_observation(state, issue, attempt, preferred_worker_host, reason)
     end
   end
 
-  defp refresh_issue_for_dispatch(issue, plan_options) do
-    fetch = &Tracker.fetch_issues_by_ids(&1, plan_options)
+  defp retry_dispatch_observation(%{event_project: nil} = state, _issue, _attempt, _worker, _reason), do: state
+
+  defp retry_dispatch_observation(state, issue, attempt, worker, reason) do
+    claimed = %{state | claimed: MapSet.put(state.claimed, issue.id)}
+    next = if is_integer(attempt), do: attempt + 1, else: 1
+
+    schedule_issue_retry(claimed, issue.id, next, %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      worker_host: worker,
+      error: "dispatch observation failed: #{inspect(reason)}"
+    })
+  end
+
+  defp refresh_issue_for_dispatch(issue, state) do
+    plan_options = scoped_plan_options(issue, state.plan_options)
+    fetch = fn [id] -> fetch_issue_for_dispatch(id, plan_options, state.event_scope) end
 
     case revalidate_issue_for_dispatch(issue, fetch, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
@@ -1106,6 +1390,27 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  defp scoped_plan_options(%Issue{native_ref: %{"execution_kind" => "plan_member", "parent" => parent}}, options) do
+    if GitLabAdapter.event_driven?(Config.settings!().tracker) do
+      case TaskPlanExecution.event_roots(options) do
+        {:ok, roots} -> Keyword.put(options, :roots, Enum.filter(roots, &(&1 == parent)))
+        {:error, _} -> Keyword.put(options, :roots, [])
+      end
+    else
+      options
+    end
+  end
+
+  defp scoped_plan_options(_issue, options), do: options
+
+  defp fetch_issue_for_dispatch(id, plan_options, scope) do
+    if not is_nil(scope) and Regex.match?(~r/\A[1-9][0-9]*\z/, id) do
+      Tracker.fetch_gitlab_event_issue(id, scope)
+    else
+      Tracker.fetch_issues_by_ids([id], plan_options)
     end
   end
 
@@ -1171,6 +1476,7 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: MapSet.put(state.claimed, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
+        |> arm_event_watchdog()
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1273,7 +1579,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_issues_by_ids([issue_id], state.plan_options) do
+    if is_nil(state.event_project) or event_scope_current?(state),
+      do: retry_notified_issue(state, issue_id, attempt, metadata),
+      else: {:noreply, state}
+  end
+
+  defp retry_notified_issue(state, issue_id, attempt, metadata) do
+    case fetch_retry_issue(state, issue_id) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -1291,6 +1603,21 @@ defmodule SymphonyElixir.Orchestrator do
          )}
     end
   end
+
+  defp fetch_retry_issue(%{event_project: project} = state, "member:" <> _ = id) when is_binary(project) do
+    jobs = Enum.flat_map(Map.values(state.event_plans), & &1.jobs)
+
+    case find_issue_by_id(jobs, id) do
+      %Issue{} = issue ->
+        options = scoped_plan_options(issue, state.plan_options)
+        fetch_issue_for_dispatch(id, options, state.event_scope)
+
+      nil ->
+        {:ok, []}
+    end
+  end
+
+  defp fetch_retry_issue(state, id), do: fetch_issue_for_dispatch(id, state.plan_options, state.event_scope)
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
@@ -1384,19 +1711,65 @@ defmodule SymphonyElixir.Orchestrator do
     if MapSet.member?(state.merge_cleanup_in_flight, hint) do
       state
     else
-      %{state | merge_cleanup_pending: MapSet.put(state.merge_cleanup_pending, hint)}
+      failures = Map.delete(state.merge_cleanup_failures, hint)
+      %{state | merge_cleanup_pending: MapSet.put(state.merge_cleanup_pending, hint), merge_cleanup_failures: failures}
     end
   end
 
+  defp accept_merge_cleanup(state, hint) do
+    case persist_merge_cleanup(state, hint) do
+      :ok -> {:reply, :queued, maybe_start_merge_cleanup(put_merge_hint(state, hint))}
+      {:error, _reason} -> {:reply, :unavailable, state}
+    end
+  end
+
+  defp persist_merge_cleanup(%{event_project: project} = state, hint) when is_binary(project) do
+    if event_scope_current?(state),
+      do: RunJournal.remember_merge_event(state.event_journal_root, state.event_scope, hint),
+      else: {:error, :gitlab_event_scope_changed}
+  end
+
+  defp persist_merge_cleanup(_state, _hint), do: :ok
+
   defp finish_merge_cleanup(state, true) do
-    state = %{state | merge_cleanup_ref: nil, merge_cleanup_in_flight: MapSet.new()}
-    if MapSet.size(state.merge_cleanup_pending) > 0, do: maybe_start_merge_cleanup(state), else: state
+    case acknowledge_merge_events(state) do
+      :ok ->
+        failures = Map.drop(state.merge_cleanup_failures, MapSet.to_list(state.merge_cleanup_in_flight))
+        next = %{state | merge_cleanup_ref: nil, merge_cleanup_in_flight: MapSet.new(), merge_cleanup_failures: failures}
+        dispatch_pending_cleanup(next)
+
+      {:error, reason} ->
+        Logger.warning("Could not acknowledge completed GitLab merge cleanup: #{inspect(reason)}")
+        finish_merge_cleanup(state, false)
+    end
   end
 
   defp finish_merge_cleanup(state, false) do
-    pending = MapSet.union(state.merge_cleanup_pending, state.merge_cleanup_in_flight)
-    %{state | merge_cleanup_ref: nil, merge_cleanup_pending: pending, merge_cleanup_in_flight: MapSet.new()}
+    {pending, failures} = Enum.reduce(state.merge_cleanup_in_flight, {state.merge_cleanup_pending, state.merge_cleanup_failures}, &retry_cleanup(state, &1, &2))
+    next = %{state | merge_cleanup_ref: nil, merge_cleanup_pending: pending, merge_cleanup_in_flight: MapSet.new(), merge_cleanup_failures: failures}
+    if is_binary(state.event_project) and not refresh_pending?(next), do: retry_pending_events(next), else: next
   end
+
+  defp retry_cleanup(%{event_project: nil}, hint, {pending, failures}), do: {MapSet.put(pending, hint), failures}
+
+  defp retry_cleanup(_state, hint, {pending, failures}) do
+    count = Map.get(failures, hint, 0) + 1
+
+    if count > @event_max_retries,
+      do: {pending, Map.delete(failures, hint)},
+      else: {MapSet.put(pending, hint), Map.put(failures, hint, count)}
+  end
+
+  defp acknowledge_merge_events(%{event_project: project, merge_cleanup_in_flight: hints} = state) when is_binary(project) do
+    Enum.reduce_while(hints, :ok, fn hint, :ok ->
+      case RunJournal.forget_merge_event(state.event_journal_root, state.event_scope, hint.iid) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp acknowledge_merge_events(_state), do: :ok
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -1406,7 +1779,7 @@ defmodule SymphonyElixir.Orchestrator do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          (TaskPlanExecution.job?(issue) or worker_slots_available?(state, metadata[:worker_host])) do
-      case refresh_issue_for_dispatch(issue, state.plan_options) do
+      case refresh_issue_for_dispatch(issue, state) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
 
@@ -1626,6 +1999,48 @@ defmodule SymphonyElixir.Orchestrator do
     else
       :unavailable
     end
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  @doc "Persist a scoped GitLab Issue hint before acknowledging its delivery."
+  @spec request_issue_event(pos_integer(), boolean()) :: :queued | :unavailable
+  def request_issue_event(iid, wake_dependents? \\ false) when is_integer(iid) and iid > 0 do
+    GenServer.call(RuntimeContext.server(__MODULE__), {:issue_event, iid, wake_dependents?})
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  @doc "Queue ordinary Issues already bound to the notified native MR."
+  @spec request_merge_dependents(String.t(), pos_integer()) :: :queued | :ignored | :unavailable
+  def request_merge_dependents(project, iid) do
+    GenServer.call(RuntimeContext.server(__MODULE__), {:merge_dependents, project, iid})
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  @doc "Wake dispatch after an asynchronous producer has queued work."
+  @spec notify_work_ready() :: :ok
+  def notify_work_ready, do: GenServer.cast(RuntimeContext.server(__MODULE__), :work_ready)
+
+  @doc "Notify local plan owners of a repository-scoped native change."
+  @spec notify_plan_event(WorkRef.t()) :: :ok
+  def notify_plan_event(work) do
+    case WorkRef.validate(work) do
+      :ok -> broadcast_plan_event({:plan_source_changed, work})
+      {:error, _} -> :ok
+    end
+  end
+
+  defp broadcast_plan_event(message) do
+    case SymphonyElixir.RepositoryService.repositories() do
+      [] -> GenServer.cast(RuntimeContext.server(__MODULE__), message)
+      contexts -> Enum.each(contexts, &notify_repository(&1, message))
+    end
+  end
+
+  defp notify_repository(context, message) do
+    RuntimeContext.with_context(context, fn -> GenServer.cast(RuntimeContext.server(__MODULE__), message) end)
   end
 
   @spec retry_now(String.t()) :: :ok | :not_retrying | :unavailable
@@ -1741,9 +2156,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call(:request_refresh, _from, state) do
-    now_ms = System.monotonic_time(:millisecond)
-    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
-    coalesced = state.poll_check_in_progress == true or already_due?
+    coalesced = refresh_pending?(state)
     state = if coalesced, do: state, else: schedule_tick(state, 0)
 
     {:reply,
@@ -1756,13 +2169,42 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call({:request_merge_cleanup, hint}, _from, state) do
-    if SymphonyElixir.MergedWorkspaceCleanup.enabled?() do
-      pending = put_merge_hint(state, hint)
-      {:reply, :queued, maybe_start_merge_cleanup(pending)}
-    else
-      {:reply, :disabled, state}
+    cond do
+      not SymphonyElixir.MergedWorkspaceCleanup.enabled?() ->
+        {:reply, :disabled, state}
+
+      is_binary(state.event_project) and hint.project != state.event_project ->
+        {:reply, :disabled, state}
+
+      true ->
+        accept_merge_cleanup(state, hint)
     end
   end
+
+  def handle_call({:issue_event, iid, wake_dependents?}, _from, state) do
+    tracker = Config.settings!().tracker
+
+    with project when is_binary(project) <- state.event_project,
+         true <- not tracker.disabled and event_scope_current?(state),
+         {:ok, dependents} <- notified_issue_dependents(project, iid, wake_dependents?) do
+      enqueue_issue_ids(state, [Integer.to_string(iid) | dependents])
+    else
+      _ -> {:reply, :unavailable, state}
+    end
+  end
+
+  def handle_call({:merge_dependents, project, iid}, _from, %{event_project: project} = state) when is_binary(project) do
+    if issue_events_enabled?() and event_scope_current?(state) do
+      case TaskReconciler.dependent_issue_ids(project, "mr", iid) do
+        {:ok, ids} -> enqueue_issue_ids(state, ids)
+        {:error, _reason} -> {:reply, :unavailable, state}
+      end
+    else
+      {:reply, :ignored, state}
+    end
+  end
+
+  def handle_call({:merge_dependents, _project, _iid}, _from, state), do: {:reply, :ignored, state}
 
   def handle_call({:retry_now, issue_id}, _from, state) do
     case Map.get(state.retry_attempts, issue_id) do
@@ -1854,6 +2296,71 @@ defmodule SymphonyElixir.Orchestrator do
       message: update[:payload] || update[:raw],
       timestamp: update[:timestamp]
     }
+  end
+
+  @impl true
+  def handle_cast(:work_ready, state) do
+    {:noreply, wake_dispatch(state)}
+  end
+
+  def handle_cast({:plan_source_changed, work}, %{event_project: project} = state) when is_binary(project) do
+    affected = Enum.filter(state.event_plans, fn {_, snapshot} -> MapSet.member?(snapshot.sources, work) end)
+    roots = MapSet.new(affected, &elem(&1, 0))
+
+    if MapSet.size(roots) > 0 do
+      notify_active_plan_members(state.running, roots)
+      retries = Map.drop(state.plan_event_retries, MapSet.to_list(roots))
+      next = %{state | pending_plan_roots: MapSet.union(state.pending_plan_roots, roots), plan_event_retries: retries}
+      {:noreply, wake_dispatch(next)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast({:plan_source_changed, _work}, state), do: {:noreply, state}
+
+  defp notify_active_plan_members(running, roots) do
+    Enum.each(running, fn {_, entry} ->
+      if entry.issue.native_ref && MapSet.member?(roots, entry.issue.native_ref["parent"]),
+        do: send(entry.pid, :gitlab_plan_changed)
+    end)
+  end
+
+  defp wake_dispatch(state), do: if(refresh_pending?(state), do: state, else: schedule_tick(state, 0))
+
+  defp notified_issue_dependents(project, iid, true), do: TaskReconciler.dependent_issue_ids(project, "issue", iid)
+  defp notified_issue_dependents(_project, _iid, false), do: {:ok, []}
+
+  defp enqueue_issue_ids(state, []), do: {:reply, :ignored, state}
+
+  defp enqueue_issue_ids(state, ids) do
+    root = state.event_journal_root
+    scope = state.event_scope
+    persisted = Enum.reduce_while(Enum.uniq(ids), :ok, &write_issue_hint(root, scope, &1, &2))
+
+    case persisted do
+      :ok ->
+        failures = Map.drop(state.issue_event_failures, ids)
+        next = %{state | issue_event_ids: MapSet.union(state.issue_event_ids, MapSet.new(ids)), issue_event_failures: failures}
+        {:reply, :queued, wake_dispatch(next)}
+
+      {:error, _reason} ->
+        {:reply, :unavailable, state}
+    end
+  end
+
+  defp write_issue_hint(root, project, id, :ok) do
+    case RunJournal.remember_issue_event(root, project, id) do
+      :ok -> {:cont, :ok}
+      error -> {:halt, error}
+    end
+  end
+
+  defp refresh_pending?(state) do
+    now = System.monotonic_time(:millisecond)
+
+    state.poll_check_in_progress == true or
+      (is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now)
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do

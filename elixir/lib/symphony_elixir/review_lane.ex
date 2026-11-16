@@ -24,13 +24,14 @@ defmodule SymphonyElixir.ReviewLane do
     config = resolve(raw)
 
     allowed =
-      ~w(enabled disabled publish_results provider host reviewer_id publisher_id projects state_dir poll_interval_ms instruction_files result_command model_settings glab_bin gh_bin allow_insecure_http webhook_secret)
+      ~w(enabled disabled publish_results provider host reviewer_id publisher_id projects state_dir poll_interval_ms instruction_files result_command model_settings glab_bin gh_bin allow_insecure_http webhook_secret event_driven)
 
     checks = [
       {Enum.all?(Map.keys(config), &(&1 in allowed)), :unknown_review_configuration},
       {is_boolean(Map.get(config, "disabled", false)), :review_lane_disabled_boolean_required},
       {is_boolean(Map.get(config, "publish_results", true)), :review_lane_publish_results_boolean_required},
       {config["provider"] in ["gitlab", "github"], :review_lane_provider_unsupported},
+      {event_mode?(config), :review_lane_event_mode_requires_gitlab},
       {valid_host?(config["host"]), :review_lane_host_required},
       {positive?(config["reviewer_id"]), :review_lane_reviewer_id_required},
       {positive?(config["publisher_id"]), :review_lane_publisher_id_required},
@@ -49,6 +50,14 @@ defmodule SymphonyElixir.ReviewLane do
   end
 
   def validate_config(_settings), do: :ok
+
+  defp event_mode?(config) do
+    case Map.get(config, "event_driven", false) do
+      false -> true
+      true -> config["provider"] == "gitlab"
+      _ -> false
+    end
+  end
 
   defp validate_rules(config) do
     case SymphonyElixir.WorkflowInstructions.load(config) do

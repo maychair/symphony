@@ -11,6 +11,10 @@ defmodule SymphonyElixir.GitLab.Adapter do
   @active_states ["opened"]
   @terminal_states ["closed"]
 
+  @spec event_driven?(map()) :: boolean()
+  def event_driven?(%{kind: "gitlab", provider: %{"event_driven" => true}}), do: true
+  def event_driven?(_), do: false
+
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(tracker_settings) do
     with :ok <-
@@ -34,6 +38,9 @@ defmodule SymphonyElixir.GitLab.Adapter do
 
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(ids), do: client_module().fetch_issues_by_ids(ids)
+
+  @spec fetch_issues_by_ids([String.t()], map()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(ids, tracker), do: client_module().fetch_issues_by_ids(ids, tracker)
 
   @spec agent_tool_specs() :: [map()]
   def agent_tool_specs, do: AgentTool.tool_specs()
