@@ -51,6 +51,8 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- is_binary(secret) and byte_size(secret) >= 16,
          :ok <- authenticate(conn, provider, secret, body),
          :ok <- scope(settings, provider, conn.body_params) do
+      notify_plan_event(provider, conn.body_params)
+
       if GitLabAdapter.event_driven?(settings),
         do: acknowledge_gitlab_event(conn, settings.disabled),
         else: acknowledge_tracker(conn, provider, settings.disabled)
@@ -150,6 +152,7 @@ defmodule SymphonyElixirWeb.WebhookController do
          true <- GitLab.web_url?(url, config, "/" <> project),
          true <- is_map(attributes),
          :ok <- Listener.request_review(project, attributes["iid"]) do
+      notify_plan_event(provider, conn.body_params)
       tracker = Config.settings!().tracker
 
       if GitLabAdapter.event_driven?(tracker),
@@ -157,6 +160,40 @@ defmodule SymphonyElixirWeb.WebhookController do
         else: acknowledge(conn, config["disabled"] == true, merge_hint(provider, conn.body_params))
     else
       _ -> conn |> put_status(403) |> json(%{error: "review_event_rejected"})
+    end
+  end
+
+  defp notify_plan_event("gitlab", %{"project" => %{"id" => id, "web_url" => url}} = payload)
+       when is_integer(id) and id > 0 and is_binary(url) do
+    case plan_object(payload) do
+      {kind, number} ->
+        Orchestrator.notify_plan_event(%{
+          "provider" => "gitlab",
+          "host" => URI.parse(url).authority,
+          "repository_id" => Integer.to_string(id),
+          "kind" => kind,
+          "number" => number
+        })
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp notify_plan_event(_provider, _payload), do: :ok
+
+  defp plan_object(%{"object_kind" => "merge_request", "object_attributes" => %{"iid" => number}})
+       when is_integer(number) and number > 0,
+       do: {"mr", number}
+
+  defp plan_object(%{"object_kind" => "note", "object_attributes" => %{"noteable_type" => "MergeRequest"}, "merge_request" => %{"iid" => number}})
+       when is_integer(number) and number > 0,
+       do: {"mr", number}
+
+  defp plan_object(payload) do
+    case issue_event(payload) do
+      {number, _} -> {"issue", number}
+      nil -> nil
     end
   end
 

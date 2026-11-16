@@ -85,6 +85,14 @@ workflow depends on that Issue. MR notifications wake tasks with an existing
 dependency, handoff, or delivery bound to that MR. The task workflow reads the
 native source and decides whether its condition is satisfied.
 
+Configured plans are reconciled once at scheduler startup. After that, a
+notification carrying an exact native Issue or bound MR identity, a member
+result, or a change to the configured roots wakes the affected plan. Other
+repository runtimes can forward authenticated GitLab events to that plan
+using the provider, host, project ID, object type, and number. Running members
+refresh their business controls on notification while keeping the existing
+initial read, execution deadline and native stop checks.
+
 ### Merged-delivery cleanup
 
 `workspace.merge_cleanup_command` is an optional trusted operator command,

@@ -3,6 +3,7 @@ defmodule SymphonyElixir.TaskObserver do
   @moduledoc "One owner-linked, bounded native fact reader. Only the owning session applies its results."
   use GenServer
   alias SymphonyElixir.{Config, TaskExecution}
+  alias SymphonyElixir.GitLab.Adapter, as: GitLabAdapter
 
   @spec start_link(map(), map(), keyword()) :: GenServer.on_start()
   def start_link(record, executions, opts) do
@@ -20,6 +21,9 @@ defmodule SymphonyElixir.TaskObserver do
   @spec activate(pid()) :: :ok | {:error, term()}
   def activate(observer), do: GenServer.call(observer, :activate)
 
+  @spec invalidate(pid()) :: :ok
+  def invalidate(observer), do: GenServer.call(observer, :invalidate)
+
   @spec stop(pid()) :: :ok | {:error, term()}
   def stop(observer), do: GenServer.call(observer, :stop)
 
@@ -28,7 +32,9 @@ defmodule SymphonyElixir.TaskObserver do
     RuntimeContext.install(opts[:runtime_context])
     Process.flag(:trap_exit, true)
     context = %{owner: owner, record: record, executions: executions, opts: opts}
-    runtime = %{active: false, task: nil, timer: nil, started: nil, result: :pending}
+    event_driven = GitLabAdapter.event_driven?(Config.settings!().tracker)
+    runtime = %{active: false, task: nil, timer: nil, started: nil, result: :pending, dirty: false}
+    runtime = Map.put(runtime, :event_driven, event_driven)
     {:ok, context |> Map.merge(runtime) |> Map.merge(%{interval: interval, timeout: timeout})}
   end
 
@@ -44,19 +50,29 @@ defmodule SymphonyElixir.TaskObserver do
   end
 
   def handle_call(:activate, _, state), do: {:reply, {:error, :observation_already_active}, state}
+
+  def handle_call(:invalidate, _, state) do
+    if state.active and is_nil(state.task) and state.result == :pending, do: send(self(), :observe)
+    {:reply, :ok, %{state | dirty: true}}
+  end
+
   def handle_call(:take, _, %{result: :pending} = state), do: {:reply, :pending, state}
 
   def handle_call(:take, _, state) do
-    Process.send_after(self(), :observe, state.interval)
+    schedule_next(state)
     result = if match?({:ok, _}, state.result) and System.monotonic_time(:millisecond) - state.started > state.timeout, do: {:error, :observation_expired}, else: state.result
     {:reply, result, %{state | result: :pending}}
   end
+
+  defp schedule_next(%{event_driven: true, dirty: true}), do: send(self(), :observe)
+  defp schedule_next(%{event_driven: true}), do: :ok
+  defp schedule_next(state), do: Process.send_after(self(), :observe, state.interval)
 
   @impl true
   def handle_info(:observe, %{active: true, task: nil, result: :pending} = state) do
     task = Task.async(RuntimeContext.wrap(fn -> TaskExecution.observe_running(state.record, state.executions, state.opts) end))
     timer = Process.send_after(self(), {:timeout, task.ref}, state.timeout)
-    {:noreply, %{state | task: task, timer: timer, started: System.monotonic_time(:millisecond)}}
+    {:noreply, %{state | task: task, timer: timer, started: System.monotonic_time(:millisecond), dirty: false}}
   end
 
   def handle_info({ref, result}, %{task: %Task{ref: ref}} = state) do

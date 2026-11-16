@@ -11,7 +11,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
-  alias SymphonyElixir.{Execution, RunJournal, TaskPlanExecution, TaskReconciler}
+  alias SymphonyElixir.{Execution, RunJournal, TaskPlanExecution, TaskReconciler, WorkRef}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -43,6 +43,8 @@ defmodule SymphonyElixir.Orchestrator do
       :event_project,
       issue_event_ids: MapSet.new(),
       issue_event_candidates: %{},
+      pending_plan_roots: MapSet.new(),
+      event_plans: %{},
       merge_cleanup_pending: MapSet.new(),
       merge_cleanup_in_flight: MapSet.new(),
       task_supervisor: SymphonyElixir.TaskSupervisor,
@@ -99,11 +101,13 @@ defmodule SymphonyElixir.Orchestrator do
       root = Execution.journal_root()
 
       with {:ok, ids} <- RunJournal.issue_events(root, project),
-           {:ok, merges} <- RunJournal.merge_events(root, project) do
+           {:ok, merges} <- RunJournal.merge_events(root, project),
+           {:ok, roots} <- TaskPlanExecution.event_roots(state.plan_options) do
         next = %{
           state
           | event_project: project,
             issue_event_ids: MapSet.new(ids),
+            pending_plan_roots: MapSet.new(roots),
             merge_cleanup_pending: MapSet.new(merges),
             next_poll_due_at_ms: nil
         }
@@ -159,6 +163,8 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> refresh_runtime_config()
       |> consume_issue_events()
+      |> reconcile_event_roots()
+      |> consume_plan_events()
       |> dispatch_notified_work()
       |> dispatch_pending_cleanup()
       |> Map.put(:poll_check_in_progress, false)
@@ -215,7 +221,7 @@ defmodule SymphonyElixir.Orchestrator do
         session_id = running_entry_session_id(running_entry)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
-        state = if state.event_project, do: wake_dispatch(state), else: state
+        state = work_finished(state, running_entry.issue)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -518,12 +524,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_notified_work(state) do
     state = reconcile_stalled_running_issues(state)
+    plans = Enum.flat_map(Map.values(state.event_plans), & &1.jobs)
+    candidates = if issue_events_enabled?(), do: Map.values(state.issue_event_candidates), else: []
 
-    case Tracker.queued_reviews() do
-      {:ok, reviews} ->
-        state = Enum.reduce(reviews, state, &reconcile_notified_issue(&2, &1, active_state_set(), terminal_state_set()))
-        candidates = if issue_events_enabled?(), do: Map.values(state.issue_event_candidates), else: []
-        next = choose_issues(candidates ++ reviews, state)
+    case Tracker.event_jobs(candidates, plans, state.plan_options) do
+      {:ok, jobs} ->
+        state = Enum.reduce(jobs, state, &reconcile_notified_issue(&2, &1, active_state_set(), terminal_state_set()))
+        next = choose_issues(jobs, state)
         %{next | issue_event_candidates: Map.drop(next.issue_event_candidates, Map.keys(next.running))}
 
       {:error, reason} ->
@@ -531,6 +538,45 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp consume_plan_events(state) do
+    Enum.reduce(state.pending_plan_roots, %{state | pending_plan_roots: MapSet.new()}, &refresh_event_plan/2)
+  end
+
+  defp reconcile_event_roots(state) do
+    case TaskPlanExecution.event_roots(state.plan_options) do
+      {:ok, roots} ->
+        pending = MapSet.intersection(state.pending_plan_roots, MapSet.new(roots))
+        plans = Map.take(state.event_plans, roots)
+        added = MapSet.new(roots -- Map.keys(plans))
+        next = %{state | event_plans: plans, pending_plan_roots: MapSet.union(pending, added)}
+        stop_removed_plan_workers(next, roots)
+
+      {:error, _} ->
+        stop_removed_plan_workers(%{state | event_plans: %{}, pending_plan_roots: MapSet.new()}, [])
+    end
+  end
+
+  defp stop_removed_plan_workers(state, roots) do
+    Enum.reduce(state.running, state, fn {id, entry}, current ->
+      parent = get_in(entry.issue.native_ref, ["parent"])
+      if is_map(parent) and parent not in roots, do: stop_reconciled_issue(current, id, false), else: current
+    end)
+  end
+
+  defp refresh_event_plan(parent, state) do
+    snapshot = TaskPlanExecution.event_snapshot(parent, state.plan_options)
+    previous = get_in(state.event_plans, [parent, :sources]) || MapSet.new()
+    snapshot = %{snapshot | sources: MapSet.union(previous, snapshot.sources)}
+    %{state | event_plans: Map.put(state.event_plans, parent, snapshot)}
+  end
+
+  defp work_finished(%{event_project: nil} = state, _issue), do: state
+
+  defp work_finished(state, %Issue{native_ref: %{"parent" => parent}}) when is_map(parent),
+    do: wake_dispatch(%{state | pending_plan_roots: MapSet.put(state.pending_plan_roots, parent)})
+
+  defp work_finished(state, _issue), do: wake_dispatch(state)
 
   defp retry_pending_events(state) do
     if (issue_events_enabled?() and MapSet.size(state.issue_event_ids) > 0) or cleanup_pending?(state) do
@@ -1226,6 +1272,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp refresh_issue_for_dispatch(issue, plan_options) do
+    plan_options = scoped_plan_options(issue, plan_options)
     fetch = fn [id] -> fetch_issue_for_dispatch(id, plan_options) end
 
     case revalidate_issue_for_dispatch(issue, fetch, terminal_state_set()) do
@@ -1246,6 +1293,19 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, reason}
     end
   end
+
+  defp scoped_plan_options(%Issue{native_ref: %{"execution_kind" => "plan_member", "parent" => parent}}, options) do
+    if GitLabAdapter.event_driven?(Config.settings!().tracker) do
+      case TaskPlanExecution.event_roots(options) do
+        {:ok, roots} -> Keyword.put(options, :roots, Enum.filter(roots, &(&1 == parent)))
+        {:error, _} -> Keyword.put(options, :roots, [])
+      end
+    else
+      options
+    end
+  end
+
+  defp scoped_plan_options(_issue, options), do: options
 
   defp fetch_issue_for_dispatch(id, plan_options) do
     if GitLabAdapter.event_driven?(Config.settings!().tracker) and Regex.match?(~r/\A[1-9][0-9]*\z/, id) do
@@ -1419,7 +1479,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case fetch_issue_for_dispatch(issue_id, state.plan_options) do
+    case fetch_retry_issue(state, issue_id) do
       {:ok, issues} ->
         issues
         |> find_issue_by_id(issue_id)
@@ -1437,6 +1497,17 @@ defmodule SymphonyElixir.Orchestrator do
          )}
     end
   end
+
+  defp fetch_retry_issue(%{event_project: project} = state, "member:" <> _ = id) when is_binary(project) do
+    jobs = Enum.flat_map(Map.values(state.event_plans), & &1.jobs)
+
+    case find_issue_by_id(jobs, id) do
+      %Issue{} = issue -> fetch_issue_for_dispatch(id, scoped_plan_options(issue, state.plan_options))
+      nil -> {:ok, []}
+    end
+  end
+
+  defp fetch_retry_issue(state, id), do: fetch_issue_for_dispatch(id, state.plan_options)
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
@@ -1829,6 +1900,26 @@ defmodule SymphonyElixir.Orchestrator do
   @spec notify_work_ready() :: :ok
   def notify_work_ready, do: GenServer.cast(RuntimeContext.server(__MODULE__), :work_ready)
 
+  @doc "Notify local plan owners of a repository-scoped native change."
+  @spec notify_plan_event(WorkRef.t()) :: :ok
+  def notify_plan_event(work) do
+    case WorkRef.validate(work) do
+      :ok -> broadcast_plan_event({:plan_source_changed, work})
+      {:error, _} -> :ok
+    end
+  end
+
+  defp broadcast_plan_event(message) do
+    case SymphonyElixir.RepositoryService.repositories() do
+      [] -> GenServer.cast(RuntimeContext.server(__MODULE__), message)
+      contexts -> Enum.each(contexts, &notify_repository(&1, message))
+    end
+  end
+
+  defp notify_repository(context, message) do
+    RuntimeContext.with_context(context, fn -> GenServer.cast(RuntimeContext.server(__MODULE__), message) end)
+  end
+
   @spec retry_now(String.t()) :: :ok | :not_retrying | :unavailable
   def retry_now(issue_id), do: retry_now(RuntimeContext.server(__MODULE__), issue_id)
 
@@ -2088,6 +2179,28 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_cast(:work_ready, state) do
     {:noreply, wake_dispatch(state)}
+  end
+
+  def handle_cast({:plan_source_changed, work}, %{event_project: project} = state) when is_binary(project) do
+    affected = Enum.filter(state.event_plans, fn {_, snapshot} -> MapSet.member?(snapshot.sources, work) end)
+    roots = MapSet.new(affected, &elem(&1, 0))
+
+    if MapSet.size(roots) > 0 do
+      notify_active_plan_members(state.running, roots)
+      next = %{state | pending_plan_roots: MapSet.union(state.pending_plan_roots, roots)}
+      {:noreply, wake_dispatch(next)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_cast({:plan_source_changed, _work}, state), do: {:noreply, state}
+
+  defp notify_active_plan_members(running, roots) do
+    Enum.each(running, fn {_, entry} ->
+      if entry.issue.native_ref && MapSet.member?(roots, entry.issue.native_ref["parent"]),
+        do: send(entry.pid, :gitlab_plan_changed)
+    end)
   end
 
   defp wake_dispatch(state), do: if(refresh_pending?(state), do: state, else: schedule_tick(state, 0))

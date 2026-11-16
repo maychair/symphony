@@ -92,9 +92,15 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  @doc "Read the already queued Review jobs independently of Issue and plan discovery."
-  @spec queued_reviews() :: {:ok, [Issue.t()]} | {:error, term()}
-  def queued_reviews, do: review_issues()
+  @doc "Combine existing event projections through the usual ownership rules."
+  @spec event_jobs([Issue.t()], [Issue.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def event_jobs(issues, plans, opts) do
+    with {:ok, reviews} <- review_issues() do
+      {plans, reviews} = Ownership.converge(reviews, plans, opts)
+      {issues, plans} = parent_lifecycle(issues, plans)
+      {:ok, issues ++ plans ++ reviews}
+    end
+  end
 
   @spec fetch_issues_by_ids([String.t()], keyword()) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(issue_ids, opts \\ []) do

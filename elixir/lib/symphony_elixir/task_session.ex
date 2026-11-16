@@ -243,11 +243,20 @@ defmodule SymphonyElixir.TaskSession do
 
   defp control_status(context, observer) do
     record = current!(context)
+    invalidate_plan_observation(observer)
 
     if record["task_observation_error"] do
       "blocked"
     else
       control_result(context, record, TaskObserver.take(observer))
+    end
+  end
+
+  defp invalidate_plan_observation(observer) do
+    receive do
+      :gitlab_plan_changed -> TaskObserver.invalidate(observer)
+    after
+      0 -> :ok
     end
   end
 
