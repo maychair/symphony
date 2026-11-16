@@ -100,6 +100,15 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     system_other = %{"notes" => [%{"id" => 1, "system" => true, "body" => "changed target branch", "author" => %{"id" => 30}}]}
     refute Policy.prior_review?([system_other], mr, config)
 
+    # Publisher-authored assignment notifications are not review results.
+    for body <- ["assigned to @reviewer", "requested review from @reviewer", "changed target branch"] do
+      note = %{"notes" => [%{"system" => true, "body" => body, "author" => %{"id" => 50}}]}
+      refute Policy.prior_review?([note], mr, config)
+    end
+
+    publisher_approval = %{"notes" => [%{"system" => true, "body" => "approved this merge request", "author" => %{"id" => 50}}]}
+    assert Policy.prior_review?([publisher_approval], mr, config)
+
     # Author's own comments do not count as reviews
     author_note = %{"notes" => [%{"id" => 1, "body" => "Here is my PR explanation", "author" => %{"id" => 30}}]}
     refute Policy.prior_review?([author_note], mr, config)
