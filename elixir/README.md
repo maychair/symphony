@@ -62,6 +62,15 @@ comments use the Review lane's webhook configuration when enabled. If one
 project hook supplies both kinds of comments, configure its secret on both
 consumers. Commit and snippet comments do not refresh Issue scheduling.
 
+Set `tracker.provider.review_lane.event_driven: true` in a GitLab workflow
+to discover and reconcile reviews from scoped MR and MR comment webhooks.
+The Review listener keeps hints in its existing journal, reads only the
+named MR, and wakes the scheduler when the resulting review record changes.
+A failed hint uses `poll_interval_ms` as its retry delay. An idle listener
+does not list native reviews, and dispatch reads its queued records from
+memory. Admission and native allocation still verify the selected MR.
+Changing the mode takes effect when the Review listener restarts.
+
 ### Merged-delivery cleanup
 
 `workspace.merge_cleanup_command` is an optional trusted operator command,

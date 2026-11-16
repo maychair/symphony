@@ -1628,6 +1628,10 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @doc "Wake dispatch after an asynchronous producer has queued work."
+  @spec notify_work_ready() :: :ok
+  def notify_work_ready, do: GenServer.cast(RuntimeContext.server(__MODULE__), :work_ready)
+
   @spec retry_now(String.t()) :: :ok | :not_retrying | :unavailable
   def retry_now(issue_id), do: retry_now(RuntimeContext.server(__MODULE__), issue_id)
 
@@ -1741,9 +1745,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_call(:request_refresh, _from, state) do
-    now_ms = System.monotonic_time(:millisecond)
-    already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
-    coalesced = state.poll_check_in_progress == true or already_due?
+    coalesced = refresh_pending?(state)
     state = if coalesced, do: state, else: schedule_tick(state, 0)
 
     {:reply,
@@ -1854,6 +1856,18 @@ defmodule SymphonyElixir.Orchestrator do
       message: update[:payload] || update[:raw],
       timestamp: update[:timestamp]
     }
+  end
+
+  @impl true
+  def handle_cast(:work_ready, state) do
+    {:noreply, if(refresh_pending?(state), do: state, else: schedule_tick(state, 0))}
+  end
+
+  defp refresh_pending?(state) do
+    now = System.monotonic_time(:millisecond)
+
+    state.poll_check_in_progress == true or
+      (is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now)
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do

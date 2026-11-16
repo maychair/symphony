@@ -42,6 +42,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     import sys,json,pathlib,time
     r=pathlib.Path(#{inspect(root)});a=sys.argv[1:];name=pathlib.Path(sys.argv[0]).name
     path=a[a.index('--method')+2];method=a[a.index('--method')+1]
+    if #{if test_context[:event_driven], do: "True", else: "False"}:
+      with (r/'requests.jsonl').open('a') as log:log.write(json.dumps([method,path])+'\\n')
     if method=='GET' and (r/'hold-scan').exists():
       (r/'scan-held').write_text('ready');deadline=time.monotonic()+15
       while not (r/'release-scan').exists() and time.monotonic()<deadline:time.sleep(0.01)
@@ -86,6 +88,11 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       "glab_bin" => Path.join(root, "glab")
     }
 
+    config =
+      if test_context[:event_driven],
+        do: Map.merge(config, %{"event_driven" => true, "poll_interval_ms" => 30_000}),
+        else: config
+
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
@@ -101,6 +108,76 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     start_supervised!({Listener, config: config})
     await_listener()
     {:ok, root: root, config: config}
+  end
+
+  @tag event_driven: true
+  test "GitLab review discovery reads only hinted reviews and reconciles head changes without a scan", c do
+    assert Listener.health().discovery == :webhook
+    assert {:ok, []} = Listener.issues()
+    refute File.exists?(Path.join(c.root, "requests.jsonl"))
+
+    :ok = Listener.request_review("team/repo", 1)
+    [record] = await_board_records()
+    assert record["eligibility"] == "current"
+    assert record["phase"] == "queued"
+    calls = review_requests(c)
+    assert ["GET", "projects/team%2Frepo/merge_requests/1"] in calls
+    refute Enum.any?(calls, fn [_, path] -> String.contains?(path, "/merge_requests?") end)
+
+    File.touch!(Path.join(c.root, "changed-head"))
+    assert {:ok, [issue]} = Listener.issues()
+    assert issue.dispatchable
+    assert review_requests(c) == calls
+
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "superseded", "round" => 1} = await_review_record("superseded")
+    assert {:ok, [superseded]} = Listener.issues()
+    refute superseded.dispatchable
+  end
+
+  @tag event_driven: true
+  test "a failed review hint remains in the journal and resumes after listener restart", c do
+    File.touch!(Path.join(c.root, "fail-read"))
+    :ok = Listener.request_review("team/repo", 1)
+    assert eventually_review(fn -> Listener.health().error != nil end)
+    assert Listener.health().pending_hints == 1
+    assert {:ok, []} = Listener.issues()
+
+    :ok = stop_supervised(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    assert [%{"phase" => "queued"}] = await_board_records()
+    assert Listener.health().pending_hints == 0
+    refute Enum.any?(review_requests(c), fn [_, path] -> String.contains?(path, "/merge_requests?") end)
+  end
+
+  defp review_requests(c) do
+    c.root
+    |> Path.join("requests.jsonl")
+    |> File.stream!()
+    |> Enum.map(&Jason.decode!/1)
+  end
+
+  defp await_review_record(eligibility) do
+    assert eventually_review(fn ->
+             {:ok, %{records: records}} = Listener.board_snapshot()
+             Enum.any?(records, &(&1["eligibility"] == eligibility))
+           end)
+
+    {:ok, %{records: [record]}} = Listener.board_snapshot()
+    record
+  end
+
+  defp eventually_review(predicate, tries \\ 500)
+  defp eventually_review(predicate, 0), do: predicate.()
+
+  defp eventually_review(predicate, tries) do
+    if predicate.() do
+      true
+    else
+      Process.sleep(10)
+      eventually_review(predicate, tries - 1)
+    end
   end
 
   test "a current canonical review does not requeue after its shared policy changes", c do
