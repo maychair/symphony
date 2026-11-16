@@ -25,6 +25,7 @@ polling:
 workspace:
   root: ~/code/symphony-workspaces
   # Optional trusted operator command; one asynchronous pass per poll, single-flight.
+  # Periodic calls have no arguments; authenticated GitLab merge hints arrive as JSON in $1.
   merge_cleanup_command: null
 hooks:
   after_create: |

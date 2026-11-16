@@ -70,7 +70,110 @@ defmodule SymphonyElixirWeb.WebhookControllerTest do
     assert Jason.decode!(resp.resp_body) == %{"accepted" => false, "disabled" => true}
   end
 
-  defp configure(provider, secret, disabled \\ false) do
+  test "authenticated GitLab merge hints reach cleanup with issue dispatch disabled" do
+    secret = String.duplicate("s", 32)
+    root = Path.dirname(Workflow.workflow_file_path())
+    log = Path.join(root, "merge-hints.jsonl")
+    gate = Path.join(root, "gate")
+    command = ~s(if [ -n "$1" ]; then printf '%s\\n' "$1" >> '#{log}'; while [ ! -f '#{gate}' ]; do sleep 0.01; done; fi)
+    configure("gitlab", secret, true, command)
+
+    try do
+      assert gitlab_merge(secret, 7, "open").status == 202
+      assert gitlab_merge("wrong", 7, "merge").status == 403
+      refute File.exists?(log)
+      assert gitlab_merge(secret, 7, "merge").status == 202
+      await_hints(log, 1)
+      assert gitlab_merge(secret, 7, "merge").status == 202
+      assert gitlab_merge(secret, 8, "merge").status == 202
+      assert read_hints(log) == [%{"provider" => "gitlab", "project_id" => 101, "project" => "team/repo", "iid" => 7}]
+      File.touch!(gate)
+      await_hints(log, 2)
+      assert Enum.map(read_hints(log), & &1["iid"]) == [7, 8]
+    after
+      File.touch!(gate)
+    end
+  end
+
+  test "an enabled tracker acknowledges a merge and retries a failing hint on its existing poll" do
+    secret = String.duplicate("s", 32)
+    root = Path.dirname(Workflow.workflow_file_path())
+    log = Path.join(root, "merge-retry.jsonl")
+    gate = Path.join(root, "allow")
+    command = ~s(if [ -n "$1" ]; then printf '%s\\n' "$1" >> '#{log}'; test -f '#{gate}'; fi)
+    configure("gitlab", secret, false, command)
+
+    assert gitlab_merge(secret, 7, "merge").status == 202
+    assert eventually(fn -> MapSet.size(:sys.get_state(Orchestrator).merge_cleanup_pending) == 1 end)
+    File.touch!(gate)
+    send(Orchestrator, :run_poll_cycle)
+
+    assert eventually(fn ->
+             state = :sys.get_state(Orchestrator)
+             is_nil(state.merge_cleanup_ref) and MapSet.size(state.merge_cleanup_pending) == 0
+           end)
+
+    hints = read_hints(log)
+    assert length(hints) >= 2
+    assert Enum.all?(hints, &(&1["iid"] == 7))
+  end
+
+  test "a merge hint gets a retryable response while the configured orchestrator is unavailable" do
+    secret = String.duplicate("s", 32)
+    configure("gitlab", secret, true, "true")
+    supervisor = SymphonyElixir.AgentRuntimeSupervisor
+    assert :ok = Supervisor.terminate_child(supervisor, Orchestrator)
+
+    try do
+      response = gitlab_merge(secret, 7, "merge")
+      assert response.status == 503
+      assert Jason.decode!(response.resp_body) == %{"error" => "merge_cleanup_unavailable"}
+    after
+      assert {:ok, _pid} = Supervisor.restart_child(supervisor, Orchestrator)
+    end
+  end
+
+  defp eventually(predicate, attempts \\ 100)
+  defp eventually(predicate, 0), do: predicate.()
+
+  defp eventually(predicate, attempts) do
+    if predicate.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(predicate, attempts - 1)
+    end
+  end
+
+  defp gitlab_merge(secret, iid, action) do
+    payload = %{
+      "object_kind" => "merge_request",
+      "project" => %{"id" => 101, "path_with_namespace" => "team/repo", "web_url" => "https://review.invalid/team/repo"},
+      "object_attributes" => %{"iid" => iid, "action" => action, "state" => if(action == "merge", do: "merged", else: "opened")}
+    }
+
+    conn = Plug.Test.conn(:post, "/", payload) |> Conn.put_req_header("x-gitlab-token", secret)
+    WebhookController.receive_event(conn, %{"provider" => "gitlab"})
+  end
+
+  defp await_hints(log, count, attempts \\ 100)
+  defp await_hints(log, count, 0), do: assert(length(read_hints(log)) == count)
+
+  defp await_hints(log, count, attempts) do
+    if length(read_hints(log)) != count do
+      Process.sleep(10)
+      await_hints(log, count, attempts - 1)
+    end
+  end
+
+  defp read_hints(log) do
+    case File.read(log) do
+      {:ok, lines} -> lines |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+      {:error, :enoent} -> []
+    end
+  end
+
+  defp configure(provider, secret, disabled \\ false, command \\ nil) do
     File.write!(Workflow.workflow_file_path(), """
     ---
     tracker:
@@ -84,6 +187,10 @@ defmodule SymphonyElixirWeb.WebhookControllerTest do
         api_url: https://review.invalid/api/v4
         token: fixture
         webhook_secret: #{Jason.encode!(secret)}
+    workspace:
+      merge_cleanup_command: #{Jason.encode!(command)}
+    polling:
+      interval_ms: 3600000
     ---
     Webhook fixture
     """)
