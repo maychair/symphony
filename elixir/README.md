@@ -121,6 +121,21 @@ its authenticated merge events still reach a configured cleanup command. No
 execution session or scheduler-owned checkout is required for the webhook hint.
 Ordinary `workspace.retain` semantics are unchanged.
 
+### Closed Issue cleanup
+
+Set the optional `workspace.issue_cleanup_command` for ordinary GitLab Issues
+with `tracker.provider.task_workflow: true`. Symphony invokes it after reading
+back the current Issue as closed and confirming execution stopped, including
+when `symphony:accept` closes the Issue. The command receives a JSON object in
+`$1` with `provider`, `project`, `iid` (a string), native Issue `url`, and
+`closed_at`. It should confirm that closure and return only resources owned by
+that Issue. Related Issues may remain open.
+
+The command uses `hooks.timeout_ms` and must tolerate retries. Symphony records
+success against the native closure timestamp. A failed invocation leaves
+reconciliation pending. The command does not replace checkout retention or
+merged-MR cleanup.
+
 After retries are exhausted, a new webhook or a process restart replays the
 recorded Issue, Review, or merge hint. Startup also reconciles configured plan
 roots. For a missed delivery, replay the webhook from GitLab or trigger a new

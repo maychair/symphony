@@ -28,6 +28,9 @@ workspace:
   # Optional trusted operator command; one asynchronous pass per poll, single-flight.
   # Periodic calls have no arguments; authenticated GitLab merge hints arrive as JSON in $1.
   merge_cleanup_command: null
+  # Optional operator command after a versioned GitLab Issue closes and execution stops.
+  # Receives the closed Issue as JSON in $1.
+  issue_cleanup_command: null
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .

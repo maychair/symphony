@@ -514,6 +514,9 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, next} ->
             %{next | issue_event_ids: MapSet.delete(next.issue_event_ids, id), issue_event_failures: Map.delete(next.issue_event_failures, id)}
 
+          {:deferred, next} ->
+            next
+
           {:error, reason} ->
             retain_issue_event(state, id, reason)
         end
@@ -542,10 +545,17 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- TaskReconciler.refresh_notified(id, state.running[id]) do
       state = reconcile_notified_issue(state, issue, active, terminal)
 
-      if candidate_issue?(issue, active, terminal) do
-        {:ok, %{state | issue_event_candidates: Map.put(state.issue_event_candidates, id, issue)}}
-      else
-        forget_issue_event(state, id)
+      cond do
+        candidate_issue?(issue, active, terminal) ->
+          {:ok, %{state | issue_event_candidates: Map.put(state.issue_event_candidates, id, issue)}}
+
+        Map.has_key?(state.running, id) and terminal_issue_state?(issue.state, terminal) and
+          TaskReconciler.enabled?() and Config.settings!().workspace.issue_cleanup_command not in [nil, ""] ->
+          # Keep the durable close notification until the worker releases its journal.
+          {:deferred, %{state | issue_event_candidates: Map.delete(state.issue_event_candidates, id)}}
+
+        true ->
+          forget_issue_event(state, id)
       end
     end
   end

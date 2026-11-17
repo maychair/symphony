@@ -2374,6 +2374,13 @@ unknown outcomes and explicit identities rather than infer success from wrappers
 
 An implementation may accept `workspace.merge_cleanup_command`, a trusted operator command disabled by default. It runs at most one asynchronous pass at a time. An authenticated and scoped GitLab merge webhook can request an immediate pass and supply the native project identity and MR IID. The command can receive these hints even with tracker dispatch disabled. Hints are advisory; the command confirms native merge and task identity, applies local policy and returns the ended task's ownership without removing the checkout. It must tolerate repeated notifications and never return a different task's ownership. Ordinary workspace retention is unchanged.
 
+For ordinary GitLab Issues with versioned task reconciliation, an implementation
+may also accept `workspace.issue_cleanup_command`. After native readback of the
+current Issue's closure and confirmation that its execution stopped, the
+command receives the Issue identity and closure timestamp. It may return only
+that Issue's ownership, even when related Issues remain open. The command must
+be safe to retry and preserve checkout retention.
+
 Repository tracker extension: `tracker.assignee` restricts GitLab/GitHub routing to that sole native owner. Ownership checks compose with required labels across admission, reconciliation, retry/recovery and continuation. Other tracker assignment semantics remain provider-owned.
 
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR, posts the deduplicated review notification and requests the engine-owned review label, without another Agent call. Handoff never writes or removes the human authorization label. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
