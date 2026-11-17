@@ -81,7 +81,7 @@ defmodule SymphonyElixir.TaskReconcilerTest do
             {{:ok, %{status: 200, body: state.dependency}}, state}
 
           method == "PUT" and body["state_event"] == "close" ->
-            raw = Map.put(state.raw, "state", "closed")
+            raw = Map.merge(state.raw, %{"state" => "closed", "closed_at" => "2026-10-16T00:01:00Z"})
             {{:ok, %{status: 200, body: raw}}, %{state | raw: raw}}
 
           method == "PUT" ->
@@ -939,6 +939,15 @@ defmodule SymphonyElixir.TaskReconcilerTest do
   end
 
   test "authorized closure waits for native stop and verifies the close write", %{issue: issue, server: server, client: client} do
+    workflow = Workflow.workflow_file_path()
+    root = Path.dirname(workflow)
+    log = Path.join(root, "issue-cleanup.log")
+    gate = Path.join(root, "cleanup-ready")
+    command = ~s(test -f '#{gate}' || exit 75; printf '%s\\n' "$1" >> '#{log}')
+    config = "workspace:\n  issue_cleanup_command: #{Jason.encode!(command)}\n"
+    File.write!(workflow, String.replace(File.read!(workflow), "\nagent:", "\n" <> config <> "agent:"))
+    :ok = WorkflowStore.force_reload()
+
     research = %{
       "type" => "research",
       "criteria" => ["answer"],
@@ -964,7 +973,8 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     item = %{"id" => "report", "kind" => "report", "url" => issue.url <> "#note_2", "version" => TaskWorkflow.digest("Evidenced conclusion"), "criteria" => ["answer"]}
     submission = note(3, "manifest", %{"contract" => contract, "items" => [item]}, contract)
     append(server, submission)
-    append(server, note(4, "accept", %{"manifest" => TaskReconciler.source_ref(submission)}, contract, 2))
+    accept = label_event(12, "symphony:accept", "2026-10-16T00:00:04Z", "add", 2)
+    Agent.update(server, &%{&1 | label_events: &1.label_events ++ [accept]})
     {:ok, record} = RunJournal.checkpoint(record, %{"native_stop_confirmed" => false, "thread_allocation_intent" => true})
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert Agent.get(server, & &1.raw["state"]) == "opened"
@@ -975,11 +985,29 @@ defmodule SymphonyElixir.TaskReconcilerTest do
     end
 
     assert {:error, {:issue_closure_unconfirmed, _}} = TaskReconciler.refresh(record, false, client: fail_close)
-    {:ok, record} = TaskReconciler.refresh(current(record), false)
+    refute File.exists?(log)
+    assert {:error, {:issue_cleanup_unconfirmed, {:exit_status, 75}}} = TaskReconciler.refresh(current(record), false)
+    record = current(record)
     assert record["closure_confirmed"]
     assert Agent.get(server, & &1.raw["state"]) == "closed"
+    assert Agent.get(server, & &1.dependency["state"]) == "opened"
+    refute Enum.any?(Agent.get(server, & &1.calls), fn {_, path, _, _} -> String.ends_with?(path, "/issues/7") end)
+    refute File.exists?(log)
+    working_config = File.read!(workflow)
+    timeout_config = "workspace:\n  issue_cleanup_command: \"sleep 1\"\nhooks:\n  timeout_ms: 20\n"
+    File.write!(workflow, String.replace(working_config, config, timeout_config))
+    :ok = WorkflowStore.force_reload()
+    assert {:error, {:issue_cleanup_unconfirmed, :timeout}} = TaskReconciler.refresh(record, false)
+    File.write!(workflow, working_config)
+    :ok = WorkflowStore.force_reload()
+    File.touch!(gate)
+
     {:ok, record} = TaskReconciler.refresh(record, false)
     assert record["workflow"]["state"] == "ended"
+    assert record["issue_cleanup_confirmed"] == "2026-10-16T00:01:00Z"
+    assert {:ok, _} = TaskReconciler.refresh(record, false)
+    assert [hint] = log |> File.stream!() |> Enum.map(&Jason.decode!/1)
+    assert hint == %{"provider" => "gitlab", "project" => "group/project", "iid" => "42", "url" => issue.url, "closed_at" => record["issue_cleanup_confirmed"]}
     assert :ok = Execution.finish(issue, opts, {:error, {:native_goal_stopped, "blocked"}})
     refute current(record)["retry_count"]
   end

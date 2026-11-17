@@ -116,13 +116,14 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:retain, :boolean, default: false)
       field(:merge_cleanup_command, :string)
+      field(:issue_cleanup_command, :string)
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root, :retain, :merge_cleanup_command], empty_values: [])
+      |> cast(attrs, [:root, :retain, :merge_cleanup_command, :issue_cleanup_command], empty_values: [])
     end
   end
 

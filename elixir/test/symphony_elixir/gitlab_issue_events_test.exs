@@ -53,14 +53,17 @@ defmodule SymphonyElixir.GitLabIssueEventsTest do
         api_url: https://gitlab.invalid/api/v4
         webhook_secret: "#{secret}"
         event_driven: true
+        task_workflow: #{context[:issue_cleanup] == true}
     agent:
       run_journal_dir: "#{journal}"
       max_concurrent_agents: 1
+      goal_mode: #{context[:issue_cleanup] == true}
     codex:
       command: sleep 20
     workspace:
       root: "#{Path.join(root, "workspaces")}"
       merge_cleanup_command: #{Jason.encode!(command)}
+      issue_cleanup_command: #{if(context[:issue_cleanup], do: Jason.encode!(command), else: "null")}
     polling:
       interval_ms: #{context[:event_retry_ms] || 3_600_000}
     ---
@@ -163,6 +166,26 @@ defmodule SymphonyElixir.GitLabIssueEventsTest do
     assert :sys.get_state(Orchestrator).next_poll_due_at_ms == nil
     assert {:ok, []} = RunJournal.issue_events(c.journal, c.scope)
     refute_received {:issue_scan, _}
+  end
+
+  @tag issue_cleanup: true, event_retry_ms: 50
+  test "the close hint stays durable while the native worker is stopping", c do
+    start_supervised!(Orchestrator)
+    worker = self()
+    issue = %Issue{id: "42", identifier: "GL-42", title: "Issue 42", state: "opened"}
+
+    :sys.replace_state(Orchestrator, fn state ->
+      %{state | running: %{"42" => %{pid: worker, ref: make_ref(), identifier: issue.identifier, issue: issue}}}
+    end)
+
+    assert deliver("team/repo", c.secret, 42, :close).status == 202
+    assert_receive {:issue_read, ["42"]}, 1_000
+    assert_receive :symphony_stop, 1_000
+    assert {:ok, ["42"]} = RunJournal.issue_events(c.journal, c.scope)
+
+    :sys.replace_state(Orchestrator, &%{&1 | running: %{}})
+    assert_receive {:issue_read, ["42"]}, 1_000
+    assert await_cleanup(fn -> RunJournal.issue_events(c.journal, c.scope) == {:ok, []} end)
   end
 
   test "a queued Issue takes a freed slot without another notification or a scan", c do

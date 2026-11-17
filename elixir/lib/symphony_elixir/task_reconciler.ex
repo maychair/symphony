@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.TaskReconciler do
   @moduledoc "Reconcile Issue decisions on the existing execution and scheduler loops."
   require Logger
-  alias SymphonyElixir.{Config, Execution, RunJournal, TaskAuthority, TaskDecision, TaskWorkflow}
+  alias SymphonyElixir.{Config, Execution, RunJournal, RuntimeContext, TaskAuthority, TaskDecision, TaskWorkflow}
   alias SymphonyElixir.GitLab.Client
 
   # Human labels. The engine never writes them: authorization, rework and
@@ -254,8 +254,9 @@ defmodule SymphonyElixir.TaskReconciler do
 
       with {:ok, saved} <- RunJournal.checkpoint(record, %{"workflow" => flow}),
            {:ok, saved} <- notify_restrictions(saved, path, settings, client, facts),
-           {:ok, saved} <- maybe_close(saved, raw, path, settings, client) do
-        routing(saved, raw, path, settings, client, active)
+           {:ok, saved, current} <- maybe_close(saved, raw, path, settings, client),
+           {:ok, saved} <- cleanup_closed_issue(saved, current, settings, active) do
+        routing(saved, current, path, settings, client, active)
       end
     end
   end
@@ -348,13 +349,61 @@ defmodule SymphonyElixir.TaskReconciler do
       with {:ok, intent} <- RunJournal.checkpoint(record, %{"closure_intent" => conclusion}),
            {:ok, _} <- request(client, "PUT", path, %{"state_event" => "close"}, settings),
            {:ok, current} <- get(client, path, settings),
-           true <- current["state"] == "closed" do
-        RunJournal.checkpoint(intent, %{"closure_confirmed" => conclusion})
+           true <- current["state"] == "closed" and current["web_url"] == record["issue_url"],
+           {:ok, confirmed} <- RunJournal.checkpoint(intent, %{"closure_confirmed" => conclusion}) do
+        {:ok, confirmed, current}
       else
         error -> {:error, {:issue_closure_unconfirmed, error}}
       end
     else
+      {:ok, record, raw}
+    end
+  end
+
+  defp cleanup_closed_issue(record, %{"state" => "closed", "closed_at" => closed_at}, settings, false)
+       when is_binary(closed_at) do
+    command = Config.settings!().workspace.issue_cleanup_command
+
+    if is_binary(command) and command != "" and stopped?(record) and record["issue_cleanup_confirmed"] != closed_at do
+      hint = %{
+        "provider" => "gitlab",
+        "project" => settings.provider["project_path"],
+        "iid" => record["issue_id"],
+        "url" => record["issue_url"],
+        "closed_at" => closed_at
+      }
+
+      case run_issue_cleanup(command, hint) do
+        :ok -> RunJournal.checkpoint(record, %{"issue_cleanup_confirmed" => closed_at})
+        {:error, reason} -> {:error, {:issue_cleanup_unconfirmed, reason}}
+      end
+    else
       {:ok, record}
+    end
+  end
+
+  defp cleanup_closed_issue(record, _raw, _settings, _active), do: {:ok, record}
+
+  defp run_issue_cleanup(command, hint) do
+    timeout = Config.settings!().hooks.timeout_ms
+
+    task =
+      Task.async(
+        RuntimeContext.wrap(fn ->
+          System.cmd("bash", ["-c", command, "issue-cleanup", Jason.encode!(hint)], stderr_to_stdout: true, env: Map.to_list(RuntimeContext.environment()))
+        end)
+      )
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {_, 0}} ->
+        Logger.info("Issue workspace cleanup completed issue_url=#{hint["url"]}")
+        :ok
+
+      {:ok, {_, status}} ->
+        {:error, {:exit_status, status}}
+
+      nil ->
+        {:error, :timeout}
     end
   end
 

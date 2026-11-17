@@ -237,6 +237,9 @@ no valid basis remains waiting; it is not reopened automatically. Reopening adds
 an explicit `reopen` restriction. A pause does not revoke an existing merge
 acceptance agreement, and a legitimate merge during pause can conclude the task
 without restarting an agent. Cleanup is independent of business acceptance.
+An operator can configure `workspace.issue_cleanup_command` to return the
+current Issue's resources after its native closure and confirmed execution
+stop. This cleanup does not require related Issues to close.
 
 ## Accounting, recovery and rollout
 

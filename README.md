@@ -65,6 +65,10 @@ The Taskboard includes only Issues carrying the human-owned `symphony:todo` memb
 
 For ordinary GitLab Issues using `task_workflow`, Done is verified by read-only native replay of the current agreement, manifest and acceptance sources, matched against the retained lifecycle. The Issue must be closed, its execution completed and its native stop confirmed. Missing, edited or unreadable evidence remains in Human Review. Reading the board neither executes work nor updates its journal.
 
+Deployments can use [closed Issue cleanup](elixir/README.md#closed-issue-cleanup)
+to return the closed Issue's resources after execution stops. Related Issues
+may remain open.
+
 Verified GitLab MR publication can emit an attempt-scoped `review-request-ATTEMPT.json` in the execution journal. The existing Agent loop verifies the native MR, posts the deduplicated review notification and requests the engine-owned `symphony:review` label, without another Agent call. Handoff never writes or removes the human `symphony:ready` authorization label. Checkpoints expose derived `stage_results`; business validation remains linked evidence and is not inferred from execution completion.
 
 ## Versioned task workflow
