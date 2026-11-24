@@ -328,16 +328,14 @@ defmodule SymphonyElixir.TaskReconciler do
   end
 
   defp post_wait_notice(notes, body, path, settings, client) do
-    if Enum.any?(notes, &(&1["body"] == body)) do
-      :ok
-    else
+    SymphonyElixir.WaitNotice.ensure(notes, &(&1["body"] == body), fn ->
       with {:ok, note} <- request(client, "POST", path <> "/notes", %{"body" => body}, settings),
            true <- is_map(note) and note["body"] == body do
         :ok
       else
         error -> {:error, {:waiting_notice_unconfirmed, error}}
       end
-    end
+    end)
   end
 
   defp maybe_close(record, raw, path, settings, client) do

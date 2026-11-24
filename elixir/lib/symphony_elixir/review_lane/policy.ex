@@ -1,4 +1,6 @@
 defmodule SymphonyElixir.ReviewLane.Policy do
+  alias SymphonyElixir.ReviewLane.WaitNotice
+
   @moduledoc "Native reviewer request and review-once admission. Remote text never supplies execution authority."
 
   @spec requested_reviewer?(map(), pos_integer()) :: boolean()
@@ -12,6 +14,48 @@ defmodule SymphonyElixir.ReviewLane.Policy do
   def prior_review?(discussions, mr, config) when is_list(discussions) and is_map(mr) and is_map(config) do
     approved?(mr) or Enum.any?(discussions, &discussion_reviewed?(&1, mr, config))
   end
+
+  @doc "Check native evidence of an existing comment by the configured publisher."
+  @spec publisher_comment?([map()], map()) :: boolean()
+  def publisher_comment?(discussions, config) do
+    Enum.any?(discussion_notes(discussions), fn {_discussion, note} -> publisher_note?(note, config) end)
+  end
+
+  @doc "Verify the submitted body and report URL against a native publisher comment."
+  @spec delivered_comment?([map()], map(), String.t(), map()) :: boolean()
+  def delivered_comment?(discussions, config, url, %{"body" => body, "artifacts" => artifacts})
+      when is_binary(body) and is_list(artifacts) do
+    Enum.any?(discussion_notes(discussions), fn {discussion, note} ->
+      publisher_note?(note, config) and String.trim_trailing(note["body"]) == String.trim_trailing(body) and
+        Enum.any?(artifacts, &report_url?(&1, config, url, discussion, note))
+    end)
+  end
+
+  def delivered_comment?(_, _, _, _), do: false
+
+  defp discussion_notes(discussions) do
+    for %{"notes" => notes} = discussion <- discussions, is_list(notes), %{} = note <- notes, do: {discussion, note}
+  end
+
+  defp publisher_note?(%{"id" => id, "body" => body, "author" => %{"id" => author}} = note, %{"publisher_id" => publisher})
+       when is_integer(id) and id > 0 and is_integer(author) and is_binary(body),
+       do: note["system"] != true and author == publisher and String.trim(body) != "" and not WaitNotice.status_note?(note)
+
+  defp publisher_note?(_, _), do: false
+
+  defp report_url?(%{"url" => report}, config, url, discussion, note) do
+    case comment_anchor(config, discussion, note["id"]) do
+      nil -> false
+      anchor -> report == url <> anchor
+    end
+  end
+
+  defp report_url?(_, _, _, _, _), do: false
+
+  defp comment_anchor(%{"provider" => "gitlab"}, _, id), do: "#note_#{id}"
+  defp comment_anchor(%{"provider" => "github"}, %{"id" => "issue_comment_" <> _}, id), do: "#issuecomment-#{id}"
+  defp comment_anchor(%{"provider" => "github"}, %{"id" => "pull_review_" <> _}, id), do: "#pullrequestreview-#{id}"
+  defp comment_anchor(_, _, _), do: nil
 
   defp approved?(mr) do
     mr["approved"] == true or
@@ -27,7 +71,8 @@ defmodule SymphonyElixir.ReviewLane.Policy do
   defp discussion_reviewed?(_discussion, _mr, _config), do: false
 
   defp note_reviewed?(note, mr, config) when is_map(note) do
-    automatic_review_note?(note, config) or human_review_note?(note, mr, config) or approval_note?(note)
+    not WaitNotice.status_note?(note) and
+      (automatic_review_note?(note, config) or human_review_note?(note, mr, config) or approval_note?(note))
   end
 
   defp note_reviewed?(_note, _mr, _config), do: false

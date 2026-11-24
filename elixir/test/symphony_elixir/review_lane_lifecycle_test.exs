@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   use SymphonyElixir.TestSupport, runtime: false
-  alias SymphonyElixir.ReviewLane.{Listener, Runner}
+  alias SymphonyElixir.ReviewLane.{Listener, Policy, Runner, WaitNotice}
   alias SymphonyElixir.Taskboard.Reviews
   alias SymphonyElixirWeb.WebhookController
 
@@ -57,11 +57,22 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     if method=='GET' and '/discussions' in path and (r/'fail-read').exists():
       (r/'fail-read').unlink();sys.exit(3)
     ds=json.loads((r/'discussions.json').read_text())
-    if path=='user':out={'id':20,'username':'reviewer'}
+    if path=='user':
+      if (r/'advance-at-notice-send').exists():(r/'changed-head').touch()
+      out={'id':20,'username':'reviewer'}
     elif '/discussions' in path:
-      assert method=='GET', 'Scheduler attempted publication'
-      out=ds
+      if method=='POST' and #{if test_context[:wait_notice], do: "True", else: "False"}:
+        if (r/'reject-notice').exists():sys.exit(3)
+        body=a[a.index('--raw-field')+1].removeprefix('body=')
+        out={'id':'notice','notes':[{'id':123,'body':body,'author':{'id':20}}]}
+        (r/'discussions.json').write_text(json.dumps(ds+[out]))
+        if (r/'lose-notice-response').exists():sys.exit(3)
+      else:
+        assert method=='GET', 'Scheduler attempted publication'
+        out=ds
     else:out={'id':1001,'project_id':10,'iid':1,'state':'opened','sha':('c' if (r/'changed-head').exists() else 'a')*40,'diff_refs':{'base_sha':'b'*40},'target_branch':('release' if (r/'changed-target').exists() else 'main'),'author':{'id':30},'reviewers':[{'id':20,'username':'reviewer'}],'web_url':'https://review.invalid/team/repo/-/merge_requests/1'}
+    if isinstance(out,dict) and out.get('iid')==1 and #{if test_context[:wait_notice], do: "True", else: "False"}:
+      out['assignees']=[{}, {'id':30,'username':'author'}]
     if path=='projects/team%2Frepo':out={'id':10,'path_with_namespace':'team/repo','web_url':'https://review.invalid/team/repo'}
     elif '/merge_requests?' in path:out=[out]
     print(json.dumps(out))
@@ -131,10 +142,276 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert review_requests(c) == calls
 
     :ok = Listener.request_review("team/repo", 1)
-    assert %{"eligibility" => "superseded", "round" => 1} = await_review_record("superseded")
-    assert {:ok, [superseded]} = Listener.issues()
+    assert eventually_review(fn -> length(await_board_records()) == 2 end)
+    assert {:ok, issues} = Listener.issues()
+    superseded = Enum.find(issues, &(&1.id == issue.id))
     refute superseded.dispatchable
+    assert superseded.native_ref["phase"] == "superseded"
     assert {:error, :review_execution_fenced} = Listener.begin_run(superseded.id)
+    assert [latest] = Enum.filter(issues, & &1.dispatchable)
+    assert latest.native_ref["head"] == String.duplicate("c", 40)
+  end
+
+  @tag event_driven: true, event_retry_ms: 60
+  test "a changed head replaces an undelivered round after its owner stops, then the native comment ends the request", c do
+    :ok = Listener.request_review("team/repo", 1)
+    [record] = await_board_records()
+    id = "review:" <> record["id"]
+
+    owner =
+      Task.async(fn ->
+        {:ok, running, _} = Listener.begin_run(id)
+
+        receive do
+          :stop -> Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true, "phase" => "fenced"})
+        end
+      end)
+
+    assert eventually_review(fn -> Enum.any?(Listener.health().fenced_runs, &(&1["phase"] == "running")) end)
+
+    File.touch!(Path.join(c.root, "changed-head"))
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "superseded"} = await_review_record("superseded")
+    assert {:ok, [stale]} = Listener.issues()
+    refute stale.dispatchable
+
+    File.touch!(Path.join(c.root, "fail-read"))
+    send(owner.pid, :stop)
+    assert Task.await(owner) == :ok
+
+    assert eventually_review(fn ->
+             {:ok, issues} = Listener.issues()
+             Enum.any?(issues, &(&1.dispatchable and &1.native_ref["head"] == String.duplicate("c", 40)))
+           end)
+
+    {:ok, issues} = Listener.issues()
+    [current] = Enum.filter(issues, & &1.dispatchable)
+    {:ok, running, _} = Listener.begin_run(current.id)
+    assert {:error, :review_execution_fenced} = Listener.begin_run(id)
+    :ok = Listener.checkpoint(current.id, running["execution_owner"], %{"native_stop_confirmed" => true})
+
+    result = %{"status" => "completed", "body" => "LGTM!", "artifacts" => [%{"label" => "Review report", "url" => record["url"] <> "#note_123"}]}
+    assert {:error, :review_comment_unverified} = Listener.submit(current.id, running["execution_owner"], %{"completion" => result})
+    note = %{"id" => 123, "body" => "LGTM!", "author" => %{"id" => 3}}
+    File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
+    assert {:error, :review_comment_unverified} = Listener.submit(current.id, running["execution_owner"], %{"completion" => result})
+    note = put_in(note, ["author", "id"], c.config["publisher_id"])
+    File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
+
+    assert {:error, :review_comment_unverified} =
+             Listener.submit(current.id, running["execution_owner"], %{"completion" => Map.put(result, "body", "Wrong body")})
+
+    assert :ok = Listener.submit(current.id, running["execution_owner"], %{"completion" => result})
+
+    File.rm!(Path.join(c.root, "changed-head"))
+    :ok = Listener.request_review("team/repo", 1)
+    assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+    assert {:ok, final} = Listener.issues()
+    assert length(final) == 2
+    refute Enum.any?(final, & &1.dispatchable)
+    assert [%{"workflow_result" => ^result}] = for(item <- final, item.native_ref["phase"] == "completed", do: item.native_ref)
+  end
+
+  @tag event_driven: true
+  test "publisher rotation keeps the existing review and its public history", c do
+    :ok = Listener.request_review("team/repo", 1)
+    [record] = await_board_records()
+    stop_supervised!(Listener)
+
+    path = Path.join(c.root, "state/review-lane.json")
+    journal = path |> File.read!() |> Jason.decode!()
+    File.write!(path, Jason.encode!(put_in(journal, ["scope", "publisher_id"], c.config["publisher_id"])))
+
+    start_supervised!({Listener, config: Map.put(c.config, "publisher_id", 25)})
+    await_listener()
+    assert {:ok, %{config: %{"publisher_id" => 25}, records: [^record]}} = Listener.board_snapshot()
+  end
+
+  @tag event_driven: true
+  test "a published comment with a lost submission prevents a duplicate after restart", c do
+    :ok = Listener.request_review("team/repo", 1)
+    [record] = await_board_records()
+    id = "review:" <> record["id"]
+    assert {:ok, running, _} = Listener.begin_run(id)
+
+    File.touch!(Path.join(c.root, "changed-head"))
+    :ok = Listener.request_review("team/repo", 1)
+    assert %{"eligibility" => "superseded"} = await_review_record("superseded")
+
+    note = %{"id" => 123, "body" => "LGTM!", "author" => %{"id" => c.config["publisher_id"]}}
+    File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
+    assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true, "phase" => "fenced"})
+
+    stop_supervised!(Listener)
+    start_supervised!({Listener, config: c.config})
+    await_listener()
+    assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+    assert {:ok, [existing]} = Listener.issues()
+    refute existing.dispatchable
+    assert existing.native_ref["phase"] == "fenced"
+  end
+
+  for outcome <- [:match, :mismatch] do
+    @tag event_driven: true, receipt_outcome: outcome
+    test "a pending comment with native #{outcome} readback reconciles after restart", c do
+      outcome = c.receipt_outcome
+      :ok = Listener.request_review("team/repo", 1)
+      [record] = await_board_records()
+      id = "review:" <> record["id"]
+      assert {:ok, running, _} = Listener.begin_run(id)
+      assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true})
+
+      note = %{"id" => 123, "body" => "LGTM!", "author" => %{"id" => c.config["publisher_id"]}}
+      File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
+      responses(c, %{"GET projects/team%2Frepo/merge_requests/1/discussions?per_page=100&page=1" => "EXIT"})
+      result = %{"body" => note["body"], "artifacts" => [%{"url" => record["url"] <> "#note_123"}]}
+      assert :ok = Listener.submit(id, running["execution_owner"], %{"completion" => result})
+      assert {:ok, %{records: [%{"pending_result" => ^result, "phase" => "fenced"}]}} = Listener.board_snapshot()
+      assert eventually_review(fn -> Listener.health().error != nil end)
+
+      stop_supervised!(Listener)
+      responses(c, %{})
+
+      if outcome == :mismatch do
+        File.write!(Path.join(c.root, "discussions.json"), "[]")
+      end
+
+      start_supervised!({Listener, config: c.config})
+      await_listener()
+
+      phase = if outcome == :match, do: "completed", else: "failed"
+
+      assert eventually_review(fn ->
+               match?({:ok, %{records: [%{"phase" => ^phase}]}}, Listener.board_snapshot())
+             end)
+
+      assert {:ok, %{records: [done]}} = Listener.board_snapshot()
+      assert done["workflow_result"] == if(outcome == :match, do: result, else: nil)
+      refute Map.has_key?(done, "pending_result")
+      assert Enum.all?(review_requests(c), fn [method, _path] -> method == "GET" end)
+    end
+  end
+
+  for outcome <- [:success, :lost_response] do
+    @tag event_driven: true, wait_notice: true, notice_outcome: outcome
+    test "Review needs_input sends one notice with #{outcome} and survives restart", c do
+      :ok = Listener.request_review("team/repo", 1)
+      [record] = await_board_records()
+      id = "review:" <> record["id"]
+      {:ok, running, _} = Listener.begin_run(id)
+      if c.notice_outcome == :lost_response, do: File.touch!(Path.join(c.root, "lose-notice-response"))
+
+      fake_discussion = %{"id" => "other", "notes" => [%{"id" => 456, "body" => "Existing note", "author" => %{"id" => 77}}]}
+      File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([fake_discussion]))
+      refute WaitNotice.status_note?(%{})
+
+      result = %{
+        "status" => "needs_input",
+        "findings" => [%{"criterion" => "Wrong default", "location" => "scripts/review.py:3", "impact" => "Missing output", "resolution" => "Retain the result."}, nil],
+        "axes" => %{
+          "spec" => %{
+            "gaps" => [
+              "Missing CI evidence.",
+              "  Missing   CI evidence. ",
+              "See /home/test/private",
+              "证据：/home/test/private",
+              "结果：Workspace/State/private",
+              "file=/tmp/private",
+              "请检查/home/test/private再运行"
+            ]
+          }
+        }
+      }
+
+      assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true})
+      assert :ok = Listener.submit(id, running["execution_owner"], %{"completion" => result})
+      assert {:error, :incomplete_review} = Listener.submit(id, running["execution_owner"], %{"completion" => result})
+      assert eventually_review(fn -> Enum.count(review_requests(c), fn [method, _] -> method == "POST" end) == 1 end)
+
+      assert eventually_review(fn ->
+               c.root |> Path.join("discussions.json") |> File.read!() |> String.contains?("symphony-review-wait")
+             end)
+
+      if c.notice_outcome == :success do
+        assert eventually_review(fn ->
+                 match?({:ok, %{records: [%{"wait_notice" => %{"state" => "confirmed"}}]}}, Listener.board_snapshot())
+               end)
+      end
+
+      stop_supervised!(Listener)
+      restored_config = if c.notice_outcome == :lost_response, do: Map.put(c.config, "publisher_id", 99), else: c.config
+      start_supervised!({Listener, config: restored_config})
+      await_listener()
+
+      assert eventually_review(fn ->
+               match?({:ok, %{records: [%{"phase" => "failed", "wait_notice" => %{"state" => "confirmed", "note_id" => 123}}]}}, Listener.board_snapshot())
+             end)
+
+      :ok = Listener.request_review("team/repo", 1)
+      assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+      assert Enum.count(review_requests(c), fn [method, _] -> method == "POST" end) == 1
+
+      [^fake_discussion, %{"notes" => [note]}] = c.root |> Path.join("discussions.json") |> File.read!() |> Jason.decode!()
+      assert note["body"] =~ "@reviewer"
+      assert note["body"] =~ "Wrong default"
+      assert length(String.split(note["body"], "Missing CI evidence.")) == 2
+      refute note["body"] =~ "private"
+      discussions = [%{"notes" => [note]}]
+      refute Policy.prior_review?(discussions, %{"author" => %{"id" => 30}}, c.config)
+      refute Policy.publisher_comment?(discussions, c.config)
+      result = %{"body" => note["body"], "artifacts" => [%{"url" => record["url"] <> "#note_123"}]}
+      refute Policy.delivered_comment?(discussions, c.config, record["url"], result)
+
+      File.touch!(Path.join(c.root, "changed-head"))
+      :ok = Listener.request_review("team/repo", 1)
+
+      assert eventually_review(fn ->
+               {:ok, issues} = Listener.issues()
+               Enum.count(issues, & &1.dispatchable) == 1
+             end)
+    end
+  end
+
+  for reason <- [:failed, :changed, :changed_after_auth, :local] do
+    @tag event_driven: true, wait_notice: true, notice_reason: reason, local_review: reason == :local
+    test "Review status notice does not publish for #{reason}", c do
+      :ok = Listener.request_review("team/repo", 1)
+      [record] = await_board_records()
+      id = "review:" <> record["id"]
+      {:ok, running, _} = Listener.begin_run(id)
+      if c.notice_reason == :changed, do: File.touch!(Path.join(c.root, "changed-head"))
+      if c.notice_reason == :changed_after_auth, do: File.touch!(Path.join(c.root, "advance-at-notice-send"))
+      result = %{"status" => if(c.notice_reason == :failed, do: "failed", else: "needs_input"), "axes" => %{"spec" => %{"gaps" => ["Missing evidence."]}}}
+      assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true})
+      assert :ok = Listener.submit(id, running["execution_owner"], %{"completion" => result})
+      :ok = Listener.request_review("team/repo", 1)
+      assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+      refute Enum.any?(review_requests(c), fn [method, _] -> method == "POST" end)
+    end
+  end
+
+  for outcome <- [:missing_receipt, :invalid_publisher, :private_details] do
+    @tag event_driven: true, event_retry_ms: 50, wait_notice: true, notice_outcome: outcome
+    test "Review wait notice fences #{outcome}", c do
+      :ok = Listener.request_review("team/repo", 1)
+      [record] = await_board_records()
+      id = "review:" <> record["id"]
+      {:ok, running, _} = Listener.begin_run(id)
+
+      case c.notice_outcome do
+        :missing_receipt -> File.touch!(Path.join(c.root, "reject-notice"))
+        :invalid_publisher -> responses(c, %{"GET user" => %{"id" => 99}})
+        :private_details -> :ok
+      end
+
+      gap = if c.notice_outcome == :private_details, do: "位置：/home/test/private", else: "Missing evidence."
+      result = %{"status" => "needs_input", "axes" => %{"spec" => %{"gaps" => [gap]}}}
+      assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true})
+      assert :ok = Listener.submit(id, running["execution_owner"], %{"completion" => result})
+      assert eventually_review(fn -> :sys.get_state(Listener).hint_failures |> Map.values() == [4] end)
+      expected = if c.notice_outcome == :missing_receipt, do: 1, else: 0
+      assert Enum.count(review_requests(c), fn [method, _] -> method == "POST" end) == expected
+    end
   end
 
   @tag event_driven: true
@@ -204,6 +481,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     end
   end
 
+  @tag local_review: true
   test "a current canonical review does not requeue after its shared policy changes", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
@@ -212,7 +490,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(hd(c.config["instruction_files"]), "\nUpdated current criteria.\n", [:append])
     assert {:ok, [retained]} = Listener.issues()
     assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
+    assert retained.native_ref["phase"] == "completed"
     refute retained.dispatchable
   end
 
@@ -237,9 +515,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert card["column"] == "Todo"
     assert File.read!(Path.join(c.root, "state/review-lane.json")) == journal
     {:ok, _} = Listener.issues()
-    assert {:ok, %{records: [record]}} = Listener.board_snapshot()
-    assert record["round"] == 1
-    assert record["eligibility"] == "superseded"
+    assert {:ok, %{records: records}} = Listener.board_snapshot()
+    assert Enum.sort(Enum.map(records, & &1["phase"])) == ["queued", "superseded"]
   end
 
   test "live disabled suppresses MR discovery and queued admission without disabling Issue discovery", c do
@@ -269,6 +546,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:ok, _, _} = Listener.begin_run(issue.id)
   end
 
+  @tag local_review: true
   test "MR disabled retains running ownership and result recording but does not queue a follow-up", c do
     {:ok, [issue]} = Listener.issues()
     assert {:ok, started, _} = Listener.begin_run(issue.id)
@@ -429,6 +707,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     GenServer.stop(replacement)
   end
 
+  @tag local_review: true
   test "queued and running review survives repeated routing polls; completion stays durable and deduplicated", c do
     assert :ok = Listener.request_review("team/repo", 1)
     assert :ok = Listener.request_review("team/repo", 1)
@@ -502,6 +781,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert Jason.decode!(File.read!(Path.join(c.root, "discussions.json"))) == []
   end
 
+  @tag local_review: true
   test "a new push after a no-findings result does not queue a new round", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, _, _} = Listener.begin_run(issue.id)
@@ -510,13 +790,14 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(Path.join(c.root, "changed-head"), "new commit")
     assert {:ok, [retained]} = Listener.issues()
     assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
+    assert retained.native_ref["phase"] == "completed"
     refute retained.dispatchable
     refute File.exists?(Path.join(c.root, "posts.json"))
     assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
   end
 
-  test "retargeting an open review retires the old round even when head and base are unchanged", c do
+  @tag local_review: true
+  test "retargeting after completion preserves the delivered review", c do
     {:ok, [issue]} = Listener.issues()
     assert issue.native_ref["target_branch"] == "main"
     {:ok, _, _} = Listener.begin_run(issue.id)
@@ -527,7 +808,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     File.write!(Path.join(c.root, "changed-target"), "release")
     assert {:ok, [retained]} = Listener.issues()
     assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
+    assert retained.native_ref["phase"] == "completed"
     refute retained.dispatchable
     assert {:ok, [^retained]} = Listener.issues()
     refute File.exists?(Path.join(c.root, "posts.json"))
@@ -542,10 +823,10 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     refute stopping.dispatchable
     assert stopping.native_ref["eligibility"] == "superseded"
     :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true, "phase" => "failed"})
-    assert {:ok, [retained]} = Listener.issues()
-    assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
-    refute retained.dispatchable
+    assert {:ok, rounds} = Listener.issues()
+    assert [replacement] = Enum.filter(rounds, & &1.dispatchable)
+    assert replacement.native_ref["round"] == 2
+    assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
   end
 
   test "ending an admitted review before thread allocation cannot release its executor ownership", c do
@@ -575,13 +856,13 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert waiting.id == issue.id
     assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
     :ok = owned_checkpoint(issue.id, %{"native_stop_confirmed" => true})
-    assert {:ok, [retained]} = Listener.issues()
-    assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
-    refute retained.dispatchable
+    assert {:ok, rounds} = Listener.issues()
+    assert [replacement] = Enum.filter(rounds, & &1.dispatchable)
+    assert replacement.native_ref["round"] == 2
+    assert {:error, :review_execution_fenced} = Listener.begin_run(issue.id)
   end
 
-  test "closed, merged and explicitly unassigned native MRs end eligibility and reopening does not queue a new round", c do
+  test "closed, merged and explicitly unassigned native MRs end eligibility and reopening restores one undelivered review", c do
     {:ok, [issue]} = Listener.issues()
     record = issue.native_ref
 
@@ -608,10 +889,10 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     end
 
     responses(c, %{path => mr})
-    assert {:ok, [retained]} = Listener.issues()
-    assert retained.native_ref["round"] == 1
-    refute retained.dispatchable
-    assert {:ok, [^retained]} = Listener.issues()
+    assert {:ok, rounds} = Listener.issues()
+    assert [replacement] = Enum.filter(rounds, & &1.dispatchable)
+    assert replacement.native_ref["round"] == 2
+    assert {:ok, ^rounds} = Listener.issues()
   end
 
   test "native scan discovers unseen assigned MRs without a mailbox or webhook and keeps failed hints durable", c do
@@ -994,6 +1275,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     refute restored.dispatchable
   end
 
+  @tag local_review: true
   test "opaque completion is retained without invoking a validator or replaying publication", c do
     {:ok, [issue]} = Listener.issues()
     {:ok, record, _} = Listener.begin_run(issue.id)
@@ -1015,7 +1297,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     refute File.exists?(Path.join(c.root, "posts.json"))
   end
 
-  @tag native_review: true
+  @tag native_review: true, local_review: true
   test "review runner executes the configured workflow once without engine-owned axes", c do
     %{issue: issue} = runner_fixture(c)
 
