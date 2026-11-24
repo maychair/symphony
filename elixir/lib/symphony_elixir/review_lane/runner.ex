@@ -81,7 +81,10 @@ defmodule SymphonyElixir.ReviewLane.Runner do
   end
 
   defp delivery(%{"publish_results" => false}), do: "Keep results local. Do not publish comments or results."
-  defp delivery(_config), do: "Publication to the selected target is authorized under the supplied workflow."
+
+  defp delivery(_config),
+    do:
+      "Publish one completed review comment to the selected target and read it back. Submit its exact body and native comment URL in the result. If review is incomplete, report the blocker through workflow_submit without publishing a review comment."
 
   defp cancelled?({:session_start_failed, {:error, :scheduler_stop}}), do: true
   defp cancelled?({:workflow_incomplete, {:error, :scheduler_stop}}), do: true

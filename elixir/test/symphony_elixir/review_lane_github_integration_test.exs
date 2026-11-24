@@ -2,7 +2,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
   use SymphonyElixir.TestSupport, runtime: false
   alias SymphonyElixir.ReviewLane.{Listener, Runner}
 
-  setup do
+  setup context do
     root = Path.dirname(Workflow.workflow_file_path())
     Supervisor.terminate_child(SymphonyElixir.Supervisor, Listener)
 
@@ -45,6 +45,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
 
     config = %{
       "enabled" => true,
+      "publish_results" => context[:publish_review] == true,
       "provider" => "github",
       "host" => "github.invalid",
       "reviewer_id" => 20,
@@ -63,7 +64,7 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     {:ok, root: root, config: config}
   end
 
-  test "assigned GitHub PR records the workflow result without posting, reacts to pushes, and stops on withdrawal", c do
+  test "assigned GitHub PR records a local result and stays completed after pushes and withdrawal", c do
     assert {:ok, [issue]} = Listener.issues()
     assert issue.native_ref["work"]["provider"] == "github"
     assert issue.native_ref["work"]["kind"] == "pr"
@@ -80,13 +81,13 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, [retained]} = Listener.issues()
     assert retained.id == issue.id
     assert retained.native_ref["round"] == 1
-    assert retained.native_ref["eligibility"] == "superseded"
+    assert retained.native_ref["phase"] == "completed"
     refute retained.dispatchable
 
     File.write!(Path.join(c.root, "timeline.json"), Jason.encode!([request_event(1, "review_requested"), request_event(2, "review_request_removed")]))
     File.write!(Path.join(c.root, "withdrawn"), "yes")
     assert {:ok, [withdrawn]} = Listener.issues()
-    assert withdrawn.native_ref["eligibility"] in ["superseded", "unassigned"]
+    assert withdrawn.native_ref["phase"] == "completed"
   end
 
   test "a GitHub author reply does not create a new review round while unchanged polls remain stable", c do
@@ -138,6 +139,20 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert complete.native_ref["phase"] == "completed"
     assert is_map(complete.native_ref["workflow_result"])
     assert File.read!(Path.join(c.root, "reviews.json")) == "[]"
+  end
+
+  @tag publish_review: true
+  test "GitHub publishing proves the provider comment and anchor type", c do
+    assert {:ok, [issue]} = Listener.issues()
+    assert {:ok, owner, _} = Listener.begin_run(issue.id)
+    assert :ok = Listener.checkpoint(issue.id, owner["execution_owner"], %{"native_stop_confirmed" => true})
+    File.write!(Path.join(c.root, "comments.json"), Jason.encode!([%{"id" => 123, "body" => "LGTM!", "user" => %{"id" => 20}}]))
+
+    completion = fn anchor -> %{"body" => "LGTM!", "artifacts" => [%{"url" => issue.url <> anchor}]} end
+    assert {:error, :review_comment_unverified} = Listener.submit(issue.id, owner["execution_owner"], %{"completion" => completion.("#pullrequestreview-123")})
+    assert :ok = Listener.submit(issue.id, owner["execution_owner"], %{"completion" => completion.("#issuecomment-123")})
+    assert {:ok, [done]} = Listener.issues()
+    assert done.native_ref["phase"] == "completed"
   end
 
   test "GitHub review webhooks use lane identity and durable hints independently of the task tracker", c do

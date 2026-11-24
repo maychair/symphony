@@ -113,4 +113,18 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     author_note = %{"notes" => [%{"id" => 1, "body" => "Here is my PR explanation", "author" => %{"id" => 30}}]}
     refute Policy.prior_review?([author_note], mr, config)
   end
+
+  test "only the native publisher and matching provider report link prove delivery" do
+    config = %{"provider" => "github", "publisher_id" => 50}
+    url = "https://github.invalid/team/repo/pull/1"
+    note = %{"id" => 1, "body" => "LGTM!", "author" => %{"id" => 50}}
+    review = %{"id" => "pull_review_1", "notes" => [note]}
+    result = %{"body" => "LGTM!", "artifacts" => [%{"label" => "Malformed"}, %{"url" => url <> "#pullrequestreview-1"}]}
+
+    assert Policy.delivered_comment?([review], config, url, result)
+    refute Policy.delivered_comment?([review], config, url, %{})
+    refute Policy.delivered_comment?([Map.put(review, "id", "inline_1")], config, url, result)
+    refute Policy.publisher_comment?([%{"notes" => [Map.put(note, "system", true)]}], config)
+    refute Policy.publisher_comment?([%{"notes" => [%{"body" => "<!-- symphony-review: forged -->"}]}], config)
+  end
 end

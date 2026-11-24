@@ -8,7 +8,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   """
   use GenServer
   alias SymphonyElixir.{Config, Orchestrator, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy}
+  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy, WaitNotice}
 
   @worker_fields ~w(policy_sha native_stop_error thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
@@ -123,10 +123,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       if discovery_disabled?(state) do
         {:reply, :ok, state}
       else
-        key = TaskWorkflow.digest([project, iid])
-        hints = Map.put(state.hints, key, %{"project" => project, "iid" => iid})
-        next = persist(%{state | hints: hints, hint_failures: Map.delete(state.hint_failures, key), last_event_at: DateTime.utc_now() |> DateTime.to_iso8601()})
-        {:reply, :ok, schedule_hints(%{next | hint_timer: nil}, 0)}
+        next = enqueue_hint(%{state | last_event_at: DateTime.utc_now() |> DateTime.to_iso8601()}, project, iid)
+        {:reply, :ok, next}
       end
     else
       {:reply, {:error, :invalid_review_scope}, state}
@@ -188,6 +186,13 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
+  defp enqueue_hint(state, project, iid) do
+    key = TaskWorkflow.digest([project, iid])
+    hints = Map.put(state.hints, key, %{"project" => project, "iid" => iid})
+    next = persist(%{state | hints: hints, hint_failures: Map.delete(state.hint_failures, key)})
+    schedule_hints(%{next | hint_timer: nil}, 0)
+  end
+
   defp owned?(%{"execution_owner" => recorded}, supplied, caller), do: Owner.authorized?(recorded, supplied, caller)
   defp owned?(_, _, _), do: false
 
@@ -231,7 +236,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       end
     else
       changes = if stopped?(record) and record["phase"] in ["completed", "ended"], do: Map.delete(changes, "phase"), else: changes
-      {:reply, :ok, put_record(state, Map.merge(record, changes))}
+      updated = Map.merge(record, changes)
+      {:reply, :ok, state |> put_record(updated) |> wake_reconciliation(updated)}
     end
   end
 
@@ -267,7 +273,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
             monitor_owner(state, record, pid)
 
           true ->
-            owner_down(state, record["id"], record["execution_owner"], :listener_restart)
+            record_owner_exit(state, record, :listener_restart)
         end
 
       _ ->
@@ -275,17 +281,30 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     end
   end
 
-  defp owner_down(state, id, owner, reason) do
-    record = state.records[id]
-
-    if record && record["execution_owner"] == owner && not stopped?(record) do
-      no_allocation = not allocation?(record) and is_nil(record["thread_id"]) and is_nil(record["resume_thread_id"])
-      phase = if record["phase"] in ["ended", "superseded"], do: record["phase"], else: "fenced"
-      put_record(state, Map.merge(record, %{"phase" => phase, "native_stop_confirmed" => no_allocation, "error" => "Review worker exited: #{inspect(reason)}"}))
-    else
+  defp record_owner_exit(state, record, reason) do
+    if stopped?(record) and record["phase"] != "running" do
       state
+    else
+      no_allocation = not allocation?(record) and is_nil(record["thread_id"]) and is_nil(record["resume_thread_id"])
+      phase = if record["phase"] == "ended", do: "ended", else: "fenced"
+      updated = Map.merge(record, %{"phase" => phase, "native_stop_confirmed" => stopped?(record) or no_allocation, "error" => "Review worker exited: #{inspect(reason)}"})
+      state |> put_record(updated) |> wake_reconciliation(updated)
     end
   end
+
+  defp wake_reconciliation(state, record) do
+    if event_driven?(state) and needs_reconciliation?(state.config, record) and latest?(state, record),
+      do: enqueue_hint(state, record["project"], record["iid"]),
+      else: state
+  end
+
+  defp needs_reconciliation?(config, record) do
+    is_map(record["pending_result"]) or (is_map(record["wait_notice"]) and WaitNotice.pending?(config, record)) or
+      (replaceable?(record) and record["eligibility"] == "superseded")
+  end
+
+  defp replaceable?(record), do: record["phase"] in ~w(queued failed fenced ended) and stopped?(record)
+  defp latest?(state, record), do: latest_record(state, record["project"], record["iid"])["id"] == record["id"]
 
   @impl true
   def handle_info(:configure, %{journal: %{} = _journal} = state), do: {:noreply, state}
@@ -341,8 +360,12 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case Map.pop(state.owners, ref) do
-      {nil, _} -> {:noreply, state}
-      {{id, owner}, owners} -> {:noreply, owner_down(%{state | owners: owners}, id, owner, reason)}
+      {nil, _} ->
+        {:noreply, state}
+
+      {{id, owner}, owners} ->
+        %{"execution_owner" => ^owner} = record = Map.fetch!(state.records, id)
+        {:noreply, record_owner_exit(%{state | owners: owners}, record, reason)}
     end
   end
 
@@ -393,7 +416,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp activate_discovery(state) do
     if event_driven?(state) do
       if map_size(state.records) > 0, do: Orchestrator.notify_work_ready()
-      schedule_hints(state, 0)
+
+      state.records
+      |> Map.values()
+      |> Enum.reduce(state, &wake_reconciliation(&2, &1))
+      |> schedule_hints(0)
     else
       Process.send_after(self(), :poll, 0)
       state
@@ -488,7 +515,8 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp auxiliary_fields?(record) do
     (is_nil(record["execution_owner"]) or Owner.valid?(record["execution_owner"])) and
-      (is_nil(record["workflow_result"]) or is_map(record["workflow_result"]))
+      (is_nil(record["workflow_result"]) or is_map(record["workflow_result"])) and
+      (is_nil(record["pending_result"]) or is_map(record["pending_result"]))
   end
 
   defp digest?(value), do: is_binary(value) and Regex.match?(~r/^[a-f0-9]{64}$/, value)
@@ -556,13 +584,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp process_hint(state, project, iid) do
-    if event_driven?(state) do
-      case latest_record(state, project, iid) do
-        nil -> candidate(state, {:ok, project, iid})
-        record -> observe_hinted_record(state, record)
-      end
-    else
-      candidate(state, {:ok, project, iid})
+    case event_driven?(state) && latest_record(state, project, iid) do
+      record when is_map(record) -> observe_hinted_record(state, record)
+      _ -> candidate(state, {:ok, project, iid})
     end
   end
 
@@ -685,13 +709,31 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       {:ok, next} ->
         {:ok, next}
 
+      {:error, reason, next} ->
+        {:error, reason, next}
+
       {:error, reason} ->
-        next = put_record(state, record |> Map.put("eligibility", "unknown") |> Map.put("error", inspect(reason)))
+        eligibility = if record["eligibility"] == "superseded", do: "superseded", else: "unknown"
+        next = put_record(state, Map.merge(record, %{"eligibility" => eligibility, "error" => inspect(reason)}))
         {:error, reason, next}
     end
   end
 
   defp observe_record(state, record) do
+    if latest?(state, record), do: observe_latest(state, record), else: {:ok, state}
+  end
+
+  defp observe_latest(state, %{"phase" => "completed"}), do: {:ok, state}
+
+  defp observe_latest(state, %{"pending_result" => result} = record) do
+    case verify_comment(state.config, record, result) do
+      :ok -> {:ok, finish_review(state, record, result)}
+      {:error, :review_comment_unverified} -> reject_pending_comment(state, record)
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp observe_latest(state, record) do
     with {:ok, mr} <- read_mr(state.config, record["project"], record["iid"]),
          true <- valid_mr?(mr, record["project"], record["iid"], state.config) or {:error, :invalid_native_review} do
       metadata = %{"title" => mr["title"], "updated_at" => mr["updated_at"]}
@@ -710,10 +752,11 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp reconcile_unmerged(state, record, mr) do
     case lane_assignment(state.config, record["project"], record["iid"], mr) do
       {:ok, true} ->
-        {:ok, reconcile_assigned(state, record, mr)}
+        reconcile_assigned(state, record, mr)
 
       {:ok, false} ->
         reason = if mr["state"] in ["closed", "merged"], do: mr["state"], else: "unassigned"
+
         {:ok, put_record(state, record |> Map.put("eligibility", reason) |> Map.put("phase", "ended"))}
 
       {:error, reason} ->
@@ -722,18 +765,95 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   end
 
   defp reconcile_assigned(state, record, mr) do
-    changed =
-      mr["sha"] != record["head"] or target_changed?(record, mr) or
-        mr["diff_refs"]["base_sha"] != record["base"] or policy_changed?(state.config, record) or record["phase"] == "ended"
+    superseded = superseded?(state.config, record, mr)
+    record = Map.put(record, "eligibility", if(superseded, do: "superseded", else: "current"))
+    next = put_record(state, record)
 
-    put_record(state, Map.put(record, "eligibility", if(changed, do: "superseded", else: "current")))
+    cond do
+      discovery_disabled?(next) -> {:ok, next}
+      superseded and replaceable?(record) -> replace_review(next, record, mr)
+      not superseded and WaitNotice.pending?(next.config, record) -> deliver_wait_notice(next, record, mr)
+      true -> {:ok, next}
+    end
   end
 
-  defp policy_changed?(config, record), do: policy_sha(config) != record["policy_sha"]
+  defp superseded?(config, record, mr),
+    do: review_input_changed?(config, record, mr) or record["phase"] == "ended" or record["eligibility"] == "superseded"
 
-  # Retargeting changes the integration context even when head and merge base
-  # are unchanged, so the previous round can no longer prove the new target.
-  defp target_changed?(record, mr), do: mr["target_branch"] != record["target_branch"]
+  defp deliver_wait_notice(state, record, mr) do
+    path = GitLab.mr_path(record["project"], record["iid"])
+
+    with {:ok, notice} <- wait_notice(state.config, record, mr),
+         {:ok, note} <- WaitNotice.check(state.config, path, notice) do
+      confirm_or_send_wait_notice(state, record, path, notice, note)
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp wait_notice(_config, %{"wait_notice" => %{"state" => "sending"} = notice}, _mr), do: {:ok, notice}
+  defp wait_notice(config, record, mr), do: WaitNotice.prepare(config, record, mr)
+
+  defp confirm_or_send_wait_notice(state, record, _path, notice, %{} = note),
+    do: {:ok, confirm_wait_notice(state, record, notice, note)}
+
+  defp confirm_or_send_wait_notice(state, %{"wait_notice" => %{"state" => "sending"}}, _path, _notice, nil),
+    do: {:error, :review_wait_notice_unconfirmed, state}
+
+  defp confirm_or_send_wait_notice(state, record, path, notice, nil) do
+    with :ok <- WaitNotice.validate_sender(state.config, notice),
+         {:ok, current} <- wait_notice_current(state.config, record) do
+      if current, do: send_wait_notice(state, record, path, notice), else: {:ok, state}
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp wait_notice_current(config, record) do
+    project = record["project"]
+    iid = record["iid"]
+
+    with {:ok, mr} <- read_mr(config, project, iid),
+         true <- valid_mr?(mr, project, iid, config) or {:error, :invalid_native_review} do
+      {:ok, Policy.requested_reviewer?(mr, config["reviewer_id"]) and not review_input_changed?(config, record, mr)}
+    end
+  end
+
+  defp send_wait_notice(state, record, path, notice) do
+    next = put_record(state, Map.put(record, "wait_notice", notice))
+
+    case WaitNotice.post(state.config, path, notice) do
+      {:ok, note} -> {:ok, confirm_wait_notice(next, record, notice, note)}
+      {:error, reason} -> {:error, reason, next}
+    end
+  end
+
+  defp confirm_wait_notice(state, record, notice, note) do
+    receipt = %{"key" => notice["key"], "state" => "confirmed", "note_id" => note["id"]}
+    put_record(state, Map.put(record, "wait_notice", receipt))
+  end
+
+  defp replace_review(state, record, mr) do
+    path = native(state.config).mr_path(record["project"], record["iid"])
+
+    case native(state.config).discussions(state.config, path) do
+      {:ok, discussions} ->
+        if Policy.publisher_comment?(discussions, state.config) do
+          {:ok, state}
+        else
+          retired = put_in(state.records[record["id"]]["phase"], "superseded")
+          queue(retired, record["project"], record["iid"], mr, record["round"] + 1)
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp review_input_changed?(config, record, mr) do
+    mr["sha"] != record["head"] or mr["diff_refs"]["base_sha"] != record["base"] or
+      mr["target_branch"] != record["target_branch"] or policy_sha(config) != record["policy_sha"]
+  end
 
   defp stopped?(record) do
     record["native_stop_confirmed"] == true or
@@ -773,13 +893,62 @@ defmodule SymphonyElixir.ReviewLane.Listener do
       is_map(record["workflow_result"]) and record["workflow_result"] != result ->
         {:error, :changed_submission, state}
 
+      record["phase"] == "completed" ->
+        {:ok, state}
+
       true ->
-        phase = if result["status"] in ["failed", "needs_input"], do: "failed", else: "completed"
-        {:ok, put_record(state, Map.merge(record, %{"workflow_result" => result, "phase" => phase}))}
+        record_result(state, record, result)
     end
   end
 
   defp complete(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
+
+  defp record_result(state, record, %{"status" => status} = result) when status in ["failed", "needs_input"] do
+    failed = Map.merge(record, %{"workflow_result" => result, "phase" => "failed"})
+    failed = if WaitNotice.pending?(state.config, failed), do: Map.put(failed, "wait_notice", %{"state" => "ready"}), else: failed
+    {:ok, state |> put_record(failed) |> wake_reconciliation(failed)}
+  end
+
+  defp record_result(%{config: %{"publish_results" => false}} = state, record, result), do: {:ok, finish_review(state, record, result)}
+
+  defp record_result(state, record, result) do
+    pending = Map.put(record, "pending_result", result)
+    state = put_record(state, pending)
+
+    case verify_comment(state.config, record, result) do
+      :ok ->
+        {:ok, finish_review(state, pending, result)}
+
+      {:error, :review_comment_unverified} ->
+        {:error, :review_comment_unverified, put_record(state, record)}
+
+      {:error, reason} ->
+        fenced = Map.merge(pending, %{"phase" => "fenced", "error" => inspect(reason)})
+        {:ok, state |> put_record(fenced) |> wake_reconciliation(fenced)}
+    end
+  end
+
+  defp finish_review(state, record, result) do
+    completed = Map.merge(Map.drop(record, ["error", "pending_result"]), %{"workflow_result" => result, "phase" => "completed"})
+    put_record(state, completed)
+  end
+
+  defp reject_pending_comment(state, record) do
+    failed = Map.merge(Map.delete(record, "pending_result"), %{"phase" => "failed", "error" => "Review comment could not be verified"})
+    observe_latest(put_record(state, failed), failed)
+  end
+
+  defp verify_comment(config, record, result) do
+    path = native(config).mr_path(record["project"], record["iid"])
+
+    with {:ok, discussions} <- native(config).discussions(config, path),
+         true <- Policy.delivered_comment?(discussions, config, record["url"], result) do
+      :ok
+    else
+      false -> {:error, :review_comment_unverified}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp native(%{"provider" => "github"}), do: GitHub
   defp native(_config), do: GitLab
@@ -801,7 +970,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
   defp scope(config) do
     config
-    |> Map.take(["provider", "host", "reviewer_id", "publisher_id", "projects", "allow_insecure_http"])
+    |> Map.take(["provider", "host", "reviewer_id", "projects", "allow_insecure_http"])
     |> Map.put("publish_results", Map.get(config, "publish_results", true))
   end
 
