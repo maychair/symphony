@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.ReviewLane.WaitNotice do
   @moduledoc "Render and read back a native GitLab Review status notice."
-  alias SymphonyElixir.ReviewLane.GitLab
+  alias SymphonyElixir.ReviewLane.{GitLab, Result}
   alias SymphonyElixir.{TaskReconciler, TaskWorkflow, WaitNotice}
 
   @marker ~r/
@@ -8,8 +8,11 @@ defmodule SymphonyElixir.ReviewLane.WaitNotice do
 <!-- symphony-engine-notice -->\z/
 
   @spec pending?(map(), map()) :: boolean()
-  def pending?(%{"provider" => "gitlab"} = config, %{"phase" => "failed", "native_stop_confirmed" => true, "workflow_result" => %{"status" => "needs_input"}} = record) do
-    config["publish_results"] != false and record["wait_notice"]["state"] != "confirmed"
+  def pending?(
+        %{"provider" => "gitlab"} = config,
+        %{"phase" => "failed", "native_stop_confirmed" => true, "workflow_result" => %{"status" => "needs_input"} = result} = record
+      ) do
+    config["publish_results"] != false and record["wait_notice"]["state"] != "confirmed" and is_nil(Result.worktree_failure(result))
   end
 
   def pending?(_, _), do: false

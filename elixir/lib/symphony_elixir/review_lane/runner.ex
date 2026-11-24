@@ -47,6 +47,14 @@ defmodule SymphonyElixir.ReviewLane.Runner do
     workflow_submit. Symphony records the result and stops the session; it does not
     prepare source, validate review content, publish results or release your resources.
     The session directory is execution scratch space, not a source checkout.
+    If this execution cannot acquire a clean worktree or verify the pinned
+    checkout after the workflow's permitted recovery steps, end the round as a
+    local execution failure. Follow the workflow's cleanup for resources you
+    acquired, then submit directly through workflow_submit with result fields
+    status: "failed", failure_kind: "worktree_acquire", and reason: a concise
+    description of the local error. Do not post a comment or discussion in this
+    case. Use needs_input only for evidence the project can provide.
+    Apply this rule if the supplied workflow describes a checkout failure as an evidence gap.
     Configured result tool: #{Jason.encode!(config["result_command"])}
     Do not approve, merge, edit source, or resume other executions.
     """
