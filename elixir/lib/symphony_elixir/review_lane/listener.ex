@@ -7,8 +7,9 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   Uncertain native execution stays fenced across restarts. Review work belongs to the Agent.
   """
   use GenServer
+  require Logger
   alias SymphonyElixir.{Config, Orchestrator, TaskWorkflow, Tracker.Issue}
-  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy, WaitNotice}
+  alias SymphonyElixir.ReviewLane.{GitHub, GitLab, Journal, Owner, Policy, Result, WaitNotice}
 
   @worker_fields ~w(policy_sha native_stop_error thread_allocation_intent turn_allocation_intent native_stop_confirmed workspace worker_host backend thread_id turn_id native_stop_receipt native_stop_recovery phase error)
 
@@ -904,9 +905,26 @@ defmodule SymphonyElixir.ReviewLane.Listener do
   defp complete(state, _id, _arguments), do: {:error, :invalid_review_submission, state}
 
   defp record_result(state, record, %{"status" => status} = result) when status in ["failed", "needs_input"] do
-    failed = Map.merge(record, %{"workflow_result" => result, "phase" => "failed"})
-    failed = if WaitNotice.pending?(state.config, failed), do: Map.put(failed, "wait_notice", %{"state" => "ready"}), else: failed
-    {:ok, state |> put_record(failed) |> wake_reconciliation(failed)}
+    failed = Map.merge(record, %{"phase" => "failed", "workflow_result" => result})
+
+    case Result.worktree_failure(result) do
+      nil ->
+        failed = if WaitNotice.pending?(state.config, failed), do: Map.put(failed, "wait_notice", %{"state" => "ready"}), else: failed
+        {:ok, state |> put_record(failed) |> wake_reconciliation(failed)}
+
+      reason ->
+        local_result = Map.merge(result, %{"status" => "failed", "failure_kind" => "worktree_acquire", "reason" => reason})
+        failed = Map.merge(failed, %{"workflow_result" => local_result, "error" => reason})
+        next = put_record(state, failed)
+
+        Logger.warning(
+          "review_worktree_acquire_failed project=#{record["project"]} mr=#{record["iid"]} round=#{record["round"]} " <>
+            "issue_id=review:#{record["id"]} issue_identifier=review-#{String.slice(record["id"], 0, 16)} " <>
+            "session_id=#{record["thread_id"]}/#{record["turn_id"]} reason=#{inspect(reason, printable_limit: 1000)}"
+        )
+
+        {:ok, next}
+    end
   end
 
   defp record_result(%{config: %{"publish_results" => false}} = state, record, result), do: {:ok, finish_review(state, record, result)}

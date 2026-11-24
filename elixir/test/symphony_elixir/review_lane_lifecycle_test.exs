@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   use SymphonyElixir.TestSupport, runtime: false
+  import ExUnit.CaptureLog
   alias SymphonyElixir.ReviewLane.{Listener, Policy, Runner, WaitNotice}
   alias SymphonyElixir.Taskboard.Reviews
   alias SymphonyElixirWeb.WebhookController
@@ -369,6 +370,85 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
                {:ok, issues} = Listener.issues()
                Enum.count(issues, & &1.dispatchable) == 1
              end)
+    end
+  end
+
+  @tag event_driven: true, wait_notice: true, native_review: true
+  test "the Review runner records a worktree acquisition failure locally", c do
+    %{issue: issue} = runner_fixture(c)
+    reason = "The worktree pool has no free slots."
+    result = %{"status" => "failed", "failure_kind" => "worktree_acquire", "reason" => reason}
+    File.write!(Path.join(c.root, "submission.json"), Jason.encode!(result))
+
+    log = capture_log(fn -> assert :ok = Runner.run(issue, nil) end)
+
+    assert %{"phase" => "failed", "native_stop_confirmed" => true, "workflow_result" => ^result} = record = review_record(c, issue)
+    refute Map.has_key?(record, "wait_notice")
+    assert log =~ "review_worktree_acquire_failed project=team/repo mr=1 round=1"
+    assert log =~ reason
+    assert File.read!(Path.join(c.root, "native-requests.jsonl")) =~ "worktree_acquire"
+
+    :ok = Listener.request_review("team/repo", 1)
+    assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+    assert Enum.all?(review_requests(c), fn [method, _] -> method == "GET" end)
+  end
+
+  @tag event_driven: true, wait_notice: true
+  test "a mislabelled worktree failure still terminates the round locally", c do
+    :ok = Listener.request_review("team/repo", 1)
+    [record] = await_board_records()
+    id = "review:" <> record["id"]
+    {:ok, running, _} = Listener.begin_run(id)
+    owner = running["execution_owner"]
+    result = %{"status" => "needs_input", "failure_kind" => "worktree_acquire", "axes" => %{"spec" => %{"gaps" => ["Missing CI evidence."]}}}
+
+    assert :ok = Listener.checkpoint(id, owner, %{"native_stop_confirmed" => true})
+    capture_log(fn -> assert :ok = Listener.submit(id, owner, %{"completion" => result}) end)
+    assert {:error, :incomplete_review} = Listener.submit(id, owner, %{"completion" => result})
+    assert {:ok, %{records: [%{"phase" => "failed", "workflow_result" => %{"status" => "failed", "reason" => reason}}]}} = Listener.board_snapshot()
+    assert reason == "No acquisition error detail was supplied."
+
+    :ok = Listener.request_review("team/repo", 1)
+    assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+    assert Enum.all?(review_requests(c), fn [method, _] -> method == "GET" end)
+  end
+
+  for {outcome, gap, reason} <- [
+        {:no_clean_slot, "缺少可领取的干净审查槽位，无法核验固定版本的实现规范。", nil},
+        {:full_pool, "项目的 5 个 worktree 名额已用满，本轮未能领取审查检出，固定版本的完整差异仍待审查。", nil},
+        {:dirty_slot, "ZMC 的 10 个槽位中有 9 个已被占用，slot-04 有受保护的未提交改动，无法检出固定版本并审查差异。", nil},
+        {:execution_reason, "尚未完成固定版本的完整差异与上下文审查，无法判定本次变更是否满足需求和仓库规范。", "No clean available zmc pool slot; nine owned, slot-04 free but dirty."}
+      ] do
+    @tag event_driven: true, wait_notice: true, legacy_worktree_gap: gap, legacy_worktree_reason: reason
+    test "Review replay suppresses a legacy ready notice for #{outcome}", c do
+      :ok = Listener.request_review("team/repo", 1)
+      [record] = await_board_records()
+      stop_supervised!(Listener)
+
+      path = Path.join(c.config["state_dir"], "review-lane.json")
+      journal = path |> File.read!() |> Jason.decode!()
+      result = %{"status" => "needs_input", "reason" => c.legacy_worktree_reason, "axes" => %{"spec" => %{"gaps" => [c.legacy_worktree_gap]}}}
+
+      failed =
+        Map.merge(record, %{
+          "phase" => "failed",
+          "native_stop_confirmed" => true,
+          "workflow_result" => result,
+          "wait_notice" => %{"state" => "ready"}
+        })
+
+      File.write!(path, Jason.encode!(put_in(journal, ["records", record["id"]], failed)))
+      start_supervised!({Listener, config: c.config})
+      await_listener()
+
+      for _ <- 1..2 do
+        :ok = Listener.request_review("team/repo", 1)
+        assert eventually_review(fn -> Listener.health().pending_hints == 0 end)
+      end
+
+      assert {:ok, %{records: [%{"phase" => "failed", "round" => 1}]}} = Listener.board_snapshot()
+      assert Enum.all?(review_requests(c), fn [method, _] -> method == "GET" end)
+      assert File.read!(Path.join(c.root, "discussions.json")) == "[]"
     end
   end
 
@@ -1643,6 +1723,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     project = %{"id" => 10, "web_url" => "https://review.invalid/team/repo", "path_with_namespace" => "team/repo"}
     responses(c, %{"GET projects/team%2Frepo/merge_requests/1" => mr, "GET projects/team%2Frepo" => project})
     assert :ok = Listener.request_review("team/repo", 1)
+    if c.config["event_driven"], do: await_board_records()
     {:ok, rounds} = Listener.issues()
     %{issue: Enum.find(rounds, & &1.dispatchable), mr: mr, project: project}
   end
