@@ -605,13 +605,17 @@ defmodule SymphonyElixir.ReviewLane.Listener do
          true <- valid_mr?(mr, project, iid, state.config) or {:error, :invalid_native_review},
          {:ok, true} <- lane_assignment(state.config, project, iid, mr),
          true <- absent_record?(state.records, project, iid),
-         {:ok, discussions} <- native(state.config).discussions(state.config, path),
-         false <- Policy.prior_review?(discussions, mr, state.config) do
-      queue(state, project, iid, mr, 1)
+         {:ok, discussions} <- native(state.config).discussions(state.config, path) do
+      marker = Policy.review_marker(work(state.config, project, iid))
+
+      if Policy.automatic_review?(discussions, state.config, marker) or Policy.prior_review?(discussions, mr) do
+        {:ok, state}
+      else
+        queue(state, project, iid, mr, 1)
+      end
     else
       {:ok, false} -> {:ok, state}
       false -> {:ok, state}
-      true -> {:ok, state}
       error -> error
     end
   end
@@ -839,7 +843,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
 
     case native(state.config).discussions(state.config, path) do
       {:ok, discussions} ->
-        if Policy.publisher_comment?(discussions, state.config) do
+        if Policy.automatic_review?(discussions, state.config, Policy.review_marker(record["work"])) do
           {:ok, state}
         else
           retired = put_in(state.records[record["id"]]["phase"], "superseded")
@@ -960,7 +964,7 @@ defmodule SymphonyElixir.ReviewLane.Listener do
     path = native(config).mr_path(record["project"], record["iid"])
 
     with {:ok, discussions} <- native(config).discussions(config, path),
-         true <- Policy.delivered_comment?(discussions, config, record["url"], result) do
+         true <- Policy.delivered_comment?(discussions, config, record["url"], Policy.review_marker(record["work"]), result) do
       :ok
     else
       false -> {:error, :review_comment_unverified}

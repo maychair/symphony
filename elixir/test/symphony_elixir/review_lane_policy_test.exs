@@ -67,64 +67,59 @@ defmodule SymphonyElixir.ReviewLanePolicyTest do
     refute ReviewLane.job?(%Issue{id: "normal"})
   end
 
-  test "prior_review? recognizes approvals and human or automated comments while ignoring unreviewed state" do
-    config = %{"reviewer_id" => 20, "publisher_id" => 50}
+  test "prior_review? recognizes approvals and human comments while ignoring unreviewed state" do
     mr = %{"author" => %{"id" => 30}}
 
-    refute Policy.prior_review?([], mr, config)
-    refute Policy.prior_review?([nil, %{}, %{"notes" => [nil]}], mr, config)
+    refute Policy.prior_review?([], mr)
+    refute Policy.prior_review?([nil, %{}, %{"notes" => [nil]}], mr)
 
     # Approved MR checks
-    assert Policy.prior_review?([], Map.put(mr, "approved", true), config)
-    assert Policy.prior_review?([], Map.put(mr, "detailed_merge_status", "approved"), config)
-    assert Policy.prior_review?([], Map.put(mr, "approved_by", [%{"id" => 20}]), config)
-    assert Policy.prior_review?([], Map.put(mr, "reviews", [%{"state" => "APPROVED"}]), config)
-
-    # Discussions with automated review notes
-    auto_pub = %{"notes" => [%{"id" => 1, "body" => "LGTM!", "author" => %{"id" => 50}}]}
-    assert Policy.prior_review?([auto_pub], mr, config)
-    auto_comment = %{"notes" => [%{"id" => 1, "body" => "<!-- symphony-review: 123 -->\\nLGTM!", "author" => %{"id" => 99}}]}
-    assert Policy.prior_review?([auto_comment], mr, config)
+    assert Policy.prior_review?([], Map.put(mr, "approved", true))
+    assert Policy.prior_review?([], Map.put(mr, "detailed_merge_status", "approved"))
+    assert Policy.prior_review?([], Map.put(mr, "approved_by", [%{"id" => 20}]))
+    assert Policy.prior_review?([], Map.put(mr, "reviews", [%{"state" => "APPROVED"}]))
 
     # Discussions with human reviews
     human_comment = %{"notes" => [%{"id" => 1, "body" => "Looks good to me, please fix typo.", "author" => %{"id" => 40}}]}
-    assert Policy.prior_review?([human_comment], mr, config)
+    assert Policy.prior_review?([human_comment], mr)
     reviewer_comment = %{"notes" => [%{"id" => 1, "body" => "Please add tests.", "author" => %{"id" => 20}}]}
-    assert Policy.prior_review?([reviewer_comment], mr, config)
+    assert Policy.prior_review?([reviewer_comment], mr)
     github_approval_empty_body = %{"notes" => [%{"id" => 1, "body" => "", "state" => "APPROVED", "author" => %{"id" => 20}}]}
-    assert Policy.prior_review?([github_approval_empty_body], mr, config)
+    assert Policy.prior_review?([github_approval_empty_body], mr)
 
     # System notes: approval vs non-approval
     system_approved = %{"notes" => [%{"id" => 1, "system" => true, "body" => "approved this merge request", "author" => %{"id" => 20}}]}
-    assert Policy.prior_review?([system_approved], mr, config)
+    assert Policy.prior_review?([system_approved], mr)
     system_other = %{"notes" => [%{"id" => 1, "system" => true, "body" => "changed target branch", "author" => %{"id" => 30}}]}
-    refute Policy.prior_review?([system_other], mr, config)
+    refute Policy.prior_review?([system_other], mr)
 
     # Publisher-authored assignment notifications are not review results.
     for body <- ["assigned to @reviewer", "requested review from @reviewer", "changed target branch"] do
       note = %{"notes" => [%{"system" => true, "body" => body, "author" => %{"id" => 50}}]}
-      refute Policy.prior_review?([note], mr, config)
+      refute Policy.prior_review?([note], mr)
     end
 
     publisher_approval = %{"notes" => [%{"system" => true, "body" => "approved this merge request", "author" => %{"id" => 50}}]}
-    assert Policy.prior_review?([publisher_approval], mr, config)
+    assert Policy.prior_review?([publisher_approval], mr)
 
     # Author's own comments do not count as reviews
     author_note = %{"notes" => [%{"id" => 1, "body" => "Here is my PR explanation", "author" => %{"id" => 30}}]}
-    refute Policy.prior_review?([author_note], mr, config)
+    refute Policy.prior_review?([author_note], mr)
   end
 
-  test "only the native publisher and matching provider report link prove delivery" do
+  test "a marked native comment and matching provider report link prove delivery regardless of author" do
     config = %{"provider" => "github", "publisher_id" => 50}
     url = "https://github.invalid/team/repo/pull/1"
-    note = %{"id" => 1, "body" => "LGTM!", "author" => %{"id" => 50}}
+    marker = Policy.review_marker(%{"number" => 1})
+    body = "LGTM!\n\n" <> marker
+    note = %{"id" => 1, "body" => body, "author" => %{"id" => 99}}
     review = %{"id" => "pull_review_1", "notes" => [note]}
-    result = %{"body" => "LGTM!", "artifacts" => [%{"label" => "Malformed"}, %{"url" => url <> "#pullrequestreview-1"}]}
+    result = %{"body" => body, "artifacts" => [%{"label" => "Malformed"}, %{"url" => url <> "#pullrequestreview-1"}]}
 
-    assert Policy.delivered_comment?([review], config, url, result)
-    refute Policy.delivered_comment?([review], config, url, %{})
-    refute Policy.delivered_comment?([Map.put(review, "id", "inline_1")], config, url, result)
-    refute Policy.publisher_comment?([%{"notes" => [Map.put(note, "system", true)]}], config)
-    refute Policy.publisher_comment?([%{"notes" => [%{"body" => "<!-- symphony-review: forged -->"}]}], config)
+    assert Policy.delivered_comment?([review], config, url, marker, result)
+    refute Policy.delivered_comment?([review], config, url, marker, %{})
+    refute Policy.delivered_comment?([Map.put(review, "id", "inline_1")], config, url, marker, result)
+    refute Policy.automatic_review?([%{review | "notes" => [Map.put(note, "system", true)]}], config, marker)
+    refute Policy.automatic_review?([%{review | "notes" => [%{"body" => marker}]}], config, marker)
   end
 end

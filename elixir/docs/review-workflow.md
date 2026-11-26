@@ -23,14 +23,12 @@ restricts the Agent to local results; the default permits publication under the
 supplied Workflow. This is instruction-level authority, not an OS sandbox. The
 scheduler never posts review comments, in either mode.
 
-The session exposes native tools and `workflow_submit`. Publishing-enabled
-lanes require one native Review comment. The Agent submits the comment body and
-native report URL. After confirmed native stop, the listener checks that the
-comment exists on the selected MR or PR, matches the body and URL, and was
-written by the configured `publisher_id`. Use the user ID of the account
-associated with the active publishing credential. This identity applies to new
-receipts and can be rotated without resetting review history. Once verification
-succeeds, the listener marks the review completed. Local-only runs retain their submitted result without a comment.
+The session exposes native tools and `workflow_submit`. The final automatic
+Review comment includes the stable HTML marker supplied by the Runner. The Agent
+submits the exact body, including the marker, and the native comment URL. After
+confirmed native stop, the listener verifies the marker, body and URL on the
+selected MR or PR. The repository's native publishing authorization still applies
+when writing the comment. Local-only runs retain their submitted result in Symphony.
 A transient read failure retains the submitted receipt for read-only retry.
 The scheduler does not evaluate review conclusions. A `failed` or `needs_input`
 result records a blocker without publishing a Review comment. A current GitLab
@@ -38,9 +36,8 @@ result records a blocker without publishing a Review comment. A current GitLab
 discussion mentioning the configured reviewer. The notice lists confirmed
 findings, evidence still needed, ownership and the conditions for requesting
 review again. Local-only lanes, ordinary failures and superseded rounds send no
-status notice. Each publishing repository must use the credential context of
-its configured publisher. The notice never qualifies as a Review verdict or prevents a
-replacement review.
+status notice. Status notices use the configured `publisher_id` credential context. A status
+notice never counts as a completed Review.
 
 The listener persists the send intent in the existing review journal before
 posting. Reconciliation rechecks the fixed MR revision, assignment and bot,
@@ -55,13 +52,11 @@ no process exit authorizes reclaiming an external resource. Normal resource retu
 belongs to the Agent's workflow; incomplete tasks retain ownership for explicit
 follow-up. The scheduler neither reads slot records nor releases slots.
 
-Each admitted MR or PR has one automatic review to deliver. Before delivery,
-a changed head, base, target or policy supersedes the previous execution.
-The listener can schedule another attempt on the latest inputs once it has
-confirmed the previous executor stopped and checked native discussions for an
-existing publisher comment. Reviewer withdrawal fences unfinished work. A new
-assignment can replace an unfinished, stopped execution. A completed review
-remains completed through later pushes and reviewer changes.
+Each admitted MR or PR has one automatic review to deliver. Discovery and replacement check native discussions for the current MR or
+PR's marker and suppress dispatch while it is present. Once the marker is
+removed, existing scheduling rules apply. Before delivery, a changed head, base,
+target or policy can supersede a stopped execution. Uncertain native reads prevent scheduling a new round.
+Reviewer withdrawal fences unfinished work.
 
 Journal schema 4 records this execution contract. Older journals remain audit-only;
 use fresh state for this version. There is no old-result conversion, migration,

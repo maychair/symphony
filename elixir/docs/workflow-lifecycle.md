@@ -1269,7 +1269,7 @@ review_lane:
       checkout: /absolute/registered/source
 ```
 
-The reviewer and publisher use separately configured stable native user IDs. Project
+The reviewer and GitLab status notice sender use separately configured native user IDs. Project
 IDs, paths and URLs must match the configured host. Discovery reads each configured
 project's paginated open MRs with `scope=all` and `reviewer_id`, then re-reads each
 candidate. This discovers requests even if the first event was lost. Duplicate or
@@ -1308,33 +1308,11 @@ live-provider deployment validation remain necessary for the full lifecycle.
 
 ## Review publication receipts
 
-`ReviewLane.Publication` delivers one body from the configured result validator.
-It does not render findings or decide whether the review is complete. A repeated
-identical submission reads back the original receipt; changing a sealed
-submission is rejected. Protocol 3 does not execute older multi-comment formats.
-
-The intent advances from `prepared` to `sending` to `published`. The journal is
-synced before POST. Only native readback of the returned discussion/note identity,
-publisher, full body and creation timestamp proves delivery. An uncertain send
-is never repeated by guessing from an identical comment.
-
-On restart, an unsent artifact can be delivered only with confirmed native stop
-and current scope and publisher authority. Changed revisions retain prior audit
-evidence without creating a replacement review. Recovery never starts an Agent.
-
-Published entries are re-read during reconciliation. Edited, deleted or replaced
-comments no longer count as current delivery evidence. A new push does not bypass
-an unresolved publication conflict for the same MR. Existing journals that
-contain submissions without the complete publication intent are rejected for
-migration, rather than inventing send history. Automatic recovery of uncertain
-native executions and operator resolution of permanently uncertain sends still
-require the execution recovery work described below. No approval or merge API
-is exposed by this publisher. Its GitLab write adapter accepts only a new
-MR discussion in a configured repository. Comment bodies reject standalone
-slash-command lines, including in examples: [GitLab quick actions](https://docs.gitlab.com/user/project/quick_actions/)
-can otherwise approve, merge or close native work through a comment. The same
-body check protects native Issue evidence publication; rejected submissions do
-not acquire a send intent.
+The Agent publishes one marked final Review comment and submits the exact body
+and native URL. The listener verifies the native comment after confirmed stop.
+An uncertain write is followed by readback. The marker binds to the native
+provider, host, repository and PR or MR. Discovery and replacement suppress dispatch while the marker is present on the expected
+target. Existing scheduling rules apply if the marker is removed.
 
 ## Review execution ownership
 
