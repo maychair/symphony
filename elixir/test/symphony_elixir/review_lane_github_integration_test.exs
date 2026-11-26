@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
   use SymphonyElixir.TestSupport, runtime: false
-  alias SymphonyElixir.ReviewLane.{Listener, Runner}
+  alias SymphonyElixir.ReviewLane.{Listener, Policy, Runner}
 
   setup context do
     root = Path.dirname(Workflow.workflow_file_path())
@@ -146,9 +146,11 @@ defmodule SymphonyElixir.ReviewLaneGitHubIntegrationTest do
     assert {:ok, [issue]} = Listener.issues()
     assert {:ok, owner, _} = Listener.begin_run(issue.id)
     assert :ok = Listener.checkpoint(issue.id, owner["execution_owner"], %{"native_stop_confirmed" => true})
-    File.write!(Path.join(c.root, "comments.json"), Jason.encode!([%{"id" => 123, "body" => "LGTM!", "user" => %{"id" => 20}}]))
+    marker = Policy.review_marker(owner["work"])
+    body = "LGTM!\n\n" <> marker
+    File.write!(Path.join(c.root, "comments.json"), Jason.encode!([%{"id" => 123, "body" => body, "user" => %{"id" => 99}}]))
 
-    completion = fn anchor -> %{"body" => "LGTM!", "artifacts" => [%{"url" => issue.url <> anchor}]} end
+    completion = fn anchor -> %{"body" => body, "artifacts" => [%{"url" => issue.url <> anchor}]} end
     assert {:error, :review_comment_unverified} = Listener.submit(issue.id, owner["execution_owner"], %{"completion" => completion.("#pullrequestreview-123")})
     assert :ok = Listener.submit(issue.id, owner["execution_owner"], %{"completion" => completion.("#issuecomment-123")})
     assert {:ok, [done]} = Listener.issues()

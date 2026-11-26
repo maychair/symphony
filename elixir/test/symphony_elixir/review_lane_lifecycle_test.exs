@@ -3,6 +3,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
   import ExUnit.CaptureLog
   alias SymphonyElixir.ReviewLane.{Listener, Policy, Runner, WaitNotice}
   alias SymphonyElixir.Taskboard.Reviews
+  alias SymphonyElixir.TaskWorkflow
   alias SymphonyElixirWeb.WebhookController
 
   defmodule FencedBackend do
@@ -191,12 +192,13 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert {:error, :review_execution_fenced} = Listener.begin_run(id)
     :ok = Listener.checkpoint(current.id, running["execution_owner"], %{"native_stop_confirmed" => true})
 
-    result = %{"status" => "completed", "body" => "LGTM!", "artifacts" => [%{"label" => "Review report", "url" => record["url"] <> "#note_123"}]}
+    body = marked_review_body(record)
+    result = %{"status" => "completed", "body" => body, "artifacts" => [%{"label" => "Review report", "url" => record["url"] <> "#note_123"}]}
     assert {:error, :review_comment_unverified} = Listener.submit(current.id, running["execution_owner"], %{"completion" => result})
     note = %{"id" => 123, "body" => "LGTM!", "author" => %{"id" => 3}}
     File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
     assert {:error, :review_comment_unverified} = Listener.submit(current.id, running["execution_owner"], %{"completion" => result})
-    note = put_in(note, ["author", "id"], c.config["publisher_id"])
+    note = Map.put(note, "body", body)
     File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
 
     assert {:error, :review_comment_unverified} =
@@ -239,7 +241,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     :ok = Listener.request_review("team/repo", 1)
     assert %{"eligibility" => "superseded"} = await_review_record("superseded")
 
-    note = %{"id" => 123, "body" => "LGTM!", "author" => %{"id" => c.config["publisher_id"]}}
+    note = %{"id" => 123, "body" => marked_review_body(record), "author" => %{"id" => 3}}
     File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
     assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true, "phase" => "fenced"})
 
@@ -262,7 +264,7 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       assert {:ok, running, _} = Listener.begin_run(id)
       assert :ok = Listener.checkpoint(id, running["execution_owner"], %{"native_stop_confirmed" => true})
 
-      note = %{"id" => 123, "body" => "LGTM!", "author" => %{"id" => c.config["publisher_id"]}}
+      note = %{"id" => 123, "body" => marked_review_body(record), "author" => %{"id" => 3}}
       File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([%{"id" => "discussion-123", "notes" => [note]}]))
       responses(c, %{"GET projects/team%2Frepo/merge_requests/1/discussions?per_page=100&page=1" => "EXIT"})
       result = %{"body" => note["body"], "artifacts" => [%{"url" => record["url"] <> "#note_123"}]}
@@ -358,10 +360,11 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
       assert length(String.split(note["body"], "Missing CI evidence.")) == 2
       refute note["body"] =~ "private"
       discussions = [%{"notes" => [note]}]
-      refute Policy.prior_review?(discussions, %{"author" => %{"id" => 30}}, c.config)
-      refute Policy.publisher_comment?(discussions, c.config)
+      marker = Policy.review_marker(record["work"])
+      refute Policy.prior_review?(discussions, %{"author" => %{"id" => 30}})
+      refute Policy.automatic_review?(discussions, c.config, marker)
       result = %{"body" => note["body"], "artifacts" => [%{"url" => record["url"] <> "#note_123"}]}
-      refute Policy.delivered_comment?(discussions, c.config, record["url"], result)
+      refute Policy.delivered_comment?(discussions, c.config, record["url"], marker, result)
 
       File.touch!(Path.join(c.root, "changed-head"))
       :ok = Listener.request_review("team/repo", 1)
@@ -531,6 +534,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert %{"eligibility" => "current", "round" => 1} = await_review_record("current")
     assert Listener.health().pending_hints == 0
   end
+
+  defp marked_review_body(record), do: "LGTM!\n\n<!-- symphony-review: #{TaskWorkflow.digest(record["work"])} -->"
 
   defp review_requests(c) do
     c.root
@@ -1004,12 +1009,8 @@ defmodule SymphonyElixir.ReviewLaneLifecycleTest do
     assert :ok = Listener.request_review("team/repo", 1)
     assert {:ok, []} = Listener.issues()
 
-    auto_note = %{
-      "id" => "101",
-      "notes" => [
-        %{"id" => 2, "body" => "<!-- symphony-review: 1 -->\\nLGTM!", "author" => %{"id" => 99}, "created_at" => "2026-01-01T00:00:00Z"}
-      ]
-    }
+    work = %{"provider" => "gitlab", "host" => "review.invalid", "repository_id" => "10", "kind" => "mr", "number" => 1}
+    auto_note = %{"id" => "101", "notes" => [%{"id" => 2, "body" => marked_review_body(%{"work" => work}), "author" => %{"id" => 30}}]}
 
     File.write!(Path.join(c.root, "discussions.json"), Jason.encode!([auto_note]))
     assert {:ok, []} = Listener.issues()
